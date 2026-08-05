@@ -999,6 +999,7 @@ class _Factory:
                 pair_compiler=self.bundle.compiler,
                 candidate_id="qd_rich_pair_" + canonical_sha256({"seed": proposal_seed})[7:35],
                 side_targeted_lineage=lineage,
+                native_validator=self.bundle.validator,
             )
 
     def audit_pair(self, pair: FrozenPair) -> dict[str, Any]:

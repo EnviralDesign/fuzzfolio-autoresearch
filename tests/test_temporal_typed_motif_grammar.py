@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 from autoresearch.temporal_search import canonical_sha256
+from autoresearch.temporal_bidirectional_genome import (
+    normalize_behaviorally_redundant_transitions,
+)
 from autoresearch.temporal_typed_motif_grammar import (
     DashboardNativeAuthority,
     Fragment,
@@ -56,6 +59,77 @@ def test_management_stages_are_one_shot_and_cannot_starve_later_exit() -> None:
     assert transitions["f3_move_break_even_request"]["sourceStateId"] == "position_after_management_2"
     assert transitions["f3_move_break_even_rejected"]["destinationStateId"] == "position_after_management_3"
     assert transitions["f4_exit_on_age_exit"]["sourceStateId"] == "position_after_management_3"
+
+
+def _duplicated_signal_exit_program() -> ModuleProgram:
+    """The frozen gen-1 specimen shape: two identical signal-exit branches."""
+
+    return ModuleProgram(
+        "short",
+        (
+            Fragment("arm", "arm_level", {"group": "g_rsi"}, {"threshold": 35.0}),
+            Fragment(
+                "entry",
+                "enter_on_level",
+                {"group": "g_rsi", "plan": "base"},
+                {"threshold": 45.0},
+            ),
+            Fragment("exit_one", "exit_on_signal", {"event": "e_rsi"}, {}),
+            Fragment("exit_two", "exit_on_signal", {"event": "e_rsi"}, {}),
+        ),
+    )
+
+
+def _signal_exit_transitions(profile: dict) -> list[dict]:
+    return [
+        item
+        for item in profile["graph"]["transitions"]
+        if item["sourceStateId"] == "position_idle"
+        and item["destinationStateId"] == "exit_pending"
+        and item["eventClass"] == "decision"
+        and item["actions"] == [{"kind": "exit_next_open"}]
+        and item["guard"].get("kind") == "all"
+        and {"kind": "fresh_event", "eventId": "e_rsi"}
+        in item["guard"].get("guards", [])
+    ]
+
+
+def test_typed_module_construction_preserves_duplicate_fragment_provenance() -> None:
+    grammar = TypedFragmentGrammar(_context(), native_authority=object())
+    canonical, _built, profile = grammar._profile_payload(
+        _duplicated_signal_exit_program()
+    )
+    signal_exits = _signal_exit_transitions(profile)
+    assert [item["id"] for item in signal_exits] == [
+        "f2_exit_on_signal_exit",
+        "f3_exit_on_signal_exit",
+    ]
+    # The pre-broad canary's per-fragment prefix invariant remains true at the
+    # grammar boundary.  Candidate finalization may later alias an exact
+    # duplicate to its deterministic survivor, but it must not erase this
+    # authored witness.
+    for index, fragment in enumerate(canonical["fragments"]):
+        prefix = f"f{index}_{fragment['productionId']}_"
+        assert any(row["id"].startswith(prefix) for row in profile["graph"]["transitions"])
+
+
+def test_duplicate_signal_exit_module_remains_natively_valid_with_all_witnesses() -> None:
+    grammar = _grammar()
+    compiled = grammar.compile_module(
+        _duplicated_signal_exit_program(),
+        candidate_id="typed_fragment_deduplicated_signal_exit",
+    )
+    assert compiled.native_report["candidateAcceptable"] is True
+    assert [item["id"] for item in _signal_exit_transitions(compiled.profile)] == [
+        "f2_exit_on_signal_exit",
+        "f3_exit_on_signal_exit",
+    ]
+    assert [item["productionId"] for item in compiled.activation_witnesses] == [
+        "arm_level",
+        "enter_on_level",
+        "exit_on_signal",
+        "exit_on_signal",
+    ]
 
 
 @pytest.mark.parametrize("seed", ["mean_reversion", "breakout", "trend"])
@@ -139,6 +213,93 @@ def test_pair_compilation_uses_canonical_dashboard_compiler_and_archive_boundary
     assert pair["profile"]["version"] == "v3"
     assert pair["profile"]["directionMode"] == "both"
     assert pair["validation"]["candidateAcceptable"] is True
+
+
+def test_direct_pair_compilation_rejects_redundant_v3_even_when_manifest_references_it() -> None:
+    grammar = _grammar()
+    long = grammar.compile_module(
+        grammar.seed(direction="long", name="mean_reversion"),
+        candidate_id="typed_fragment_duplicate_v3_long",
+    )
+    short = grammar.compile_module(
+        grammar.seed(direction="short", name="trend"),
+        candidate_id="typed_fragment_duplicate_v3_short",
+    )
+
+    class DuplicatePairAuthority:
+        def compile_pair(self, *, long_profile, short_profile, candidate_id):
+            del long_profile, short_profile
+            duplicate = {
+                "sourceStateId": "position_idle",
+                "destinationStateId": "exit_pending",
+                "eventClass": "decision",
+                "guard": {"kind": "fresh_event", "eventId": "e_rsi"},
+                "actions": [{"kind": "exit_next_open"}],
+                "reasonCode": "signal_exit.requested",
+            }
+            profile = {
+                "version": "v3",
+                "directionMode": "both",
+                "graph": {
+                    "entryArbitration": {
+                        "modules": [
+                            {
+                                "direction": "long",
+                                "sourceProfileSnapshotSha256": long.native_report[
+                                    "profileSnapshotSha256"
+                                ],
+                            },
+                            {
+                                "direction": "short",
+                                "sourceProfileSnapshotSha256": short.native_report[
+                                    "profileSnapshotSha256"
+                                ],
+                            },
+                        ],
+                        # This reference means the ordinary normalizer must
+                        # preserve both rows.  The compiler-output audit is
+                        # intentionally stricter and still rejects the v3.
+                        "transitionIds": ["duplicate_b"],
+                    },
+                    "transitions": [
+                        {"id": "duplicate_a", "priority": 5, **duplicate},
+                        {"id": "duplicate_b", "priority": 6, **duplicate},
+                    ],
+                },
+            }
+            return {
+                "profile": profile,
+                "validation": {
+                    "schemaVersion": "temporal_search_candidate_validation_v1",
+                    "candidateId": candidate_id,
+                    "rawSourceProfileSha256": canonical_sha256(profile),
+                    "status": "valid_evaluable",
+                    "evaluatorId": "test-pair-authority",
+                    "candidateAcceptable": True,
+                    "programSha256": "sha256:" + "a" * 64,
+                    "validationReportSha256": "sha256:" + "b" * 64,
+                },
+            }
+
+    probe = DuplicatePairAuthority().compile_pair(
+        long_profile=long.profile,
+        short_profile=short.profile,
+        candidate_id="typed_fragment_duplicate_v3_probe",
+    )["profile"]
+    protected, protected_report = normalize_behaviorally_redundant_transitions(probe)
+    assert [row["id"] for row in protected["graph"]["transitions"]] == [
+        "duplicate_a",
+        "duplicate_b",
+    ]
+    assert protected_report["removedTransitionCount"] == 0
+
+    with pytest.raises(GrammarError, match="behaviorally redundant transitions"):
+        grammar.compile_pair(
+            long,
+            short,
+            candidate_id="typed_fragment_duplicate_v3",
+            pair_authority=DuplicatePairAuthority(),
+        )
 
 
 def test_generator_proves_canary_scale_diversity_without_retry_until_valid() -> None:

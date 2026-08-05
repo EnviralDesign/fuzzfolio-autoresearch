@@ -30,6 +30,7 @@ from .temporal_bidirectional_genome import (
     canonical_json,
     canonical_sha256,
     deterministic_same_side_crossover,
+    normalize_behaviorally_redundant_transitions,
     proposal_side,
 )
 from .temporal_discovery_base import TemporalDiscoveryContractError
@@ -268,7 +269,18 @@ class TypedGrammarPairOperator:
 
     def indicator_plans(self, module: FrozenModule) -> Sequence[Mapping[str, Any]]:
         registry = self._registry(module)
-        return [] if registry is None else registry.enumerate_plans(module.canonical_payload()["profile"])
+        if registry is None:
+            return []
+        # Plans carry the parent source-profile hash.  Generate them from the
+        # same normalized graph that ``apply_indicator`` will pass to the
+        # operator, including when a persisted pre-deduplication module is
+        # resumed.
+        profile, _transition_deduplication = (
+            normalize_behaviorally_redundant_transitions(
+                module.canonical_payload()["profile"]
+            )
+        )
+        return registry.enumerate_plans(profile)
 
     def apply_indicator(self, module: FrozenModule, plan: Mapping[str, Any], *, candidate_id: str) -> tuple[FrozenModule, Mapping[str, Any]]:
         registry = self._registry(module)
@@ -276,18 +288,79 @@ class TypedGrammarPairOperator:
             raise TemporalDiscoveryContractError("indicator learning registry is not frozen for this pair run")
         operator = registry.get(str(plan.get("operatorId") or ""))
         source_profile = module.canonical_payload()["profile"]
+        normalized_parent, parent_transition_deduplication = (
+            normalize_behaviorally_redundant_transitions(source_profile)
+        )
+        if parent_transition_deduplication["removedTransitionCount"]:
+            # Old persisted parents can predate the frozen-module boundary.
+            # Re-admit their *raw* profile first so the native parent identity,
+            # lineage aliases, plans, preview, and application record all bind
+            # the identical normalized source graph.
+            module = FrozenModule.validate_native(
+                program=_clone(module.program),
+                profile=source_profile,
+                grammar_context=module.grammar_context,
+                catalog=module.catalog,
+                policy=module.policy,
+                native_authority_identity=module.native_authority,
+                native_validator=self._native_validator,
+                candidate_id=candidate_id + "_indicator_parent_transition_dedupe",
+                lineage=[_clone(item) for item in module.lineage],
+            )
+            source_profile = module.canonical_payload()["profile"]
+            if source_profile != normalized_parent:
+                raise TemporalDiscoveryContractError(
+                    "indicator parent transition normalization drifted during re-admission"
+                )
         preview = operator.preview(source_profile, plan)
         from .temporal_typed_motif_grammar import (
             validate_entry_route_decision_indicator_cap,
         )
 
         validate_entry_route_decision_indicator_cap(preview)
-        report = self._native_validator.validate_v2(profile=preview, candidate_id=candidate_id)
+        _normalized_preview, preview_transition_deduplication = (
+            normalize_behaviorally_redundant_transitions(preview)
+        )
+        if preview_transition_deduplication["removedTransitionCount"]:
+            raise TemporalDiscoveryContractError(
+                "indicator-learning preview introduced behaviorally redundant transitions after parent normalization"
+            )
+        report = self._native_validator.validate_v2(
+            profile=preview,
+            candidate_id=candidate_id,
+        )
         child_program = report.get("programSha256")
         child, application = operator.apply(source_profile, plan, parent_validated_program_sha256=module.native_program_sha256, child_validated_program_sha256=child_program)
         if child != preview:
             raise TemporalDiscoveryContractError("indicator-learning preview/application diverged")
-        frozen = self._freeze(module, program=module.program, profile=child, report=report, lineage=[*[_clone(item) for item in module.lineage], {"operation": "indicator_learning", "side": module.direction, "plan": _clone(plan), "planSha256": plan.get("planSha256"), "application": _clone(application)}])
+        if not isinstance(application, Mapping) or any(
+            application.get(key) != value
+            for key, value in {
+                "parentSourceProfileSha256": canonical_sha256(source_profile),
+                "childSourceProfileSha256": canonical_sha256(preview),
+                "parentValidatedProgramSha256": module.native_program_sha256,
+                "childValidatedProgramSha256": child_program,
+            }.items()
+        ):
+            raise TemporalDiscoveryContractError(
+                "indicator-learning application did not bind the exact normalized parent and child identities"
+            )
+        frozen = self._freeze(
+            module,
+            program=module.program,
+            profile=preview,
+            report=report,
+            lineage=[
+                *[_clone(item) for item in module.lineage],
+                {
+                    "operation": "indicator_learning",
+                    "side": module.direction,
+                    "plan": _clone(plan),
+                    "planSha256": plan.get("planSha256"),
+                    "application": _clone(application),
+                },
+            ],
+        )
         audit = {"schemaVersion": "temporal_qd_indicator_operation_audit_v1", "side": module.direction, "operatorId": plan.get("operatorId"), "planSha256": plan.get("planSha256"), "applicationSha256": application.get("applicationSha256"), "parentModuleIdentitySha256": module.identity_sha256, "childModuleIdentitySha256": frozen.identity_sha256, "nativeValidationReportSha256": frozen.native_validation_report_sha256}
         audit["auditSha256"] = canonical_sha256(audit)
         return frozen, audit
@@ -361,7 +434,16 @@ def _operation_choices(module: FrozenModule, authority: PairModuleOperator) -> l
     return _sorted(rows)
 
 
-def _compile_pair(long: FrozenModule, short: FrozenModule, *, parent: FrozenPair, pair_compiler: CanonicalPairCompiler, candidate_id: str, lineage: Sequence[Mapping[str, Any]]) -> FrozenPair:
+def _compile_pair(
+    long: FrozenModule,
+    short: FrozenModule,
+    *,
+    parent: FrozenPair,
+    native_validator: NativeModuleValidator | None,
+    pair_compiler: CanonicalPairCompiler,
+    candidate_id: str,
+    lineage: Sequence[Mapping[str, Any]],
+) -> FrozenPair:
     return FrozenPair.compile(
         long=long,
         short=short,
@@ -369,6 +451,7 @@ def _compile_pair(long: FrozenModule, short: FrozenModule, *, parent: FrozenPair
         pair_compiler=pair_compiler,
         candidate_id=candidate_id,
         side_targeted_lineage=lineage,
+        native_validator=native_validator,
     )
 
 
@@ -393,6 +476,42 @@ def propose_pair(
             pair = pair_factory.create_pair(proposal_seed=seed)
         if not isinstance(pair, FrozenPair):
             raise TemporalDiscoveryContractError("pair immigrant factory must return FrozenPair")
+        inherited_transition_duplicates = []
+        for module in (pair.long, pair.short):
+            _profile, report = normalize_behaviorally_redundant_transitions(
+                module.profile
+            )
+            if report["removedTransitionCount"]:
+                inherited_transition_duplicates.append(report)
+        if inherited_transition_duplicates:
+            # A factory can legally hydrate a persisted parent.  Re-admit only
+            # the affected sides before the pair is materialized, so an old
+            # archive cannot carry redundant structure into a new generation.
+            pair = FrozenPair.compile(
+                long=pair.long,
+                short=pair.short,
+                pair_compiler_identity=pair.pair_compiler,
+                pair_compiler=pair_compiler,
+                candidate_id="qd_pair_factory_transition_dedupe_"
+                + canonical_sha256(
+                    {
+                        "proposalSeed": seed,
+                        "pairIdentitySha256": pair.identity_sha256,
+                    }
+                )[7:35],
+                side_targeted_lineage=pair.side_targeted_lineage,
+                native_validator=native_validator,
+            )
+        _compiled_profile, compiled_transition_report = (
+            normalize_behaviorally_redundant_transitions(
+                pair.profile,
+                preserve_referenced_transition_ids=False,
+            )
+        )
+        if compiled_transition_report["removedTransitionCount"]:
+            raise TemporalDiscoveryContractError(
+                "pair immigrant factory emitted behaviorally redundant v3 transitions"
+            )
         with timed_span("proposal.immigrant.factory_audit"):
             factory_audit = None
             audit_pair = getattr(pair_factory, "audit_pair", None)
@@ -463,7 +582,15 @@ def propose_pair(
             raise TemporalDiscoveryContractError("side-local operation emitted an opposite-side module")
         lineage = [*_clone(parent.canonical_payload())["sideTargetedLineage"], {"operation": selected["kind"], "side": side, "proposalSeed": seed, "operationSha256": canonical_sha256(selected), "audit": _clone(audit)}]
         long, short = (changed, other) if side == "long" else (other, changed)
-        pair = _compile_pair(long, short, parent=parent, pair_compiler=pair_compiler, candidate_id=candidate_id, lineage=lineage)
+        pair = _compile_pair(
+            long,
+            short,
+            parent=parent,
+            native_validator=native_validator,
+            pair_compiler=pair_compiler,
+            candidate_id=candidate_id,
+            lineage=lineage,
+        )
         payload = {**base, "disposition": "materialized", "operation": selected, "operationAudit": _clone(audit), "changedModule": changed.canonical_payload(), "pair": pair.canonical_payload(), "pairIdentitySha256": pair.identity_sha256}
         payload["proposalSha256"] = canonical_sha256(payload)
         return pair, payload
@@ -538,7 +665,15 @@ def _propose_pair_sequence(
     return current, payload
 
 
-def propose_same_side_crossover(*, proposal_seed: str, parent: FrozenPair, mate: FrozenPair, module_authority: PairModuleOperator, pair_compiler: CanonicalPairCompiler) -> tuple[FrozenPair, dict[str, Any]]:
+def propose_same_side_crossover(
+    *,
+    proposal_seed: str,
+    parent: FrozenPair,
+    mate: FrozenPair,
+    module_authority: PairModuleOperator,
+    pair_compiler: CanonicalPairCompiler,
+    native_validator: NativeModuleValidator | None = None,
+) -> tuple[FrozenPair, dict[str, Any]]:
     """Cross only matching long↔long or short↔short modules, deterministically."""
     seed, side = str(proposal_seed), proposal_side(proposal_seed)
     left = parent.long if side == "long" else parent.short
@@ -555,7 +690,22 @@ def propose_same_side_crossover(*, proposal_seed: str, parent: FrozenPair, mate:
     changed = module_authority.compile_program(left, program, candidate_id="qd_pair_cross_" + canonical_sha256({"seed": seed, "side": side})[7:31])
     opposite = parent.short if side == "long" else parent.long
     lineage = [*_clone(parent.canonical_payload())["sideTargetedLineage"], {**record, "side": side}]
-    pair = _compile_pair(changed if side == "long" else opposite, opposite if side == "long" else changed, parent=parent, pair_compiler=pair_compiler, candidate_id="qd_pair_cross_" + canonical_sha256({"seed": seed, "parent": parent.identity_sha256, "mate": mate.identity_sha256})[7:31], lineage=lineage)
+    pair = _compile_pair(
+        changed if side == "long" else opposite,
+        opposite if side == "long" else changed,
+        parent=parent,
+        native_validator=native_validator,
+        pair_compiler=pair_compiler,
+        candidate_id="qd_pair_cross_"
+        + canonical_sha256(
+            {
+                "seed": seed,
+                "parent": parent.identity_sha256,
+                "mate": mate.identity_sha256,
+            }
+        )[7:31],
+        lineage=lineage,
+    )
     audit = {"schemaVersion": "temporal_qd_pair_crossover_audit_v1", "side": side, "sameSide": True, "operation": record, "pairIdentitySha256": pair.identity_sha256}
     audit["auditSha256"] = canonical_sha256(audit)
     return pair, audit
@@ -567,6 +717,7 @@ def _propose_crossover(
     parent: FrozenPair,
     mate: FrozenPair,
     module_authority: PairModuleOperator,
+    native_validator: NativeModuleValidator,
     pair_compiler: CanonicalPairCompiler,
     parent_selection: Mapping[str, Any] | None,
     mate_selection: Mapping[str, Any] | None,
@@ -594,6 +745,7 @@ def _propose_crossover(
             parent=parent,
             mate=mate,
             module_authority=module_authority,
+            native_validator=native_validator,
             pair_compiler=pair_compiler,
         )
     except (BidirectionalGenomeError, TemporalDiscoveryContractError) as exc:
@@ -659,6 +811,7 @@ def replay_pair_proposal(*, payload: Mapping[str, Any], module_authority: PairMo
             parent=parent,
             mate=mate,
             module_authority=module_authority,
+            native_validator=native_validator,
             pair_compiler=pair_compiler,
             parent_selection=data.get("parentSelection"),
             mate_selection=data.get("mateSelection"),
@@ -672,7 +825,14 @@ def replay_pair_proposal(*, payload: Mapping[str, Any], module_authority: PairMo
             return None
         parent = FrozenPair.from_payload(data["parentPair"])
         mate = FrozenPair.from_payload(data["matePair"])
-        pair, audit = propose_same_side_crossover(proposal_seed=data["proposalSeed"], parent=parent, mate=mate, module_authority=module_authority, pair_compiler=pair_compiler)
+        pair, audit = propose_same_side_crossover(
+            proposal_seed=data["proposalSeed"],
+            parent=parent,
+            mate=mate,
+            module_authority=module_authority,
+            native_validator=native_validator,
+            pair_compiler=pair_compiler,
+        )
         if audit != data.get("crossoverAudit") or pair.canonical_payload() != data.get("pair") or pair.identity_sha256 != data.get("pairIdentitySha256"):
             raise TemporalDiscoveryContractError("pair crossover replay diverged")
         return pair
@@ -1981,6 +2141,7 @@ def _generate_pair_population_legacy_impl(
                         parent=parent,
                         mate=mate,
                         module_authority=module_authority,
+                        native_validator=native_validator,
                         pair_compiler=pair_compiler,
                         parent_selection=parent_selection,
                         mate_selection=mate_selection,
@@ -2555,6 +2716,7 @@ def _generate_pair_population_optimized_impl(
                         parent=parent,
                         mate=mate,
                         module_authority=module_authority,
+                        native_validator=native_validator,
                         pair_compiler=pair_compiler,
                         parent_selection=parent_selection,
                         mate_selection=mate_selection,

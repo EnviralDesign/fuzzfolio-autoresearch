@@ -18,7 +18,11 @@ import sys
 import tempfile
 from typing import Any
 
-from .temporal_bidirectional_genome import FrozenModule, FrozenPair
+from .temporal_bidirectional_genome import (
+    FrozenModule,
+    FrozenPair,
+    normalize_behaviorally_redundant_transitions,
+)
 from .temporal_discovery_validation import SubprocessCandidateValidator
 from .temporal_qd_pair_factory import load_pair_run_config
 from .temporal_search import TemporalSearchContractError, canonical_sha256
@@ -119,6 +123,80 @@ def _plain(value: Any) -> Any:
     return value
 
 
+_TRANSITION_ALIASES_SCHEMA = "temporal_prebroad_transition_aliases_v1"
+
+
+def _transition_alias_manifest(
+    *,
+    profile: Mapping[str, Any],
+    profile_sha256: str,
+    deduplication_reports: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bind removed authored IDs to their surviving compiled transitions."""
+
+    aliases: list[dict[str, str]] = []
+    for report in deduplication_reports:
+        for group in report.get("groups") or []:
+            if not isinstance(group, Mapping):
+                continue
+            survivor = group.get("survivorTransitionId")
+            semantic_sha = group.get("semanticTransitionSha256")
+            removed = group.get("removedTransitionIds")
+            if not isinstance(survivor, str) or not isinstance(semantic_sha, str) or not isinstance(removed, (list, tuple)):
+                raise CanaryArtifactError("transition deduplication lineage has an invalid alias group")
+            for identifier in removed:
+                if not isinstance(identifier, str):
+                    raise CanaryArtifactError("transition deduplication lineage has an invalid removed transition id")
+                aliases.append(
+                    {
+                        "removedTransitionId": identifier,
+                        "survivorTransitionId": survivor,
+                        "semanticTransitionSha256": semantic_sha,
+                    }
+                )
+    aliases.sort(
+        key=lambda item: (
+            item["removedTransitionId"],
+            item["survivorTransitionId"],
+            item["semanticTransitionSha256"],
+        )
+    )
+    surviving_ids = {
+        str(item.get("id"))
+        for item in ((profile.get("graph") or {}).get("transitions") or [])
+        if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+    }
+    if any(item["survivorTransitionId"] not in surviving_ids for item in aliases):
+        raise CanaryArtifactError("transition alias survivor is absent from the frozen module profile")
+    manifest = {
+        "schemaVersion": _TRANSITION_ALIASES_SCHEMA,
+        "profileSha256": profile_sha256,
+        "aliases": aliases,
+    }
+    manifest["manifestSha256"] = canonical_sha256(manifest)
+    return manifest
+
+
+def _module_transition_aliases(
+    module: FrozenModule,
+    *,
+    profile: Mapping[str, Any],
+    profile_sha256: str,
+) -> dict[str, Any]:
+    reports = [
+        item["deduplication"]
+        for item in module.lineage
+        if isinstance(item, Mapping)
+        and item.get("operation") == "deduplicate_behaviorally_redundant_transitions"
+        and isinstance(item.get("deduplication"), Mapping)
+    ]
+    return _transition_alias_manifest(
+        profile=profile,
+        profile_sha256=profile_sha256,
+        deduplication_reports=reports,
+    )
+
+
 def _module_artifact(module: FrozenModule, report: Mapping[str, Any]) -> dict[str, Any]:
     context = _context(module); program = _plain(module.program); profile = _plain(module.profile)
     context_sha = canonical_sha256(_plain(module.grammar_context.payload))
@@ -126,7 +204,32 @@ def _module_artifact(module: FrozenModule, report: Mapping[str, Any]) -> dict[st
     # which verifies it inside ``temporal_prebroad_canary``.  Do not recalculate
     # that identity with this repository's compatibility codec.
     profile_sha = str(report["rawSourceProfileSha256"])
-    return {"context": context, "contextSha256": context_sha, "program": program, "programSha256": canonical_sha256(program), "nativeArtifact": {"schemaVersion": "temporal_prebroad_frozen_native_module_artifact_v1", "profile": profile, "profileSha256": profile_sha, "validation": dict(report), "identities": {"profileSha256": profile_sha, "contextSha256": context_sha, "programSha256": canonical_sha256(program), "rawModuleSha256": canonical_sha256(profile), "nativeProgramSha256": report["programSha256"], "nativeValidationReportSha256": report["validationReportSha256"], "compiledGraphStructureSha256": compiled_graph_signature(profile)}}}
+    return {
+        "context": context,
+        "contextSha256": context_sha,
+        "program": program,
+        "programSha256": canonical_sha256(program),
+        "nativeArtifact": {
+            "schemaVersion": "temporal_prebroad_frozen_native_module_artifact_v1",
+            "profile": profile,
+            "profileSha256": profile_sha,
+            "validation": dict(report),
+            "identities": {
+                "profileSha256": profile_sha,
+                "contextSha256": context_sha,
+                "programSha256": canonical_sha256(program),
+                "rawModuleSha256": canonical_sha256(profile),
+                "nativeProgramSha256": report["programSha256"],
+                "nativeValidationReportSha256": report["validationReportSha256"],
+                "compiledGraphStructureSha256": compiled_graph_signature(profile),
+            },
+        },
+        "transitionAliases": _module_transition_aliases(
+            module,
+            profile=profile,
+            profile_sha256=profile_sha,
+        ),
+    }
 
 
 def _revalidate(pair: FrozenPair, candidate_id: str, authority: SubprocessCandidateValidator) -> dict[str, Any]:
@@ -196,7 +299,14 @@ def main(pair):
  for side,key in (('long','longModule'),('short','shortModule')):
   for ix,frag in enumerate(pair[key]['program']['fragments']):
    prefix=side+'_f%d_%s_'%(ix,frag['productionId']); rows=[x for x in transitions if x['id'].startswith(prefix)]
-   if not rows: raise ValueError('unmapped fragment '+prefix)
+   if not rows:
+    aliases=pair[key]['transitionAliases']['aliases']; by_id={x['id']:x for x in transitions}
+    targets=[side+'_'+x['survivorTransitionId'] for x in aliases if (side+'_'+x['removedTransitionId']).startswith(prefix)]
+    rows=[]
+    for target in targets:
+     if target not in by_id: raise ValueError('transition alias target is absent '+target)
+     if target not in {x['id'] for x in rows}: rows.append(by_id[target])
+    if not rows: raise ValueError('unmapped fragment '+prefix)
    primary=next((x for x in rows if x['actions']), next((x for x in rows if x['id'].endswith('_arm') or x['id'].endswith('_gate')), rows[0]))
    life=primary['reasonCode'].split('.')[-1]; action=primary['actions'][0]['kind'] if primary['actions'] else None
    mappings.append({'moduleDirection':side,'fragmentIndex':ix,'productionId':frag['productionId'],'lifecycles':[{'lifecycle':life,'transitionId':primary['id'],'actionKind':action}]})
@@ -356,9 +466,12 @@ def build_registry_artifacts(config_path: Path, output_path: Path, *, dashboard_
             for side,key in (("long", "longModule"),("short", "shortModule")):
                 raw_context=config[key]["context"]; grammar=TypedFragmentGrammar(_grammar_context(raw_context), native_authority=authority)
                 canonical=row[side]; program=ModuleProgram(side, tuple(Fragment(uid="registry_%d" % index, production_id=item["productionId"], resources=item["resources"], choices=item["choices"]) for index,item in enumerate(canonical["fragments"])))
-                compiled=grammar.compile_module(program,candidate_id=candidate+"_"+side); report=compiled.native_report; profile=dict(compiled.profile); profiles[side]=profile
+                canonical_program,_built,authored_profile=grammar._profile_payload(program)
+                profile,deduplication=normalize_behaviorally_redundant_transitions(authored_profile)
+                report=authority.validate_v2(profile=profile,candidate_id=candidate+"_"+side)
+                compiled=grammar._compiled(program,canonical_program,profile,report,candidate_id=candidate+"_"+side); profiles[side]=profile
                 context=_public_context(raw_context)
-                profile_sha=str(report["rawSourceProfileSha256"]); modules[side+"Module"]={"context":context,"contextSha256":grammar.context_sha256,"program":dict(compiled.program),"programSha256":compiled.identities["programSha256"],"nativeArtifact":{"schemaVersion":"temporal_prebroad_frozen_native_module_artifact_v1","profile":profile,"profileSha256":profile_sha,"validation":dict(report),"identities":{"profileSha256":profile_sha,**dict(compiled.identities)}}}
+                profile_sha=str(report["rawSourceProfileSha256"]); modules[side+"Module"]={"context":context,"contextSha256":grammar.context_sha256,"program":dict(compiled.program),"programSha256":compiled.identities["programSha256"],"nativeArtifact":{"schemaVersion":"temporal_prebroad_frozen_native_module_artifact_v1","profile":profile,"profileSha256":profile_sha,"validation":dict(report),"identities":{"profileSha256":profile_sha,**dict(compiled.identities)}},"transitionAliases":_transition_alias_manifest(profile=profile,profile_sha256=profile_sha,deduplication_reports=[deduplication])}
             result=client.compile_pair(candidate_id=candidate,long_profile=profiles["long"],short_profile=profiles["short"],expected_long_raw_source_profile_sha256=canonical_sha256(profiles["long"]),expected_short_raw_source_profile_sha256=canonical_sha256(profiles["short"]))
             built.append({"candidateId":candidate,**modules,"pair":{"profile":result["profile"],"validation":result["report"]}})
     solved=_solve_streams(built,dashboard_python)

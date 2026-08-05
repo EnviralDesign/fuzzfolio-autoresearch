@@ -24,6 +24,7 @@ GENOME_SCHEMA = "temporal_bidirectional_genome_v1"
 MODULE_SCHEMA = "temporal_bidirectional_module_snapshot_v1"
 PAIR_SCHEMA = "temporal_bidirectional_pair_snapshot_v1"
 HOLD_MUTATION_SCHEMA = "temporal_management_plan_hold_mutation_v1"
+TRANSITION_DEDUPLICATION_SCHEMA = "temporal_behaviorally_redundant_transition_deduplication_v1"
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SIDE = frozenset(("long", "short"))
 _MUTABLE_ALIAS_KEYS = frozenset(
@@ -152,6 +153,155 @@ def _assert_no_mutable_alias(value: Any, *, name: str) -> None:
     elif isinstance(value, (list, tuple)):
         for item in value:
             _assert_no_mutable_alias(item, name=name)
+
+
+def normalize_behaviorally_redundant_transitions(
+    profile: Mapping[str, Any],
+    *,
+    preserve_referenced_transition_ids: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Remove only exact duplicate graph transitions from an authored profile.
+
+    Transition selection in the native temporal kernel is ordered by
+    ``(priority, id)``.  For transitions whose every field other than those
+    two selection/identity fields is canonically identical, selecting either
+    one yields the same destination and actions.  Retaining that first native
+    selection key is therefore behavior-preserving while avoiding redundant
+    graph structure.
+
+    This deliberately does *not* simplify guards, reorder actions, or treat
+    labels/reason codes/unknown fields as cosmetic.  Those fields remain in
+    the equivalence material so the rule stays conservative as the graph
+    schema evolves.  An ID targeted by a guard or entry-arbitration structure
+    also remains semantic and protects its whole equivalence group. Malformed
+    transition rows are likewise left for the native validator to reject
+    rather than being repaired here.
+    """
+
+    normalized = _mapping(
+        _thaw(profile),
+        name="transition-deduplication profile",
+    )
+
+    def empty_report() -> dict[str, Any]:
+        report = {
+            "schemaVersion": TRANSITION_DEDUPLICATION_SCHEMA,
+            "transitionCount": 0,
+            "duplicateGroupCount": 0,
+            "removedTransitionCount": 0,
+            "groups": [],
+        }
+        report["reportSha256"] = canonical_sha256(report)
+        return report
+
+    graph = normalized.get("graph")
+    if not isinstance(graph, dict):
+        return normalized, empty_report()
+    transitions = graph.get("transitions")
+    if not isinstance(transitions, list):
+        return normalized, empty_report()
+
+    referenced_transition_ids: set[str] = set()
+
+    def collect_references(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if key in {"transitionId", "conflictTransitionId"} and isinstance(
+                    item, str
+                ):
+                    referenced_transition_ids.add(item)
+                elif key in {"supervisorTransitionIds", "transitionIds"} and isinstance(
+                    item, (list, tuple)
+                ):
+                    referenced_transition_ids.update(
+                        transition_id
+                        for transition_id in item
+                        if isinstance(transition_id, str)
+                    )
+                collect_references(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_references(item)
+
+    if preserve_referenced_transition_ids:
+        collect_references(normalized)
+
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, transition in enumerate(transitions):
+        if not isinstance(transition, dict):
+            continue
+        # Only valid native transition identity/priority shapes participate.
+        # Invalid rows must remain visible to the downstream native validator.
+        identifier = transition.get("id")
+        priority = transition.get("priority")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or isinstance(priority, bool)
+            or not isinstance(priority, int)
+        ):
+            continue
+        semantics = {
+            key: value
+            for key, value in transition.items()
+            if key not in {"id", "priority"}
+        }
+        groups.setdefault(canonical_json(semantics), []).append((index, transition))
+
+    survivor_indexes = set(range(len(transitions)))
+    audit_groups: list[dict[str, Any]] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        if preserve_referenced_transition_ids and any(
+            transition["id"] in referenced_transition_ids
+            for _index, transition in members
+        ):
+            continue
+        # Match the native kernel's transition arbitration order exactly.
+        survivor_index, survivor = min(
+            members,
+            key=lambda item: (int(item[1]["priority"]), str(item[1]["id"])),
+        )
+        removed = [
+            item
+            for item in members
+            if item[0] != survivor_index
+        ]
+        survivor_indexes.difference_update(index for index, _item in removed)
+        audit_groups.append(
+            {
+                "survivorTransitionId": survivor["id"],
+                "survivorPriority": survivor["priority"],
+                "removedTransitionIds": [item["id"] for _index, item in removed],
+                "removedPriorities": [item["priority"] for _index, item in removed],
+                "semanticTransitionSha256": canonical_sha256(
+                    {
+                        key: value
+                        for key, value in survivor.items()
+                        if key not in {"id", "priority"}
+                    }
+                ),
+            }
+        )
+
+    if audit_groups:
+        graph["transitions"] = [
+            transition
+            for index, transition in enumerate(transitions)
+            if index in survivor_indexes
+        ]
+    report = {
+        "schemaVersion": TRANSITION_DEDUPLICATION_SCHEMA,
+        "transitionCount": len(transitions),
+        "duplicateGroupCount": len(audit_groups),
+        "removedTransitionCount": sum(
+            len(group["removedTransitionIds"]) for group in audit_groups
+        ),
+        "groups": audit_groups,
+    }
+    report["reportSha256"] = canonical_sha256(report)
+    return normalized, report
 
 
 @dataclass(frozen=True)
@@ -287,16 +437,68 @@ class FrozenModule:
         if native_validator is None:
             raise BidirectionalGenomeError("native module validator is mandatory")
         candidate = _identifier(candidate_id, name="native module candidate id")
-        report = native_validator.validate_v2(profile=_mapping(profile, name="hydrated v2 module profile"), candidate_id=candidate)
+        normalized_profile, transition_report = (
+            normalize_behaviorally_redundant_transitions(
+                _mapping(profile, name="hydrated v2 module profile")
+            )
+        )
+        report = native_validator.validate_v2(
+            profile=normalized_profile,
+            candidate_id=candidate,
+        )
+        normalized_lineage = list(lineage)
+        if transition_report["removedTransitionCount"]:
+            normalized_lineage.append(
+                {
+                    "operation": "deduplicate_behaviorally_redundant_transitions",
+                    "side": normalized_profile.get("directionMode"),
+                    "deduplication": transition_report,
+                }
+            )
         return cls.freeze(
             program=program,
-            profile=profile,
+            profile=normalized_profile,
             grammar_context=grammar_context,
             catalog=catalog,
             policy=policy,
             native_authority=native_authority_identity,
             native_report=report,
-            lineage=lineage,
+            lineage=normalized_lineage,
+        )
+
+    @classmethod
+    def normalize_transitions(
+        cls,
+        module: "FrozenModule",
+        *,
+        native_validator: NativeModuleValidator,
+        candidate_id: str,
+    ) -> tuple["FrozenModule", dict[str, Any]]:
+        """Re-admit an older frozen module only when its graph needs repair."""
+
+        profile, report = normalize_behaviorally_redundant_transitions(
+            module.profile
+        )
+        if not report["removedTransitionCount"]:
+            return module, report
+        return (
+            cls.validate_native(
+                program=_thaw(module.program),
+                # Re-admit the original profile so ``validate_native`` records
+                # the exact removed->survivor aliases in immutable lineage.
+                # Passing ``profile`` here would be behaviorally correct but
+                # would lose the provenance needed to map authored grammar
+                # fragments to their surviving transition.
+                profile=_thaw(module.profile),
+                grammar_context=module.grammar_context,
+                catalog=module.catalog,
+                policy=module.policy,
+                native_authority_identity=module.native_authority,
+                native_validator=native_validator,
+                candidate_id=candidate_id,
+                lineage=[_thaw(item) for item in module.lineage],
+            ),
+            report,
         )
 
     def identity_material(self) -> dict[str, Any]:
@@ -579,6 +781,7 @@ class FrozenPair:
         pair_compiler: CanonicalPairCompiler,
         candidate_id: str,
         side_targeted_lineage: Sequence[Mapping[str, Any]] = (),
+        native_validator: NativeModuleValidator | None = None,
     ) -> "FrozenPair":
         if long.direction != "long" or short.direction != "short":
             raise BidirectionalGenomeError("economic candidates require exactly one long and one short v2 module")
@@ -586,10 +789,68 @@ class FrozenPair:
             raise BidirectionalGenomeError("canonical pair compiler authority is mandatory")
         pair_compiler_identity = IdentitySnapshot.from_payload(pair_compiler_identity.canonical_payload(), expected_kind="pairCompiler")
         candidate = _identifier(candidate_id, name="pair candidate id")
+        transition_reports: list[dict[str, Any]] = []
+        for side, module in (("long", long), ("short", short)):
+            _profile, report = normalize_behaviorally_redundant_transitions(
+                module.profile
+            )
+            if not report["removedTransitionCount"]:
+                continue
+            if native_validator is None:
+                raise BidirectionalGenomeError(
+                    "pair compilation with redundant transitions requires a native module validator"
+                )
+            normalized, applied_report = FrozenModule.normalize_transitions(
+                module,
+                native_validator=native_validator,
+                candidate_id=f"{candidate}_{side}_transition_dedupe",
+            )
+            if applied_report != report:
+                raise BidirectionalGenomeError(
+                    "transition deduplication report drifted during module re-admission"
+                )
+            if side == "long":
+                long = normalized
+            else:
+                short = normalized
+            transition_reports.append(
+                {
+                    "side": side,
+                    "deduplicationReportSha256": report["reportSha256"],
+                    "removedTransitionCount": report["removedTransitionCount"],
+                }
+            )
+        if transition_reports:
+            side_targeted_lineage = (
+                *side_targeted_lineage,
+                *[
+                    {
+                        "operation": "deduplicate_behaviorally_redundant_transitions",
+                        "side": report["side"],
+                        "deduplicationReportSha256": report[
+                            "deduplicationReportSha256"
+                        ],
+                        "removedTransitionCount": report[
+                            "removedTransitionCount"
+                        ],
+                    }
+                    for report in transition_reports
+                ],
+            )
         result = _mapping(pair_compiler.compile_pair(long_profile=_thaw(long.profile), short_profile=_thaw(short.profile), candidate_id=candidate), name="canonical pair compiler result")
         if set(result) != {"profile", "validation"}:
             raise BidirectionalGenomeError("canonical pair compiler result fields are not exact")
         profile = _mapping(result["profile"], name="compiled v3 profile")
+        _normalized_profile, compiled_transition_report = (
+            normalize_behaviorally_redundant_transitions(
+                profile,
+                preserve_referenced_transition_ids=False,
+            )
+        )
+        if compiled_transition_report["removedTransitionCount"]:
+            raise BidirectionalGenomeError(
+                "canonical pair compiler emitted behaviorally redundant transitions"
+            )
         validation = _mapping(result["validation"], name="compiled v3 validation")
         profile_sha = canonical_sha256(profile)
         if profile.get("version") != "v3" or profile.get("directionMode") != "both" or "hold" in profile:
@@ -695,6 +956,7 @@ def apply_pair_hold_mutation(
         pair_compiler=pair_compiler,
         candidate_id=candidate_id,
         side_targeted_lineage=(*[_thaw(item) for item in pair.side_targeted_lineage], {"operation": "pair_hold_mutation", "side": plan.side, "holdMutationPlanSha256": plan.plan_sha256}),
+        native_validator=native_validator,
     )
 
 
@@ -706,6 +968,7 @@ BidirectionalGenome = FrozenPair
 __all__ = [
     "BidirectionalGenome", "BidirectionalGenomeError", "CanonicalPairCompiler", "FrozenModule", "FrozenPair", "GENOME_SCHEMA",
     "HOLD_MUTATION_SCHEMA", "HoldMutationPlan", "IdentitySnapshot", "MODULE_SCHEMA", "NativeModuleValidator",
-    "PAIR_SCHEMA", "SameSideCrossover", "apply_hold_mutation", "apply_pair_hold_mutation", "canonical_hold",
+    "PAIR_SCHEMA", "SameSideCrossover", "TRANSITION_DEDUPLICATION_SCHEMA", "apply_hold_mutation", "apply_pair_hold_mutation", "canonical_hold",
     "canonical_json", "canonical_sha256", "deterministic_same_side_crossover", "proposal_side",
+    "normalize_behaviorally_redundant_transitions",
 ]
