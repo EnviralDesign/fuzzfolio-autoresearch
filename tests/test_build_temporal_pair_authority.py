@@ -11,6 +11,7 @@ from autoresearch import temporal_qd_pair_factory
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_qd_pair_factory import (
     PAIR_RUN_CONFIG_SCHEMA,
+    PAIR_RUN_CONFIG_SCHEMA_LEGACY,
     default_immigrant_construction_policy,
     default_hold_operator_policy,
     freeze_pair_run_config,
@@ -132,16 +133,28 @@ def test_catalog_context_and_freeze_are_catalog_bound(tmp_path, monkeypatch):
     assert frozen["schemaVersion"] == PAIR_RUN_CONFIG_SCHEMA
     assert frozen["pairRunConfigSha256"].startswith("sha256:")
     assert frozen["holdOperatorPolicy"] == default_hold_operator_policy()
+    assert frozen["initialProtectionOperatorPolicy"]["schemaVersion"] == (
+        "temporal_qd_initial_protection_policy_v2"
+    )
     assert (
         frozen["immigrantConstructionPolicy"]
         == default_immigrant_construction_policy()
     )
     assert frozen["operatorImplementation"]["schemaVersion"] == (
-        "temporal_qd_pair_operator_implementation_v3"
+        "temporal_qd_pair_operator_implementation_v4"
     )
     assert frozen["operatorImplementation"]["richImmigrantBuilderVersion"] == (
-        "temporal_qd_rich_immigrant_builder_v2"
+        "temporal_qd_rich_immigrant_builder_v3"
     )
+
+    legacy_raw = {
+        "schemaVersion": PAIR_RUN_CONFIG_SCHEMA_LEGACY,
+        "longModule": side,
+        "shortModule": copy.deepcopy(side),
+        "nativeJsonlAuthority": fake_transport,
+        "holdOperatorPolicy": default_hold_operator_policy(),
+    }
+    assert freeze_pair_run_config(legacy_raw)["schemaVersion"] == PAIR_RUN_CONFIG_SCHEMA
 
     rejected_policy = default_hold_operator_policy()
     rejected_policy["choices"][-1]["hours"] = 169.0

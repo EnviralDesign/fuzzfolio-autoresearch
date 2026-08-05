@@ -13,6 +13,44 @@ from autoresearch.temporal_discovery_base import (
 )
 
 
+@pytest.mark.parametrize(
+    "changed_field",
+    ["execution_engine", "worker_contract", "construction_policy", "cost_views"],
+)
+def test_rotating_continuation_rejects_evidence_semantic_drift(
+    changed_field: str,
+) -> None:
+    policy = {"enabled": True, "catalog": {"catalogSha256": "sha256:" + "d" * 64}}
+    values = {
+        "execution_engine_commit": "a" * 40,
+        "worker_contract_sha256": "sha256:" + "b" * 64,
+        "construction_operator_policy": policy,
+        "base_decision_timeframe": "M15",
+        "cost_views": supervisor.QD_COST_VIEWS,
+    }
+    source = supervisor._rotating_evidence_semantic_authority(**values)
+    changed = dict(values)
+    if changed_field == "execution_engine":
+        changed["execution_engine_commit"] = "c" * 40
+    elif changed_field == "worker_contract":
+        changed["worker_contract_sha256"] = "sha256:" + "c" * 64
+    elif changed_field == "construction_policy":
+        changed["construction_operator_policy"] = {**policy, "enabled": False}
+    else:
+        changed["cost_views"] = {
+            **supervisor.QD_COST_VIEWS,
+            "research_conservative": {
+                **supervisor.QD_COST_VIEWS["research_conservative"],
+                "spreadBps": 3.0,
+            },
+        }
+    with pytest.raises(TemporalDiscoveryContractError, match="semantics drifted"):
+        supervisor._require_continuation_evidence_semantics(
+            {"sourceEvidenceSemanticAuthority": source},
+            supervisor._rotating_evidence_semantic_authority(**changed),
+        )
+
+
 def test_four_generation_continuation_is_deterministic_and_never_targets_source_root(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -233,8 +233,78 @@ def build_qd_generation_funnel(
     tests meaningful and prevents stale rows from looking terminally selected.
     """
     entries = [_mapping(row, name="QD proposal journal entry") for row in proposal_entries]
+    # G0 evaluates a deterministic sparse subset of an immutable construction
+    # journal.  The funnel's attempt sequence is evaluation-local, while the
+    # original construction locator remains bound on every row.
+    g0 = population.get("g0Bootstrap")
+    if g0 is not None:
+        if not isinstance(g0, Mapping) or set(g0) != {"constructionPoolIdentitySha256", "acceptedPoolSha256", "selectionSha256", "ledgerSha256"}:
+            raise TemporalDiscoveryContractError("QD G0 funnel bootstrap binding is invalid")
+        construction_ordinals: set[int] = set()
+        remapped: list[dict[str, Any]] = []
+        for local_ordinal, row in enumerate(entries):
+            construction_ordinal = row.get("proposalOrdinal")
+            if isinstance(construction_ordinal, bool) or not isinstance(construction_ordinal, int) or construction_ordinal in construction_ordinals:
+                raise TemporalDiscoveryContractError("QD G0 funnel construction ordinal mapping is invalid")
+            construction_ordinals.add(construction_ordinal)
+            local = dict(row)
+            local["proposalOrdinal"] = local_ordinal
+            local["g0ConstructionReference"] = {
+                "constructionProposalOrdinal": construction_ordinal,
+                "proposalEntrySha256": row.get("entrySha256"),
+                **dict(g0),
+            }
+            remapped.append(local)
+        entries = remapped
     proposals, static_rows, native_rows, admission_rows = _stage_records(entries)
+    if g0 is not None:
+        entry_by_candidate = {
+            str(_mapping(row.get("funnelCandidate"), name="G0 funnel candidate").get("candidateId")): row
+            for row in entries
+            if isinstance(row.get("funnelCandidate"), Mapping)
+        }
+        for row in admission_rows:
+            source = entry_by_candidate.get(str(row.get("candidateId")))
+            if source is None:
+                raise TemporalDiscoveryContractError("G0 funnel admission lacks selected construction source")
+            reference = _mapping(source.get("g0ConstructionReference"), name="G0 construction reference")
+            proof = {
+                "schemaVersion": "temporal_qd_g0_funnel_proof_v1",
+                "candidateId": row["candidateId"],
+                "rawSourceProfileSha256": row["rawSourceProfileSha256"],
+                **dict(g0),
+                "constructionProposalOrdinal": reference["constructionProposalOrdinal"],
+                "proposalEntrySha256": reference["proposalEntrySha256"],
+                "nativeStaticProofSha256": canonical_sha256({"static": source.get("funnelCandidate", {}).get("staticReachability"), "native": source.get("funnelCandidate", {}).get("nativeValidation")}),
+            }
+            row["g0BootstrapProof"] = proof
+        g0_proof_authority = {
+            "schemaVersion": "temporal_qd_g0_funnel_proof_authority_v1",
+            "proofs": sorted((dict(row["g0BootstrapProof"]) for row in admission_rows), key=lambda row: str(row["candidateId"])),
+        }
+        g0_proof_authority["authoritySha256"] = canonical_sha256(g0_proof_authority)
+    else:
+        g0_proof_authority = None
     attempts = [proposal_attempt_from_journal_entry(entry) for entry in entries]
+    if g0 is not None:
+        # The generic funnel is intentionally evaluation-local for G0: its
+        # attempt ledger describes exactly the sparse selected cohort, while
+        # the immutable construction journal remains bound in each proof. Do
+        # not present the 64-entry construction accounting beside 32 local
+        # attempts, since the generic reducer correctly rejects that mismatch.
+        construction_accounting = dict(proposal_accounting)
+        proposal_accounting = {
+            **construction_accounting,
+            "dispositionCounts": {
+                key: sum(1 for row in attempts if row["disposition"] == key)
+                for key in sorted({str(row["disposition"]) for row in attempts})
+            },
+            "originProposalCounts": {
+                key: sum(1 for row in attempts if row["originKind"] == key)
+                for key in sorted({str(row["originKind"]) for row in attempts})
+            },
+            "g0ConstructionProposalAccounting": construction_accounting,
+        }
     planned = _planned_windows(authority, task_manifest)
     completed = _mapping(checkpoint.get("completed"), name="QD evaluation checkpoint completed")
     candidate_results: dict[str, dict[str, tuple[dict[str, Any], Mapping[str, Any]]]] = defaultdict(dict)
@@ -267,6 +337,9 @@ def build_qd_generation_funnel(
         for cell in _rows(archive.get("cells"), name="QD archive cells")
         for member in _rows(_mapping(cell, name="QD archive cell").get("members"), name="QD archive cell members")
     }
+    rotating_proposal_only = isinstance(
+        archive.get("rotatingEvidenceTransaction"), Mapping
+    )
     duplicate_ids = {
         str(candidate_id)
         for row in _rows(_mapping(archive.get("resolvedExecutionDeduplication") or {"duplicates": []}, name="QD resolved deduplication").get("duplicates"), name="QD resolved duplicates")
@@ -308,7 +381,8 @@ def build_qd_generation_funnel(
         else:
             outcome = "rejected"
         canonical_identity = next((row.get("canonicalEvidenceIdentitySha256") for row in admission_rows if row["candidateId"] == candidate_id), None)
-        evaluation_plans.append({**base, "canonicalEvidenceIdentitySha256": canonical_identity, "outcome": outcome, "expectedWindowIds": candidate_windows})
+        g0_proof = next((row.get("g0BootstrapProof") for row in admission_rows if row["candidateId"] == candidate_id), None)
+        evaluation_plans.append({**base, "canonicalEvidenceIdentitySha256": canonical_identity, **({"g0BootstrapProof": g0_proof} if g0_proof is not None else {}), "outcome": outcome, "expectedWindowIds": candidate_windows})
         for window_id, (behavior, _material) in sorted(observed.items()):
             evaluation_results.append({**base, "canonicalEvidenceIdentitySha256": canonical_identity, "windowId": window_id, "resultSha256": behavior["resultSha256"]})
         if outcome != "evaluated":
@@ -316,6 +390,21 @@ def build_qd_generation_funnel(
         behaviors = [observed[window][0] for window in candidate_windows]
         raw_results = [observed[window][1] for window in candidate_windows]
         quality, reasons = _quality_disposition(behaviors, raw_results, minimum_total_trades=minimum_total_trades, minimum_trades_per_window=minimum_trades_per_window)
+        member = archive_members.get(candidate_id)
+        if (
+            rotating_proposal_only
+            and member is not None
+            and member.get("archiveLane") in {"quality", "rotating_frontier"}
+        ):
+            # The rotating transaction has already classified exact cumulative
+            # equal-coverage evidence.  This artifact intentionally reports
+            # only the proposal campaign, so reapplying legacy current-panel
+            # support/worst-window gates here would contradict that authority.
+            if "finite_economics" in reasons:
+                raise TemporalDiscoveryContractError(
+                    "rotating archive retained non-finite proposal evidence"
+                )
+            quality, reasons = "eligible", []
         evidence = {"schemaVersion": QD_FUNNEL_ADAPTER_SCHEMA, "candidateId": candidate_id, "windows": behaviors}
         activation_outcome = "recorded" if quality == "eligible" else "quality_rejected"
         activation.append({
@@ -336,7 +425,6 @@ def build_qd_generation_funnel(
         # exploration lane. Preserve that fact explicitly without allowing the
         # generic funnel to treat it as a quality/promotion retention.
         if activation_outcome == "recorded":
-            member = archive_members.get(candidate_id)
             retention.append({
                 **base,
                 "canonicalEvidenceIdentitySha256": canonical_identity,
@@ -345,7 +433,6 @@ def build_qd_generation_funnel(
                 **({"archiveMemberIdentitySha256": canonical_sha256(member)} if member is not None else {}),
             })
         else:
-            member = archive_members.get(candidate_id)
             if member is not None and member.get("archiveLane") == "negative_novelty":
                 retention.append({
                     **base,
@@ -368,6 +455,7 @@ def build_qd_generation_funnel(
             activation_quality_records=activation,
             archive_retention_records=retention,
             proposal_accounting=proposal_accounting,
+            g0_proof_authority=g0_proof_authority,
         )
     except GenerationFunnelContractError as exc:
         raise TemporalDiscoveryContractError(f"QD generation funnel contract failed: {exc}") from exc

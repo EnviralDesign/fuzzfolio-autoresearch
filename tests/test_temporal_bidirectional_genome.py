@@ -559,6 +559,45 @@ def test_pair_multi_operation_mutation_is_replayable_and_records_each_step() -> 
     ).canonical_payload() == child.canonical_payload()
 
 
+def test_v1_structural_multistep_and_crossover_proposals_replay_byte_exactly() -> None:
+    legacy_schema = pair_generation_module.PAIR_PROPOSAL_SCHEMA_LEGACY
+    parent = _pair()
+    structural, structural_v2 = propose_pair(
+        proposal_seed="legacy-structural",
+        parent=parent,
+        pair_factory=None,
+        module_authority=_PairOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        replay_operation={"kind": "typed_grammar", "plan": {"op": "grammar", "side": proposal_side("legacy-structural")}},
+    )
+    multistep, multistep_v2 = _propose_pair_sequence(
+        proposal_seed="legacy-multistep", parent=parent, mutation_depth=2,
+        module_authority=_PairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(),
+    )
+    mate = _pair(_module("long", marker="first"), _module("short", marker="first"))
+    crossover, crossover_v2 = _propose_crossover(
+        proposal_seed="legacy-crossover", parent=parent, mate=mate,
+        module_authority=_MaterializingCrossoverPairOps(), pair_compiler=FakePairCompiler(),
+        parent_selection=None, mate_selection=None, mate_selection_attempts=[],
+    )
+    for proposal, expected, authority in (
+        (structural_v2, structural, _PairOps()),
+        (multistep_v2, multistep, _PairOps()),
+        (crossover_v2, crossover, _MaterializingCrossoverPairOps()),
+    ):
+        legacy = pair_generation_module._replay_payload_for_schema(
+            proposal, schema_version=legacy_schema
+        )
+        replayed = replay_pair_proposal(
+            payload=legacy, module_authority=authority,
+            native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(),
+        )
+        assert (replayed.canonical_payload() if replayed else None) == (
+            expected.canonical_payload() if expected else None
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation_depth", "authority_type", "terminal_disposition"),
     [

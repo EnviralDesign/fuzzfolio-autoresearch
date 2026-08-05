@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from autoresearch.temporal_discovery_base import canonical_sha256
 from autoresearch.temporal_generation_funnel import (
     GenerationFunnelContractError,
     build_generation_funnel_artifact,
@@ -125,6 +126,50 @@ def test_happy_path_builds_immutable_identity_bound_funnel(tmp_path: Path) -> No
     write_generation_funnel_artifact(target, artifact)
     write_generation_funnel_artifact(target, artifact)
     assert json.loads(target.read_text(encoding="utf-8"))["artifactSha256"] == artifact["artifactSha256"]
+
+
+def test_g0_proof_authority_is_required_and_tamper_evident() -> None:
+    """A pre-economic G0 admission has no substitute evidence authority."""
+    inputs = _inputs("qd_g0")
+    proof = {
+        "schemaVersion": "temporal_qd_g0_funnel_proof_v1",
+        "candidateId": "qd_g0",
+        "rawSourceProfileSha256": RAW,
+        "constructionPoolIdentitySha256": "sha256:" + "6" * 64,
+        "acceptedPoolSha256": "sha256:" + "7" * 64,
+        "selectionSha256": "sha256:" + "8" * 64,
+        "ledgerSha256": "sha256:" + "9" * 64,
+        "constructionProposalOrdinal": 41,
+        "proposalEntrySha256": "sha256:" + "0" * 64,
+        "nativeStaticProofSha256": "sha256:" + "a" * 64,
+    }
+    authority = {
+        "schemaVersion": "temporal_qd_g0_funnel_proof_authority_v1",
+        "proofs": [proof],
+    }
+    authority["authoritySha256"] = canonical_sha256(authority)
+    for stage in (inputs["admission_records"][0], inputs["evaluation_plans"][0]):
+        stage.pop("canonicalEvidenceIdentitySha256")
+        stage["g0BootstrapProof"] = proof
+    inputs["g0_proof_authority"] = authority
+    assert _build(inputs)["candidates"][0]["terminalDisposition"] == "retained"
+
+    missing = _inputs("qd_g0")
+    for stage in (missing["admission_records"][0], missing["evaluation_plans"][0]):
+        stage.pop("canonicalEvidenceIdentitySha256")
+        stage["g0BootstrapProof"] = proof
+    with pytest.raises(GenerationFunnelContractError, match="lacks canonical evidence identity"):
+        _build(missing)
+
+    tampered = _inputs("qd_g0")
+    for stage in (tampered["admission_records"][0], tampered["evaluation_plans"][0]):
+        stage.pop("canonicalEvidenceIdentitySha256")
+        stage["g0BootstrapProof"] = proof
+    tampered_authority = json.loads(json.dumps(authority))
+    tampered_authority["proofs"][0]["selectionSha256"] = "sha256:" + "b" * 64
+    tampered["g0_proof_authority"] = tampered_authority
+    with pytest.raises(GenerationFunnelContractError, match="proof authority identity mismatch"):
+        _build(tampered)
 
 
 def test_static_and_native_rejections_are_preserved_as_terminal_candidates() -> None:

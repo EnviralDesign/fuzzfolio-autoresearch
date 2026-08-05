@@ -454,6 +454,42 @@ def proposal_candidate_from_journal_entry(entry: Mapping[str, Any]) -> dict[str,
     return output
 
 
+def _verified_g0_bootstrap_proof(row: Mapping[str, Any]) -> bool:
+    proof = row.get("g0BootstrapProof")
+    if not isinstance(proof, Mapping) or set(proof) != {"schemaVersion", "candidateId", "rawSourceProfileSha256", "constructionPoolIdentitySha256", "acceptedPoolSha256", "selectionSha256", "ledgerSha256", "constructionProposalOrdinal", "proposalEntrySha256", "nativeStaticProofSha256"}:
+        return False
+    if proof.get("schemaVersion") != "temporal_qd_g0_funnel_proof_v1":
+        return False
+    if isinstance(proof.get("constructionProposalOrdinal"), bool) or not isinstance(proof.get("constructionProposalOrdinal"), int):
+        return False
+    for key in ("rawSourceProfileSha256", "constructionPoolIdentitySha256", "acceptedPoolSha256", "selectionSha256", "ledgerSha256", "proposalEntrySha256", "nativeStaticProofSha256"):
+        value = proof.get(key)
+        if not isinstance(value, str) or not value.startswith("sha256:"):
+            return False
+    return True
+
+
+def _g0_proof_authority(authority: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
+    if authority is None:
+        return {}
+    if not isinstance(authority, Mapping) or set(authority) != {"schemaVersion", "proofs", "authoritySha256"} or authority.get("schemaVersion") != "temporal_qd_g0_funnel_proof_authority_v1":
+        raise GenerationFunnelContractError("G0 funnel proof authority schema is invalid")
+    if authority.get("authoritySha256") != canonical_sha256({key: value for key, value in authority.items() if key != "authoritySha256"}):
+        raise GenerationFunnelContractError("G0 funnel proof authority identity mismatch")
+    result: dict[str, Mapping[str, Any]] = {}
+    proofs = authority.get("proofs")
+    if not isinstance(proofs, Sequence) or isinstance(proofs, (str, bytes)):
+        raise GenerationFunnelContractError("G0 funnel proof authority rows are invalid")
+    for proof in proofs:
+        if not isinstance(proof, Mapping) or not _verified_g0_bootstrap_proof({"g0BootstrapProof": proof}):
+            raise GenerationFunnelContractError("G0 funnel proof authority contains invalid proof")
+        candidate_id, raw = proof.get("candidateId"), proof.get("rawSourceProfileSha256")
+        if not isinstance(candidate_id, str) or not isinstance(raw, str) or not raw.startswith("sha256:") or candidate_id in result:
+            raise GenerationFunnelContractError("G0 funnel proof authority candidate binding is invalid")
+        result[candidate_id] = proof
+    return result
+
+
 def build_generation_funnel_artifact(
     *,
     proposal_attempt_ledger: Sequence[Mapping[str, Any]],
@@ -468,6 +504,7 @@ def build_generation_funnel_artifact(
     synthetic_evidence_records: Sequence[Mapping[str, Any]] | None = None,
     proposal_accounting: Mapping[str, Any],
     completeness_policy: Mapping[str, Any] | None = None,
+    g0_proof_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Join independently authored stage records into one immutable artifact.
 
@@ -479,6 +516,7 @@ def build_generation_funnel_artifact(
     """
 
     policy = _normalized_policy(completeness_policy)
+    trusted_g0_proofs = _g0_proof_authority(g0_proof_authority)
     proposals = _index_single(proposal_journal, source="proposal journal", proposal=True)
     attempt_ledger = _build_attempt_ledger(
         proposal_attempt_ledger,
@@ -536,9 +574,14 @@ def build_generation_funnel_artifact(
             admission = _required(admission_rows, candidate_id, stage="unique admission")
             _merge_identity(binding, admission, source="unique admission")
             admission_outcome = _outcome(admission, source="unique admission", allowed={"admitted", "rejected_duplicate"})
+            trusted_proof = trusted_g0_proofs.get(candidate_id)
             if admission_outcome == "admitted" and not _identity_from(
                 admission, source="unique admission"
-            )["canonicalEvidenceIdentitySha256"]:
+            )["canonicalEvidenceIdentitySha256"] and not (
+                trusted_proof is not None
+                and admission.get("g0BootstrapProof") == trusted_proof
+                and trusted_proof.get("rawSourceProfileSha256") == binding["rawSourceProfileSha256"]
+            ):
                 raise GenerationFunnelContractError(
                     f"admitted candidate {candidate_id} lacks canonical evidence identity"
                 )
@@ -560,7 +603,11 @@ def build_generation_funnel_artifact(
             evaluation_outcome = _outcome(plan, source="evaluation plan", allowed={"evaluated", "partial", "rejected"})
             if evaluation_outcome in {"evaluated", "partial"} and not _identity_from(
                 plan, source="evaluation plan"
-            )["canonicalEvidenceIdentitySha256"]:
+            )["canonicalEvidenceIdentitySha256"] and not (
+                trusted_proof is not None
+                and plan.get("g0BootstrapProof") == trusted_proof
+                and trusted_proof.get("rawSourceProfileSha256") == binding["rawSourceProfileSha256"]
+            ):
                 raise GenerationFunnelContractError(
                     f"evaluation plan for {candidate_id} lacks canonical evidence identity"
                 )

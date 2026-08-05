@@ -456,6 +456,133 @@ def load_stage_results(
     return grouped
 
 
+def load_provenance_bound_window_evidence(
+    *,
+    result_root: Path | str,
+    task_manifest: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    panel: Mapping[str, Any],
+    candidates: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Derive authority-independent window digests from authority-bound blobs."""
+
+    from .temporal_qd_rotating_evidence import build_candidate_window_evidence
+
+    tasks = task_manifest.get("tasks")
+    completed = checkpoint.get("completed")
+    if not isinstance(tasks, list) or not isinstance(completed, Mapping):
+        raise TemporalDiscoveryContractError("rotating evidence task ledger is invalid")
+    task_map = {
+        str(row.get("task_id")): row
+        for row in tasks
+        if isinstance(row, Mapping) and isinstance(row.get("task_id"), str)
+    }
+    if len(task_map) != len(tasks) or set(task_map) != set(completed):
+        raise TemporalDiscoveryContractError(
+            "rotating evidence requires an exactly completed task matrix"
+        )
+    authority_id = task_manifest.get("authorityId")
+    matrix_sha = task_manifest.get("taskMatrixSha256")
+    if not isinstance(authority_id, str) or not isinstance(matrix_sha, str):
+        raise TemporalDiscoveryContractError("rotating evidence task authority is invalid")
+    windows = {
+        (str(row.get("analysisWindowStart")), str(row.get("analysisWindowEnd"))): row
+        for row in panel.get("windows") or []
+        if isinstance(row, Mapping)
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for task_id in sorted(task_map):
+        task = task_map[task_id]
+        payload = task.get("payload")
+        record = completed[task_id]
+        if not isinstance(payload, Mapping) or not isinstance(record, Mapping):
+            raise TemporalDiscoveryContractError("rotating evidence task record is invalid")
+        candidate_id = str(payload.get("candidate_id") or "")
+        candidate = candidates.get(candidate_id)
+        if candidate is None or record.get("candidateId") != candidate_id:
+            raise TemporalDiscoveryContractError("rotating evidence candidate provenance mismatch")
+        raw_path = record.get("resultPath")
+        if not isinstance(raw_path, str):
+            raise TemporalDiscoveryContractError("rotating evidence result path is missing")
+        path = Path(raw_path)
+        if path.resolve().parent != (Path(result_root) / "results").resolve():
+            raise TemporalDiscoveryContractError("rotating evidence result escaped its authority root")
+        raw = _read_json(path, name="rotating candidate/window result")
+        result_sha = canonical_sha256(raw)
+        if result_sha != record.get("resultSha256"):
+            raise TemporalDiscoveryContractError("rotating evidence raw result identity mismatch")
+        try:
+            validate_v3_candidate_window_result(raw, task_payload=payload)
+        except TemporalSearchContractError as exc:
+            raise TemporalDiscoveryContractError(
+                "rotating evidence raw result does not match its task"
+            ) from exc
+        if raw.get("candidate_id") != candidate_id:
+            raise TemporalDiscoveryContractError(
+                "rotating evidence raw result candidate does not match its task"
+            )
+        window_record = _window_record(raw)
+        key = (
+            str(window_record.get("analysisWindowStart")),
+            str(window_record.get("analysisWindowEnd")),
+        )
+        window = windows.get(key)
+        if window is None:
+            raise TemporalDiscoveryContractError("rotating evidence result is outside its panel")
+        candidate_snapshot = candidate.get("profileSnapshotSha256")
+        if (
+            not isinstance(candidate_snapshot, str)
+            or window_record.get("sourceProfileSnapshotSha256")
+            != candidate_snapshot
+        ):
+            raise TemporalDiscoveryContractError(
+                "rotating evidence source profile does not match its candidate"
+            )
+        evidence_plan = payload.get("evidence_plan")
+        plan_id = evidence_plan.get("plan_id") if isinstance(evidence_plan, Mapping) else None
+        if not isinstance(plan_id, str) or not plan_id.startswith("sha256:"):
+            raise TemporalDiscoveryContractError("rotating evidence plan identity is invalid")
+        metrics = {
+            "conservativeNetR": window_record["conservativeNetR"],
+            "noCostNetR": window_record["noCostNetR"],
+            "maxDrawdownR": window_record["maxDrawdownR"],
+            "closedTrades": window_record["trades"],
+            "observations": window_record["observations"],
+            "v3Admissible": window_record["v3Admissible"],
+            "resolvedProgramSha256": window_record["resolvedProgramSha256"],
+            "resolvedProfileSnapshotSha256": window_record[
+                "resolvedProfileSnapshotSha256"
+            ],
+            "sourceProfileSnapshotSha256": window_record[
+                "sourceProfileSnapshotSha256"
+            ],
+        }
+        grouped.setdefault(candidate_id, []).append(
+            build_candidate_window_evidence(
+                candidate=candidate,
+                panel=panel,
+                window=window,
+                metrics=metrics,
+                evidence_plan_semantic_sha256=plan_id,
+                provenance={
+                    "authorityId": authority_id,
+                    "taskMatrixSha256": matrix_sha,
+                    "taskId": task_id,
+                    "resultSha256": result_sha,
+                },
+            )
+        )
+    for candidate_id, rows in grouped.items():
+        rows.sort(key=lambda row: str(row["windowId"]))
+        if len(rows) != len(windows):
+            raise TemporalDiscoveryContractError(
+                f"rotating evidence candidate {candidate_id} lacks complete panel coverage"
+            )
+    if set(grouped) != set(candidates):
+        raise TemporalDiscoveryContractError("rotating evidence population coverage mismatch")
+    return grouped
+
+
 def _result_set_sha256(
     grouped: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> str:

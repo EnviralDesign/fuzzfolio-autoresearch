@@ -25,7 +25,14 @@ from .temporal_qd_evolution import (
     qd_predeclared_evidence_context,
 )
 from .temporal_qd_evidence_ladder import validate_template_discovery_windows
+from .temporal_qd_rotating_evidence import (
+    panel_for_generation,
+    panel_scoped_evaluation_identity,
+    validate_generation_template,
+    validate_panel_template,
+)
 from .temporal_qd_evaluation_population import (
+    ROTATING_COHORT_POPULATION_SCHEMA,
     evaluation_population_path,
     is_optimized_pair_population,
     load_evaluation_population,
@@ -67,6 +74,9 @@ def freeze_qd_screening_campaign(
     worker_contract_sha256: str | None = None,
     construction_catalog_path: Path | str | None = None,
     evidence_ladder: Mapping[str, Any] | None = None,
+    rotating_evidence: Mapping[str, Any] | None = None,
+    campaign_role: str = "proposal_current_panel",
+    panel_id: str | None = None,
 ) -> dict[str, Any]:
     population_file = Path(population_path)
     projection_file = evaluation_population_path(population_file)
@@ -92,7 +102,11 @@ def freeze_qd_screening_campaign(
             )
         population_payload = _read(population_file, name="QD generation population")
         population_schema = population_payload.get("schemaVersion")
-        if population_schema not in {QD_POPULATION_SCHEMA, INITIAL_POPULATION_SCHEMA}:
+        if population_schema not in {
+            QD_POPULATION_SCHEMA,
+            INITIAL_POPULATION_SCHEMA,
+            ROTATING_COHORT_POPULATION_SCHEMA,
+        }:
             raise TemporalDiscoveryContractError("unknown QD generation population schema")
         if is_optimized_pair_population(population_payload):
             raise TemporalDiscoveryContractError(
@@ -100,6 +114,31 @@ def freeze_qd_screening_campaign(
             )
         candidates, population_sha = _load_population(population_file)
         bidirectional_policy = _bidirectional_pair_policy(population_payload)
+    if campaign_role not in {
+        "proposal_current_panel",
+        "retained_parent_current_panel",
+        "prior_panel_backfill",
+    }:
+        raise TemporalDiscoveryContractError("unknown QD screening campaign role")
+    if population_schema == ROTATING_COHORT_POPULATION_SCHEMA:
+        if rotating_evidence is None:
+            raise TemporalDiscoveryContractError(
+                "rotating cohort population requires rotating evidence"
+            )
+        if population_payload.get("proposalPopulation") is not False:
+            raise TemporalDiscoveryContractError(
+                "rotating evaluation cohort cannot claim proposal authority"
+            )
+        if population_payload.get("cohortRole") != campaign_role:
+            raise TemporalDiscoveryContractError(
+                "rotating evaluation cohort role mismatch"
+            )
+        if population_payload.get("rotatingEvidenceSha256") != rotating_evidence.get(
+            "rotatingEvidenceSha256"
+        ):
+            raise TemporalDiscoveryContractError(
+                "rotating evaluation cohort curriculum mismatch"
+            )
     frozen_construction_catalog = (
         _read(Path(construction_catalog_path), name="frozen QD construction catalog")
         if construction_catalog_path is not None
@@ -146,7 +185,7 @@ def freeze_qd_screening_campaign(
             population_payload.get("policySha256") != QD_POLICY_SHA256
         ):
             raise TemporalDiscoveryContractError("QD v3 population policy mismatch")
-        if (
+        if rotating_evidence is None and (
             population_payload.get("predeclaredEvidenceContextSha256")
             != evidence_context["predeclaredEvidenceContextSha256"]
         ):
@@ -159,6 +198,8 @@ def freeze_qd_screening_campaign(
         raise TemporalDiscoveryContractError(
             "QD screening template requires candidates and windows"
         )
+    if evidence_ladder is not None and rotating_evidence is not None:
+        raise TemporalDiscoveryContractError("QD campaign cannot combine legacy and rotating evidence")
     if evidence_ladder is not None:
         validate_template_discovery_windows(template, evidence_ladder)
     worker_contract = _clone(template["workerContract"], name="QD worker contract")
@@ -222,9 +263,22 @@ def freeze_qd_screening_campaign(
     task_count = len(finite_candidates) * len(windows)
     generation_index = (
         int(population_payload["generationIndex"])
-        if population_schema == QD_POPULATION_SCHEMA
+        if population_schema in {QD_POPULATION_SCHEMA, ROTATING_COHORT_POPULATION_SCHEMA}
         else 0
     )
+    if rotating_evidence is not None:
+        resolved_panel_id = panel_id or str(
+            panel_for_generation(rotating_evidence, generation_index)["panelId"]
+        )
+        validate_panel_template(template, rotating_evidence, resolved_panel_id)
+        if population_schema == ROTATING_COHORT_POPULATION_SCHEMA and population_payload.get(
+            "panelId"
+        ) != resolved_panel_id:
+            raise TemporalDiscoveryContractError(
+                "rotating evaluation cohort panel mismatch"
+            )
+    else:
+        resolved_panel_id = None
     preparation = {
         "schemaVersion": TEMPORAL_SEARCH_PREPARATION_SCHEMA,
         "authorityLabel": (
@@ -256,7 +310,7 @@ def freeze_qd_screening_campaign(
         plans = [item["evidencePlan"] for item in candidate["windowInputs"]]
         source_candidate = candidate_map[str(candidate["candidateId"])]
         canonical_evidence_identity = None
-        if population_schema == QD_POPULATION_SCHEMA:
+        if population_schema == QD_POPULATION_SCHEMA and rotating_evidence is None:
             canonical_evidence_identity = qd_canonical_evidence_identity(
                 source_candidate, evidence_context
             )
@@ -267,6 +321,12 @@ def freeze_qd_screening_campaign(
                 raise TemporalDiscoveryContractError(
                     "QD candidate canonical evidence identity diverged before evaluation"
                 )
+        elif rotating_evidence is not None:
+            canonical_evidence_identity = panel_scoped_evaluation_identity(
+                candidate=source_candidate, evidence_context=evidence_context,
+                contract=rotating_evidence, generation_index=generation_index,
+                panel_id=resolved_panel_id, campaign_role=campaign_role,
+            )
         evaluation_candidates.append(
             {
                 "candidateId": candidate["candidateId"],
@@ -332,7 +392,11 @@ def freeze_qd_screening_campaign(
             "reservedEvidencePermitted": False,
         },
         "evaluationSeeds": [],
+        "campaignRole": campaign_role,
+        "proposalPopulation": population_schema != ROTATING_COHORT_POPULATION_SCHEMA,
+        **({"panelId": resolved_panel_id} if resolved_panel_id is not None else {}),
         **({"evidenceLadder": _clone(evidence_ladder, name="QD evidence ladder")} if evidence_ladder is not None else {}),
+        **({"rotatingEvidence": _clone(rotating_evidence, name="rotating QD evidence")} if rotating_evidence is not None else {}),
         "candidates": evaluation_candidates,
         **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
     }
@@ -356,11 +420,14 @@ def freeze_qd_screening_campaign(
         "candidateCount": len(finite_candidates),
         "windowCount": len(windows),
         "taskCount": task_count,
+        "campaignRole": campaign_role,
+        "proposalPopulation": population_schema != ROTATING_COHORT_POPULATION_SCHEMA,
         **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
         "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
         "marketEvidenceScope": "predeclared_development_windows_only",
         "reservedEvidencePermitted": False,
         **({"evidenceLadderSha256": evidence_ladder["evidenceLadderSha256"]} if evidence_ladder is not None else {}),
+        **({"rotatingEvidenceSha256": rotating_evidence["rotatingEvidenceSha256"], "panelId": resolved_panel_id} if rotating_evidence is not None else {}),
     }
     campaign["campaignSha256"] = canonical_sha256(campaign)
     _write_once(root / "campaign.json", campaign)
@@ -372,6 +439,7 @@ def freeze_qd_screening_campaign(
         "candidateCount": len(finite_candidates),
         "windowCount": len(windows),
         "taskCount": task_count,
+        "campaignRole": campaign_role,
         "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
         **({"evaluationPopulationSha256": evaluation_population_sha256} if evaluation_population_sha256 is not None else {}),
         "outputRoot": str(root.resolve()),

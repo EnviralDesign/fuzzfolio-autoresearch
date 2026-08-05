@@ -1388,6 +1388,314 @@ def build_qd_archive(
     }
 
 
+def load_qd_evaluated_members(
+    *,
+    population_path: Path | str,
+    result_root: Path | str,
+    generation_index: int,
+    generation_journal_path: Path | str | None = None,
+    minimum_total_trades: int = 8,
+    minimum_trades_per_window: int = 4,
+    cap_trades: int = 20,
+) -> dict[str, Any]:
+    """Load every evaluated member without applying archive capacity.
+
+    Rotating evidence needs a conservative/diverse provisional reduction over
+    the complete current-panel union.  The legacy archive reducer is not an
+    acceptable source because its per-cell capacity would discard evidence
+    before that union is formed.
+    """
+
+    population_file = Path(population_path)
+    projection_file = evaluation_population_path(population_file)
+    evaluation_population: Mapping[str, Any] | None = None
+    if projection_file.is_file():
+        if generation_journal_path is None:
+            raise TemporalDiscoveryContractError(
+                "optimized QD evaluated members require their generation journal"
+            )
+        evaluation_population = load_evaluation_population(
+            population_path=population_file,
+            journal_path=Path(generation_journal_path),
+        )
+        candidates = [
+            _clone(row, name="QD evaluation population candidate")
+            for row in evaluation_population["candidates"]
+        ]
+        population_sha = str(evaluation_population["populationSha256"])
+    else:
+        candidates, population_sha = _load_population(population_file)
+    candidate_map = {str(row["candidateId"]): row for row in candidates}
+    results = load_stage_results(result_root)
+    if set(results) != set(candidate_map):
+        raise TemporalDiscoveryContractError(
+            "QD evaluated member result set must exactly cover its population"
+        )
+    members: list[dict[str, Any]] = []
+    for candidate_id in sorted(candidate_map):
+        candidate = candidate_map[candidate_id]
+        windows = results[candidate_id]
+        execution_binding = _require_candidate_execution_binding(candidate, windows)
+        if any(window.get("v3Admissible") is not True for window in windows):
+            raise TemporalDiscoveryContractError(
+                "rotating QD evidence requires terminal-adjusted v3 results"
+            )
+        aggregate = _aggregate_candidate(candidate, windows)
+        if (
+            aggregate.get("authoredProgramSha256")
+            != execution_binding["authoredProgramSha256"]
+            or aggregate.get("sourceProfileSnapshotSha256")
+            != execution_binding["sourceProfileSnapshotSha256"]
+            or aggregate.get("resolvedProfileSnapshotSha256")
+            != execution_binding["resolvedProfileSnapshotSha256"]
+            or aggregate.get("resolvedProgramSha256")
+            != execution_binding["resolvedProgramSha256"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "rotating QD aggregate execution identity mismatch"
+            )
+        descriptor = qd_behavior_descriptor(candidate, aggregate)
+        members.append(
+            {
+                "candidateId": candidate_id,
+                "generationIndex": generation_index,
+                "candidate": candidate,
+                "aggregate": aggregate,
+                "descriptor": descriptor,
+                "objectives": _objective_row(candidate, aggregate),
+                "finiteDataValidity": _finite_data_validity(
+                    aggregate,
+                    minimum_total_trades=minimum_total_trades,
+                    minimum_trades_per_window=minimum_trades_per_window,
+                    cap_trades=cap_trades,
+                ),
+                "cappedTradeSupport": float(
+                    min(max(0, int(aggregate.get("totalTrades") or 0)), cap_trades)
+                ),
+            }
+        )
+    return {
+        "schemaVersion": "temporal_qd_evaluated_members_v1",
+        "generationIndex": generation_index,
+        "populationSha256": population_sha,
+        **(
+            {
+                "evaluationPopulationSha256": evaluation_population[
+                    "evaluationPopulationSha256"
+                ]
+            }
+            if evaluation_population is not None
+            else {}
+        ),
+        "resultSetSha256": _result_set_sha256(results),
+        "memberCount": len(members),
+        "members": members,
+    }
+
+
+def build_rotating_qd_parent_archive(
+    *,
+    current_members: Sequence[Mapping[str, Any]],
+    cumulative_archive: Mapping[str, Any],
+    output_path: Path | str,
+    generation_index: int,
+    previous_archive_path: Path | str,
+    bidirectional_pair_policy: Mapping[str, Any] | None = None,
+    cell_capacity: int = 4,
+) -> dict[str, Any]:
+    """Project exact cumulative breeders into the existing parent interface.
+
+    The projection is a new, explicitly bound use of the v3 parent container;
+    legacy archives retain their original interpretation.  Every retained
+    member carries its cumulative evidence row and robust lane, and no stale
+    prior member is merged.
+    """
+
+    previous, previous_sha = _load_archive(Path(previous_archive_path))
+    material = _clone(cumulative_archive, name="cumulative breeder archive")
+    cumulative_sha = _identity_payload(
+        material, "archiveSha256", name="cumulative breeder archive"
+    )
+    if material.get("mode") != "replace" or material.get("generationIndex") != generation_index:
+        raise TemporalDiscoveryContractError("rotating cumulative archive is not replace-mode")
+    quality_ids = {str(value) for value in material.get("qualityCandidateIds") or []}
+    frontier_ids = {str(value) for value in material.get("frontierCandidateIds") or []}
+    if quality_ids & frontier_ids:
+        raise TemporalDiscoveryContractError("rotating breeder lanes overlap")
+    allowed = quality_ids | frontier_ids
+    member_map = {str(row.get("candidateId")): row for row in current_members}
+    cumulative_map = {str(row.get("candidateId")): row for row in material.get("members") or [] if isinstance(row, Mapping)}
+    if not allowed <= set(member_map) or not allowed <= set(cumulative_map):
+        raise TemporalDiscoveryContractError("rotating breeder projection lacks current rich members")
+    selected: list[dict[str, Any]] = []
+    for candidate_id in sorted(allowed):
+        row = _clone(member_map[candidate_id], name="rotating current member")
+        cumulative = _clone(cumulative_map[candidate_id], name="rotating cumulative member")
+        candidate = row.get("candidate")
+        if not isinstance(candidate, Mapping) or candidate.get("candidateIdentitySha256") != cumulative.get("candidateIdentitySha256") or candidate.get("programSha256") != cumulative.get("programSha256"):
+            raise TemporalDiscoveryContractError("rotating breeder genome identity drifted")
+        lane = "quality" if candidate_id in quality_ids else "rotating_frontier"
+        robust_objectives = cumulative.get("robustObjectives")
+        if not isinstance(robust_objectives, Mapping):
+            raise TemporalDiscoveryContractError(
+                "rotating breeder lacks cumulative robust objectives"
+            )
+        row["objectives"] = {
+            "worstWindowConservativeNetR": float(
+                robust_objectives["worstWindowConservativeNetR"]
+            ),
+            "maximumDrawdownR": float(robust_objectives["drawdown"]),
+            "structuralComplexity": float(
+                (row.get("objectives") or {}).get("structuralComplexity", 0.0)
+            ),
+        }
+        row.update(
+            {
+                "archiveLane": lane,
+                "retentionReason": (
+                    "cumulative_robust_quality"
+                    if lane == "quality"
+                    else "bounded_cumulative_frontier_fallback"
+                ),
+                "robustBreederEligible": True,
+                "cumulativeEvidence": cumulative,
+                "cumulativeEvidenceArchiveSha256": cumulative_sha,
+                "robustObjectives": robust_objectives,
+                "paretoFront": None,
+                "crowdingDistance": None,
+            }
+        )
+        selected.append(row)
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in selected:
+        groups[str(row["descriptor"]["cellId"])].append(row)
+    cells: list[dict[str, Any]] = []
+    for cell_id in sorted(groups):
+        rows = sorted(
+            groups[cell_id],
+            key=lambda row: (
+                row["archiveLane"] != "quality",
+                int(row["cumulativeEvidence"].get("robustParetoFront") or 0),
+                -(
+                    math.inf
+                    if row["cumulativeEvidence"].get("robustCrowdingDistance")
+                    is None
+                    else float(
+                        row["cumulativeEvidence"]["robustCrowdingDistance"]
+                    )
+                ),
+                -float(
+                    row["robustObjectives"]["worstWindowConservativeNetR"]
+                ),
+                float(row["robustObjectives"]["drawdown"]),
+                float(row["robustObjectives"]["costDrag"]),
+                -float(row["robustObjectives"]["novelty"]),
+                -float(row["cumulativeEvidence"].get("currentPanelRank") or 0.0),
+                str(row["candidateId"]),
+            ),
+        )[:cell_capacity]
+        cells.append(
+            {
+                "cellId": cell_id,
+                "descriptor": _clone(rows[0]["descriptor"], name="rotating descriptor"),
+                "candidateCountBeforeCapacity": len(groups[cell_id]),
+                "qualityEligibleCountBeforeCapacity": sum(row["archiveLane"] == "quality" for row in groups[cell_id]),
+                "negativeNoveltyEligibleCountBeforeCapacity": 0,
+                "observationalCountBeforeCapacity": 0,
+                "breedingEligibleMemberCount": len(rows),
+                "negativeNoveltyMemberCount": 0,
+                "selectionVisitCount": 0,
+                "offspringAttemptCount": 0,
+                "members": sorted(rows, key=lambda row: str(row["candidateId"])),
+            }
+        )
+    policy = _bidirectional_pair_policy(previous)
+    supplied = (
+        _bidirectional_pair_policy({"bidirectionalPairPolicy": bidirectional_pair_policy})
+        if bidirectional_pair_policy is not None
+        else None
+    )
+    if supplied is not None and policy is not None and supplied != policy:
+        raise TemporalDiscoveryContractError("rotating parent pair policy drifted")
+    policy = supplied or policy
+    breeder_width = int(material.get("breederWidth") or 0)
+    breeder_parent_count = sum(len(row["members"]) for row in cells)
+    if breeder_width < 1 or breeder_parent_count > breeder_width:
+        raise TemporalDiscoveryContractError(
+            "rotating breeder width does not cover the projected parent archive"
+        )
+    # Preserve the ordinary 80/20 evolutionary mix only when the robust
+    # archive can actually support it.  Sparse robust evidence earns only its
+    # proportional offspring share; deterministic immigrants fill the rest.
+    if breeder_parent_count * 5 < breeder_width * 4:
+        offspring_numerator = breeder_parent_count
+        offspring_denominator = breeder_width
+    else:
+        offspring_numerator = 4
+        offspring_denominator = 5
+    parent_schedule = {
+        "schemaVersion": "temporal_qd_rotating_parent_schedule_v1",
+        "breederWidth": breeder_width,
+        "breederParentCount": breeder_parent_count,
+        "maximumOffspringNumerator": 4,
+        "maximumOffspringDenominator": 5,
+        "offspringNumerator": offspring_numerator,
+        "offspringDenominator": offspring_denominator,
+        "immigrantsFillUnsupportedShare": True,
+        "schedulingMethod": "deterministic_rational_prefix_balance",
+    }
+    parent_schedule["scheduleSha256"] = canonical_sha256(parent_schedule)
+    archive = {
+        "schemaVersion": QD_ARCHIVE_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
+        "generationIndex": generation_index,
+        "populationSha256": canonical_sha256({"cumulativeArchiveSha256": cumulative_sha, "candidateIds": sorted(allowed)}),
+        "resultSetSha256": cumulative_sha,
+        "previousArchiveSha256": previous_sha,
+        "cellCapacity": cell_capacity,
+        "candidateCountSeen": int(previous.get("candidateCountSeen") or 0) + len(current_members),
+        "candidateCountReducedThisGeneration": len(current_members),
+        "occupiedCellCount": len(cells),
+        "newCellCount": len({row["cellId"] for row in cells} - {str(row.get("cellId")) for row in previous.get("cells") or []}),
+        "memberCount": sum(len(row["members"]) for row in cells),
+        "qualityMemberCount": sum(member["archiveLane"] == "quality" for cell in cells for member in cell["members"]),
+        "observationalMemberCount": 0,
+        "negativeNoveltyMemberCount": 0,
+        "paretoAdmissionCount": len(allowed),
+        "paretoEvictionCount": max(0, int(previous.get("memberCount") or 0) - len(allowed)),
+        "rotatingEvidenceTransaction": {
+            "schemaVersion": "temporal_qd_rotating_parent_projection_v1",
+            "cumulativeArchiveSha256": cumulative_sha,
+            "rotatingEvidenceSha256": material.get("rotatingEvidenceSha256"),
+            "requiredPanelIds": material.get("requiredPanelIds"),
+            "mode": "replace",
+            "frontierFallbackPermitted": True,
+            "parentSchedule": parent_schedule,
+        },
+        **({"bidirectionalPairPolicy": {key: value for key, value in policy.items() if key != "policySha256"}} if policy is not None else {}),
+        "cells": cells,
+    }
+    archive["archiveSha256"] = canonical_sha256(archive)
+    _write_once(Path(output_path), archive)
+    return {
+        "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
+        "archiveSha256": archive["archiveSha256"],
+        "cumulativeArchiveSha256": cumulative_sha,
+        "occupiedCellCount": archive["occupiedCellCount"],
+        "memberCount": archive["memberCount"],
+        "qualityMemberCount": archive["qualityMemberCount"],
+        "frontierMemberCount": sum(member["archiveLane"] == "rotating_frontier" for cell in cells for member in cell["members"]),
+        "newCellCount": archive["newCellCount"],
+        "paretoAdmissionCount": archive["paretoAdmissionCount"],
+        "paretoEvictionCount": archive["paretoEvictionCount"],
+        "observationalMemberCount": 0,
+        "negativeNoveltyMemberCount": 0,
+    }
+
+
 def _normalize_parameters(parameters: Mapping[str, Any] | None) -> dict[str, Any]:
     value = _clone(parameters or DEFAULT_QD_PARAMETERS, name="QD parameters")
     required = {
@@ -1759,12 +2067,35 @@ def canonical_empty_bidirectional_archive_template() -> dict[str, Any]:
 def _reproduction_cells(
     archive: Mapping[str, Any], *, allow_empty_quality_bootstrap: bool = False
 ) -> list[dict[str, Any]]:
+    rotating = isinstance(archive.get("rotatingEvidenceTransaction"), Mapping)
     eligible = []
     for cell in archive.get("cells") or []:
         members = [
             member
             for member in cell.get("members") or []
-            if member.get("archiveLane") == "quality" and _quality_member(member)
+            if (
+                member.get("archiveLane") == "quality"
+                and (
+                    _quality_member(member)
+                    or (
+                        rotating
+                        and member.get("robustBreederEligible") is True
+                        and member.get("cumulativeEvidenceArchiveSha256")
+                        == archive["rotatingEvidenceTransaction"].get(
+                            "cumulativeArchiveSha256"
+                        )
+                    )
+                )
+            )
+            or (
+                rotating
+                and member.get("archiveLane") == "rotating_frontier"
+                and member.get("robustBreederEligible") is True
+                and member.get("cumulativeEvidenceArchiveSha256")
+                == archive["rotatingEvidenceTransaction"].get(
+                    "cumulativeArchiveSha256"
+                )
+            )
         ]
         if members:
             filtered = _clone(cell, name="eligible QD reproduction cell")
@@ -1881,6 +2212,16 @@ def _initial_selection_state(
 
 
 def _parent_member_order(member: Mapping[str, Any]) -> tuple[Any, ...]:
+    robust = member.get("robustObjectives")
+    if isinstance(robust, Mapping):
+        return (
+            0 if member.get("archiveLane") == "quality" else 1,
+            -float(robust["worstWindowConservativeNetR"]),
+            float(robust["drawdown"]),
+            float(robust["costDrag"]),
+            -float(robust["novelty"]),
+            str(member["candidateId"]),
+        )
     crowding = member.get("crowdingDistance")
     crowding_value = float(crowding) if crowding is not None else math.inf
     return (
@@ -1953,16 +2294,22 @@ def _select_parent(
     member = _rank_aware_parent_member(cell["members"], rng=rng)
     selection_state[cell_id]["selectionVisitCount"] += 1
     selection_state[cell_id]["offspringAttemptCount"] += 1
+    selected_lane = str(member.get("archiveLane") or "quality")
+    selected_reason = (
+        "bounded_cumulative_frontier_fallback"
+        if selected_lane == "rotating_frontier"
+        else (
+            "negative_novelty_slot_unavailable_quality_fallback"
+            if negative_novelty_slot
+            else "quality_eligible_parent"
+        )
+    )
     return (
         cell,
         member,
         mode,
-        "quality",
-        (
-            "negative_novelty_slot_unavailable_quality_fallback"
-            if negative_novelty_slot
-            else "quality_eligible_parent"
-        ),
+        selected_lane,
+        selected_reason,
     )
 
 
@@ -3217,6 +3564,8 @@ def generate_qd_generation(
     bidirectional_native_validator: Any | None = None,
     bidirectional_pair_compiler: Any | None = None,
     bidirectional_operator_implementation_identity: Mapping[str, Any] | None = None,
+    initial_construction_pool_size: int | None = None,
+    evaluation_population_size: int | None = None,
 ) -> dict[str, Any]:
     if generation_index < 1:
         raise TemporalDiscoveryContractError("evolved QD generations begin at index 1")
@@ -3253,11 +3602,23 @@ def generate_qd_generation(
             evidence_identity_context or qd_predeclared_evidence_context({}),
             name="pair QD evidence identity context",
         )
+        requested_width = int(_normalize_parameters(parameters)["targetUniqueCandidates"])
+        if (initial_construction_pool_size is None) != (evaluation_population_size is None):
+            raise TemporalDiscoveryContractError("G0 construction and evaluation widths must be supplied together")
+        is_g0 = initial_construction_pool_size is not None
+        if is_g0 and (
+            generation_index != 1
+            or int(evaluation_population_size) != requested_width
+            or int(initial_construction_pool_size) < requested_width
+            or any((cell.get("members") or []) for cell in (archive.get("cells") or []) if isinstance(cell, Mapping))
+        ):
+            raise TemporalDiscoveryContractError("G0 requires an empty generation-1 archive and must bind the normal evaluation width")
+        construction_width = int(initial_construction_pool_size) if is_g0 else requested_width
         return generate_pair_population(
             output_root=root,
             generation_index=generation_index,
-            target_unique_candidates=int(_normalize_parameters(parameters)["targetUniqueCandidates"]),
-            run_config={"parentArchiveSha256": archive_sha, "parameters": _normalize_parameters(parameters), "evidenceIdentityContext": pair_evidence_context},
+            target_unique_candidates=construction_width,
+            run_config={"parentArchiveSha256": archive_sha, "parameters": _normalize_parameters(parameters), "evidenceIdentityContext": pair_evidence_context, **({"g0Bootstrap": {"initialConstructionPoolSize": construction_width, "evaluationPopulationSize": requested_width}} if is_g0 else {})},
             pair_policy={key: value for key, value in pair_policy.items() if key != "policySha256"},
             parent_pairs=parents,
             pair_factory=bidirectional_pair_factory,
@@ -3276,6 +3637,7 @@ def generate_qd_generation(
                 _normalize_parameters(parameters)["maxProposalAttempts"]
             ),
             max_new_proposals=max_new_proposals,
+            g0_evaluation_width=(requested_width if is_g0 else None),
         )
     if any(
         value is None
@@ -3938,7 +4300,9 @@ __all__ = [
     "QD_POLICY_SHA256",
     "QD_VERSION",
     "build_qd_archive",
+    "build_rotating_qd_parent_archive",
     "generate_qd_generation",
+    "load_qd_evaluated_members",
     "qd_behavior_descriptor",
     "qd_canonical_evidence_identity",
     "qd_construction_operator_policy",

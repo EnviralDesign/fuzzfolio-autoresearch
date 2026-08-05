@@ -22,6 +22,14 @@ from .temporal_discovery_validation import DashboardBidirectionalPairCompiler, D
 from .temporal_indicator_learning_v1 import IndicatorLearningRegistry
 from .temporal_qd_observability import timed_span, timing_scope
 from .temporal_qd_pair_generation import TypedGrammarPairOperator
+from .temporal_qd_initial_protection import (
+    apply_immigrant_initial_protection,
+    apply_initial_protection_plan,
+    default_initial_protection_policy,
+    enumerate_initial_protection_plans,
+    immigrant_initial_protection_selector,
+    validate_initial_protection_policy,
+)
 from .temporal_typed_motif_grammar import (
     ENTRY_ROUTE_DECISION_INDICATOR_CAP,
     ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION,
@@ -35,14 +43,15 @@ from .temporal_typed_motif_grammar import (
     validate_entry_route_decision_indicator_cap,
 )
 
-PAIR_RUN_CONFIG_SCHEMA = "temporal_qd_bidirectional_pair_run_config_v1"
+PAIR_RUN_CONFIG_SCHEMA_LEGACY = "temporal_qd_bidirectional_pair_run_config_v1"
+PAIR_RUN_CONFIG_SCHEMA = "temporal_qd_bidirectional_pair_run_config_v2"
 PAIR_HOLD_POLICY_SCHEMA = "temporal_qd_pair_hold_operator_policy_v2"
-PAIR_IMMIGRANT_POLICY_SCHEMA = "temporal_qd_rich_immigrant_construction_policy_v1"
+PAIR_IMMIGRANT_POLICY_SCHEMA = "temporal_qd_rich_immigrant_construction_policy_v2"
 # v2 closes a composition-order hole: an indicator plan is now admitted only
 # after it has passed the entry-route decision-indicator cap.  This must bind
 # the selector stream and frozen operator identity so a resume never silently
 # reinterprets a v1 authority under the stricter construction semantics.
-PAIR_IMMIGRANT_BUILDER_VERSION = "temporal_qd_rich_immigrant_builder_v2"
+PAIR_IMMIGRANT_BUILDER_VERSION = "temporal_qd_rich_immigrant_builder_v3"
 
 _DEPTH_BUCKETS = (0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4)
 
@@ -96,12 +105,13 @@ def default_immigrant_construction_policy() -> dict[str, Any]:
         "builderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
         "selector": "sha256_length_prefixed_rejection_uniform_v1",
         "sideSelection": "independent_long_short_v1",
-        "seedResources": ["seedName", "evidenceGroup", "eventBinding", "managementPlan"],
+        "seedResources": ["seedName", "evidenceGroup", "eventBinding", "managementPlan", "initialProtection"],
         "grammarMutationDepthBuckets": list(_DEPTH_BUCKETS),
         "grammarSelection": "uniform_available_operation_family_then_plan_v1",
         "indicatorMutationDepthBuckets": list(_DEPTH_BUCKETS),
         "indicatorSelection": "uniform_available_operator_then_plan_v1",
         "holdSelection": "uniform_frozen_hold_choice_v1",
+        "initialProtectionSelection": "uniform_mode_then_uniform_coarse_values_v1",
         "nativeAdmission": "compose_then_validate_once_per_side_v2",
         "entryRouteCapPlanAdmission": "reject_invalid_indicator_preview_then_continue_v1",
         "capacityAdmission": {
@@ -309,7 +319,18 @@ def _immigrant_selector_axes(frozen: Mapping[str, Any]) -> dict[str, Any]:
             "eventIds": tuple(str(item["id"]) for item in context["events"]),
             "planIds": tuple(str(item) for item in context["plans"]),
         }
-    return {"sides": sides, "holdChoices": hold_choices}
+    result = {
+        "sides": sides,
+        "holdChoices": hold_choices,
+    }
+    if "initialProtectionOperatorPolicy" in frozen:
+        result["initialProtectionPolicy"] = validate_initial_protection_policy(
+            _mapping(
+                frozen["initialProtectionOperatorPolicy"],
+                name="pair initial protection operator policy",
+            )
+        )
+    return result
 
 
 def _selector_fingerprint_from_axes(
@@ -319,6 +340,7 @@ def _selector_fingerprint_from_axes(
 
     result: dict[str, Any] = {}
     hold_choices = axes["holdChoices"]
+    protection_policy = axes.get("initialProtectionPolicy")
     for direction in ("long", "short"):
         side = axes["sides"][direction]
         side_seed = canonical_sha256(
@@ -355,6 +377,14 @@ def _selector_fingerprint_from_axes(
                 values=hold_choices,
             ),
         }
+        if isinstance(protection_policy, Mapping):
+            result[direction]["initialProtection"] = (
+                immigrant_initial_protection_selector(
+                    policy=protection_policy,
+                    choose=_selector_value,
+                    seed=side_seed,
+                )
+            )
     return result
 
 
@@ -389,6 +419,18 @@ def immigrant_capacity_audit(
         )
     )
     hold_count = len(frozen["holdOperatorPolicy"]["choices"])
+    protection_count = 1
+    if "initialProtectionOperatorPolicy" in frozen:
+        initial_protection = validate_initial_protection_policy(
+            _mapping(
+                frozen["initialProtectionOperatorPolicy"],
+                name="pair initial protection operator policy",
+            )
+        )
+        protection_count = len(initial_protection["stopPercentChoices"]) * (
+            len(initial_protection["rewardMultipleChoices"])
+            + len(initial_protection["targetPercentChoices"])
+        )
     side_capacity: dict[str, int] = {}
     side_axes: dict[str, dict[str, int]] = {}
     for direction in ("long", "short"):
@@ -400,6 +442,11 @@ def immigrant_capacity_audit(
             "eventBindings": len(context["events"]),
             "managementPlans": len(context["plans"]),
             "holdPolicies": hold_count,
+            **(
+                {"initialProtectionPlans": protection_count}
+                if protection_count > 1
+                else {}
+            ),
         }
         if any(value < 1 for value in axes.values()):
             raise TemporalDiscoveryContractError(
@@ -469,7 +516,10 @@ def freeze_pair_run_config(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Validate external JSON and return the sole persisted pair authority."""
     value = _mapping(raw, name="bidirectional pair run config")
     required = {"schemaVersion", "longModule", "shortModule", "nativeJsonlAuthority", "holdOperatorPolicy"}
-    if set(value) != required or value.get("schemaVersion") != PAIR_RUN_CONFIG_SCHEMA:
+    if set(value) != required or value.get("schemaVersion") not in {
+        PAIR_RUN_CONFIG_SCHEMA_LEGACY,
+        PAIR_RUN_CONFIG_SCHEMA,
+    }:
         raise TemporalDiscoveryContractError("bidirectional pair run config fields/schema are not exact")
     hold = _hold_operator_policy(_mapping(value["holdOperatorPolicy"], name="pair hold operator policy"))
     transport = _bound_transport(_mapping(value["nativeJsonlAuthority"], name="pair native JSONL authority"))
@@ -481,17 +531,21 @@ def freeze_pair_run_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         "shortModule": _side(_mapping(value["shortModule"], name="short pair module"), "short"),
         "grammarRegistry": _registry_identity(),
         "holdOperatorPolicy": hold,
+        "initialProtectionOperatorPolicy": default_initial_protection_policy(),
         "immigrantConstructionPolicy": default_immigrant_construction_policy(),
         "nativeJsonlAuthority": transport,
         "nativeAuthority": native_snapshot.canonical_payload(),
         "pairCompilerAuthority": compiler_snapshot.canonical_payload(),
     }
     result["operatorImplementation"] = {
-        "schemaVersion": "temporal_qd_pair_operator_implementation_v3",
+        "schemaVersion": "temporal_qd_pair_operator_implementation_v4",
         "typedGrammarRegistrySha256": result["grammarRegistry"]["registrySha256"],
         "longIndicatorPolicySha256": result["longModule"]["indicatorPolicy"]["policySha256"],
         "shortIndicatorPolicySha256": result["shortModule"]["indicatorPolicy"]["policySha256"],
         "holdOperatorPolicySha256": canonical_sha256(hold),
+        "initialProtectionOperatorPolicySha256": canonical_sha256(
+            result["initialProtectionOperatorPolicy"]
+        ),
         "richImmigrantBuilderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
         "richImmigrantConstructionPolicySha256": canonical_sha256(result["immigrantConstructionPolicy"]),
         "entryRouteDecisionIndicatorPolicy": _clone(
@@ -791,6 +845,155 @@ class _Factory:
             selected[0]["holdPolicy"] = canonical
         return child
 
+    def _apply_dynamic_initial_protection(
+        self,
+        profile: Mapping[str, Any],
+        *,
+        side: Mapping[str, Any],
+        side_seed: str,
+        selector: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], Mapping[str, Any] | None]:
+        """Use the canonical scalar-construction transaction for G0 dynamic mode.
+
+        The parent and child validations are deliberately explicit: the
+        construction operator binds both program identities into its audit.
+        When a seed simply has no authorized completed-bar scalar, retain an
+        auditable static fallback rather than pretending dynamic was sampled.
+        """
+
+        from .temporal_operator_construction_v3 import (
+            ConstructionCatalog,
+            ScalarDynamicManagementConstructionOperator,
+        )
+
+        desired_site = str(selector.get("dynamicSite") or "")
+        if desired_site not in {"initial_stop", "initial_target"}:
+            raise TemporalDiscoveryContractError("dynamic initial protection site is invalid")
+        operator = ScalarDynamicManagementConstructionOperator(
+            ConstructionCatalog(side["catalog"])
+        )
+        plans = [
+            plan
+            for plan in operator.enumerate_plans(profile)
+            if isinstance(plan.get("construction"), Mapping)
+            and plan["construction"].get("site") == desired_site
+        ]
+        if not plans:
+            policy = self.bundle.config["initialProtectionOperatorPolicy"]
+            fallback = {
+                "mode": "coupled_reward_multiple",
+                "stopPercent": _selector_value(
+                    side_seed,
+                    axis="initial_protection_dynamic_fallback_stop_percent",
+                    values=policy["stopPercentChoices"],
+                ),
+                "rewardMultiple": _selector_value(
+                    side_seed,
+                    axis="initial_protection_dynamic_fallback_reward_multiple",
+                    values=policy["rewardMultipleChoices"],
+                ),
+            }
+            child, audit = apply_immigrant_initial_protection(
+                profile,
+                plan_id=str(selector["planId"]),
+                selector=fallback,
+                policy=self.bundle.config["initialProtectionOperatorPolicy"],
+            )
+            audit["dynamicDisposition"] = "deferred_no_catalog_authorized_completed_bar_scalar"
+            audit["requestedDynamicSite"] = desired_site
+            audit["applicationSha256"] = canonical_sha256(
+                {key: value for key, value in audit.items() if key != "applicationSha256"}
+            )
+            return child, audit, None
+        selected = _selector_value(
+            side_seed,
+            axis="initial_protection_dynamic_construction_plan",
+            values=sorted(plans, key=canonical_sha256),
+        )
+        parent_report = self.bundle.validator.validate_v2(
+            profile=dict(profile),
+            candidate_id="qd_rich_dynamic_parent_" + side_seed[7:35],
+        )
+        preview = operator.preview(profile, selected)
+        child_report = self.bundle.validator.validate_v2(
+            profile=preview,
+            candidate_id="qd_rich_dynamic_child_" + side_seed[7:35],
+        )
+        child, application = operator.apply(
+            profile,
+            selected,
+            parent_validated_program_sha256=parent_report["programSha256"],
+            child_validated_program_sha256=child_report["programSha256"],
+        )
+        if child != preview:
+            raise TemporalDiscoveryContractError(
+                "dynamic initial protection construction preview/application diverged"
+            )
+        construction = selected["construction"]
+        plan_id = str(construction["planId"])
+        locator_site = "stop" if desired_site == "initial_stop" else "target"
+        selected_plan = next(
+            item
+            for item in child["executionConfig"]["managementLibrary"]["plans"]
+            if item.get("id") == plan_id
+        )
+        locator = selected_plan[
+            "initialStop" if locator_site == "stop" else "initialTarget"
+        ]
+        multiplier_audit: Mapping[str, Any] | None = None
+        if locator.get("kind") == "indicator_distance_multiple":
+            desired_multiple = _selector_value(
+                side_seed,
+                axis="initial_protection_dynamic_distance_multiple",
+                values=self.bundle.config["initialProtectionOperatorPolicy"][
+                    "distanceMultipleChoices"
+                ],
+            )
+            replacement = {
+                "kind": "indicator_distance_multiple",
+                "bindingId": locator["bindingId"],
+                "multiple": desired_multiple,
+            }
+            if replacement != locator:
+                adjustment = next(
+                    item
+                    for item in enumerate_initial_protection_plans(
+                        child, self.bundle.config["initialProtectionOperatorPolicy"]
+                    )
+                    if item["planId"] == plan_id
+                    and item["site"] == locator_site
+                    and item["replacement"] == replacement
+                )
+                child, multiplier_audit = apply_initial_protection_plan(
+                    child,
+                    adjustment,
+                    self.bundle.config["initialProtectionOperatorPolicy"],
+                )
+                child_report = self.bundle.validator.validate_v2(
+                    profile=child,
+                    candidate_id="qd_rich_dynamic_adjusted_" + side_seed[7:35],
+                )
+            else:
+                multiplier_audit = {
+                    "schemaVersion": "temporal_qd_initial_protection_dynamic_grid_v1",
+                    "selectedMultiple": desired_multiple,
+                    "disposition": "already_selected_by_construction",
+                }
+        audit = {
+            "schemaVersion": "temporal_qd_initial_protection_immigrant_dynamic_v1",
+            "requestedDynamicSite": desired_site,
+            "dynamicDisposition": "materialized",
+            "constructionPlanSha256": selected["planSha256"],
+            "application": application,
+            **(
+                {"distanceMultipleApplication": multiplier_audit}
+                if multiplier_audit is not None
+                else {}
+            ),
+        }
+        audit["applicationSha256"] = canonical_sha256(audit)
+        return child, audit, child_report
+
     def _construct_module(
         self,
         direction: str,
@@ -830,11 +1033,14 @@ class _Factory:
                 )
                 policy_id = IdentitySnapshot.create(
                     kind="policy",
-                    schema_version="temporal_qd_pair_module_policy_v1",
+                    schema_version="temporal_qd_pair_module_policy_v2",
                     payload={
                         "modulePolicy": side["policy"],
                         "indicatorPolicy": side["indicatorPolicy"],
                         "holdOperatorPolicy": self.bundle.config["holdOperatorPolicy"],
+                        "initialProtectionOperatorPolicy": self.bundle.config[
+                            "initialProtectionOperatorPolicy"
+                        ],
                         "immigrantConstructionPolicy": self.construction_policy,
                     },
                 )
@@ -888,6 +1094,29 @@ class _Factory:
                 hold=_mapping(selector["hold"], name="rich immigrant selected hold"),
                 copy_profile=runtime is None,
             )
+        with timed_span("immigrant.initial_protection.apply"):
+            protection_selector = _mapping(
+                selector["initialProtection"],
+                name="rich immigrant initial protection selector",
+            )
+            protection_selector["planId"] = str(selector["planId"])
+            final_native_report: Mapping[str, Any] | None = None
+            if protection_selector["mode"] == "dynamic_catalog_authorized":
+                profile, initial_protection_audit, final_native_report = (
+                    self._apply_dynamic_initial_protection(
+                        profile,
+                        side=side,
+                        side_seed=side_seed,
+                        selector=protection_selector,
+                    )
+                )
+            else:
+                profile, initial_protection_audit = apply_immigrant_initial_protection(
+                    profile,
+                    plan_id=str(selector["planId"]),
+                    selector=protection_selector,
+                    policy=self.bundle.config["initialProtectionOperatorPolicy"],
+                )
         # Indicator and hold operations occur after grammar materialization.
         # Recheck the entry-route cap before this path can freeze a module.
         with timed_span("immigrant.entry_route_indicator_cap.validate"):
@@ -917,6 +1146,7 @@ class _Factory:
                         "rowsSha256"
                     ],
                 },
+                "initialProtection": initial_protection_audit,
                 "entryRouteDecisionIndicatorReportSha256": canonical_sha256(
                     entry_route_cap_report
                 ),
@@ -929,10 +1159,25 @@ class _Factory:
                         if isinstance(item, Mapping)
                     ),
                     "holdKind": canonical_hold(selector["hold"])["kind"],
+                    "initialProtectionMode": selector["initialProtection"]["mode"],
                 },
             }
             audit["auditSha256"] = canonical_sha256(audit)
         with timed_span("immigrant.side.native_validate_and_freeze"):
+            if final_native_report is not None:
+                return FrozenModule.freeze(
+                    program=program.canonical(),
+                    profile=profile,
+                    grammar_context=context_id,
+                    catalog=catalog_id,
+                    policy=policy_id,
+                    native_authority=self.bundle.native_identity,
+                    native_report=final_native_report,
+                    lineage=[
+                        {"operation": "typed_seed", "side": direction, "seedName": selector["seedName"], "groupId": selector["groupId"], "eventId": selector["eventId"], "planId": selector["planId"], "proposalSeed": str(proposal_seed)},
+                        {"operation": "rich_immigrant_construction", "side": direction, "audit": audit},
+                    ],
+                )
             return FrozenModule.validate_native(
                 program=program.canonical(),
                 profile=profile,
@@ -1051,6 +1296,12 @@ class PairAuthorityBundle:
         data["holdOperatorPolicy"] = _hold_operator_policy(
             _mapping(data.get("holdOperatorPolicy"), name="frozen pair hold operator policy")
         )
+        data["initialProtectionOperatorPolicy"] = validate_initial_protection_policy(
+            _mapping(
+                data.get("initialProtectionOperatorPolicy"),
+                name="frozen pair initial protection operator policy",
+            )
+        )
         data["immigrantConstructionPolicy"] = _immigrant_construction_policy(
             _mapping(
                 data.get("immigrantConstructionPolicy"),
@@ -1070,11 +1321,14 @@ class PairAuthorityBundle:
         if _bound_transport(raw_transport) != stored_transport:
             raise TemporalDiscoveryContractError("frozen pair native authority content drifted")
         expected_operator = {
-            "schemaVersion": "temporal_qd_pair_operator_implementation_v3",
+            "schemaVersion": "temporal_qd_pair_operator_implementation_v4",
             "typedGrammarRegistrySha256": data["grammarRegistry"]["registrySha256"],
             "longIndicatorPolicySha256": data["longModule"]["indicatorPolicy"]["policySha256"],
             "shortIndicatorPolicySha256": data["shortModule"]["indicatorPolicy"]["policySha256"],
             "holdOperatorPolicySha256": canonical_sha256(data["holdOperatorPolicy"]),
+            "initialProtectionOperatorPolicySha256": canonical_sha256(
+                data["initialProtectionOperatorPolicy"]
+            ),
             "richImmigrantBuilderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
             "richImmigrantConstructionPolicySha256": canonical_sha256(
                 data["immigrantConstructionPolicy"]
@@ -1103,6 +1357,7 @@ class PairAuthorityBundle:
             native_validator=self.validator,
             indicator_registry=self.indicator_for,
             hold_operator_policy=data["holdOperatorPolicy"],
+            initial_protection_policy=data["initialProtectionOperatorPolicy"],
         )
 
     def close(self) -> None: self.client.close()
@@ -1149,11 +1404,14 @@ class PairAuthorityBundle:
         )
         policy_id = IdentitySnapshot.create(
             kind="policy",
-            schema_version="temporal_qd_pair_module_policy_v1",
+            schema_version="temporal_qd_pair_module_policy_v2",
             payload={
                 "modulePolicy": side["policy"],
                 "indicatorPolicy": side["indicatorPolicy"],
                 "holdOperatorPolicy": self.config["holdOperatorPolicy"],
+                "initialProtectionOperatorPolicy": self.config[
+                    "initialProtectionOperatorPolicy"
+                ],
                 "immigrantConstructionPolicy": self.config[
                     "immigrantConstructionPolicy"
                 ],
@@ -1199,7 +1457,7 @@ class PairAuthorityBundle:
         side = self._side(direction)
         context_id = IdentitySnapshot.create(kind="grammarContext", schema_version="temporal_typed_grammar_context_v1", payload=side["context"])
         catalog_id = IdentitySnapshot.create(kind="catalog", schema_version="temporal_indicator_learning_catalog_v1", payload={"catalog": side["catalog"], "catalogSha256": side["catalogSha256"]})
-        policy_id = IdentitySnapshot.create(kind="policy", schema_version="temporal_qd_pair_module_policy_v1", payload={"modulePolicy": side["policy"], "indicatorPolicy": side["indicatorPolicy"], "holdOperatorPolicy": self.config["holdOperatorPolicy"]})
+        policy_id = IdentitySnapshot.create(kind="policy", schema_version="temporal_qd_pair_module_policy_v2", payload={"modulePolicy": side["policy"], "indicatorPolicy": side["indicatorPolicy"], "holdOperatorPolicy": self.config["holdOperatorPolicy"], "initialProtectionOperatorPolicy": self.config["initialProtectionOperatorPolicy"]})
         # The snapshot is checked against the module by every typed operation.
         template = FrozenModule.freeze  # keeps the actual construction below visually local
         grammar = TypedFragmentGrammar(GrammarContext(instrument=side["context"]["instrument"], indicators=tuple(side["context"]["indicators"]), evidence_groups=tuple(side["context"]["groups"]), event_bindings=tuple(side["context"]["events"]), execution_config=side["context"]["executionConfig"], budgets=side["context"]["budgets"]), native_authority=self.validator)
@@ -1244,7 +1502,10 @@ def refresh_pair_run_config(template: Mapping[str, Any]) -> dict[str, Any]:
     if set(frozen) == authored_fields:
         return freeze_pair_run_config(frozen)
     supplied = frozen.pop("pairRunConfigSha256", None)
-    if supplied != canonical_sha256(frozen) or frozen.get("schemaVersion") != PAIR_RUN_CONFIG_SCHEMA:
+    if supplied != canonical_sha256(frozen) or frozen.get("schemaVersion") not in {
+        PAIR_RUN_CONFIG_SCHEMA_LEGACY,
+        PAIR_RUN_CONFIG_SCHEMA,
+    }:
         raise TemporalDiscoveryContractError("pair run config template identity/schema mismatch")
 
     def authored_side(direction: str) -> dict[str, Any]:

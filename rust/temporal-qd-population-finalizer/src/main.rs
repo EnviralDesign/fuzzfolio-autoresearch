@@ -21,6 +21,26 @@ struct ManifestCandidate {
     proposal_ordinal: usize,
     candidate_id: String,
     candidate_identity_sha256: String,
+    #[serde(default)]
+    accepted_pair_entry_sha256: Option<String>,
+    #[serde(default)]
+    reference_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactFile {
+    path: String,
+    file_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct G0BootstrapBinding {
+    construction_pool_identity_sha256: String,
+    accepted_pool_sha256: String,
+    selection_sha256: String,
+    ledger_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,7 +59,31 @@ struct Manifest {
     population_shell_path: String,
     population_shell_file_sha256: String,
     final_newline: String,
+    #[serde(default)]
+    g0_bootstrap: Option<G0BootstrapBinding>,
+    #[serde(default)]
+    g0_artifacts: Option<BTreeMap<String, ArtifactFile>>,
     manifest_sha256: String,
+}
+
+fn self_hashed_json(path: &Path, field_name: &str) -> Result<Value> {
+    let bytes = fs::read(path)?;
+    let semantic_end = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let semantic = &bytes[..semantic_end];
+    let (end, fields) = object_fields(semantic, 0)?;
+    if end != semantic.len() {
+        bail!("G0 artifact has trailing bytes");
+    }
+    let hash = field(&fields, field_name)?;
+    let embedded = json_string(semantic, hash.value.clone(), field_name)?;
+    if sha256_bytes(&semantic_without_field(semantic, hash)?) != embedded {
+        bail!("G0 artifact identity mismatch");
+    }
+    Ok(serde_json::from_slice(semantic)?)
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +116,117 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex_digest(Sha256::digest(bytes)))
+}
+
+/// The G0 pool identity is authored with Python's `canonical_json`: sorted
+/// keys, compact separators, and ASCII-only string escaping.  Keep this small
+/// implementation local to the finalizer instead of trusting a mutable outer
+/// manifest checksum as a replacement for that embedded commitment.
+fn canonical_json(value: &Value) -> String {
+    fn append_string(result: &mut String, value: &str) {
+        use std::fmt::Write as _;
+        result.push('"');
+        for character in value.chars() {
+            match character {
+                '"' => result.push_str("\\\""),
+                '\\' => result.push_str("\\\\"),
+                '\u{08}' => result.push_str("\\b"),
+                '\u{0c}' => result.push_str("\\f"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                character if (character as u32) < 0x20 || (character as u32) > 0x7e => {
+                    let mut units = [0u16; 2];
+                    for unit in character.encode_utf16(&mut units).iter() {
+                        write!(result, "\\u{unit:04x}").unwrap();
+                    }
+                }
+                character => result.push(character),
+            }
+        }
+        result.push('"');
+    }
+    fn append_value(result: &mut String, value: &Value) {
+        match value {
+            Value::Null => result.push_str("null"),
+            Value::Bool(value) => result.push_str(if *value { "true" } else { "false" }),
+            Value::Number(value) => result.push_str(&value.to_string()),
+            Value::String(value) => append_string(result, value),
+            Value::Array(values) => {
+                result.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        result.push(',');
+                    }
+                    append_value(result, value);
+                }
+                result.push(']');
+            }
+            Value::Object(values) => {
+                result.push('{');
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                for (index, (key, value)) in entries.into_iter().enumerate() {
+                    if index > 0 {
+                        result.push(',');
+                    }
+                    append_string(result, key);
+                    result.push(':');
+                    append_value(result, value);
+                }
+                result.push('}');
+            }
+        }
+    }
+    let mut result = String::new();
+    append_value(&mut result, value);
+    result
+}
+
+fn sha256_canonical_json(value: &Value) -> String {
+    sha256_bytes(canonical_json(value).as_bytes())
+}
+
+fn verify_g0_pool_identity(pool: &Value) -> Result<()> {
+    let object = pool
+        .as_object()
+        .context("G0 accepted pool is not an object")?;
+    let references = object
+        .get("acceptedReferences")
+        .and_then(Value::as_array)
+        .context("G0 accepted pool references absent")?;
+    let mut references = references.clone();
+    references.sort_by(|left, right| {
+        left.get("referenceSha256")
+            .and_then(Value::as_str)
+            .cmp(&right.get("referenceSha256").and_then(Value::as_str))
+    });
+    let material = json!({
+        "schemaVersion": object.get("schemaVersion"),
+        "constructionPoolSize": object.get("constructionPoolSize"),
+        "constructionPoolIdentitySha256": object.get("constructionPoolIdentitySha256"),
+        "acceptedReferences": references,
+    });
+    let embedded = object
+        .get("acceptedPoolSha256")
+        .and_then(Value::as_str)
+        .context("G0 accepted pool identity absent")?;
+    if embedded != sha256_canonical_json(&material) {
+        bail!("G0 accepted pool identity mismatch");
+    }
+    Ok(())
+}
+
+fn reject_g0_artifact_symlink(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("G0 artifact is not a regular in-root file");
+    }
+    let parent = path.parent().context("G0 artifact has no parent")?;
+    if fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        bail!("G0 artifact parent is a symlink");
+    }
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -315,6 +470,21 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
     if manifest.accepted_candidates.len() != manifest.candidate_count {
         bail!("manifest candidate count does not match accepted reference count");
     }
+    if let Some(binding) = &manifest.g0_bootstrap {
+        for value in [
+            &binding.construction_pool_identity_sha256,
+            &binding.accepted_pool_sha256,
+            &binding.selection_sha256,
+            &binding.ledger_sha256,
+        ] {
+            if value.len() != 71
+                || !value.starts_with("sha256:")
+                || !value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("G0 bootstrap binding is not a SHA-256 identity");
+            }
+        }
+    }
     Ok(manifest)
 }
 
@@ -506,6 +676,131 @@ fn cleanup_stale_temporaries(output: &Path, keep: Option<&Path>) -> Result<()> {
 fn finalize(manifest_path: &Path) -> Result<Value> {
     let started = Instant::now();
     let manifest = load_manifest(manifest_path)?;
+    if let Some(binding) = &manifest.g0_bootstrap {
+        let artifacts = manifest
+            .g0_artifacts
+            .as_ref()
+            .context("G0 manifest lacks authoritative artifacts")?;
+        if artifacts.len() != 3
+            || !["acceptedPool", "selection", "ledger"]
+                .iter()
+                .all(|key| artifacts.contains_key(*key))
+        {
+            bail!("G0 artifact manifest schema is invalid");
+        }
+        let mut values: BTreeMap<String, Value> = BTreeMap::new();
+        for (key, hash_field) in [
+            ("acceptedPool", "acceptedPoolSha256"),
+            ("selection", "selectionSha256"),
+            ("ledger", "ledgerSha256"),
+        ] {
+            let artifact = artifacts.get(key).unwrap();
+            let expected_path = match key {
+                "acceptedPool" => "../../g0-bootstrap/accepted-pool.json",
+                "selection" => "../../g0-bootstrap/selection.json",
+                _ => "../../g0-bootstrap/campaign-construction-ledger.json",
+            };
+            if artifact.path != expected_path {
+                bail!("G0 artifact path is not the closed finalizer location");
+            }
+            let path = resolve_relative(manifest_path, &artifact.path)?;
+            reject_g0_artifact_symlink(&path)?;
+            if sha256_file(&path)? != artifact.file_sha256 {
+                bail!("G0 artifact file SHA mismatch");
+            }
+            let value = if key == "acceptedPool" {
+                serde_json::from_slice::<Value>(&fs::read(&path)?)
+                    .context("parse G0 accepted pool")?
+            } else {
+                self_hashed_json(&path, hash_field)?
+            };
+            if key == "acceptedPool" {
+                verify_g0_pool_identity(&value)?;
+            }
+            values.insert(key.to_string(), value);
+        }
+        let pool = values.get("acceptedPool").unwrap();
+        let selection = values.get("selection").unwrap();
+        let ledger = values.get("ledger").unwrap();
+        if pool
+            .get("constructionPoolIdentitySha256")
+            .and_then(Value::as_str)
+            != Some(&binding.construction_pool_identity_sha256)
+            || pool.get("acceptedPoolSha256").and_then(Value::as_str)
+                != Some(&binding.accepted_pool_sha256)
+            || selection.get("selectionSha256").and_then(Value::as_str)
+                != Some(&binding.selection_sha256)
+            || selection
+                .get("campaignLedgerSha256")
+                .and_then(Value::as_str)
+                != Some(&binding.ledger_sha256)
+            || ledger.get("ledgerSha256").and_then(Value::as_str) != Some(&binding.ledger_sha256)
+        {
+            bail!("G0 artifact hash chain mismatch");
+        }
+        let refs = pool
+            .get("acceptedReferences")
+            .and_then(Value::as_array)
+            .context("G0 pool references absent")?;
+        let selected = selection
+            .get("selected")
+            .and_then(Value::as_array)
+            .context("G0 selection rows absent")?;
+        if selected.len() != manifest.candidate_count {
+            bail!("G0 selection width differs from manifest");
+        }
+        let mut expected = BTreeMap::new();
+        for row in selected {
+            let ordinal = row
+                .get("proposalOrdinal")
+                .and_then(Value::as_u64)
+                .context("G0 selected ordinal")? as usize;
+            let ref_sha = row
+                .get("referenceSha256")
+                .and_then(Value::as_str)
+                .context("G0 selected reference")?;
+            let reference = refs
+                .iter()
+                .find(|value| value.get("referenceSha256").and_then(Value::as_str) == Some(ref_sha))
+                .context("G0 selection references foreign pool row")?;
+            for key in [
+                "proposalOrdinal",
+                "candidateId",
+                "candidateIdentitySha256",
+                "referenceSha256",
+            ] {
+                if reference.get(key) != row.get(key) {
+                    bail!("G0 selected reference drift");
+                }
+            }
+            expected.insert(ordinal, (row, reference));
+        }
+        if expected.len() != manifest.candidate_count {
+            bail!("G0 selection duplicate ordinal");
+        }
+        for candidate in &manifest.accepted_candidates {
+            let (selected_row, reference) = expected
+                .get(&candidate.proposal_ordinal)
+                .context("manifest candidate absent from G0 selection")?;
+            if selected_row.get("candidateId").and_then(Value::as_str)
+                != Some(&candidate.candidate_id)
+                || selected_row
+                    .get("candidateIdentitySha256")
+                    .and_then(Value::as_str)
+                    != Some(&candidate.candidate_identity_sha256)
+                || candidate.reference_sha256.as_deref()
+                    != selected_row.get("referenceSha256").and_then(Value::as_str)
+                || candidate.accepted_pair_entry_sha256.as_deref()
+                    != reference
+                        .get("acceptedPairEntrySha256")
+                        .and_then(Value::as_str)
+            {
+                bail!("manifest candidate differs from authoritative G0 selection");
+            }
+        }
+    } else if manifest.g0_artifacts.is_some() {
+        bail!("legacy manifest contains G0 artifacts");
+    }
     let journal_dir = resolve_relative(manifest_path, &manifest.journal_directory)?;
     let output = resolve_relative(manifest_path, &manifest.output_path)?;
     let shell_path = resolve_relative(manifest_path, &manifest.population_shell_path)?;
@@ -547,27 +842,6 @@ fn finalize(manifest_path: &Path) -> Result<Value> {
     }
 
     validate_journal_files(&journal_dir, manifest.expected_proposal_count)?;
-    let scan_started = Instant::now();
-    let mut accepted = Vec::with_capacity(manifest.candidate_count);
-    let mut journal_bytes = 0u64;
-    for (ordinal, expected_sha) in manifest.expected_entry_sha256s.iter().enumerate() {
-        let path = journal_dir.join(format!("{ordinal:08}.json"));
-        if let Some(reference) = scan_journal_entry(&path, ordinal, expected_sha, &manifest)? {
-            journal_bytes += reference.file_bytes;
-            accepted.push(reference);
-        } else {
-            journal_bytes += fs::metadata(path)?.len();
-        }
-    }
-    accepted.sort_by(|left, right| left.id.cmp(&right.id));
-    for pair in accepted.windows(2) {
-        if pair[0].id == pair[1].id {
-            bail!("duplicate candidate ID {}", pair[0].id);
-        }
-    }
-    if accepted.len() != manifest.candidate_count {
-        bail!("accepted journal count does not match manifest candidate count");
-    }
     let expected_by_ordinal: BTreeMap<usize, (&str, &str)> = manifest
         .accepted_candidates
         .iter()
@@ -584,7 +858,33 @@ fn finalize(manifest_path: &Path) -> Result<Value> {
     if expected_by_ordinal.len() != manifest.accepted_candidates.len() {
         bail!("manifest contains duplicate accepted proposal ordinals");
     }
-    for reference in &accepted {
+    let scan_started = Instant::now();
+    let mut selected = Vec::with_capacity(manifest.candidate_count);
+    let mut journal_bytes = 0u64;
+    for (ordinal, expected_sha) in manifest.expected_entry_sha256s.iter().enumerate() {
+        let path = journal_dir.join(format!("{ordinal:08}.json"));
+        if let Some(reference) = scan_journal_entry(&path, ordinal, expected_sha, &manifest)? {
+            journal_bytes += reference.file_bytes;
+            // Every constructed entry is verified above.  Only references
+            // named by the immutable closed selector may cross into the
+            // evaluated population.
+            if expected_by_ordinal.contains_key(&reference.ordinal) {
+                selected.push(reference);
+            }
+        } else {
+            journal_bytes += fs::metadata(path)?.len();
+        }
+    }
+    selected.sort_by(|left, right| left.id.cmp(&right.id));
+    for pair in selected.windows(2) {
+        if pair[0].id == pair[1].id {
+            bail!("duplicate candidate ID {}", pair[0].id);
+        }
+    }
+    if selected.len() != manifest.candidate_count {
+        bail!("selected journal count does not match manifest candidate count");
+    }
+    for reference in &selected {
         let expected = expected_by_ordinal
             .get(&reference.ordinal)
             .with_context(|| {
@@ -627,7 +927,7 @@ fn finalize(manifest_path: &Path) -> Result<Value> {
     )?;
     write_and_hash(&mut writer, &mut semantic_hash, b"[")?;
     let mut candidate_bytes = 0u64;
-    for (index, reference) in accepted.iter().enumerate() {
+    for (index, reference) in selected.iter().enumerate() {
         if index > 0 {
             write_and_hash(&mut writer, &mut semantic_hash, b",")?;
         }
@@ -681,7 +981,7 @@ fn finalize(manifest_path: &Path) -> Result<Value> {
     Ok(json!({
         "schemaVersion": "temporal_qd_population_finalizer_result_v1",
         "contractVersion": CONTRACT_VERSION,
-        "candidateCount": accepted.len(),
+        "candidateCount": selected.len(),
         "journalBytesScanned": journal_bytes,
         "candidateBytesCopied": candidate_bytes,
         "encodedBytes": encoded_bytes,

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import autoresearch.temporal_qd_evolution as qd_module
+from autoresearch.temporal_bidirectional_genome import IdentitySnapshot
 from autoresearch.temporal_discovery_base import (
     TemporalDiscoveryContractError,
     canonical_sha256,
@@ -1151,3 +1152,242 @@ def test_empty_quality_bootstrap_is_immigrant_only_and_restart_exact(
     ]
     assert all(entry["originKind"] == "random_immigrant" for entry in entries)
     assert all("parentCandidateId" not in entry["proposal"] for entry in entries)
+
+
+def test_rotating_frontier_archive_is_a_bounded_explicit_parent_fallback(
+    tmp_path: Path,
+) -> None:
+    previous = qd_module.canonical_empty_bidirectional_archive_template()
+    previous_path = tmp_path / "previous.json"
+    previous_path.write_text(json.dumps(previous), encoding="utf-8")
+    candidate = {
+        "candidateId": "frontier-candidate",
+        "candidateIdentitySha256": "sha256:" + "a" * 64,
+        "programSha256": "sha256:" + "b" * 64,
+    }
+    cumulative_member = {
+        **candidate,
+        "cellId": "cell",
+        "currentPanelRank": -0.1,
+        "coveredMonths": 12,
+        "windowMetrics": [],
+        "robustObjectives": {
+            "worstWindowConservativeNetR": -0.1,
+            "drawdown": 1.0,
+            "costDrag": 0.2,
+            "novelty": 1.0,
+        },
+    }
+    cumulative = {
+        "schemaVersion": "temporal_qd_cumulative_breeder_archive_v1",
+        "mode": "replace",
+        "rotatingEvidenceSha256": "sha256:" + "c" * 64,
+        "generationIndex": 1,
+        "requiredPanelIds": ["panel-1"],
+        "breederWidth": 5,
+        "qualityCandidateIds": [],
+        "frontierCandidateIds": [candidate["candidateId"]],
+        "members": [cumulative_member],
+    }
+    cumulative["archiveSha256"] = canonical_sha256(cumulative)
+    current_member = {
+        "candidateId": candidate["candidateId"],
+        "candidate": candidate,
+        "aggregate": {},
+        "descriptor": {"cellId": "cell", "structuralMeasurements": {}},
+        "objectives": {
+            "worstWindowConservativeNetR": -0.1,
+            "maximumDrawdownR": 1.0,
+            "structuralComplexity": 1.0,
+        },
+        "finiteDataValidity": {
+            "isFiniteData": True,
+            "passesSupportGate": True,
+            "validForQuality": True,
+            "totalTrades": 48,
+            "capTrades": 20,
+        },
+        "cappedTradeSupport": 20.0,
+    }
+    result = qd_module.build_rotating_qd_parent_archive(
+        current_members=[current_member],
+        cumulative_archive=cumulative,
+        output_path=tmp_path / "archive.json",
+        generation_index=1,
+        previous_archive_path=previous_path,
+    )
+    archive, _ = qd_module._load_archive(tmp_path / "archive.json")
+    eligible = qd_module._reproduction_cells(archive)
+    assert result["qualityMemberCount"] == 0
+    assert result["frontierMemberCount"] == 1
+    assert eligible[0]["members"][0]["archiveLane"] == "rotating_frontier"
+
+
+def test_rotating_parent_cell_capacity_preserves_robust_pareto_winner(
+    tmp_path: Path,
+) -> None:
+    previous = qd_module.canonical_empty_bidirectional_archive_template()
+    previous_path = tmp_path / "previous.json"
+    previous_path.write_text(json.dumps(previous), encoding="utf-8")
+
+    def candidate(candidate_id: str, token: str) -> dict:
+        return {
+            "candidateId": candidate_id,
+            "candidateIdentitySha256": "sha256:" + token * 64,
+            "programSha256": "sha256:" + ("1" if token == "a" else "2") * 64,
+        }
+
+    winner = candidate("pareto-winner", "a")
+    dominated = candidate("current-panel-winner", "b")
+
+    def cumulative_row(raw: dict, *, rank: float, front: int, worst: float) -> dict:
+        return {
+            **raw,
+            "cellId": "shared-cell",
+            "currentPanelRank": rank,
+            "robustParetoFront": front,
+            "robustCrowdingDistance": None,
+            "robustObjectives": {
+                "worstWindowConservativeNetR": worst,
+                "drawdown": 1.0 if front == 0 else 5.0,
+                "costDrag": 0.1 if front == 0 else 2.0,
+                "novelty": 2.0 if front == 0 else 0.0,
+            },
+        }
+
+    cumulative = {
+        "schemaVersion": "temporal_qd_cumulative_breeder_archive_v1",
+        "mode": "replace",
+        "rotatingEvidenceSha256": "sha256:" + "c" * 64,
+        "generationIndex": 1,
+        "requiredPanelIds": ["panel-1"],
+        "breederWidth": 2,
+        "qualityCandidateIds": [winner["candidateId"], dominated["candidateId"]],
+        "frontierCandidateIds": [],
+        "members": [
+            cumulative_row(winner, rank=1.0, front=0, worst=1.0),
+            cumulative_row(dominated, rank=100.0, front=1, worst=-1.0),
+        ],
+    }
+    cumulative["archiveSha256"] = canonical_sha256(cumulative)
+
+    def current_member(raw: dict) -> dict:
+        return {
+            "candidateId": raw["candidateId"],
+            "candidate": raw,
+            "aggregate": {},
+            "descriptor": {"cellId": "shared-cell", "structuralMeasurements": {}},
+            "objectives": {
+                "worstWindowConservativeNetR": 0.0,
+                "maximumDrawdownR": 0.0,
+                "structuralComplexity": 1.0,
+            },
+            "finiteDataValidity": {
+                "isFiniteData": True,
+                "passesSupportGate": True,
+                "validForQuality": True,
+                "totalTrades": 20,
+                "capTrades": 20,
+            },
+            "cappedTradeSupport": 20.0,
+        }
+
+    qd_module.build_rotating_qd_parent_archive(
+        current_members=[current_member(winner), current_member(dominated)],
+        cumulative_archive=cumulative,
+        output_path=tmp_path / "archive.json",
+        generation_index=1,
+        previous_archive_path=previous_path,
+        cell_capacity=1,
+    )
+    archive, _ = qd_module._load_archive(tmp_path / "archive.json")
+    assert archive["cells"][0]["members"][0]["candidateId"] == "pareto-winner"
+
+
+def _g0_pair_policy() -> dict:
+    compiler = IdentitySnapshot.create(
+        kind="pairCompiler",
+        schema_version="fixture_pair_compiler_v1",
+        payload={"fixture": "g0-capacity"},
+    )
+    return {
+        "schemaVersion": qd_module.BIDIRECTIONAL_QD_POLICY_SCHEMA,
+        "enabled": True,
+        "compilerAuthority": compiler.canonical_payload(),
+    }
+
+
+def _g0_generation_kwargs(tmp_path: Path, *, pool: int, width: int, attempts: int) -> dict:
+    archive = qd_module.canonical_empty_bidirectional_archive_template()
+    archive_path = tmp_path / "initial-archive.json"
+    archive_path.write_text(json.dumps(archive), encoding="utf-8")
+    parameters = {**qd_module.DEFAULT_QD_PARAMETERS, "targetUniqueCandidates": width, "maxProposalAttempts": attempts}
+    return {
+        "parent_archive_path": archive_path,
+        "output_root": tmp_path / "generation",
+        "generation_index": 1,
+        "parameters": parameters,
+        "bidirectional_pair_policy": _g0_pair_policy(),
+        "bidirectional_pair_factory": object(),
+        "bidirectional_module_authority": object(),
+        "bidirectional_native_validator": object(),
+        "bidirectional_pair_compiler": object(),
+        "bidirectional_operator_implementation_identity": {
+            "schemaVersion": "fixture_operator_implementation_v1",
+            "identity": canonical_sha256({"fixture": "g0-capacity"}),
+        },
+        "initial_construction_pool_size": pool,
+        "evaluation_population_size": width,
+        "max_new_proposals": 0,
+    }
+
+
+def test_g0_pair_generation_capacity_uses_pool_ceiling_before_any_proposal(
+    tmp_path: Path,
+) -> None:
+    kwargs = _g0_generation_kwargs(tmp_path, pool=10, width=4, attempts=9)
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="pair generation proposal ceiling is below its target",
+    ):
+        qd_module.generate_qd_generation(**kwargs)
+    assert not (tmp_path / "generation" / "pair-config.json").exists()
+
+
+def test_g0_pair_generation_exact_capacity_boundary_binds_pool_and_normal_width(
+    tmp_path: Path,
+) -> None:
+    kwargs = _g0_generation_kwargs(tmp_path, pool=10, width=4, attempts=10)
+    result = qd_module.generate_qd_generation(**kwargs)
+    assert result["completed"] is False
+    assert result["terminationReason"] == "max_new_proposals_reached"
+    config = json.loads((tmp_path / "generation" / "pair-config.json").read_text())
+    assert config["targetUniqueCandidates"] == 10
+    assert config["maxProposalAttempts"] == 10
+    assert config["runConfig"]["g0Bootstrap"] == {
+        "initialConstructionPoolSize": 10,
+        "evaluationPopulationSize": 4,
+    }
+
+
+@pytest.mark.parametrize(
+    ("pool", "width", "attempts"),
+    [(11, 4, 11), (10, 5, 10), (10, 4, 11)],
+)
+def test_g0_pair_generation_rejects_frozen_pool_width_or_capacity_drift_on_restart(
+    tmp_path: Path, pool: int, width: int, attempts: int
+) -> None:
+    base = _g0_generation_kwargs(tmp_path, pool=10, width=4, attempts=10)
+    assert qd_module.generate_qd_generation(**base)["completed"] is False
+    drifted = _g0_generation_kwargs(tmp_path, pool=pool, width=width, attempts=attempts)
+    with pytest.raises(TemporalDiscoveryContractError, match="divergent pair-generation artifact"):
+        qd_module.generate_qd_generation(**drifted)
+
+
+def test_g0_pair_generation_never_reapplies_to_later_generation_or_continuation(
+    tmp_path: Path,
+) -> None:
+    kwargs = _g0_generation_kwargs(tmp_path, pool=10, width=4, attempts=10)
+    kwargs["generation_index"] = 2
+    with pytest.raises(TemporalDiscoveryContractError, match="G0 requires an empty generation-1 archive"):
+        qd_module.generate_qd_generation(**kwargs)

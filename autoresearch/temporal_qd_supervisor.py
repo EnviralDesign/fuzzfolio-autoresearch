@@ -45,7 +45,9 @@ from .temporal_qd_evolution import (
     _normalize_parameters,
     _read,
     build_qd_archive,
+    build_rotating_qd_parent_archive,
     generate_qd_generation,
+    load_qd_evaluated_members,
     qd_construction_operator_policy,
     qd_predeclared_evidence_context,
     qd_canonical_evidence_identity,
@@ -56,10 +58,27 @@ from .temporal_qd_evidence_ladder import (
     validate_template_discovery_windows,
     validate_template_stage_window,
 )
+from .temporal_qd_rotating_evidence import (
+    build_candidate_panel_bundle,
+    build_cumulative_breeder_archive,
+    build_current_panel_evaluation_cohort,
+    build_generation_evidence_checkpoint,
+    build_rotating_evidence_contract,
+    panel_for_generation,
+    reduce_provisional_diverse_survivors,
+    required_panel_ids,
+    template_for_generation,
+    validate_generation_template,
+    validate_panel_template,
+    validate_rotating_evidence_contract,
+)
 from .temporal_qd_evaluation_population import (
+    build_rotating_cohort_population,
     evaluation_population_path,
+    hydrate_evaluation_candidate,
     load_evaluation_population,
 )
+from .temporal_discovery_results import load_provenance_bound_window_evidence
 from .temporal_generation_funnel import (
     GenerationFunnelContractError,
     supervisor_funnel_snapshot,
@@ -96,6 +115,58 @@ LEGACY_CONTINUATION_DISCOVERY_WORKER_TASKS = (
     LEGACY_CONTINUATION_CANDIDATE_EVALUATIONS
     * FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE
 )
+QD_COST_VIEWS = {
+    "none": {"spreadBps": 0.0, "slippageBps": 0.0, "commissionBps": 0.0},
+    "research_conservative": {
+        "spreadBps": 2.0,
+        "slippageBps": 1.0,
+        "commissionBps": 0.5,
+    },
+}
+
+
+def _rotating_evidence_semantic_authority(
+    *,
+    execution_engine_commit: str,
+    worker_contract_sha256: str,
+    construction_operator_policy: Mapping[str, Any] | None,
+    base_decision_timeframe: str,
+    cost_views: Mapping[str, Any],
+) -> dict[str, Any]:
+    authority = {
+        "schemaVersion": "temporal_qd_rotating_evidence_semantic_authority_v1",
+        "executionEngineCommit": _git_sha(
+            execution_engine_commit, name="rotating execution engine commit"
+        ),
+        "workerContractSha256": _sha256(
+            worker_contract_sha256, name="rotating worker contract"
+        ),
+        "constructionOperatorPolicySha256": (
+            canonical_sha256(construction_operator_policy)
+            if construction_operator_policy is not None
+            else None
+        ),
+        "baseDecisionTimeframe": str(base_decision_timeframe).strip().upper(),
+        "costViewsSha256": canonical_sha256(cost_views),
+    }
+    authority["authoritySha256"] = canonical_sha256(authority)
+    if not authority["baseDecisionTimeframe"]:
+        raise TemporalDiscoveryContractError(
+            "rotating evidence semantic authority lacks a base timeframe"
+        )
+    return authority
+
+
+def _require_continuation_evidence_semantics(
+    continuation: Mapping[str, Any], current: Mapping[str, Any]
+) -> None:
+    source = continuation.get("sourceEvidenceSemanticAuthority")
+    if not isinstance(source, Mapping) or _clone(
+        source, name="source rotating evidence semantic authority"
+    ) != _clone(current, name="current rotating evidence semantic authority"):
+        raise TemporalDiscoveryContractError(
+            "QD continuation rotating evidence semantics drifted"
+        )
 
 
 def _broad_admission_contract_values(generation_count: int) -> dict[str, int]:
@@ -118,6 +189,147 @@ def _broad_admission_contract_values(generation_count: int) -> dict[str, int]:
         "discoveryWindowsPerCandidate": FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE,
         "discoveryWorkerTasks": discovery_worker_tasks,
     }
+
+
+def _rotating_task_upper_bounds(
+    *,
+    contract: Mapping[str, Any],
+    first_generation_index: int,
+    generation_count: int,
+    proposal_width: int,
+    initial_parent_count: int,
+) -> dict[str, int]:
+    """Freeze truthful maxima for the multi-campaign generation transaction."""
+
+    provisional = int(contract["provisionalReduction"]["maxCandidates"])
+    breeder_width = int(contract["robustSelection"]["breederWidth"])
+    if initial_parent_count < 0:
+        raise TemporalDiscoveryContractError(
+            "rotating initial parent count cannot be negative"
+        )
+    windows_per_panel = len(contract["panels"][0]["windows"])
+    proposal_candidate_panels = generation_count * proposal_width
+    retained_parent_candidate_panels = initial_parent_count + max(
+        0, generation_count - 1
+    ) * breeder_width
+    backfill_candidate_panels = sum(
+        provisional * max(0, len(required_panel_ids(contract, index)) - 1)
+        for index in range(
+            first_generation_index, first_generation_index + generation_count
+        )
+    )
+    candidate_panels = (
+        proposal_candidate_panels
+        + retained_parent_candidate_panels
+        + backfill_candidate_panels
+    )
+    return {
+        "generationCount": generation_count,
+        "candidatesPerGeneration": proposal_width,
+        "proposalCandidateEvaluations": generation_count * proposal_width,
+        "proposalCandidatePanels": proposal_candidate_panels,
+        "initialParentCandidateCount": initial_parent_count,
+        "retainedParentCandidatePanelsUpperBound": retained_parent_candidate_panels,
+        "backfillCandidatePanelsUpperBound": backfill_candidate_panels,
+        "totalCandidatePanelsUpperBound": candidate_panels,
+        "windowsPerPanel": windows_per_panel,
+        "workerTasksUpperBound": candidate_panels * windows_per_panel,
+    }
+
+
+def _immigrant_construction_capacity_requirement(
+    config: Mapping[str, Any],
+) -> int:
+    """Return the one frozen pair-immigrant requirement for freeze and reopen.
+
+    G0 constructs its full pool before selecting the normal evaluation width.
+    Capacity therefore means ``pool + later normal widths``, not merely market
+    evaluations.  Ordinary/continuation blocks retain their historical normal
+    ``generation_count * width`` requirement.
+    """
+
+    plan = config.get("generationPlan")
+    if not isinstance(plan, Mapping):
+        raise TemporalDiscoveryContractError("QD generation plan is invalid")
+    try:
+        first = int(plan["firstGenerationIndex"])
+        count = int(plan["generationCount"])
+        width = int(plan["targetUniqueCandidatesPerGeneration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TemporalDiscoveryContractError("QD generation plan capacity is invalid") from exc
+    if any(isinstance(plan.get(key), bool) for key in (
+        "firstGenerationIndex", "generationCount", "targetUniqueCandidatesPerGeneration"
+    )) or first < 1 or count < 1 or width < 1:
+        raise TemporalDiscoveryContractError("QD generation plan capacity is invalid")
+    g0 = config.get("g0Bootstrap")
+    if g0 is None:
+        return count * width
+    if not isinstance(g0, Mapping) or set(g0) != {
+        "schemaVersion", "initialConstructionPoolSize", "evaluationPopulationSize", "activation"
+    }:
+        raise TemporalDiscoveryContractError("QD G0 bootstrap capacity binding is invalid")
+    try:
+        pool = int(g0["initialConstructionPoolSize"])
+        evaluation_width = int(g0["evaluationPopulationSize"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TemporalDiscoveryContractError("QD G0 bootstrap capacity is invalid") from exc
+    if (
+        any(isinstance(g0.get(key), bool) for key in (
+            "initialConstructionPoolSize", "evaluationPopulationSize"
+        ))
+        or g0.get("schemaVersion") != "temporal_qd_g0_bootstrap_config_v1"
+        or g0.get("activation") != "generation_1_pair_random_immigrants_only"
+        or first != 1
+        or pool < 1
+        or evaluation_width != width
+        or pool < evaluation_width
+    ):
+        raise TemporalDiscoveryContractError("QD G0 bootstrap capacity binding is invalid")
+    return pool + (count - 1) * width
+
+
+def _require_frozen_immigrant_capacity_requirement(
+    config: Mapping[str, Any], contract: Mapping[str, Any]
+) -> int:
+    """Recompute and bind the capacity total recorded at fresh freeze time."""
+
+    required = _immigrant_construction_capacity_requirement(config)
+    frozen = contract.get("immigrantConstructionCandidateRequirement")
+    if frozen is None:
+        # The explicit field was introduced with G0. Preserve no-G0 legacy
+        # blocks, whose normal-width requirement is unambiguous.
+        if config.get("g0Bootstrap") is not None:
+            raise TemporalDiscoveryContractError(
+                "QD G0 frozen construction capacity requirement is unavailable"
+            )
+        return required
+    if isinstance(frozen, bool):
+        raise TemporalDiscoveryContractError(
+            "QD frozen construction capacity requirement drifted"
+        )
+    try:
+        observed = int(frozen)
+    except (TypeError, ValueError) as exc:
+        raise TemporalDiscoveryContractError(
+            "QD frozen construction capacity requirement drifted"
+        ) from exc
+    if observed != required:
+        raise TemporalDiscoveryContractError(
+            "QD frozen construction capacity requirement drifted"
+        )
+    return required
+
+
+def _archive_member_count(archive: Mapping[str, Any]) -> int:
+    cells = archive.get("cells")
+    if not isinstance(cells, list):
+        raise TemporalDiscoveryContractError("QD archive cells are invalid")
+    total = 0
+    for cell in cells:
+        if not isinstance(cell, Mapping) or not isinstance(cell.get("members"), list):
+            raise TemporalDiscoveryContractError("QD archive members are invalid")
+        total += len(cell["members"])
+    return total
 
 
 def _utc_now() -> str:
@@ -474,6 +686,76 @@ def _results_descriptor(
     return descriptor
 
 
+def _rotating_campaign_artifacts(
+    *, campaign_root: Path, population_path: Path | None = None
+) -> dict[str, Any]:
+    """Reopen one evaluation-only campaign and its exact result matrix."""
+
+    campaign = _canonical_file(campaign_root / "campaign.json", name="rotating campaign")
+    authority = _canonical_file(campaign_root / "authority.json", name="rotating authority")
+    identity = _canonical_file(
+        campaign_root / "evaluation-identity.json", name="rotating evaluation identity"
+    )
+    result_root = campaign_root / "screening-run"
+    manifest = _canonical_file(
+        result_root / "task-manifest.json", name="rotating task manifest"
+    )
+    checkpoint = _canonical_file(
+        result_root / "checkpoint.json", name="rotating task checkpoint"
+    )
+    summary = _canonical_file(result_root / "summary.json", name="rotating task summary")
+    campaign_sha = _identity_payload(
+        campaign, "campaignSha256", name="rotating campaign"
+    )
+    authority_id = _identity_payload(
+        authority, "authorityId", name="rotating authority"
+    )
+    identity_sha = _identity_payload(
+        identity, "evaluationIdentitySha256", name="rotating evaluation identity"
+    )
+    tasks = manifest.get("tasks")
+    if not isinstance(tasks, list) or manifest.get("taskMatrixSha256") != canonical_sha256(tasks):
+        raise TemporalDiscoveryContractError("rotating campaign task matrix drifted")
+    if any(
+        value != authority_id
+        for value in (
+            campaign.get("authorityId"),
+            manifest.get("authorityId"),
+            checkpoint.get("authorityId"),
+            summary.get("authorityId"),
+        )
+    ):
+        raise TemporalDiscoveryContractError("rotating campaign authority binding drifted")
+    results = _results_descriptor(
+        result_root=result_root, checkpoint=checkpoint, task_manifest=manifest
+    )
+    output: dict[str, Any] = {
+        "schemaVersion": "temporal_qd_rotating_campaign_artifacts_v1",
+        "campaignSha256": campaign_sha,
+        "authorityId": authority_id,
+        "evaluationIdentitySha256": identity_sha,
+        "taskMatrixSha256": manifest["taskMatrixSha256"],
+        "taskCount": len(tasks),
+        "checkpointSha256": canonical_sha256(checkpoint),
+        "summarySha256": canonical_sha256(summary),
+        "results": results,
+    }
+    if population_path is not None:
+        population = _canonical_file(population_path, name="rotating cohort population")
+        output["population"] = _self_hashed_descriptor(
+            population_path,
+            population,
+            field="populationSha256",
+            name="rotating cohort population",
+        )
+        if campaign.get("populationSha256") != population["populationSha256"]:
+            raise TemporalDiscoveryContractError(
+                "rotating cohort campaign population binding drifted"
+            )
+    output["artifactsSha256"] = canonical_sha256(output)
+    return output
+
+
 def _capture_screening_artifacts(
     *,
     population_path: Path,
@@ -643,9 +925,14 @@ def _capture_screening_artifacts(
                     evaluation_population,
                     field="evaluationPopulationSha256",
                     name=f"{label} evaluation population",
-                )
+                ),
             }
             if evaluation_population is not None
+            else {}
+        ),
+        **(
+            {"g0Bootstrap": _clone(evaluation_population["g0Bootstrap"], name=f"{label} G0 bootstrap binding")}
+            if evaluation_population is not None and evaluation_population.get("g0Bootstrap") is not None
             else {}
         ),
     }
@@ -695,6 +982,65 @@ def _capture_generation_artifacts(
             **snapshot,
             "snapshotSha256": snapshot["snapshotSha256"],
         }
+    evidence_root = generation_root / "evidence"
+    ledger_path = evidence_root / "generation-ledger.json"
+    if ledger_path.is_file():
+        ledger = _canonical_file(ledger_path, name="rotating generation ledger")
+        _identity_payload(
+            ledger, "ledgerSha256", name="rotating generation ledger"
+        )
+        for binding in ledger.get("campaigns") or []:
+            if not isinstance(binding, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "rotating generation campaign ledger is invalid"
+                )
+            if binding.get("role") == "proposal_current_panel":
+                continue
+            recorded_campaign_artifacts = binding.get("artifacts")
+            if not isinstance(recorded_campaign_artifacts, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "rotating cohort campaign lacks its artifact ledger"
+                )
+            current_campaign_artifacts = _rotating_campaign_artifacts(
+                campaign_root=Path(str(binding.get("campaignRoot") or "")),
+                population_path=Path(str(binding.get("populationPath") or "")),
+            )
+            if _clone(
+                current_campaign_artifacts,
+                name="rotating campaign artifacts",
+            ) != _clone(
+                recorded_campaign_artifacts,
+                name="recorded rotating campaign artifacts",
+            ):
+                raise TemporalDiscoveryContractError(
+                    "rotating campaign artifact ledger drifted"
+                )
+        output["rotatingEvidenceLedger"] = _self_hashed_descriptor(
+            ledger_path,
+            ledger,
+            field="ledgerSha256",
+            name="rotating generation ledger",
+        )
+        rotating_checkpoint_path = evidence_root / "checkpoint.json"
+        rotating_checkpoint = _canonical_file(
+            rotating_checkpoint_path, name="rotating generation checkpoint"
+        )
+        output["rotatingEvidenceCheckpoint"] = _self_hashed_descriptor(
+            rotating_checkpoint_path,
+            rotating_checkpoint,
+            field="checkpointSha256",
+            name="rotating generation checkpoint",
+        )
+        cumulative_path = evidence_root / "cumulative-archive.json"
+        cumulative = _canonical_file(
+            cumulative_path, name="cumulative breeder archive"
+        )
+        output["cumulativeBreederArchive"] = _self_hashed_descriptor(
+            cumulative_path,
+            cumulative,
+            field="archiveSha256",
+            name="cumulative breeder archive",
+        )
     return output
 
 
@@ -728,11 +1074,21 @@ def _validate_generation_artifacts(
     )
     evaluation = config.get("evaluation") or {}
     repositories = config.get("repositories") or {}
+    rotating = config.get("rotatingEvidence")
+    expected_template_sha = evaluation.get("templatePreparationSha256")
+    if rotating is not None:
+        panel = panel_for_generation(rotating, generation_index)
+        expected_template_sha = rotating["panelTemplates"][panel["panelId"]][
+            "preparationSha256"
+        ]
     if (
         evaluation_identity.get("templatePreparationSha256")
-        != evaluation.get("templatePreparationSha256")
-        or evaluation_identity.get("predeclaredEvidenceContextSha256")
-        != evaluation.get("predeclaredEvidenceContextSha256")
+        != expected_template_sha
+        or (
+            rotating is None
+            and evaluation_identity.get("predeclaredEvidenceContextSha256")
+            != evaluation.get("predeclaredEvidenceContextSha256")
+        )
         or evaluation_identity.get("executionEngineCommit")
         != repositories.get("executionEngineCommit")
         or evaluation_identity.get("policySha256") != config.get("policySha256")
@@ -750,6 +1106,31 @@ def _validate_generation_artifacts(
         raise TemporalDiscoveryContractError(
             "completed generation evidence ladder drifted from frozen config"
         )
+    if rotating is not None:
+        if evaluation_identity.get("rotatingEvidence") != rotating:
+            raise TemporalDiscoveryContractError(
+                "completed generation rotating evidence drifted from frozen config"
+            )
+        for field in (
+            "rotatingEvidenceLedger",
+            "rotatingEvidenceCheckpoint",
+            "cumulativeBreederArchive",
+        ):
+            if field not in current:
+                raise TemporalDiscoveryContractError(
+                    "completed rotating generation lacks its full evidence ledger"
+                )
+        if (
+            generation_record.get("rotatingEvidenceLedgerSha256")
+            != current["rotatingEvidenceLedger"]["ledgerSha256"]
+            or generation_record.get("rotatingEvidenceCheckpointSha256")
+            != current["rotatingEvidenceCheckpoint"]["checkpointSha256"]
+            or generation_record.get("cumulativeArchiveSha256")
+            != current["cumulativeBreederArchive"]["archiveSha256"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "completed rotating generation evidence identities disagree"
+            )
     for field, identity in (
         ("population", "populationSha256"),
         ("journal", "journalSha256"),
@@ -767,6 +1148,14 @@ def _validate_generation_artifacts(
         raise TemporalDiscoveryContractError(
             "completed generation evaluation population identity disagrees with supervisor record"
         )
+    expected_g0 = config.get("g0Bootstrap") if generation_index == 1 else None
+    if expected_g0 is not None:
+        current_g0 = current.get("g0Bootstrap")
+        recorded_g0 = generation_record.get("g0Bootstrap")
+        if not isinstance(current_g0, Mapping) or current_g0 != recorded_g0:
+            raise TemporalDiscoveryContractError("completed G0 bootstrap identities disagree with immutable outputs")
+    elif "g0Bootstrap" in current or "g0Bootstrap" in generation_record:
+        raise TemporalDiscoveryContractError("G0 bootstrap appeared outside its frozen generation-1 boundary")
     archive = _canonical_file(
         Path(current["archive"]["path"]), name="QD generation archive"
     )
@@ -833,7 +1222,13 @@ def _validate_completed_generations(
             "QD supervisor candidate counter disagrees with completed generation records"
         )
     if int(state.get("workerTasksCompleted") or 0) != sum(
-        int(record.get("taskCount") or 0) for record in records.values()
+        int(
+            record.get("totalGenerationTaskCount")
+            if record.get("totalGenerationTaskCount") is not None
+            else record.get("taskCount")
+            or 0
+        )
+        for record in records.values()
     ):
         raise TemporalDiscoveryContractError(
             "QD supervisor worker-task counter disagrees with completed generation records"
@@ -993,7 +1388,33 @@ def _continuation_binding(
             "QD continuation source was not admitted as a broad campaign"
         )
     contract = config.get("broadAdmissionContract")
-    expected_contract = _broad_admission_contract_values(source_count)
+    rotating = config.get("rotatingEvidence")
+    initial_parent_count = 0
+    if isinstance(rotating, Mapping):
+        initial_binding = config.get("initialArchive")
+        if not isinstance(initial_binding, Mapping):
+            raise TemporalDiscoveryContractError(
+                "QD rotating continuation source lacks its initial archive binding"
+            )
+        initial_archive, initial_sha = _load_archive(
+            Path(str(initial_binding.get("path") or ""))
+        )
+        if initial_sha != initial_binding.get("archiveSha256"):
+            raise TemporalDiscoveryContractError(
+                "QD rotating continuation initial archive drifted"
+            )
+        initial_parent_count = _archive_member_count(initial_archive)
+    expected_contract = (
+        _rotating_task_upper_bounds(
+            contract=rotating,
+            first_generation_index=source_first,
+            generation_count=source_count,
+            proposal_width=int(plan.get("targetUniqueCandidatesPerGeneration") or 0),
+            initial_parent_count=initial_parent_count,
+        )
+        if isinstance(rotating, Mapping)
+        else _broad_admission_contract_values(source_count)
+    )
     if not isinstance(contract, Mapping) or contract.get(
         "schemaVersion"
     ) != "temporal_qd_broad_admission_contract_v1":
@@ -1045,6 +1466,41 @@ def _continuation_binding(
             raise TemporalDiscoveryContractError(
                 "QD continuation source does not begin immediately after its prior source"
             )
+    semantic_authority = None
+    if isinstance(rotating, Mapping):
+        repositories = config.get("repositories")
+        evaluation = config.get("evaluation")
+        if not isinstance(repositories, Mapping) or not isinstance(evaluation, Mapping):
+            raise TemporalDiscoveryContractError(
+                "QD rotating continuation source lacks evidence semantics"
+            )
+        construction = config.get("constructionOperatorPolicy")
+        if construction is not None and not isinstance(construction, Mapping):
+            raise TemporalDiscoveryContractError(
+                "QD rotating continuation construction policy is invalid"
+            )
+        cost_views = evaluation.get("costViews")
+        predeclared_context = evaluation.get("predeclaredEvidenceContext")
+        if not isinstance(cost_views, Mapping):
+            raise TemporalDiscoveryContractError(
+                "QD rotating continuation cost views are invalid"
+            )
+        if not isinstance(predeclared_context, Mapping):
+            raise TemporalDiscoveryContractError(
+                "QD rotating continuation evidence context is invalid"
+            )
+        semantic_authority = _rotating_evidence_semantic_authority(
+            execution_engine_commit=str(
+                repositories.get("executionEngineCommit") or ""
+            ),
+            worker_contract_sha256=str(config.get("workerContractSha256") or ""),
+            construction_operator_policy=construction,
+            base_decision_timeframe=str(
+                predeclared_context.get("baseDecisionTimeframe")
+                or ""
+            ),
+            cost_views=cost_views,
+        )
     return {
         "schemaVersion": "temporal_qd_generation_continuation_v1",
         "sourceRunRoot": str(root),
@@ -1055,6 +1511,17 @@ def _continuation_binding(
         "sourceArchivePath": str(archive_path.resolve()),
         "sourceArchiveSha256": latest["archiveSha256"],
         "nextImmigrantContinuationOrdinal": latest["nextImmigrantContinuationOrdinal"],
+        **(
+            {
+                "rotatingEvidenceSha256": rotating["rotatingEvidenceSha256"],
+                "sourceCumulativeArchiveSha256": latest[
+                    "cumulativeArchiveSha256"
+                ],
+                "sourceEvidenceSemanticAuthority": semantic_authority,
+            }
+            if isinstance(rotating, Mapping)
+            else {}
+        ),
         **(
             {
                 "priorContinuationFrom": prior_binding
@@ -1114,9 +1581,12 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
                 raise TemporalDiscoveryContractError(
                     "QD broad admission contract is unavailable"
                 )
+            required_unique_candidates = _require_frozen_immigrant_capacity_requirement(
+                config, contract
+            )
             current_capacity = immigrant_capacity_audit(
                 pair_config,
-                required_unique_candidates=int(contract["candidateEvaluations"]),
+                required_unique_candidates=required_unique_candidates,
             )
             if _clone(
                 current_capacity, name="reopened pair immigrant capacity audit"
@@ -1198,6 +1668,15 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
             if canonical_sha256(stage_template) != binding.get("sha256"):
                 raise TemporalDiscoveryContractError(f"QD {stage} ladder template drifted")
             validate_template_stage_window(stage_template, ladder, stage=stage)
+    rotating = config.get("rotatingEvidence")
+    if rotating is not None:
+        rotating = validate_rotating_evidence_contract(rotating)
+        for panel in rotating["panels"]:
+            binding = rotating["panelTemplates"][panel["panelId"]]
+            panel_template = _canonical_file(
+                Path(binding["path"]), name=f"rotating {panel['panelId']} template"
+            )
+            validate_panel_template(panel_template, rotating, panel["panelId"])
 
     return command
 
@@ -1225,7 +1704,10 @@ def _frozen_config(
     construction_catalog_path: Path | str | None = None,
     bidirectional_pair_config: Mapping[str, Any] | None = None,
     evidence_ladder_config: Mapping[str, Any] | None = None,
+    rotating_evidence_config: Mapping[str, Any] | None = None,
     continuation_from: Mapping[str, Any] | None = None,
+    initial_construction_pool_size: int | None = None,
+    evaluation_population_size: int | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -1253,10 +1735,10 @@ def _frozen_config(
         generation_count != expected_broad_generation_count
         or int(normalized_parameters["targetUniqueCandidates"])
         != FRESH_BROAD_CANDIDATES_PER_GENERATION
-        or evidence_ladder_config is None
+        or (evidence_ladder_config is None and rotating_evidence_config is None)
     ):
         raise TemporalDiscoveryContractError(
-            "fresh broad admission requires a frozen evidence ladder and the frozen five-generation x 1,024-candidate contract; a continuation requires exactly four generations"
+                "fresh broad admission requires a frozen evidence ladder or rotating evidence contract and the frozen five-generation x 1,024-candidate contract; a continuation requires exactly four generations"
         )
     initial_archive, initial_archive_sha = _load_archive(initial_archive_path)
     template = _read(template_preparation_path, name="QD template preparation")
@@ -1265,10 +1747,34 @@ def _frozen_config(
         if evidence_ladder_config is not None
         else None
     )
+    if evidence_ladder_config is not None and rotating_evidence_config is not None:
+        raise TemporalDiscoveryContractError("QD supervisor cannot combine legacy and rotating evidence")
+    rotating_evidence = (
+        build_rotating_evidence_contract(rotating_evidence_config)
+        if rotating_evidence_config is not None else None
+    )
+    if continuation_from is not None and continuation_from.get(
+        "rotatingEvidenceSha256"
+    ) is not None:
+        if (
+            rotating_evidence is None
+            or rotating_evidence["rotatingEvidenceSha256"]
+            != continuation_from["rotatingEvidenceSha256"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD continuation rotating evidence curriculum drifted"
+            )
     if broad_admission:
-        if evidence_ladder is None:
-            raise TemporalDiscoveryContractError("broad admission requires a frozen evidence ladder")
-        validate_template_discovery_windows(template, evidence_ladder)
+        if evidence_ladder is not None:
+            validate_template_discovery_windows(template, evidence_ladder)
+        elif rotating_evidence is not None:
+            validate_generation_template(
+                template, rotating_evidence, first_generation_index
+            )
+        else:
+            raise TemporalDiscoveryContractError(
+                "broad admission requires frozen legacy or rotating evidence"
+            )
     ladder_execution: dict[str, Any] | None = None
     if evidence_ladder is not None:
         validation_path = Path(str(evidence_ladder_config.get("validationTemplatePreparationPath") or ""))
@@ -1295,12 +1801,87 @@ def _frozen_config(
         ),
         construction_catalog_path=construction_catalog_path,
     )
+    if continuation_from is not None and rotating_evidence is not None:
+        _require_continuation_evidence_semantics(
+            continuation_from,
+            _rotating_evidence_semantic_authority(
+                execution_engine_commit=execution_engine_commit,
+                worker_contract_sha256=worker_contract_sha256,
+                construction_operator_policy=(
+                    construction_policy if construction_policy["enabled"] else None
+                ),
+                base_decision_timeframe=str(
+                    evidence_context.get("baseDecisionTimeframe") or ""
+                ),
+                cost_views=QD_COST_VIEWS,
+            ),
+        )
     pair_authority = load_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
+    g0_enabled = bool(pair_authority is not None and not is_continuation and first_generation_index == 1)
+    if g0_enabled and initial_construction_pool_size is None and evaluation_population_size is None:
+        evaluation_population_size = int(normalized_parameters["targetUniqueCandidates"])
+        initial_construction_pool_size = (
+            4000 if evaluation_population_size == 1024 else evaluation_population_size
+        )
+    if g0_enabled and (
+        initial_construction_pool_size is None
+        or evaluation_population_size is None
+        or isinstance(initial_construction_pool_size, bool)
+        or isinstance(evaluation_population_size, bool)
+        or int(initial_construction_pool_size) < 1
+        or int(evaluation_population_size) < 1
+        or int(initial_construction_pool_size) < int(evaluation_population_size)
+        or int(evaluation_population_size) != int(normalized_parameters["targetUniqueCandidates"])
+    ):
+        raise TemporalDiscoveryContractError("G0 construction/evaluation sizes are invalid or drift from the frozen normal width")
+    if g0_enabled and int(normalized_parameters["maxProposalAttempts"]) < int(initial_construction_pool_size):
+        raise TemporalDiscoveryContractError("G0 construction pool exceeds the frozen generation-1 proposal ceiling")
+    generation_plan = {
+        "firstGenerationIndex": first_generation_index,
+        "generationCount": generation_count,
+        "lastGenerationIndex": first_generation_index + generation_count - 1,
+        "targetUniqueCandidatesPerGeneration": normalized_parameters[
+            "targetUniqueCandidates"
+        ],
+        "targetUniqueEvaluations": evaluation_target,
+        "checkpointCadence": "every_proposal_and_completed_generation",
+        "completeGenerationBeforeArchiveReduction": True,
+        "workerCompletionOrderAffectsReduction": False,
+        **(
+            {
+                "rotatingEvidenceTaskUpperBounds": _rotating_task_upper_bounds(
+                    contract=rotating_evidence,
+                    first_generation_index=first_generation_index,
+                    generation_count=generation_count,
+                    proposal_width=int(normalized_parameters["targetUniqueCandidates"]),
+                    initial_parent_count=_archive_member_count(initial_archive),
+                )
+            }
+            if rotating_evidence is not None
+            else {}
+        ),
+    }
+    g0_bootstrap = (
+        {
+            "schemaVersion": "temporal_qd_g0_bootstrap_config_v1",
+            "initialConstructionPoolSize": int(initial_construction_pool_size),
+            "evaluationPopulationSize": int(evaluation_population_size),
+            "activation": "generation_1_pair_random_immigrants_only",
+        }
+        if g0_enabled
+        else None
+    )
+    pair_capacity_requirement = _immigrant_construction_capacity_requirement(
+        {
+            "generationPlan": generation_plan,
+            **({"g0Bootstrap": g0_bootstrap} if g0_bootstrap is not None else {}),
+        }
+    )
     pair_capacity_audit = None
     if broad_admission and pair_authority is not None:
         pair_capacity_audit = immigrant_capacity_audit(
             pair_authority,
-            required_unique_candidates=evaluation_target,
+            required_unique_candidates=pair_capacity_requirement,
         )
     source = None if pair_authority is not None else ExactGeneratorV2Continuation(
         source_preparation_path=source_preparation_path,
@@ -1323,11 +1904,26 @@ def _frozen_config(
             {
                 "broadAdmissionContract": {
                     "schemaVersion": "temporal_qd_broad_admission_contract_v1",
-                    **_broad_admission_contract_values(
-                        expected_broad_generation_count
+                    **(
+                        _rotating_task_upper_bounds(
+                            contract=rotating_evidence,
+                            first_generation_index=first_generation_index,
+                            generation_count=generation_count,
+                            proposal_width=int(
+                                normalized_parameters["targetUniqueCandidates"]
+                            ),
+                            initial_parent_count=_archive_member_count(initial_archive),
+                        )
+                        if rotating_evidence is not None
+                        else _broad_admission_contract_values(
+                            expected_broad_generation_count
+                        )
                     ),
                     **(
-                        {"immigrantConstructionCapacity": pair_capacity_audit}
+                        {
+                            "immigrantConstructionCandidateRequirement": pair_capacity_requirement,
+                            "immigrantConstructionCapacity": pair_capacity_audit,
+                        }
                         if pair_capacity_audit is not None
                         else {}
                     ),
@@ -1389,29 +1985,13 @@ def _frozen_config(
             "gatewayUrl": str(gateway_url).rstrip("/"),
             "timeoutSecondsPerGeneration": float(evaluation_timeout_seconds),
             "enqueueBatchSize": int(enqueue_batch_size),
-            "costViews": {
-                "none": {"spreadBps": 0.0, "slippageBps": 0.0, "commissionBps": 0.0},
-                "research_conservative": {
-                    "spreadBps": 2.0,
-                    "slippageBps": 1.0,
-                    "commissionBps": 0.5,
-                },
-            },
+            "costViews": _clone(QD_COST_VIEWS, name="frozen QD cost views"),
         },
         **({"evidenceLadder": evidence_ladder} if evidence_ladder is not None else {}),
+        **({"rotatingEvidence": rotating_evidence} if rotating_evidence is not None else {}),
         **({"evidenceLadderExecution": ladder_execution} if ladder_execution is not None else {}),
-        "generationPlan": {
-            "firstGenerationIndex": first_generation_index,
-            "generationCount": generation_count,
-            "lastGenerationIndex": first_generation_index + generation_count - 1,
-            "targetUniqueCandidatesPerGeneration": normalized_parameters[
-                "targetUniqueCandidates"
-            ],
-            "targetUniqueEvaluations": evaluation_target,
-            "checkpointCadence": "every_proposal_and_completed_generation",
-            "completeGenerationBeforeArchiveReduction": True,
-            "workerCompletionOrderAffectsReduction": False,
-        },
+        "generationPlan": generation_plan,
+        **({"g0Bootstrap": g0_bootstrap} if g0_bootstrap is not None else {}),
         "frozenSearchPolicy": normalized_parameters,
         "operationalTripwires": [
             "determinism_drift",
@@ -1443,6 +2023,495 @@ def _frozen_config(
     return config, validator_command
 
 
+def _campaign_window_evidence(
+    *,
+    campaign_root: Path,
+    panel: Mapping[str, Any],
+    candidates: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    result_root = campaign_root / "screening-run"
+    return load_provenance_bound_window_evidence(
+        result_root=result_root,
+        task_manifest=_canonical_file(
+            result_root / "task-manifest.json", name="rotating task manifest"
+        ),
+        checkpoint=_canonical_file(
+            result_root / "checkpoint.json", name="rotating task checkpoint"
+        ),
+        panel=panel,
+        candidates=candidates,
+    )
+
+
+def _run_rotating_cohort_campaign(
+    *,
+    root: Path,
+    candidates: list[dict[str, Any]],
+    generation_index: int,
+    panel_id: str,
+    campaign_role: str,
+    template_path: Path,
+    config: Mapping[str, Any],
+    client: LabGatewayClient,
+) -> tuple[dict[str, Any], Path, Path]:
+    # A parent/backfill campaign can begin hours after the proposal campaign.
+    # Reopen all path-backed authorities immediately before freezing another
+    # task matrix so one generation cannot mix catalog/template semantics.
+    _validate_frozen_sources(config)
+    cohort = build_rotating_cohort_population(
+        candidates=candidates,
+        generation_index=generation_index,
+        panel_id=panel_id,
+        cohort_role=campaign_role,
+        rotating_evidence_sha256=config["rotatingEvidence"][
+            "rotatingEvidenceSha256"
+        ],
+    )
+    population_path = root / "population.json"
+    _write_once(population_path, cohort)
+    campaign_root = root / "campaign"
+    result = freeze_qd_screening_campaign(
+        population_path=population_path,
+        template_preparation_path=template_path,
+        output_root=campaign_root,
+        execution_engine_commit=config["repositories"]["executionEngineCommit"],
+        worker_contract_sha256=config["workerContractSha256"],
+        construction_catalog_path=(
+            (config.get("constructionOperatorPolicy") or {})
+            .get("catalog", {})
+            .get("path")
+        ),
+        rotating_evidence=config["rotatingEvidence"],
+        campaign_role=campaign_role,
+        panel_id=panel_id,
+    )
+    authority = _canonical_file(campaign_root / "authority.json", name="rotating authority")
+    evaluation = run_temporal_search_tasks(
+        client,
+        authority,
+        output_root=campaign_root / "screening-run",
+        timeout_seconds=float(config["evaluation"]["timeoutSecondsPerGeneration"]),
+        resume=True,
+        enqueue_batch_size=int(config["evaluation"]["enqueueBatchSize"]),
+    )
+    if evaluation.get("completedTaskCount") != result["taskCount"]:
+        raise TemporalDiscoveryContractError(
+            "rotating cohort campaign did not complete its exact task matrix"
+        )
+    return result, population_path, campaign_root
+
+
+def _load_previous_cumulative_archive(parent_archive_path: Path) -> dict[str, Any] | None:
+    parent, _ = _load_archive(parent_archive_path)
+    binding = parent.get("rotatingEvidenceTransaction")
+    candidate = parent_archive_path.parent / "evidence" / "cumulative-archive.json"
+    if not candidate.is_file():
+        if binding is not None:
+            raise TemporalDiscoveryContractError(
+                "rotating parent archive lost its cumulative evidence source"
+            )
+        return None
+    payload = _canonical_file(candidate, name="previous cumulative breeder archive")
+    cumulative_sha = _identity_payload(
+        payload, "archiveSha256", name="previous cumulative breeder archive"
+    )
+    if (
+        not isinstance(binding, Mapping)
+        or binding.get("cumulativeArchiveSha256") != cumulative_sha
+    ):
+        raise TemporalDiscoveryContractError(
+            "rotating parent archive cumulative evidence binding drifted"
+        )
+    return payload
+
+
+def _complete_rotating_generation_transaction(
+    *,
+    root: Path,
+    generation_root: Path,
+    generation_index: int,
+    proposal_root: Path,
+    proposal_campaign_root: Path,
+    parent_archive_path: Path,
+    archive_path: Path,
+    config: Mapping[str, Any],
+    client: LabGatewayClient,
+) -> dict[str, Any]:
+    """Complete one atomic proposal/reevaluation/backfill/archive transaction."""
+
+    _validate_frozen_sources(config)
+    contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
+    panel = panel_for_generation(contract, generation_index)
+    evidence_root = generation_root / "evidence"
+    cohort_path = evidence_root / "cohort.json"
+    checkpoint_path = evidence_root / "checkpoint.json"
+    provisional_path = evidence_root / "provisional.json"
+    cumulative_path = evidence_root / "cumulative-archive.json"
+    ledger_path = evidence_root / "generation-ledger.json"
+
+    projection = load_evaluation_population(
+        population_path=proposal_root / "population.json",
+        journal_path=proposal_root / "generation-journal.json",
+    )
+    new_candidates = {
+        str(row["candidateId"]): row for row in projection["candidates"]
+    }
+    previous, _previous_sha = _load_archive(parent_archive_path)
+    parent_candidates = {
+        str(member["candidateId"]): _clone(
+            member["candidate"], name="retained rotating parent"
+        )
+        for cell in previous.get("cells") or []
+        for member in cell.get("members") or []
+        if isinstance(member, Mapping) and isinstance(member.get("candidate"), Mapping)
+    }
+    cohort = build_current_panel_evaluation_cohort(
+        new_candidates=list(new_candidates.values()),
+        retained_parents=list(parent_candidates.values()),
+        contract=contract,
+        generation_index=generation_index,
+    )
+    _write_once(cohort_path, cohort)
+    if checkpoint_path.is_file():
+        existing_checkpoint = _canonical_file(
+            checkpoint_path, name="rotating generation checkpoint"
+        )
+        _identity_payload(
+            existing_checkpoint,
+            "checkpointSha256",
+            name="rotating generation checkpoint",
+        )
+        if (
+            existing_checkpoint.get("rotatingEvidenceSha256")
+            != contract["rotatingEvidenceSha256"]
+            or existing_checkpoint.get("generationIndex") != generation_index
+            or existing_checkpoint.get("cohortSha256") != cohort["cohortSha256"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "rotating generation checkpoint drifted before restart"
+            )
+    checkpoint = build_generation_evidence_checkpoint(
+        contract=contract,
+        generation_index=generation_index,
+        stage="current_panel_evaluation",
+        cohort=cohort,
+        stage_artifacts={
+            "proposalCampaignSha256": _canonical_file(
+                proposal_campaign_root / "campaign.json", name="proposal campaign"
+            )["campaignSha256"]
+        },
+    )
+    _replace(checkpoint_path, checkpoint)
+
+    member_batches = [
+        load_qd_evaluated_members(
+            population_path=proposal_root / "population.json",
+            result_root=proposal_campaign_root / "screening-run",
+            generation_index=generation_index,
+            generation_journal_path=proposal_root / "generation-journal.json",
+            minimum_total_trades=int(config["frozenSearchPolicy"]["minimumTotalTrades"]),
+            minimum_trades_per_window=int(
+                config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+            ),
+            cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+        )
+    ]
+    campaign_bindings: list[dict[str, Any]] = [
+        {
+            "role": "proposal_current_panel",
+            "panelId": panel["panelId"],
+            "campaignRoot": str(proposal_campaign_root.resolve()),
+            "campaignSha256": _canonical_file(
+                proposal_campaign_root / "campaign.json", name="proposal campaign"
+            )["campaignSha256"],
+        }
+    ]
+    parent_campaign_root: Path | None = None
+    if parent_candidates:
+        template = contract["panelTemplates"][panel["panelId"]]
+        result, population_path, parent_campaign_root = _run_rotating_cohort_campaign(
+            root=evidence_root / "current-parents",
+            candidates=list(parent_candidates.values()),
+            generation_index=generation_index,
+            panel_id=str(panel["panelId"]),
+            campaign_role="retained_parent_current_panel",
+            template_path=Path(template["path"]),
+            config=config,
+            client=client,
+        )
+        member_batches.append(
+            load_qd_evaluated_members(
+                population_path=population_path,
+                result_root=parent_campaign_root / "screening-run",
+                generation_index=generation_index,
+                minimum_total_trades=int(
+                    config["frozenSearchPolicy"]["minimumTotalTrades"]
+                ),
+                minimum_trades_per_window=int(
+                    config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+                ),
+                cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+            )
+        )
+        campaign_bindings.append(
+            {
+                "role": "retained_parent_current_panel",
+                "panelId": panel["panelId"],
+                "campaignRoot": str(parent_campaign_root.resolve()),
+                "populationPath": str(population_path.resolve()),
+                "campaignSha256": result["campaignSha256"],
+            }
+        )
+
+    current_members: dict[str, dict[str, Any]] = {}
+    for batch in member_batches:
+        for member in batch["members"]:
+            candidate_id = str(member["candidateId"])
+            if candidate_id in current_members:
+                raise TemporalDiscoveryContractError(
+                    "current-panel proposal/parent union contains duplicate candidate"
+                )
+            current_members[candidate_id] = member
+    cell_counts: dict[str, int] = {}
+    for member in current_members.values():
+        cell_id = str(member["descriptor"]["cellId"])
+        cell_counts[cell_id] = cell_counts.get(cell_id, 0) + 1
+    provisional_input = [
+        {
+            "candidateId": candidate_id,
+            "candidateIdentitySha256": member["candidate"].get(
+                "candidateIdentitySha256"
+            ),
+            "programSha256": member["candidate"].get("programSha256"),
+            "profileSnapshotSha256": member["candidate"].get(
+                "profileSnapshotSha256"
+            ),
+            "cellId": member["descriptor"]["cellId"],
+            "costView": "research_conservative",
+            "currentPanelRank": float(
+                member["aggregate"].get("totalConservativeNetR") or 0.0
+            ),
+            "novelty": 1.0 / float(cell_counts[str(member["descriptor"]["cellId"])]),
+        }
+        for candidate_id, member in sorted(current_members.items())
+    ]
+    provisional = reduce_provisional_diverse_survivors(
+        provisional_input,
+        limit=int(contract["provisionalReduction"]["maxCandidates"]),
+    )
+    provisional_artifact = {
+        "schemaVersion": "temporal_qd_provisional_survivors_v1",
+        "generationIndex": generation_index,
+        "panelId": panel["panelId"],
+        "cohortSha256": cohort["cohortSha256"],
+        "candidateCount": len(provisional),
+        "candidates": provisional,
+    }
+    provisional_artifact["provisionalSha256"] = canonical_sha256(
+        provisional_artifact
+    )
+    _write_once(provisional_path, provisional_artifact)
+    checkpoint = build_generation_evidence_checkpoint(
+        contract=contract,
+        generation_index=generation_index,
+        stage="provisional_reduction",
+        cohort=cohort,
+        provisional_candidate_ids=[row["candidateId"] for row in provisional],
+        stage_artifacts={
+            "provisionalSha256": provisional_artifact["provisionalSha256"]
+        },
+    )
+    _replace(checkpoint_path, checkpoint)
+
+    rich_candidates: dict[str, dict[str, Any]] = {}
+    for row in provisional:
+        candidate_id = str(row["candidateId"])
+        candidate = current_members[candidate_id]["candidate"]
+        if candidate_id in new_candidates:
+            candidate = hydrate_evaluation_candidate(
+                candidate,
+                proposal_root=proposal_root / "proposal-journal",
+            )
+            current_members[candidate_id]["candidate"] = candidate
+        rich_candidates[candidate_id] = _clone(candidate, name="provisional rich candidate")
+
+    current_records: dict[str, list[dict[str, Any]]] = {}
+    new_records = _campaign_window_evidence(
+        campaign_root=proposal_campaign_root,
+        panel=panel,
+        candidates=new_candidates,
+    )
+    current_records.update(new_records)
+    if parent_campaign_root is not None:
+        current_records.update(
+            _campaign_window_evidence(
+                campaign_root=parent_campaign_root,
+                panel=panel,
+                candidates=parent_candidates,
+            )
+        )
+    bundles: dict[str, dict[str, dict[str, Any]]] = {
+        candidate_id: {} for candidate_id in rich_candidates
+    }
+    previous_cumulative = _load_previous_cumulative_archive(parent_archive_path)
+    if previous_cumulative is not None:
+        for bundle in previous_cumulative.get("candidatePanelBundles") or []:
+            if not isinstance(bundle, Mapping):
+                continue
+            candidate_id = str(bundle.get("candidateId"))
+            if candidate_id in bundles:
+                bundles[candidate_id][str(bundle.get("panelId"))] = _clone(
+                    bundle, name="previous candidate panel bundle"
+                )
+    for candidate_id in rich_candidates:
+        bundles[candidate_id][str(panel["panelId"])] = build_candidate_panel_bundle(
+            contract=contract,
+            candidate=rich_candidates[candidate_id],
+            panel_id=str(panel["panelId"]),
+            records=current_records[candidate_id],
+        )
+
+    required = required_panel_ids(contract, generation_index)
+    for backfill_panel_id in required:
+        missing = [
+            candidate_id
+            for candidate_id in sorted(rich_candidates)
+            if backfill_panel_id not in bundles[candidate_id]
+        ]
+        if not missing:
+            continue
+        template = contract["panelTemplates"][backfill_panel_id]
+        result, population_path, backfill_campaign_root = _run_rotating_cohort_campaign(
+            root=evidence_root / "backfill" / backfill_panel_id,
+            candidates=[rich_candidates[candidate_id] for candidate_id in missing],
+            generation_index=generation_index,
+            panel_id=backfill_panel_id,
+            campaign_role="prior_panel_backfill",
+            template_path=Path(template["path"]),
+            config=config,
+            client=client,
+        )
+        backfill_panel = next(
+            row for row in contract["panels"] if row["panelId"] == backfill_panel_id
+        )
+        records = _campaign_window_evidence(
+            campaign_root=backfill_campaign_root,
+            panel=backfill_panel,
+            candidates={candidate_id: rich_candidates[candidate_id] for candidate_id in missing},
+        )
+        for candidate_id in missing:
+            bundles[candidate_id][backfill_panel_id] = build_candidate_panel_bundle(
+                contract=contract,
+                candidate=rich_candidates[candidate_id],
+                panel_id=backfill_panel_id,
+                records=records[candidate_id],
+            )
+        campaign_bindings.append(
+            {
+                "role": "prior_panel_backfill",
+                "panelId": backfill_panel_id,
+                "campaignRoot": str(backfill_campaign_root.resolve()),
+                "populationPath": str(population_path.resolve()),
+                "campaignSha256": result["campaignSha256"],
+                "candidateIds": missing,
+            }
+        )
+    checkpoint = build_generation_evidence_checkpoint(
+        contract=contract,
+        generation_index=generation_index,
+        stage="cumulative_backfill",
+        cohort=cohort,
+        provisional_candidate_ids=list(rich_candidates),
+        stage_artifacts={
+            "campaignsSha256": canonical_sha256(campaign_bindings),
+            "requiredPanelIds": required,
+        },
+    )
+    _replace(checkpoint_path, checkpoint)
+    for binding in campaign_bindings:
+        if binding["role"] == "proposal_current_panel":
+            continue
+        binding["artifacts"] = _rotating_campaign_artifacts(
+            campaign_root=Path(binding["campaignRoot"]),
+            population_path=Path(binding["populationPath"]),
+        )
+
+    cumulative = build_cumulative_breeder_archive(
+        contract=contract,
+        generation_index=generation_index,
+        provisional=provisional,
+        bundles={
+            candidate_id: [
+                panel_bundles[panel_id] for panel_id in sorted(panel_bundles)
+            ]
+            for candidate_id, panel_bundles in bundles.items()
+        },
+        previous_archive=previous_cumulative,
+    )
+    _write_once(cumulative_path, cumulative)
+    archive_result = build_rotating_qd_parent_archive(
+        current_members=list(current_members.values()),
+        cumulative_archive=cumulative,
+        output_path=archive_path,
+        generation_index=generation_index,
+        previous_archive_path=parent_archive_path,
+        bidirectional_pair_policy=(
+            pair_policy_from_config(config["bidirectionalPairGeneration"])
+            if config.get("bidirectionalPairGeneration") is not None
+            else None
+        ),
+        cell_capacity=int(config["frozenSearchPolicy"]["cellCapacity"]),
+    )
+    checkpoint = build_generation_evidence_checkpoint(
+        contract=contract,
+        generation_index=generation_index,
+        stage="cumulative_archive",
+        cohort=cohort,
+        provisional_candidate_ids=list(rich_candidates),
+        cumulative_archive=cumulative,
+        stage_artifacts={
+            "parentArchiveSha256": archive_result["archiveSha256"],
+            "campaignsSha256": canonical_sha256(campaign_bindings),
+        },
+    )
+    _replace(checkpoint_path, checkpoint)
+    ledger = {
+        "schemaVersion": "temporal_qd_rotating_generation_ledger_v1",
+        "generationIndex": generation_index,
+        "rotatingEvidenceSha256": contract["rotatingEvidenceSha256"],
+        "panelId": panel["panelId"],
+        "cohortSha256": cohort["cohortSha256"],
+        "provisionalSha256": provisional_artifact["provisionalSha256"],
+        "cumulativeArchiveSha256": cumulative["archiveSha256"],
+        "parentArchiveSha256": archive_result["archiveSha256"],
+        "checkpointSha256": checkpoint["checkpointSha256"],
+        "campaigns": campaign_bindings,
+        "proposalCandidateIds": cohort["newProposalCandidateIds"],
+        "retainedParentEvaluationCandidateIds": cohort[
+            "retainedParentEvaluationCandidateIds"
+        ],
+        "proposalOnlyFunnelReporting": True,
+    }
+    ledger["ledgerSha256"] = canonical_sha256(ledger)
+    _write_once(ledger_path, ledger)
+    return {
+        **archive_result,
+        "rotatingEvidenceLedgerSha256": ledger["ledgerSha256"],
+        "rotatingEvidenceCheckpointSha256": checkpoint["checkpointSha256"],
+        "cumulativeArchiveSha256": cumulative["archiveSha256"],
+        "additionalWorkerTaskCount": sum(
+            int(
+                _canonical_file(
+                    Path(binding["campaignRoot"]) / "campaign.json",
+                    name="rotating campaign",
+                )["taskCount"]
+            )
+            for binding in campaign_bindings
+            if binding["role"] != "proposal_current_panel"
+        ),
+    }
+
+
 def run_qd_supervisor(
     *,
     run_root: Path | str,
@@ -1469,7 +2538,10 @@ def run_qd_supervisor(
     generation_funnel_enabled: bool = False,
     bidirectional_pair_config: Mapping[str, Any] | None = None,
     evidence_ladder_config: Mapping[str, Any] | None = None,
+    rotating_evidence_config: Mapping[str, Any] | None = None,
     continuation_from: Mapping[str, Any] | None = None,
+    initial_construction_pool_size: int | None = None,
+    evaluation_population_size: int | None = None,
 ) -> dict[str, Any]:
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -1503,13 +2575,18 @@ def run_qd_supervisor(
         construction_catalog_path=construction_catalog_path,
         bidirectional_pair_config=bidirectional_pair_config,
         evidence_ladder_config=evidence_ladder_config,
+        rotating_evidence_config=rotating_evidence_config,
         continuation_from=continuation_from,
+        initial_construction_pool_size=initial_construction_pool_size,
+        evaluation_population_size=evaluation_population_size,
     )
     config_path = root / "config.json"
     state_path = root / "state.json"
     _write_once(config_path, config)
     if config.get("evidenceLadder") is not None:
         _write_once(root / "evidence-ladder.json", config["evidenceLadder"])
+    if config.get("rotatingEvidence") is not None:
+        _write_once(root / "rotating-evidence.json", config["rotatingEvidence"])
     if state_path.exists():
         state = _load_state(state_path, config_sha256=config["configSha256"])
     else:
@@ -1596,6 +2673,12 @@ def run_qd_supervisor(
             campaign_root = generation_root / "campaign"
             result_root = campaign_root / "screening-run"
             archive_path = generation_root / "archive.json"
+            generation_template_file = template_preparation_file
+            if config.get("rotatingEvidence") is not None:
+                template_binding = template_for_generation(config["rotatingEvidence"], generation_index)
+                generation_template_file = Path(template_binding["path"])
+                template_payload = _read(generation_template_file, name="rotating QD panel template")
+                validate_generation_template(template_payload, config["rotatingEvidence"], generation_index)
 
             state.update(
                 {
@@ -1651,6 +2734,7 @@ def run_qd_supervisor(
                 generation_result = generate_qd_generation(**generation_kwargs)
             else:
                 with PairAuthorityBundle(config["bidirectionalPairGeneration"]) as pair_authority:
+                    g0 = config.get("g0Bootstrap")
                     generation_result = generate_qd_generation(
                         **generation_kwargs,
                         bidirectional_pair_policy=pair_policy_from_config(config["bidirectionalPairGeneration"]),
@@ -1659,6 +2743,8 @@ def run_qd_supervisor(
                         bidirectional_native_validator=pair_authority.validator,
                         bidirectional_pair_compiler=pair_authority.compiler,
                         bidirectional_operator_implementation_identity=config["bidirectionalPairGeneration"]["operatorImplementation"],
+                        initial_construction_pool_size=(int(g0["initialConstructionPoolSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
+                        evaluation_population_size=(int(g0["evaluationPopulationSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
                     )
             if generation_result.get("completed") is not True:
                 raise TemporalDiscoveryContractError(
@@ -1670,7 +2756,7 @@ def run_qd_supervisor(
             validator_command = _validate_frozen_sources(config)
             campaign_result = freeze_qd_screening_campaign(
                 population_path=proposal_root / "population.json",
-                template_preparation_path=template_preparation_file,
+                template_preparation_path=generation_template_file,
                 output_root=campaign_root,
                 execution_engine_commit=config["repositories"]["executionEngineCommit"],
                 worker_contract_sha256=config["workerContractSha256"],
@@ -1680,6 +2766,7 @@ def run_qd_supervisor(
                     .get("path")
                 ),
                 evidence_ladder=config.get("evidenceLadder"),
+                rotating_evidence=config.get("rotatingEvidence"),
             )
             evaluation_identity = _read(
                 campaign_root / "evaluation-identity.json",
@@ -1693,8 +2780,8 @@ def run_qd_supervisor(
                 )
                 != config["workerContractSha256"]
                 or evaluation_identity.get("policySha256") != QD_POLICY_SHA256
-                or evaluation_identity.get("predeclaredEvidenceContextSha256")
-                != config["evaluation"]["predeclaredEvidenceContextSha256"]
+                or (config.get("rotatingEvidence") is None and evaluation_identity.get("predeclaredEvidenceContextSha256")
+                != config["evaluation"]["predeclaredEvidenceContextSha256"])
             ):
                 raise TemporalDiscoveryContractError(
                     "frozen QD evaluation identity drifted from supervisor config"
@@ -1761,24 +2848,41 @@ def run_qd_supervisor(
                     "QD generation evaluation did not complete its exact task matrix"
                 )
 
-            state["stage"] = "reducing_archive"
-            _save_state(state_path, state)
-            archive_result = build_qd_archive(
-                population_path=proposal_root / "population.json",
-                result_root=result_root,
-                output_path=archive_path,
-                generation_index=generation_index,
-                previous_archive_path=parent_archive_path,
-                generation_journal_path=proposal_root / "generation-journal.json",
-                cell_capacity=int(config["frozenSearchPolicy"]["cellCapacity"]),
-                minimum_total_trades=int(
-                    config["frozenSearchPolicy"]["minimumTotalTrades"]
-                ),
-                minimum_trades_per_window=int(
-                    config["frozenSearchPolicy"]["minimumTradesPerWindow"]
-                ),
-                cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+            state["stage"] = (
+                "rotating_evidence_transaction"
+                if config.get("rotatingEvidence") is not None
+                else "reducing_archive"
             )
+            _save_state(state_path, state)
+            if config.get("rotatingEvidence") is not None:
+                archive_result = _complete_rotating_generation_transaction(
+                    root=root,
+                    generation_root=generation_root,
+                    generation_index=generation_index,
+                    proposal_root=proposal_root,
+                    proposal_campaign_root=campaign_root,
+                    parent_archive_path=parent_archive_path,
+                    archive_path=archive_path,
+                    config=config,
+                    client=client,
+                )
+            else:
+                archive_result = build_qd_archive(
+                    population_path=proposal_root / "population.json",
+                    result_root=result_root,
+                    output_path=archive_path,
+                    generation_index=generation_index,
+                    previous_archive_path=parent_archive_path,
+                    generation_journal_path=proposal_root / "generation-journal.json",
+                    cell_capacity=int(config["frozenSearchPolicy"]["cellCapacity"]),
+                    minimum_total_trades=int(
+                        config["frozenSearchPolicy"]["minimumTotalTrades"]
+                    ),
+                    minimum_trades_per_window=int(
+                        config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+                    ),
+                    cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+                )
             funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
             if funnel_enabled:
                 evaluation_population = load_evaluation_population(
@@ -1852,12 +2956,16 @@ def run_qd_supervisor(
                 "journalSha256": journal_sha,
                 "proposalCount": generation_result["proposalCount"],
                 "candidateCount": generation_result["candidateCount"],
+                **({"g0Bootstrap": generation_result["g0Bootstrap"]} if generation_result.get("g0Bootstrap") is not None else {}),
+                **({"constructionPoolSize": generation_result["constructionPoolSize"], "constructedAcceptedCount": generation_result["constructedAcceptedCount"]} if generation_result.get("g0Bootstrap") is not None else {}),
                 "originProposalCounts": generation_result["originProposalCounts"],
                 "originAcceptedCounts": generation_result["originAcceptedCounts"],
                 "campaignSha256": campaign_result["campaignSha256"],
                 "evaluationIdentitySha256": campaign_result["evaluationIdentitySha256"],
                 "taskMatrixSha256": campaign_result["taskMatrixSha256"],
                 "taskCount": campaign_result["taskCount"],
+                "totalGenerationTaskCount": int(campaign_result["taskCount"])
+                + int(archive_result.get("additionalWorkerTaskCount") or 0),
                 "archiveSha256": archive_result["archiveSha256"],
                 "resultSetSha256": _sha256(
                     _canonical_file(
@@ -1875,6 +2983,24 @@ def run_qd_supervisor(
                 ],
                 "paretoAdmissionCount": archive_result["paretoAdmissionCount"],
                 "paretoEvictionCount": archive_result["paretoEvictionCount"],
+                **(
+                    {
+                        "rotatingEvidenceLedgerSha256": archive_result[
+                            "rotatingEvidenceLedgerSha256"
+                        ],
+                        "rotatingEvidenceCheckpointSha256": archive_result[
+                            "rotatingEvidenceCheckpointSha256"
+                        ],
+                        "cumulativeArchiveSha256": archive_result[
+                            "cumulativeArchiveSha256"
+                        ],
+                        "frontierMemberCount": archive_result[
+                            "frontierMemberCount"
+                        ],
+                    }
+                    if config.get("rotatingEvidence") is not None
+                    else {}
+                ),
                 "proposalSlots": generation_result["proposalSlots"],
                 "uniqueIdentityCounts": generation_result["uniqueIdentityCounts"],
                 "duplicateCounters": generation_result["duplicateCounters"],
@@ -1908,7 +3034,8 @@ def run_qd_supervisor(
                     )
                     + int(generation_result["candidateCount"]),
                     "workerTasksCompleted": int(state.get("workerTasksCompleted") or 0)
-                    + int(campaign_result["taskCount"]),
+                    + int(campaign_result["taskCount"])
+                    + int(archive_result.get("additionalWorkerTaskCount") or 0),
                     "uniqueIdentityCounts": generation_result["uniqueIdentityCounts"],
                     "duplicateCounters": generation_result["duplicateCounters"],
                     "proposalSlotCounters": generation_result["proposalSlotCounters"],
@@ -2187,6 +3314,8 @@ def main() -> None:
         help="canonical Stage 5E7-v3 construction catalog snapshot",
     )
     parser.add_argument("--generation-count", type=int, required=True)
+    parser.add_argument("--initial-construction-pool-size", type=int, default=4000)
+    parser.add_argument("--evaluation-population-size", type=int, default=1024)
     parser.add_argument("--first-generation-index", type=int, default=1)
     parser.add_argument("--initial-immigrant-continuation-ordinal", type=int, default=0)
     parser.add_argument("--autoresearch-commit", required=True)
@@ -2202,6 +3331,11 @@ def main() -> None:
         "--evidence-ladder-config",
         type=Path,
         help="closed temporal_qd_evidence_ladder_input_v1 JSON; enables frozen 3m/12m/36m evidence gates",
+    )
+    parser.add_argument(
+        "--rotating-evidence-config",
+        type=Path,
+        help="closed temporal_qd_rotating_evidence_input_v1 JSON; enables the rotating cumulative breeder transaction",
     )
     parser.add_argument("--stop-after-generation", type=int)
     parser.add_argument("--bidirectional-pair-config", type=Path, help="closed temporal_qd_bidirectional_pair_run_config_v1 JSON; opt-in only")
@@ -2241,6 +3375,16 @@ def main() -> None:
                 _read(args.evidence_ladder_config, name="QD evidence ladder config")
                 if args.evidence_ladder_config is not None else None
             ),
+            rotating_evidence_config=(
+                _read(
+                    args.rotating_evidence_config,
+                    name="QD rotating evidence config",
+                )
+                if args.rotating_evidence_config is not None
+                else None
+            ),
+            initial_construction_pool_size=args.initial_construction_pool_size,
+            evaluation_population_size=args.evaluation_population_size,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return
@@ -2278,6 +3422,16 @@ def main() -> None:
             if args.evidence_ladder_config is not None
             else None
         ),
+        rotating_evidence_config=(
+            _read(
+                args.rotating_evidence_config,
+                name="QD rotating evidence config",
+            )
+            if args.rotating_evidence_config is not None
+            else None
+        ),
+        initial_construction_pool_size=args.initial_construction_pool_size,
+        evaluation_population_size=args.evaluation_population_size,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

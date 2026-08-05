@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from .temporal_discovery_base import TemporalDiscoveryContractError, _clone, canonical_sha256
+from .temporal_qd_g0_bootstrap import (
+    verify_campaign_ledger,
+    verify_g0_bootstrap_selection,
+)
 
 
 EVALUATION_POPULATION_SCHEMA = "temporal_qd_evaluation_population_v1"
+ROTATING_COHORT_POPULATION_SCHEMA = "temporal_qd_rotating_cohort_population_v1"
 
 
 def evaluation_population_path(population_path: Path | str) -> Path:
@@ -131,15 +136,50 @@ def load_evaluation_population(
         or payload.get("proposalAttempts") != len(funnel_entries)
     ):
         raise TemporalDiscoveryContractError("QD evaluation population proposal accounting mismatch")
+    g0_bootstrap = payload.get("g0Bootstrap")
+    g0_selected_ordinals: set[int] | None = None
+    if g0_bootstrap is not None:
+        if not isinstance(g0_bootstrap, Mapping) or set(g0_bootstrap) != {
+            "constructionPoolIdentitySha256", "acceptedPoolSha256", "selectionSha256", "ledgerSha256"
+        }:
+            raise TemporalDiscoveryContractError("QD evaluation population G0 binding is invalid")
+        base = source.parent / "g0-bootstrap"
+        try:
+            pool = json.loads((base / "accepted-pool.json").read_text(encoding="utf-8"))
+            selection = json.loads((base / "selection.json").read_text(encoding="utf-8"))
+            ledger = json.loads((base / "campaign-construction-ledger.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise TemporalDiscoveryContractError("QD G0 bootstrap artifacts are unavailable") from exc
+        verified_selection = verify_g0_bootstrap_selection(artifact=selection, accepted_pool=pool)
+        verify_campaign_ledger(
+            ledger=ledger,
+            accepted_pool=pool,
+            selected_reference_sha256s=[str(row["referenceSha256"]) for row in verified_selection["selected"]],
+        )
+        expected = {
+            "constructionPoolIdentitySha256": pool.get("constructionPoolIdentitySha256"),
+            "acceptedPoolSha256": pool.get("acceptedPoolSha256"),
+            "selectionSha256": verified_selection.get("selectionSha256"),
+            "ledgerSha256": ledger.get("ledgerSha256"),
+        }
+        if dict(g0_bootstrap) != expected:
+            raise TemporalDiscoveryContractError("QD evaluation population G0 binding drift")
+        g0_selected_ordinals = {int(row["proposalOrdinal"]) for row in verified_selection["selected"]}
+    seen_funnel_ordinals: set[int] = set()
     for ordinal, entry in enumerate(funnel_entries):
         if (
             not isinstance(entry, Mapping)
-            or entry.get("proposalOrdinal") != ordinal
+            or isinstance(entry.get("proposalOrdinal"), bool)
+            or not isinstance(entry.get("proposalOrdinal"), int)
+            or entry.get("proposalOrdinal") in seen_funnel_ordinals
             or not isinstance(entry.get("entrySha256"), str)
             or not isinstance(entry.get("originKind"), str)
             or not isinstance(entry.get("disposition"), str)
         ):
             raise TemporalDiscoveryContractError("QD evaluation population funnel entry is invalid")
+        seen_funnel_ordinals.add(int(entry["proposalOrdinal"]))
+    if g0_selected_ordinals is not None and seen_funnel_ordinals != g0_selected_ordinals:
+        raise TemporalDiscoveryContractError("QD evaluation population G0 funnel is not the selected subset")
     if journal_path is not None:
         try:
             journal = json.loads(Path(journal_path).read_text(encoding="utf-8"))
@@ -182,8 +222,8 @@ def load_evaluation_population(
             or journal.get("proposalCount") != len(funnel_entries)
         ):
             raise TemporalDiscoveryContractError("QD evaluation population journal proposal count mismatch")
-        for ordinal, entry in enumerate(funnel_entries):
-            if entries[ordinal] != entry.get("entrySha256"):
+        for entry_sha, entry in zip(entries, funnel_entries, strict=True):
+            if entry_sha != entry.get("entrySha256"):
                 raise TemporalDiscoveryContractError(
                     "QD evaluation population journal funnel reference mismatch"
                 )
@@ -195,8 +235,7 @@ def load_evaluation_population(
             if (
                 isinstance(ordinal, bool)
                 or not isinstance(ordinal, int)
-                or ordinal < 0
-                or ordinal >= len(funnel_entries)
+                or ordinal not in seen_funnel_ordinals
             ):
                 raise TemporalDiscoveryContractError(
                     "QD evaluation population candidate proposal ordinal is invalid"
@@ -220,7 +259,7 @@ def load_evaluation_population(
             if ordinal in accepted_ordinals:
                 raise TemporalDiscoveryContractError("QD evaluation population accepted ordinals are not unique")
             accepted_ordinals.add(ordinal)
-            funnel = funnel_entries[ordinal]
+            funnel = next(row for row in funnel_entries if row["proposalOrdinal"] == ordinal)
             funnel_candidate = funnel.get("candidate")
             if (
                 funnel.get("disposition") != "accepted"
@@ -234,16 +273,132 @@ def load_evaluation_population(
                 )
         for candidate in candidates:
             ordinal = candidate.get("proposalOrdinal")
-            if not isinstance(ordinal, int) or ordinal < 0 or ordinal >= len(entries) or entries[ordinal] != candidate.get("proposalEntrySha256"):
+            if not isinstance(ordinal, int) or not any(
+                row["proposalOrdinal"] == ordinal and row["entrySha256"] == candidate.get("proposalEntrySha256")
+                for row in funnel_entries
+            ):
                 raise TemporalDiscoveryContractError(
                     "QD evaluation population journal candidate reference mismatch"
                 )
     return _clone(payload, name="QD evaluation population")
 
 
+def hydrate_evaluation_candidate(
+    candidate: Mapping[str, Any], *, proposal_root: Path | str
+) -> dict[str, Any]:
+    """Reopen the rich, immutable proposal behind one compact projection.
+
+    Retained parents are already rich and pass through unchanged.  New pair
+    proposals are hydrated from their own append-only proposal journal; this
+    avoids decoding the population-sized source document during rotating
+    cohort construction.
+    """
+
+    compact = _clone(candidate, name="QD evaluation candidate")
+    if isinstance(compact.get("bidirectionalGenome"), Mapping):
+        return compact
+    ordinal = compact.get("proposalOrdinal")
+    entry_sha = compact.get("proposalEntrySha256")
+    if (
+        isinstance(ordinal, bool)
+        or not isinstance(ordinal, int)
+        or ordinal < 0
+        or not isinstance(entry_sha, str)
+        or not entry_sha.startswith("sha256:")
+    ):
+        raise TemporalDiscoveryContractError(
+            "QD compact candidate lacks an immutable proposal reference"
+        )
+    path = Path(proposal_root) / f"{ordinal:08d}.json"
+    try:
+        entry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TemporalDiscoveryContractError(
+            f"could not read QD proposal journal entry: {path}"
+        ) from exc
+    if not isinstance(entry, Mapping):
+        raise TemporalDiscoveryContractError("QD proposal journal entry is invalid")
+    supplied = entry.get("entrySha256")
+    material = {key: value for key, value in entry.items() if key != "entrySha256"}
+    if supplied != entry_sha or canonical_sha256(material) != supplied:
+        raise TemporalDiscoveryContractError("QD proposal journal entry identity mismatch")
+    rich = entry.get("candidate")
+    if not isinstance(rich, Mapping):
+        raise TemporalDiscoveryContractError("QD accepted proposal lacks rich candidate material")
+    for field in (
+        "candidateId",
+        "candidateIdentitySha256",
+        "programSha256",
+        "sourceProfileSha256",
+    ):
+        if rich.get(field) != compact.get(field):
+            raise TemporalDiscoveryContractError(
+                f"QD rich candidate {field} differs from its evaluation projection"
+            )
+    return _clone(rich, name="QD rich proposal candidate")
+
+
+def build_rotating_cohort_population(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    generation_index: int,
+    panel_id: str,
+    cohort_role: str,
+    rotating_evidence_sha256: str,
+) -> dict[str, Any]:
+    """Build a small executable population for parent/backfill campaigns.
+
+    This schema is intentionally not a proposal population: it has no proposal
+    ordinals or funnel entries, and therefore cannot inflate proposal counts.
+    """
+
+    if generation_index < 1 or not panel_id or not cohort_role:
+        raise TemporalDiscoveryContractError("rotating cohort identity is invalid")
+    rows = sorted(
+        (_clone(row, name="rotating cohort candidate") for row in candidates),
+        key=lambda row: str(row.get("candidateId")),
+    )
+    seen: set[str] = set()
+    for row in rows:
+        candidate_id = row.get("candidateId")
+        profile = row.get("sourceProfile")
+        if (
+            not isinstance(candidate_id, str)
+            or not candidate_id
+            or candidate_id in seen
+            or not isinstance(profile, Mapping)
+            or canonical_sha256(profile) != row.get("sourceProfileSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "rotating cohort contains invalid or duplicate candidate material"
+            )
+        for field in ("candidateIdentitySha256", "programSha256"):
+            value = row.get(field)
+            if not isinstance(value, str) or not value.startswith("sha256:"):
+                raise TemporalDiscoveryContractError(
+                    f"rotating cohort candidate {field} is invalid"
+                )
+        seen.add(candidate_id)
+    output = {
+        "schemaVersion": ROTATING_COHORT_POPULATION_SCHEMA,
+        "generationIndex": generation_index,
+        "panelId": panel_id,
+        "cohortRole": cohort_role,
+        "rotatingEvidenceSha256": rotating_evidence_sha256,
+        "candidateCount": len(rows),
+        "candidates": rows,
+        "proposalPopulation": False,
+    }
+    output["populationSha256"] = canonical_sha256(output)
+    return output
+
+
 __all__ = [
     "EVALUATION_POPULATION_SCHEMA",
+    "ROTATING_COHORT_POPULATION_SCHEMA",
+    "build_rotating_cohort_population",
     "evaluation_population_path",
+    "hydrate_evaluation_candidate",
     "is_optimized_pair_population",
     "load_evaluation_population",
     "raw_file_sha256",

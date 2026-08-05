@@ -237,6 +237,29 @@ def test_adapter_negative_conservative_candidate_is_quality_rejected_not_promote
     assert row["terminalDisposition"] == "activation_quality_rejected"
 
 
+def test_rotating_proposal_funnel_defers_to_cumulative_robust_archive_lane(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    record = inputs["checkpoint"]["completed"]["task-qd_retained"]
+    material = _result("qd_retained", conservative_terminal_net_r=-0.25)
+    Path(record["resultPath"]).write_text(json.dumps(material), encoding="utf-8")
+    record["resultSha256"] = canonical_sha256(material)
+    inputs["archive"]["rotatingEvidenceTransaction"] = {
+        "schemaVersion": "temporal_qd_rotating_parent_projection_v1"
+    }
+    inputs["archive"]["cells"][0]["members"][0]["archiveLane"] = "quality"
+
+    artifact = build_qd_generation_funnel(**inputs)
+
+    row = next(
+        item for item in artifact["candidates"] if item["candidateId"] == "qd_retained"
+    )
+    assert row["stages"]["activationQuality"]["outcome"] == "recorded"
+    assert row["stages"]["archiveRetention"]["outcome"] == "retained"
+    assert row["terminalDisposition"] == "retained"
+
+
 def test_adapter_refuses_stripped_materialized_stage_projection(tmp_path: Path) -> None:
     inputs = _inputs(tmp_path)
     inputs["proposal_entries"][3].pop("funnelCandidate")

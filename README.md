@@ -72,34 +72,48 @@ See [cli.md](cli.md) for arguments.
 The temporal QD broad system is implemented as a frozen, diagnostic authority.
 Each broad run still requires fresh native, no-market, and current-worker
 admission against its exact committed inputs before launch.
-The only fresh broad admission shape is exactly five generations of 1,024 unique
-bidirectional-v3 candidates: 5,120 candidate evaluations and 15,360 discovery
-worker tasks over the same three deterministic, separated one-month windows.
-Conservative costs control quality and reproduction; the no-cost view is
-diagnostic only.
+The next fresh broad admission shape is five generations with an evaluation
+width of 1,024 bidirectional-v3 candidates. Generation 1 first constructs 4,000
+valid random immigrants and selects 1,024 by deterministic, pre-economic
+structural diversity. Every generation evaluates four separated three-month
+windows from the frozen Latin-square rotation, or twelve candidate-months.
+Retained-parent current-panel work and survivor backfill make the exact task
+count dynamic and identity-bound; the supervisor freezes an upper bound rather
+than claiming one fixed campaign total. Conservative costs control quality and
+reproduction; the no-cost view is diagnostic only.
 
-First materialize the immutable 3m/12m/36m evidence ladder. It binds three
-discovery months, a disjoint 12-month validation for at most 128 diverse
-survivors, and a disjoint 36-month scrutiny for at most 32 finalists; the
-post-`2026-01-01T00:00:00Z` tail remains untouched.
+First materialize the immutable rotating evidence authority. It attests all
+sixteen year-quarter cells, freezes four Latin-square panels, labels the later
+12-month and 36-month stages as research scrutiny, and leaves only the outer
+tail untouched. The legacy fixed 3m/12m/36m ladder remains readable for prior
+campaigns but is not the next-search authority.
 
 ```powershell
-uv run temporal-qd-materialize-evidence-ladder `
-  --evidence-ladder-input <ladder-input.json> `
+uv run temporal-qd-materialize-rotating-evidence `
+  --rotating-evidence-input <rotating-evidence-input.json> `
   --seed-population <frozen-seed-population.json> `
   --construction-catalog <construction-catalog.json> `
+  --bidirectional-pair-config <pair-config.json> `
   --worker-contract-sha256 <sha256:...> `
   --worker-contract-schema <schema> `
   --base-timeframe <timeframe> `
-  --output-root <ladder-root>
+  --output-root <rotating-evidence-root>
 ```
 
 Run the broad supervisor only with the materialized/frozen authority,
 `--broad-admission`, `--generation-count 5`, and parameters whose
 `targetUniqueCandidates` is `1024`. Supply the frozen archive, preparation,
 construction catalog, commits, worker contract, bidirectional pair config, and
-the ladder config through `temporal-qd-supervisor`; it fails closed if that exact
-admission shape is not present.
+the rotating evidence config through `temporal-qd-supervisor`; it fails closed
+if that exact admission shape is not present.
+
+For a fresh bidirectional-pair generation 1, the supervisor uses an immutable
+G0 bootstrap by default: it constructs 4,000 valid random immigrants, records
+their compact journal-backed pool and construction ledger, then deterministically
+selects exactly 1,024 for market evaluation. `--initial-construction-pool-size`
+and `--evaluation-population-size` are frozen into the run config; the latter
+must equal the normal generation width. Later generations and continuations use
+only the normal width and never rerun G0.
 
 Continuations are never automatic. A completed fresh 1–5 broad authority may
 continue as a separate legacy-compatible four-generation 6–9 block (and later

@@ -201,6 +201,7 @@ def finalize_population_with_rust(
     population_without_sha: Mapping[str, Any],
     expected_entry_sha256s: Sequence[str],
     accepted_candidates: Sequence[Mapping[str, Any]],
+    g0_bootstrap: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Finalize exactly one population from immutable proposal journal bytes."""
 
@@ -226,6 +227,47 @@ def finalize_population_with_rust(
         }
         for reference in accepted_candidates
     ]
+    g0_artifacts: dict[str, Any] | None = None
+    if g0_bootstrap is not None:
+        artifact_root = root / "g0-bootstrap"
+        paths = {
+            "acceptedPool": artifact_root / "accepted-pool.json",
+            "selection": artifact_root / "selection.json",
+            "ledger": artifact_root / "campaign-construction-ledger.json",
+        }
+        try:
+            pool = json.loads(paths["acceptedPool"].read_text(encoding="utf-8"))
+            selection = json.loads(paths["selection"].read_text(encoding="utf-8"))
+            ledger = json.loads(paths["ledger"].read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise TemporalDiscoveryContractError("G0 native finalizer artifacts are unavailable") from exc
+        if (
+            pool.get("constructionPoolIdentitySha256") != g0_bootstrap["constructionPoolIdentitySha256"]
+            or pool.get("acceptedPoolSha256") != g0_bootstrap["acceptedPoolSha256"]
+            or selection.get("selectionSha256") != g0_bootstrap["selectionSha256"]
+            or selection.get("campaignLedgerSha256") != g0_bootstrap["ledgerSha256"]
+            or ledger.get("ledgerSha256") != g0_bootstrap["ledgerSha256"]
+        ):
+            raise TemporalDiscoveryContractError("G0 native finalizer artifact identity drift")
+        refs = {str(row.get("referenceSha256")): row for row in pool.get("acceptedReferences") or [] if isinstance(row, Mapping)}
+        selected = list(selection.get("selected") or [])
+        selected_manifest = []
+        for selected_row in selected:
+            ref = refs.get(str(selected_row.get("referenceSha256"))) if isinstance(selected_row, Mapping) else None
+            if not isinstance(ref, Mapping) or any(ref.get(key) != selected_row.get(key) for key in ("proposalOrdinal", "candidateId", "candidateIdentitySha256", "referenceSha256")):
+                raise TemporalDiscoveryContractError("G0 native finalizer selected reference drift")
+            selected_manifest.append({
+                "proposalOrdinal": int(ref["proposalOrdinal"]), "candidateId": str(ref["candidateId"]),
+                "candidateIdentitySha256": str(ref["candidateIdentitySha256"]),
+                "acceptedPairEntrySha256": str(ref["acceptedPairEntrySha256"]), "referenceSha256": str(ref["referenceSha256"]),
+            })
+        if sorted(references, key=lambda row: int(row["proposalOrdinal"])) != sorted([{key: row[key] for key in ("proposalOrdinal", "candidateId", "candidateIdentitySha256")} for row in selected_manifest], key=lambda row: int(row["proposalOrdinal"])):
+            raise TemporalDiscoveryContractError("G0 native finalizer candidates are not the authoritative selection")
+        references = selected_manifest
+        g0_artifacts = {
+            key: {"path": "../../g0-bootstrap/" + path.name, "fileSha256": _sha256_file(path)}
+            for key, path in paths.items()
+        }
     manifest: dict[str, Any] = {
         "schemaVersion": _MANIFEST_SCHEMA,
         "contractVersion": RUST_FINALIZER_CONTRACT_VERSION,
@@ -243,6 +285,25 @@ def finalize_population_with_rust(
         ),
         "finalNewline": "crlf" if os.linesep == "\r\n" else "lf",
     }
+    # The journal is deliberately wider than the evaluated first generation.
+    # Rust still scans and authenticates every immutable construction entry,
+    # but copies only the closed selector subset.  These identities make the
+    # subset authority part of the native finalization contract.
+    if g0_bootstrap is not None:
+        required = {
+            "constructionPoolIdentitySha256",
+            "acceptedPoolSha256",
+            "selectionSha256",
+            "ledgerSha256",
+        }
+        if set(g0_bootstrap) != required or any(
+            not isinstance(g0_bootstrap[key], str)
+            or not g0_bootstrap[key].startswith("sha256:")
+            for key in required
+        ):
+            raise TemporalDiscoveryContractError("G0 native finalizer binding is invalid")
+        manifest["g0Bootstrap"] = dict(g0_bootstrap)
+        manifest["g0Artifacts"] = g0_artifacts
     manifest["manifestSha256"] = canonical_sha256(manifest)
     _write_canonical_once(manifest_path, manifest)
 
