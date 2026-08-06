@@ -1397,6 +1397,7 @@ def load_qd_evaluated_members(
     minimum_total_trades: int = 8,
     minimum_trades_per_window: int = 4,
     cap_trades: int = 20,
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Load every evaluated member without applying archive capacity.
 
@@ -1426,7 +1427,10 @@ def load_qd_evaluated_members(
     else:
         candidates, population_sha = _load_population(population_file)
     candidate_map = {str(row["candidateId"]): row for row in candidates}
-    results = load_stage_results(result_root)
+    results = load_stage_results(
+        result_root,
+        tail_result_index=tail_result_index,
+    )
     if set(results) != set(candidate_map):
         raise TemporalDiscoveryContractError(
             "QD evaluated member result set must exactly cover its population"

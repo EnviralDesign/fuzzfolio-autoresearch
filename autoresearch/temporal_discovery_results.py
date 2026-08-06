@@ -431,7 +431,24 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
 
 def load_stage_results(
     result_root: Path | str,
+    *,
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    """Load canonical candidate/window records from raw blobs or a verified index.
+
+    ``tail_result_index`` is deliberately an operational, in-memory reuse
+    boundary.  Callers may supply it only after the matching immutable result
+    matrix has been source-verified by ``temporal_qd_tail_result_index``.  It
+    is not persisted as part of this loader's semantic output, and the raw
+    path below remains the default/oracle.
+    """
+
+    if tail_result_index is not None:
+        # Import lazily: the index module uses ``_window_record`` from this
+        # module to build its exact legacy-compatible projection.
+        from .temporal_qd_tail_result_index import load_indexed_stage_results
+
+        return load_indexed_stage_results(tail_result_index)
     grouped: dict[str, list[dict[str, Any]]] = {}
     for path in _result_files(result_root):
         result = _read_json(path, name="candidate/window result")
@@ -463,8 +480,37 @@ def load_provenance_bound_window_evidence(
     checkpoint: Mapping[str, Any],
     panel: Mapping[str, Any],
     candidates: Mapping[str, Mapping[str, Any]],
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Derive authority-independent window digests from authority-bound blobs."""
+    """Derive authority-independent window digests from verified result data.
+
+    The optional index is a same-transaction projection of this exact task
+    matrix, already source-verified by its owner.  The default continues to
+    reopen the immutable raw blobs for compatibility and audit use.
+    """
+
+    if tail_result_index is not None:
+        # Keep this import lazy for the same cycle-avoidance reason as the
+        # stage loader above.
+        from .temporal_qd_tail_result_index import (
+            load_indexed_provenance_bound_window_evidence,
+            validate_tail_result_index,
+        )
+
+        indexed = validate_tail_result_index(tail_result_index)
+        if (
+            indexed["authorityId"] != task_manifest.get("authorityId")
+            or indexed["taskManifestSha256"] != canonical_sha256(task_manifest)
+            or indexed["checkpointSha256"] != canonical_sha256(checkpoint)
+        ):
+            raise TemporalDiscoveryContractError(
+                "indexed rotating evidence does not match its task matrix"
+            )
+        return load_indexed_provenance_bound_window_evidence(
+            index=indexed,
+            panel=panel,
+            candidates=candidates,
+        )
 
     from .temporal_qd_rotating_evidence import build_candidate_window_evidence
 

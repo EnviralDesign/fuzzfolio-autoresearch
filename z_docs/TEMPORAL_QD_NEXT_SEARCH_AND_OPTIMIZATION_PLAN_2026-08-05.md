@@ -2,9 +2,10 @@
 
 Date: 2026-08-05
 
-Status: pre-optimization semantic checkpoint implemented and locally admitted;
-checkpoint commit/push pending. Optimization and economic launch remain pending.
-No new economic search is authorized by this document.
+Status: pre-optimization semantics admitted and committed; the first bounded
+deep-optimization checkpoint is recorded in
+`TEMPORAL_QD_DEEP_OPTIMIZATION_CHECKPOINT_2026-08-05.md`. Economic launch
+remains pending. No new economic search is authorized by this document.
 
 ## Outcome sought
 

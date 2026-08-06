@@ -79,6 +79,10 @@ from .temporal_qd_evaluation_population import (
     load_evaluation_population,
 )
 from .temporal_discovery_results import load_provenance_bound_window_evidence
+from .temporal_qd_tail_result_index import (
+    build_tail_result_index,
+    validate_tail_result_index,
+)
 from .temporal_generation_funnel import (
     GenerationFunnelContractError,
     supervisor_funnel_snapshot,
@@ -123,6 +127,70 @@ QD_COST_VIEWS = {
         "commissionBps": 0.5,
     },
 }
+
+# This is deliberately an execution-only switch.  It is not part of the
+# frozen config, campaign authority, checkpoint, ledger, or result identity:
+# an interrupted run may resume in either mode without changing its semantic
+# contract.  Legacy raw loading stays the default/oracle until the indexed
+# path has a longer production parity history.
+TAIL_RESULT_MODE_LEGACY = "legacy"
+TAIL_RESULT_MODE_INDEXED = "indexed"
+_TAIL_RESULT_MODES = frozenset(
+    {TAIL_RESULT_MODE_LEGACY, TAIL_RESULT_MODE_INDEXED}
+)
+
+
+def _normalize_tail_result_mode(value: str) -> str:
+    if not isinstance(value, str) or value not in _TAIL_RESULT_MODES:
+        allowed = ", ".join(sorted(_TAIL_RESULT_MODES))
+        raise TemporalDiscoveryContractError(
+            f"tail result mode must be one of: {allowed}"
+        )
+    return value
+
+
+def _verified_tail_result_index(
+    *,
+    campaign_root: Path,
+    indexes: dict[Path, dict[str, Any]],
+    include_funnel_projection: bool = False,
+) -> dict[str, Any]:
+    """Return one source-verified, retained index for a completed campaign.
+
+    ``build_tail_result_index`` is intentionally the only source-blob reader
+    on the indexed rotating-tail path.  On a restart it verifies an existing
+    immutable index against every raw blob exactly once; for the rest of this
+    supervisor transaction the returned mapping is reused in memory.
+    """
+
+    result_root = (campaign_root / "screening-run").resolve()
+    existing = indexes.get(result_root)
+    if existing is not None:
+        checked = validate_tail_result_index(existing)
+        if checked["funnelProjectionIncluded"] != include_funnel_projection:
+            raise TemporalDiscoveryContractError(
+                "retained tail result index funnel projection mode drifted"
+            )
+        # Keep returning the retained mapping itself.  The validator above is
+        # a no-I/O integrity check; allocating a fresh top-level copy here
+        # would defeat the transaction's explicit identity/retention boundary.
+        return existing
+    authority = _canonical_file(campaign_root / "authority.json", name="tail authority")
+    task_manifest = _canonical_file(
+        result_root / "task-manifest.json", name="tail task manifest"
+    )
+    checkpoint = _canonical_file(
+        result_root / "checkpoint.json", name="tail task checkpoint"
+    )
+    index = build_tail_result_index(
+        result_root=result_root,
+        authority=authority,
+        task_manifest=task_manifest,
+        checkpoint=checkpoint,
+        include_funnel_projection=include_funnel_projection,
+    )
+    indexes[result_root] = index
+    return index
 
 
 def _rotating_evidence_semantic_authority(
@@ -617,6 +685,7 @@ def _results_descriptor(
     result_root: Path,
     checkpoint: Mapping[str, Any],
     task_manifest: Mapping[str, Any],
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     tasks = task_manifest.get("tasks")
     completed = checkpoint.get("completed")
@@ -633,6 +702,26 @@ def _results_descriptor(
         raise TemporalDiscoveryContractError(
             "completed generation checkpoint does not cover its exact task matrix"
         )
+    indexed_entries: dict[str, Mapping[str, Any]] | None = None
+    if tail_result_index is not None:
+        indexed = validate_tail_result_index(tail_result_index)
+        if (
+            indexed["authorityId"] != task_manifest.get("authorityId")
+            or indexed["taskManifestSha256"] != canonical_sha256(task_manifest)
+            or indexed["checkpointSha256"] != canonical_sha256(checkpoint)
+            or indexed["taskCount"] != len(expected_tasks)
+        ):
+            raise TemporalDiscoveryContractError(
+                "indexed completed results descriptor binding drifted"
+            )
+        indexed_entries = {
+            str(entry["task"]["taskId"]): entry for entry in indexed["entries"]
+        }
+        if set(indexed_entries) != set(expected_tasks):
+            raise TemporalDiscoveryContractError(
+                "indexed completed results descriptor task matrix drifted"
+            )
+
     rows: list[dict[str, Any]] = []
     for task_id in sorted(expected_tasks):
         record = completed[task_id]
@@ -652,18 +741,44 @@ def _results_descriptor(
             raise TemporalDiscoveryContractError(
                 "completed generation result is outside its immutable result root"
             )
-        try:
-            material, metadata = read_json_object(result_path)
-        except ResultCodecError as exc:
-            raise TemporalDiscoveryContractError(
-                f"completed generation result is corrupt: {result_path}"
-            ) from exc
-        semantic_sha = canonical_sha256(material)
-        if record.get("resultSha256") != semantic_sha:
-            raise TemporalDiscoveryContractError(
-                "completed generation result semantic identity mismatch"
-            )
-        codec = _result_record_codec_metadata(metadata)
+        if indexed_entries is None:
+            try:
+                material, metadata = read_json_object(result_path)
+            except ResultCodecError as exc:
+                raise TemporalDiscoveryContractError(
+                    f"completed generation result is corrupt: {result_path}"
+                ) from exc
+            semantic_sha = canonical_sha256(material)
+            if record.get("resultSha256") != semantic_sha:
+                raise TemporalDiscoveryContractError(
+                    "completed generation result semantic identity mismatch"
+                )
+            codec = _result_record_codec_metadata(metadata)
+        else:
+            entry = indexed_entries[task_id]
+            indexed_task = entry["task"]
+            raw_ref = entry["rawResultRef"]
+            if (
+                indexed_task["candidateId"] != expected_candidate
+                or indexed_task["taskPayloadSha256"]
+                != canonical_sha256(task["payload"])
+                or raw_ref["relativePath"]
+                != result_path.resolve().relative_to(result_root.resolve()).as_posix()
+                or record.get("resultSha256") != raw_ref["resultSha256"]
+            ):
+                raise TemporalDiscoveryContractError(
+                    "indexed completed generation result binding drifted"
+                )
+            semantic_sha = str(raw_ref["resultSha256"])
+            codec = {
+                "resultCodec": raw_ref["codec"],
+                "resultSemanticSha256": semantic_sha,
+                "resultSemanticSizeBytes": raw_ref["semanticSizeBytes"],
+                "resultUncompressedSha256": raw_ref["uncompressedSha256"],
+                "resultUncompressedSizeBytes": raw_ref["uncompressedSizeBytes"],
+                "resultBlobSha256": raw_ref["blobSha256"],
+                "resultBlobSizeBytes": raw_ref["blobSizeBytes"],
+            }
         if any(record.get(key) != value for key, value in codec.items() if key in record):
             raise TemporalDiscoveryContractError(
                 "completed generation result representation metadata mismatch"
@@ -687,7 +802,10 @@ def _results_descriptor(
 
 
 def _rotating_campaign_artifacts(
-    *, campaign_root: Path, population_path: Path | None = None
+    *,
+    campaign_root: Path,
+    population_path: Path | None = None,
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reopen one evaluation-only campaign and its exact result matrix."""
 
@@ -727,7 +845,10 @@ def _rotating_campaign_artifacts(
     ):
         raise TemporalDiscoveryContractError("rotating campaign authority binding drifted")
     results = _results_descriptor(
-        result_root=result_root, checkpoint=checkpoint, task_manifest=manifest
+        result_root=result_root,
+        checkpoint=checkpoint,
+        task_manifest=manifest,
+        tail_result_index=tail_result_index,
     )
     output: dict[str, Any] = {
         "schemaVersion": "temporal_qd_rotating_campaign_artifacts_v1",
@@ -764,6 +885,7 @@ def _capture_screening_artifacts(
     generation_index: int,
     label: str,
     generation_journal_path: Path | None = None,
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reopen the immutable outputs common to every frozen screening campaign."""
 
@@ -866,6 +988,7 @@ def _capture_screening_artifacts(
         result_root=result_root,
         checkpoint=checkpoint,
         task_manifest=task_manifest,
+        tail_result_index=tail_result_index,
     )
     output = {
         "schemaVersion": "temporal_qd_supervisor_generation_artifacts_v1",
@@ -940,14 +1063,30 @@ def _capture_screening_artifacts(
 
 
 def _capture_generation_artifacts(
-    *, root: Path, generation_index: int, generation_funnel_enabled: bool = False
+    *,
+    root: Path,
+    generation_index: int,
+    generation_funnel_enabled: bool = False,
+    tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
+    tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
+    indexes = tail_result_indexes if tail_result_indexes is not None else {}
     generation_root = root / "generations" / f"generation-{generation_index:04d}"
     proposal_root = generation_root / "proposal"
     campaign_root = generation_root / "campaign"
     population_path = proposal_root / "population.json"
     journal_path = proposal_root / "generation-journal.json"
     archive_path = generation_root / "archive.json"
+    proposal_tail_index = (
+        _verified_tail_result_index(
+            campaign_root=campaign_root,
+            indexes=indexes,
+            include_funnel_projection=generation_funnel_enabled,
+        )
+        if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+        else None
+    )
     output = _capture_screening_artifacts(
         population_path=population_path,
         archive_path=archive_path,
@@ -955,6 +1094,7 @@ def _capture_generation_artifacts(
         generation_index=generation_index,
         label="QD generation",
         generation_journal_path=journal_path,
+        tail_result_index=proposal_tail_index,
     )
     journal = _canonical_file(journal_path, name="QD generation journal")
     if int(journal.get("generationIndex", -1)) != generation_index:
@@ -1004,6 +1144,14 @@ def _capture_generation_artifacts(
             current_campaign_artifacts = _rotating_campaign_artifacts(
                 campaign_root=Path(str(binding.get("campaignRoot") or "")),
                 population_path=Path(str(binding.get("populationPath") or "")),
+                tail_result_index=(
+                    _verified_tail_result_index(
+                        campaign_root=Path(str(binding.get("campaignRoot") or "")),
+                        indexes=indexes,
+                    )
+                    if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                    else None
+                ),
             )
             if _clone(
                 current_campaign_artifacts,
@@ -1045,7 +1193,12 @@ def _capture_generation_artifacts(
 
 
 def _validate_generation_artifacts(
-    *, root: Path, generation_record: Mapping[str, Any], config: Mapping[str, Any]
+    *,
+    root: Path,
+    generation_record: Mapping[str, Any],
+    config: Mapping[str, Any],
+    tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
+    tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
 ) -> None:
     generation_index = int(generation_record.get("generationIndex", -1))
     if generation_index < 1:
@@ -1062,6 +1215,8 @@ def _validate_generation_artifacts(
         root=root,
         generation_index=generation_index,
         generation_funnel_enabled=funnel_enabled,
+        tail_result_mode=tail_result_mode,
+        tail_result_indexes=tail_result_indexes,
     )
     if _clone(current, name="completed generation artifacts") != _clone(
         recorded, name="recorded completed generation artifacts"
@@ -1189,9 +1344,11 @@ def _validate_generation_artifacts(
             )
 
 
-def _validate_completed_generations(
-    *, root: Path, state: Mapping[str, Any], config: Mapping[str, Any]
+def _validate_completed_generation_ledger(
+    *, state: Mapping[str, Any], config: Mapping[str, Any]
 ) -> dict[int, dict[str, Any]]:
+    """Validate completed-generation state without reopening campaign artifacts."""
+
     completed = state.get("completedGenerations") or []
     if not isinstance(completed, list):
         raise TemporalDiscoveryContractError("completed QD generations are invalid")
@@ -1203,9 +1360,6 @@ def _validate_completed_generations(
         index = int(record.get("generationIndex", -1))
         if index in records:
             raise TemporalDiscoveryContractError("completed QD generation index is duplicated")
-        _validate_generation_artifacts(
-            root=root, generation_record=record, config=config
-        )
         records[index] = record
     first = int(config["generationPlan"]["firstGenerationIndex"])
     last = int(config["generationPlan"]["lastGenerationIndex"])
@@ -1234,6 +1388,67 @@ def _validate_completed_generations(
             "QD supervisor worker-task counter disagrees with completed generation records"
         )
     return records
+
+
+def _validate_completed_generations(
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    config: Mapping[str, Any],
+    tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
+    tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Revalidate every completed generation for restart/audit admission."""
+
+    records = _validate_completed_generation_ledger(state=state, config=config)
+    for index in sorted(records):
+        _validate_generation_artifacts(
+            root=root,
+            generation_record=records[index],
+            config=config,
+            tail_result_mode=tail_result_mode,
+            tail_result_indexes=tail_result_indexes,
+        )
+        # A restart/audit pass never needs one generation's verified
+        # projections while validating the next.  Release each boundary so
+        # the retained in-memory set is bounded by one generation.
+        if (
+            tail_result_mode == TAIL_RESULT_MODE_INDEXED
+            and tail_result_indexes is not None
+        ):
+            tail_result_indexes.clear()
+    return records
+
+
+def _validate_published_generation_boundary(
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    config: Mapping[str, Any],
+    generation_index: int,
+    tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
+    tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
+) -> None:
+    """Validate only the just-published immutable generation boundary.
+
+    The run has already admitted every historical generation at startup.  At
+    a new state-save boundary, reopening history would both duplicate source
+    verification and evict the active generation's retained projection.
+    """
+
+    records = _validate_completed_generation_ledger(state=state, config=config)
+    record = records.get(generation_index)
+    if record is None:
+        raise TemporalDiscoveryContractError(
+            "published QD generation is missing from completed state"
+        )
+    _validate_generation_artifacts(
+        root=root,
+        generation_record=record,
+        config=config,
+        tail_result_mode=tail_result_mode,
+        tail_result_indexes=tail_result_indexes,
+    )
 
 
 def _validate_evidence_ladder_execution(
@@ -2028,6 +2243,7 @@ def _campaign_window_evidence(
     campaign_root: Path,
     panel: Mapping[str, Any],
     candidates: Mapping[str, Mapping[str, Any]],
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     result_root = campaign_root / "screening-run"
     return load_provenance_bound_window_evidence(
@@ -2040,6 +2256,7 @@ def _campaign_window_evidence(
         ),
         panel=panel,
         candidates=candidates,
+        tail_result_index=tail_result_index,
     )
 
 
@@ -2136,9 +2353,13 @@ def _complete_rotating_generation_transaction(
     archive_path: Path,
     config: Mapping[str, Any],
     client: LabGatewayClient,
+    tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
+    tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Complete one atomic proposal/reevaluation/backfill/archive transaction."""
 
+    tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
+    indexes = tail_result_indexes if tail_result_indexes is not None else {}
     _validate_frozen_sources(config)
     contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
     panel = panel_for_generation(contract, generation_index)
@@ -2203,6 +2424,18 @@ def _complete_rotating_generation_transaction(
     )
     _replace(checkpoint_path, checkpoint)
 
+    proposal_tail_index = (
+        _verified_tail_result_index(
+            campaign_root=proposal_campaign_root,
+            indexes=indexes,
+            include_funnel_projection=bool(
+                (config.get("generationFunnel") or {}).get("enabled")
+            ),
+        )
+        if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+        else None
+    )
+
     member_batches = [
         load_qd_evaluated_members(
             population_path=proposal_root / "population.json",
@@ -2214,6 +2447,7 @@ def _complete_rotating_generation_transaction(
                 config["frozenSearchPolicy"]["minimumTradesPerWindow"]
             ),
             cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+            tail_result_index=proposal_tail_index,
         )
     ]
     campaign_bindings: list[dict[str, Any]] = [
@@ -2251,6 +2485,14 @@ def _complete_rotating_generation_transaction(
                     config["frozenSearchPolicy"]["minimumTradesPerWindow"]
                 ),
                 cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+                tail_result_index=(
+                    _verified_tail_result_index(
+                        campaign_root=parent_campaign_root,
+                        indexes=indexes,
+                    )
+                    if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                    else None
+                ),
             )
         )
         campaign_bindings.append(
@@ -2340,6 +2582,7 @@ def _complete_rotating_generation_transaction(
         campaign_root=proposal_campaign_root,
         panel=panel,
         candidates=new_candidates,
+        tail_result_index=proposal_tail_index,
     )
     current_records.update(new_records)
     if parent_campaign_root is not None:
@@ -2348,6 +2591,14 @@ def _complete_rotating_generation_transaction(
                 campaign_root=parent_campaign_root,
                 panel=panel,
                 candidates=parent_candidates,
+                tail_result_index=(
+                    _verified_tail_result_index(
+                        campaign_root=parent_campaign_root,
+                        indexes=indexes,
+                    )
+                    if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                    else None
+                ),
             )
         )
     bundles: dict[str, dict[str, dict[str, Any]]] = {
@@ -2398,6 +2649,14 @@ def _complete_rotating_generation_transaction(
             campaign_root=backfill_campaign_root,
             panel=backfill_panel,
             candidates={candidate_id: rich_candidates[candidate_id] for candidate_id in missing},
+            tail_result_index=(
+                _verified_tail_result_index(
+                    campaign_root=backfill_campaign_root,
+                    indexes=indexes,
+                )
+                if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                else None
+            ),
         )
         for candidate_id in missing:
             bundles[candidate_id][backfill_panel_id] = build_candidate_panel_bundle(
@@ -2434,6 +2693,14 @@ def _complete_rotating_generation_transaction(
         binding["artifacts"] = _rotating_campaign_artifacts(
             campaign_root=Path(binding["campaignRoot"]),
             population_path=Path(binding["populationPath"]),
+            tail_result_index=(
+                _verified_tail_result_index(
+                    campaign_root=Path(binding["campaignRoot"]),
+                    indexes=indexes,
+                )
+                if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                else None
+            ),
         )
 
     cumulative = build_cumulative_breeder_archive(
@@ -2542,7 +2809,9 @@ def run_qd_supervisor(
     continuation_from: Mapping[str, Any] | None = None,
     initial_construction_pool_size: int | None = None,
     evaluation_population_size: int | None = None,
+    tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
 ) -> dict[str, Any]:
+    tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
     initial_archive_file = Path(initial_archive_path)
@@ -2580,6 +2849,13 @@ def run_qd_supervisor(
         initial_construction_pool_size=initial_construction_pool_size,
         evaluation_population_size=evaluation_population_size,
     )
+    if (
+        tail_result_mode == TAIL_RESULT_MODE_INDEXED
+        and config.get("rotatingEvidence") is None
+    ):
+        raise TemporalDiscoveryContractError(
+            "indexed tail result mode is currently supported only by rotating evidence"
+        )
     config_path = root / "config.json"
     state_path = root / "state.json"
     _write_once(config_path, config)
@@ -2587,6 +2863,10 @@ def run_qd_supervisor(
         _write_once(root / "evidence-ladder.json", config["evidenceLadder"])
     if config.get("rotatingEvidence") is not None:
         _write_once(root / "rotating-evidence.json", config["rotatingEvidence"])
+    # Retain indexes only for the active supervisor transaction.  They are
+    # source-verified once at admission and then reused by member, provenance,
+    # funnel, and artifact reducers without reopening raw result blobs.
+    tail_result_indexes: dict[Path, dict[str, Any]] = {}
     if state_path.exists():
         state = _load_state(state_path, config_sha256=config["configSha256"])
     else:
@@ -2614,8 +2894,16 @@ def run_qd_supervisor(
     # self-claimed completed state, as permission to skip immutable work.
     validator_command = _validate_frozen_sources(config)
     completed_by_index = _validate_completed_generations(
-        root=root, state=state, config=config
+        root=root,
+        state=state,
+        config=config,
+        tail_result_mode=tail_result_mode,
+        tail_result_indexes=tail_result_indexes,
     )
+    # Completed generation validation does not share a live reduction
+    # transaction with the next generation.  Release its retained projections
+    # before opening the gateway or creating new work.
+    tail_result_indexes.clear()
     if state.get("status") == "completed":
         expected_completed = int(config["generationPlan"]["generationCount"])
         if len(completed_by_index) != expected_completed:
@@ -2865,6 +3153,8 @@ def run_qd_supervisor(
                     archive_path=archive_path,
                     config=config,
                     client=client,
+                    tail_result_mode=tail_result_mode,
+                    tail_result_indexes=tail_result_indexes,
                 )
             else:
                 archive_result = build_qd_archive(
@@ -2902,6 +3192,15 @@ def run_qd_supervisor(
                     archive=_canonical_file(archive_path, name="QD generation archive"),
                     minimum_total_trades=int(config["frozenSearchPolicy"]["minimumTotalTrades"]),
                     minimum_trades_per_window=int(config["frozenSearchPolicy"]["minimumTradesPerWindow"]),
+                    tail_result_index=(
+                        _verified_tail_result_index(
+                            campaign_root=campaign_root,
+                            indexes=tail_result_indexes,
+                            include_funnel_projection=True,
+                        )
+                        if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                        else None
+                    ),
                 )
                 try:
                     write_generation_funnel_artifact(
@@ -2913,6 +3212,8 @@ def run_qd_supervisor(
                 root=root,
                 generation_index=generation_index,
                 generation_funnel_enabled=funnel_enabled,
+                tail_result_mode=tail_result_mode,
+                tail_result_indexes=tail_result_indexes,
             )
             if (
                 artifacts["population"]["populationSha256"]
@@ -3043,7 +3344,14 @@ def run_qd_supervisor(
                 }
             )
             _save_state(state_path, state)
-            _validate_completed_generations(root=root, state=state, config=config)
+            _validate_published_generation_boundary(
+                root=root,
+                state=state,
+                config=config,
+                generation_index=generation_index,
+                tail_result_mode=tail_result_mode,
+                tail_result_indexes=tail_result_indexes,
+            )
             _event(
                 "generation_completed",
                 generationIndex=generation_index,
@@ -3057,6 +3365,10 @@ def run_qd_supervisor(
             immigrant_cursor = int(
                 generation_result["nextImmigrantContinuationOrdinal"]
             )
+            # The artifacts and state boundary have been captured.  The next
+            # generation has a distinct result matrix, so retaining old
+            # compact projections only inflates the long-running supervisor.
+            tail_result_indexes.clear()
             if stop_after_generation == generation_index:
                 return {
                     "schemaVersion": "temporal_qd_supervisor_result_v3",
@@ -3328,6 +3640,15 @@ def main() -> None:
     parser.add_argument("--broad-admission", action="store_true")
     parser.add_argument("--generation-funnel-enabled", action="store_true")
     parser.add_argument(
+        "--tail-result-mode",
+        choices=sorted(_TAIL_RESULT_MODES),
+        default=TAIL_RESULT_MODE_LEGACY,
+        help=(
+            "operational rotating-tail reducer: legacy reopens raw results; "
+            "indexed reuses one source-verified in-memory projection per campaign"
+        ),
+    )
+    parser.add_argument(
         "--evidence-ladder-config",
         type=Path,
         help="closed temporal_qd_evidence_ladder_input_v1 JSON; enables frozen 3m/12m/36m evidence gates",
@@ -3385,6 +3706,7 @@ def main() -> None:
             ),
             initial_construction_pool_size=args.initial_construction_pool_size,
             evaluation_population_size=args.evaluation_population_size,
+            tail_result_mode=args.tail_result_mode,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return
@@ -3432,6 +3754,7 @@ def main() -> None:
         ),
         initial_construction_pool_size=args.initial_construction_pool_size,
         evaluation_population_size=args.evaluation_population_size,
+        tail_result_mode=args.tail_result_mode,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

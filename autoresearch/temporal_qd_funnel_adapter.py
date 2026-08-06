@@ -223,6 +223,7 @@ def build_qd_generation_funnel(
     archive: Mapping[str, Any],
     minimum_total_trades: int = 8,
     minimum_trades_per_window: int = 4,
+    tail_result_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reduce a frozen QD generation into the generic immutable funnel.
 
@@ -307,25 +308,111 @@ def build_qd_generation_funnel(
         }
     planned = _planned_windows(authority, task_manifest)
     completed = _mapping(checkpoint.get("completed"), name="QD evaluation checkpoint completed")
+    indexed_funnel_rows: dict[str, Mapping[str, Any]] | None = None
+    indexed_entries: dict[str, Mapping[str, Any]] | None = None
+    if tail_result_index is not None:
+        # The supervisor supplies the same in-memory mapping it has just
+        # source-verified for the completed campaign.  Rechecking its compact
+        # identities here avoids a second raw-blob pass while still requiring
+        # this exact authority/manifest/checkpoint matrix.
+        from .temporal_qd_tail_result_index import (
+            load_indexed_funnel_projections,
+            validate_tail_result_index,
+        )
+
+        indexed = validate_tail_result_index(tail_result_index)
+        if (
+            indexed["authorityId"] != authority.get("authorityId")
+            or indexed["authoritySha256"] != canonical_sha256(authority)
+            or indexed["taskManifestSha256"] != canonical_sha256(task_manifest)
+            or indexed["checkpointSha256"] != canonical_sha256(checkpoint)
+            or set(completed) != set(planned)
+        ):
+            raise TemporalDiscoveryContractError(
+                "indexed QD funnel result matrix binding drifted"
+            )
+        indexed_entries = {
+            str(entry["task"]["taskId"]): entry for entry in indexed["entries"]
+        }
+        if set(indexed_entries) != set(planned):
+            raise TemporalDiscoveryContractError(
+                "indexed QD funnel task matrix drifted"
+            )
+        indexed_funnel_rows = load_indexed_funnel_projections(
+            indexed,
+            window_ids_by_task={
+                task_id: str(task["windowId"])
+                for task_id, task in planned.items()
+            },
+        )
+        if set(indexed_funnel_rows) != set(planned):
+            raise TemporalDiscoveryContractError(
+                "indexed QD funnel projection task matrix drifted"
+            )
     candidate_results: dict[str, dict[str, tuple[dict[str, Any], Mapping[str, Any]]]] = defaultdict(dict)
     for task_id, record_value in completed.items():
         if task_id not in planned:
             raise TemporalDiscoveryContractError("QD checkpoint has an unplanned task result")
         record = _mapping(record_value, name="QD checkpoint result record")
-        path = record.get("resultPath")
-        if not isinstance(path, str) or not path:
-            raise TemporalDiscoveryContractError("QD checkpoint result path is missing")
-        try:
-            material, _metadata = read_json_object(Path(path))
-        except ResultCodecError as exc:
-            raise TemporalDiscoveryContractError("QD immutable result blob is corrupt") from exc
-        result_sha = canonical_sha256(material)
-        if record.get("resultSha256") != result_sha:
-            raise TemporalDiscoveryContractError("QD checkpoint result semantic identity mismatch")
         task = planned[str(task_id)]
         if record.get("candidateId") != task["candidateId"]:
             raise TemporalDiscoveryContractError("QD checkpoint result candidate identity mismatch")
-        behavior = _result_behavior(material, result_sha=result_sha, window_id=task["windowId"])
+        if indexed_funnel_rows is None:
+            path = record.get("resultPath")
+            if not isinstance(path, str) or not path:
+                raise TemporalDiscoveryContractError("QD checkpoint result path is missing")
+            try:
+                material, _metadata = read_json_object(Path(path))
+            except ResultCodecError as exc:
+                raise TemporalDiscoveryContractError("QD immutable result blob is corrupt") from exc
+            result_sha = canonical_sha256(material)
+            if record.get("resultSha256") != result_sha:
+                raise TemporalDiscoveryContractError("QD checkpoint result semantic identity mismatch")
+            behavior = _result_behavior(material, result_sha=result_sha, window_id=task["windowId"])
+        else:
+            assert indexed_entries is not None
+            entry = indexed_entries[str(task_id)]
+            raw_ref = entry["rawResultRef"]
+            indexed_task = entry["task"]
+            if (
+                indexed_task["candidateId"] != task["candidateId"]
+                or indexed_task["taskPayloadSha256"]
+                != canonical_sha256(task["payload"])
+                or record.get("resultSha256") != raw_ref["resultSha256"]
+            ):
+                raise TemporalDiscoveryContractError(
+                    "indexed QD funnel result binding drifted"
+                )
+            indexed_row = indexed_funnel_rows[str(task_id)]
+            behavior = dict(indexed_row["resultBehavior"])
+            result_sha = str(raw_ref["resultSha256"])
+            if (
+                behavior.get("resultSha256") != result_sha
+                or behavior.get("windowId") != task["windowId"]
+            ):
+                raise TemporalDiscoveryContractError(
+                    "indexed QD funnel behavior binding drifted"
+                )
+            # ``_quality_disposition`` only consumes these two economic
+            # metrics from a raw result.  Preserve its legacy input shape so
+            # the classifier and the resulting funnel artifact stay byte for
+            # byte identical without retaining full worker payloads.
+            material = {
+                "cost_view_results": {
+                    "research_conservative": {
+                        "replay_result": {
+                            "metrics": {
+                                "terminalAdjustedTotalNetR": indexed_row[
+                                    "terminalAdjustedConservativeNetR"
+                                ],
+                                "terminalAdjustedMaxDrawdownR": indexed_row[
+                                    "terminalAdjustedMaxDrawdownR"
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
         if task["windowId"] in candidate_results[task["candidateId"]]:
             raise TemporalDiscoveryContractError("QD checkpoint duplicated a candidate/window result")
         candidate_results[task["candidateId"]][task["windowId"]] = (behavior, material)

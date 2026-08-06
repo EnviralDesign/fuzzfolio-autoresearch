@@ -77,6 +77,45 @@ def test_completed_generation_counter_uses_total_rotating_worker_tasks(
     ) == {1: records[0], 2: records[1]}
 
 
+def test_completed_generation_validation_releases_indexed_cache_per_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen_cache_sizes: list[int] = []
+
+    def fake_validate_generation_artifacts(**kwargs) -> None:
+        indexes = kwargs["tail_result_indexes"]
+        assert indexes is not None
+        seen_cache_sizes.append(len(indexes))
+        indexes[
+            tmp_path / f"generation-{kwargs['generation_record']['generationIndex']}"
+        ] = {}
+
+    monkeypatch.setattr(
+        supervisor, "_validate_generation_artifacts", fake_validate_generation_artifacts
+    )
+    records = [
+        {"generationIndex": 1, "candidateCount": 1, "taskCount": 1},
+        {"generationIndex": 2, "candidateCount": 1, "taskCount": 1},
+    ]
+    state = {
+        "completedGenerations": records,
+        "uniqueCandidatesEvaluated": 2,
+        "workerTasksCompleted": 2,
+    }
+    indexes: dict[Path, dict] = {}
+    assert supervisor._validate_completed_generations(
+        root=tmp_path,
+        state=state,
+        config={
+            "generationPlan": {"firstGenerationIndex": 1, "lastGenerationIndex": 2}
+        },
+        tail_result_mode=supervisor.TAIL_RESULT_MODE_INDEXED,
+        tail_result_indexes=indexes,
+    ) == {1: records[0], 2: records[1]}
+    assert seen_cache_sizes == [0, 0]
+    assert indexes == {}
+
+
 def test_rotating_task_upper_bounds_include_parent_fairness_and_backfill() -> None:
     contract = build_rotating_evidence_contract(
         {
