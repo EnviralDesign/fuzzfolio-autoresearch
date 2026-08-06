@@ -255,17 +255,36 @@ def _catalog_indicator_semantics(module: FrozenModule) -> dict[str, dict[str, st
     primitives = catalog.get("indicators") if isinstance(catalog, Mapping) else None
     if not isinstance(primitives, Sequence) or isinstance(primitives, (str, bytes)):
         raise TemporalDiscoveryContractError("frozen module catalog snapshot lacks indicator primitives")
-    primitive_by_id = {
-        str(item.get("id")): item for item in primitives if isinstance(item, Mapping) and isinstance(item.get("id"), str)
-    }
+    primitive_by_id: dict[str, Mapping[str, Any]] = {}
+    for primitive in primitives:
+        if not isinstance(primitive, Mapping):
+            continue
+        meta = primitive.get("meta")
+        nested_id = meta.get("id") if isinstance(meta, Mapping) else None
+        flat_id = primitive.get("id")
+        if isinstance(nested_id, str) and isinstance(flat_id, str) and nested_id != flat_id:
+            raise TemporalDiscoveryContractError("frozen module catalog indicator identity is ambiguous")
+        primitive_id = nested_id if isinstance(nested_id, str) else flat_id
+        if not isinstance(primitive_id, str) or not primitive_id:
+            continue
+        if primitive_id in primitive_by_id:
+            raise TemporalDiscoveryContractError("frozen module catalog indicator identities duplicate")
+        primitive_by_id[primitive_id] = primitive
     result: dict[str, dict[str, str]] = {}
     for item in indicators:
         if not isinstance(item, Mapping) or not isinstance(item.get("meta"), Mapping):
             raise TemporalDiscoveryContractError("frozen module indicator is malformed")
         meta = item["meta"]
-        instance, base, implementation = meta.get("instanceId"), meta.get("baseIndicatorId"), meta.get("id")
-        if not all(isinstance(value, str) and value for value in (instance, base, implementation)):
+        instance, implementation = meta.get("instanceId"), meta.get("id")
+        if not all(isinstance(value, str) and value for value in (instance, implementation)):
             raise TemporalDiscoveryContractError("frozen module indicator identity is incomplete")
+        base = meta.get("baseIndicatorId")
+        if base is None:
+            # Standalone catalog primitives (especially directional events)
+            # are their own semantic family and legitimately omit an alias.
+            base = implementation
+        if not isinstance(base, str) or not base:
+            raise TemporalDiscoveryContractError("frozen module indicator base identity is malformed")
         primitive = primitive_by_id.get(implementation)
         if primitive is None:
             raise TemporalDiscoveryContractError("module indicator implementation is absent from frozen catalog")

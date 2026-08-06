@@ -71,12 +71,12 @@ def _snapshot(kind: str, payload: dict) -> IdentitySnapshot:
 def _source_profile(side: str, *, family: str, opaque: str, name_only_trailing: bool = False) -> dict:
     setup, trigger = f"{opaque}_{side}_setup", f"{opaque}_{side}_trigger"
     implementation = f"{family}_IMPL"
-    return {"version": "v2", "directionMode": side, "name": "activate_trailing_only_in_name" if name_only_trailing else f"{opaque}_{side}", "indicators": [{"config": {}, "meta": {"instanceId": setup, "baseIndicatorId": family, "id": implementation}}, {"config": {}, "meta": {"instanceId": trigger, "baseIndicatorId": f"{family}_EVENT", "id": f"{implementation}_EVENT"}}], "executionConfig": {"managementLibrary": {"defaultPlanId": "base", "plans": [{"id": "base", "initialStop": {"kind": "fixed_percent", "percent": 1.0}, "initialTarget": {"kind": "reward_multiple", "multiple": 2.0}, "holdPolicy": {"kind": "market_bars", "bars": 8}}]}}, "graph": {"states": [{"id": f"{opaque}_ready"}], "transitions": [], "eventBindings": [], "evidenceGroups": []}}
+    return {"version": "v2", "directionMode": side, "name": "activate_trailing_only_in_name" if name_only_trailing else f"{opaque}_{side}", "indicators": [{"config": {}, "meta": {"instanceId": setup, "baseIndicatorId": family, "id": implementation}}, {"config": {}, "meta": {"instanceId": trigger, "id": f"{implementation}_EVENT"}}], "executionConfig": {"managementLibrary": {"defaultPlanId": "base", "plans": [{"id": "base", "initialStop": {"kind": "fixed_percent", "percent": 1.0}, "initialTarget": {"kind": "reward_multiple", "multiple": 2.0}, "holdPolicy": {"kind": "market_bars", "bars": 8}}]}}, "graph": {"states": [{"id": f"{opaque}_ready"}], "transitions": [], "eventBindings": [], "evidenceGroups": []}}
 
 
 def _pair(*, ordinal: int, family: str = "RSI", opaque: str = "opaque", mode: str = "live", name_only_trailing: bool = False, initial_state_id: str = "flat") -> FrozenPair:
     primitive_ids = [f"{family}_IMPL", f"{family}_IMPL_EVENT"]
-    catalog = _snapshot("catalog", {"catalog": {"indicators": [{"id": identifier, "implementation": identifier} for identifier in primitive_ids]}, "catalogSha256": canonical_sha256({"catalog": family})})
+    catalog = _snapshot("catalog", {"catalog": {"indicators": [{"meta": {"id": identifier}, "implementation": identifier} for identifier in primitive_ids]}, "catalogSha256": canonical_sha256({"catalog": family})})
     compiler_identity_material = {"compiler": "g0-fixture", "mode": mode}
     if initial_state_id != "flat":
         compiler_identity_material["initialStateId"] = initial_state_id
