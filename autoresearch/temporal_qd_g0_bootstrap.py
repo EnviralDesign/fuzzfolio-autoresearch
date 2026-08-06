@@ -526,6 +526,9 @@ def _pair_descriptor_vector(*, pair: FrozenPair, liveness: Mapping[str, Mapping[
     graph = pair.profile.get("graph")
     if not isinstance(graph, Mapping):
         raise TemporalDiscoveryContractError("frozen pair lacks compiled graph")
+    initial_state_id = graph.get("initialStateId")
+    if not isinstance(initial_state_id, str) or not initial_state_id:
+        raise TemporalDiscoveryContractError("frozen pair compiled graph lacks initialStateId")
     compiled = graph.get("transitions")
     modules = ((graph.get("entryArbitration") or {}).get("modules"))
     if not isinstance(compiled, Sequence) or isinstance(compiled, (str, bytes)) or not isinstance(modules, Sequence):
@@ -545,7 +548,9 @@ def _pair_descriptor_vector(*, pair: FrozenPair, liveness: Mapping[str, Mapping[
         transitions = [row for row in compiled if isinstance(row, Mapping) and row.get("id") in requested]
         if len(transitions) != len(transition_ids):
             raise TemporalDiscoveryContractError("frozen pair compiled module lacks transitions")
-        state_ids = {"flat", *_list_of_text(module.get("stateIds"), label="compiled module stateIds")}
+        # The compiler owns the shared entry-state identifier. Module manifests
+        # intentionally enumerate only their direction-local states.
+        state_ids = {initial_state_id, *_list_of_text(module.get("stateIds"), label="compiled module stateIds")}
         # Preserve the compiled graph's declared state-array order.  It is an
         # authoritative construction choice, unlike opaque state IDs.
         states = [row for row in graph.get("states") or [] if isinstance(row, Mapping) and row.get("id") in state_ids]

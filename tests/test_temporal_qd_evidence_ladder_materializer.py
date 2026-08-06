@@ -85,7 +85,11 @@ def _population() -> dict:
     return payload
 
 
-def _pair_config(timeframes: list[str]) -> dict:
+def _pair_config(
+    timeframes: list[str],
+    *,
+    schema_version: str = "temporal_qd_bidirectional_pair_run_config_v1",
+) -> dict:
     side = {
         "indicatorPolicy": {
             "schemaVersion": "temporal_indicator_learning_policy_v1",
@@ -94,12 +98,37 @@ def _pair_config(timeframes: list[str]) -> dict:
         },
     }
     payload = {
-        "schemaVersion": "temporal_qd_bidirectional_pair_run_config_v1",
+        "schemaVersion": schema_version,
         "longModule": side,
         "shortModule": json.loads(json.dumps(side)),
     }
     payload["pairRunConfigSha256"] = canonical_sha256(payload)
     return payload
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        "temporal_qd_bidirectional_pair_run_config_v1",
+        "temporal_qd_bidirectional_pair_run_config_v2",
+    ],
+)
+def test_pair_config_identity_accepts_current_and_legacy_frozen_schemas(
+    tmp_path: Path,
+    schema_version: str,
+) -> None:
+    from autoresearch.temporal_qd_evidence_ladder_materializer import (
+        _pair_config_identity,
+    )
+
+    path = _write(
+        tmp_path / "pair.json",
+        _pair_config(["M5", "H1"], schema_version=schema_version),
+    )
+    identity = _pair_config_identity(path)
+    assert identity is not None
+    assert identity["payload"]["schemaVersion"] == schema_version
+    assert identity["pairRunConfigSha256"].startswith("sha256:")
 
 
 def _attestor(observed: list[LakeWindowRequest]):

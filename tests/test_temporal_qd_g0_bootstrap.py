@@ -33,8 +33,9 @@ class _Native:
 
 
 class _PairCompiler:
-    def __init__(self, *, mode: str = "live") -> None:
+    def __init__(self, *, mode: str = "live", initial_state_id: str = "flat") -> None:
         self.mode = mode
+        self.initial_state_id = initial_state_id
 
     def compile_pair(self, *, long_profile, short_profile, candidate_id):
         def module(side, source):
@@ -48,15 +49,17 @@ class _PairCompiler:
         for item in modules:
             side = item["direction"]; watch, pending, opened = item["stateIds"]; arm, enter, fill, exit_ = item["transitionIds"]
             transitions.extend([
-                {"id": arm, "sourceStateId": "flat", "destinationStateId": watch, "eventClass": "decision", "guard": {"kind": "fresh_event", "eventId": f"{side}_event"}, "actions": []},
+                {"id": arm, "sourceStateId": self.initial_state_id, "destinationStateId": watch, "eventClass": "decision", "guard": {"kind": "fresh_event", "eventId": f"{side}_event"}, "actions": []},
                 {"id": enter, "sourceStateId": watch if self.mode != f"{side}_unreachable" else f"{side}_dead", "destinationStateId": pending, "eventClass": "decision", "guard": {"kind": "evidence_at_least", "groupId": f"{side}_group", "thresholdPercent": 55}, "actions": [] if self.mode in {"no_entry", f"{side}_dead"} else [{"kind": "enter_next_open", "managementPlanId": f"{side}_base"}]},
                 {"id": fill, "sourceStateId": pending, "destinationStateId": opened, "eventClass": "execution", "guard": {"kind": "execution_status_is", "status": "filled"}, "actions": []},
-                {"id": exit_, "sourceStateId": watch if self.mode == "rewired" else opened, "destinationStateId": "flat", "eventClass": "decision", "priority": 7, "guard": {"kind": "state_age_at_least", "events": 4}, "actions": [{"kind": "activate_trailing_stop_next_open"}] if self.mode == "trailing" else [{"kind": "exit_next_open"}]},
+                {"id": exit_, "sourceStateId": watch if self.mode == "rewired" else opened, "destinationStateId": self.initial_state_id, "eventClass": "decision", "priority": 7, "guard": {"kind": "state_age_at_least", "events": 4}, "actions": [{"kind": "activate_trailing_stop_next_open"}] if self.mode == "trailing" else [{"kind": "exit_next_open"}]},
             ])
         plans = []
         for side, source in (("long", long_profile), ("short", short_profile)):
             base = copy.deepcopy(source["executionConfig"]["managementLibrary"]["plans"][0]); base["id"] = f"{side}_base"; plans.append(base)
         profile = {"version": "v3", "directionMode": "both", "name": candidate_id, "executionConfig": {"managementLibrary": {"defaultPlanId": "long_base", "plans": plans}}, "graph": {"initialStateId": "flat", "states": [{"id": "flat"}] + [{"id": state} for module_ in modules for state in module_["stateIds"]], "entryArbitration": {"modules": modules}, "transitions": transitions, "eventBindings": [{"id": "long_event", "indicatorInstanceId": long_profile["indicators"][1]["meta"]["instanceId"], "longOutput": "bullish", "shortOutput": "bearish"}, {"id": "short_event", "indicatorInstanceId": short_profile["indicators"][1]["meta"]["instanceId"], "longOutput": "bullish", "shortOutput": "bearish"}], "evidenceGroups": [{"id": "long_group", "indicatorInstanceIds": [long_profile["indicators"][0]["meta"]["instanceId"]]}, {"id": "short_group", "indicatorInstanceIds": [short_profile["indicators"][0]["meta"]["instanceId"]]}]}}
+        profile["graph"]["initialStateId"] = self.initial_state_id
+        profile["graph"]["states"][0]["id"] = self.initial_state_id
         raw = canonical_sha256(profile)
         return {"profile": profile, "validation": {"schemaVersion": "temporal_search_candidate_validation_v1", "rawSourceProfileSha256": raw, "profileSnapshotSha256": canonical_sha256({"snapshot": profile}), "programSha256": canonical_sha256({"native": profile}), "validationReportSha256": canonical_sha256({"validation": profile}), "status": "valid_evaluable", "candidateAcceptable": True}}
 
@@ -71,11 +74,14 @@ def _source_profile(side: str, *, family: str, opaque: str, name_only_trailing: 
     return {"version": "v2", "directionMode": side, "name": "activate_trailing_only_in_name" if name_only_trailing else f"{opaque}_{side}", "indicators": [{"config": {}, "meta": {"instanceId": setup, "baseIndicatorId": family, "id": implementation}}, {"config": {}, "meta": {"instanceId": trigger, "baseIndicatorId": f"{family}_EVENT", "id": f"{implementation}_EVENT"}}], "executionConfig": {"managementLibrary": {"defaultPlanId": "base", "plans": [{"id": "base", "initialStop": {"kind": "fixed_percent", "percent": 1.0}, "initialTarget": {"kind": "reward_multiple", "multiple": 2.0}, "holdPolicy": {"kind": "market_bars", "bars": 8}}]}}, "graph": {"states": [{"id": f"{opaque}_ready"}], "transitions": [], "eventBindings": [], "evidenceGroups": []}}
 
 
-def _pair(*, ordinal: int, family: str = "RSI", opaque: str = "opaque", mode: str = "live", name_only_trailing: bool = False) -> FrozenPair:
+def _pair(*, ordinal: int, family: str = "RSI", opaque: str = "opaque", mode: str = "live", name_only_trailing: bool = False, initial_state_id: str = "flat") -> FrozenPair:
     primitive_ids = [f"{family}_IMPL", f"{family}_IMPL_EVENT"]
     catalog = _snapshot("catalog", {"catalog": {"indicators": [{"id": identifier, "implementation": identifier} for identifier in primitive_ids]}, "catalogSha256": canonical_sha256({"catalog": family})})
-    compiler_identity = _snapshot("pairCompiler", {"compiler": "g0-fixture", "mode": mode})
-    native = _Native(); compiler = _PairCompiler(mode=mode)
+    compiler_identity_material = {"compiler": "g0-fixture", "mode": mode}
+    if initial_state_id != "flat":
+        compiler_identity_material["initialStateId"] = initial_state_id
+    compiler_identity = _snapshot("pairCompiler", compiler_identity_material)
+    native = _Native(); compiler = _PairCompiler(mode=mode, initial_state_id=initial_state_id)
     def module(side: str) -> FrozenModule:
         return FrozenModule.validate_native(program={"schemaVersion": "temporal_typed_fragment_grammar_v2", "grammarVersion": "3", "direction": side, "fragments": []}, profile=_source_profile(side, family=family, opaque=opaque, name_only_trailing=name_only_trailing), grammar_context=_snapshot("grammarContext", {"context": "fixture"}), catalog=catalog, policy=_snapshot("policy", {"policy": "fixture"}), native_authority_identity=_snapshot("nativeAuthority", {"authority": "fixture"}), native_validator=native, candidate_id=f"module-{ordinal}-{side}")
     return FrozenPair.compile(long=module("long"), short=module("short"), pair_compiler_identity=compiler_identity, pair_compiler=compiler, candidate_id=f"pair-{ordinal}")
@@ -126,6 +132,11 @@ def test_semantics_ignore_opaque_native_ids_but_detect_catalog_indicator_family_
     assert same_a == same_b
     assert same_a["long.indicatorSemantics"] != changed["long.indicatorSemantics"]
     assert set(same_a) == set(DESCRIPTOR_AXES)
+
+
+def test_pair_descriptor_binds_compiler_owned_shared_initial_state_id() -> None:
+    descriptor = descriptor_vector(_reference(3, initial_state_id="flat_supervisor"))
+    assert set(descriptor) == set(DESCRIPTOR_AXES)
 
 
 def test_compiled_graph_topology_ignores_pure_id_renames_but_detects_rewiring() -> None:

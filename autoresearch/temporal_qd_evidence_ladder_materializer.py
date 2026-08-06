@@ -31,6 +31,10 @@ from .temporal_qd_evidence_ladder import (
 )
 from .temporal_stage5e7_v3_evidence_envelope import _catalog, _population_members, _reachable_profiles
 from .temporal_indicator_learning_v1 import EVIDENCE_LOOKBACK_CHOICES
+from .temporal_qd_pair_factory import (
+    PAIR_RUN_CONFIG_SCHEMA,
+    PAIR_RUN_CONFIG_SCHEMA_LEGACY,
+)
 from .temporal_search import TEMPORAL_SEARCH_PREPARATION_SCHEMA, build_authority
 
 
@@ -95,7 +99,12 @@ def _pair_config_identity(path: Path | str | None) -> dict[str, Any] | None:
     resolved = Path(path).resolve()
     payload = _read(resolved, name="bidirectional pair run config")
     supplied = payload.pop("pairRunConfigSha256", None)
-    if payload.get("schemaVersion") != "temporal_qd_bidirectional_pair_run_config_v1" or not isinstance(supplied, str) or canonical_sha256(payload) != supplied:
+    if (
+        payload.get("schemaVersion")
+        not in {PAIR_RUN_CONFIG_SCHEMA_LEGACY, PAIR_RUN_CONFIG_SCHEMA}
+        or not isinstance(supplied, str)
+        or canonical_sha256(payload) != supplied
+    ):
         raise TemporalDiscoveryContractError("bidirectional pair run config identity/schema mismatch")
     return {
         "path": str(resolved), "pairRunConfigSha256": supplied,
