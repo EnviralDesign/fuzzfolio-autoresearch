@@ -1680,16 +1680,6 @@ def run_native_generation(
         )
     ) != identity_ledger_sha256:
         raise TemporalQDNativeError("identity ledger self-hash mismatch")
-    target_unique_candidates = generation_config.get("targetUniqueCandidates")
-    if (
-        isinstance(target_unique_candidates, int)
-        and not isinstance(target_unique_candidates, bool)
-        and target_unique_candidates > 0
-    ):
-        _assert_native_prelaunch_resources(
-            output_root=root,
-            target_unique_candidates=target_unique_candidates,
-        )
     binary, authority = ensure_native_batch()
     if _sha256_file(binary) != authority["executableSha256"]:
         raise TemporalQDNativeError(
@@ -1722,6 +1712,31 @@ def run_native_generation(
     manifest_path = native_root / "manifest.json"
     _write_bytes_once(authority_path, canonical_json_bytes(authority) + b"\n")
     _write_bytes_once(manifest_path, canonical_json_bytes(manifest) + b"\n")
+    result_path = native_root / NATIVE_GENERATION_RESULT_FILENAME
+    existing_result = _existing_regular_file(
+        result_path, name="native generation result"
+    )
+    if existing_result is not None:
+        cached_result = validate_generation_result(
+            _parse_canonical_json_line(
+                existing_result[0], name="native generation result"
+            ),
+            manifest=manifest,
+        )
+        # An immutable result is already bound to this exact authority and
+        # manifest, so a restart must not re-run native finalization or apply
+        # fresh-run resource admission checks.
+        return cached_result["pairGenerationResult"]
+    target_unique_candidates = generation_config.get("targetUniqueCandidates")
+    if (
+        isinstance(target_unique_candidates, int)
+        and not isinstance(target_unique_candidates, bool)
+        and target_unique_candidates > 0
+    ):
+        _assert_native_prelaunch_resources(
+            output_root=root,
+            target_unique_candidates=target_unique_candidates,
+        )
     completed = _run_checked(
         (str(binary), "--manifest", str(manifest_path)),
         cwd=_repo_root(),
@@ -1735,7 +1750,7 @@ def run_native_generation(
     )
     file_result = validate_generation_result(
         _load_canonical_object(
-            native_root / NATIVE_GENERATION_RESULT_FILENAME,
+            result_path,
             name="native generation result",
         ),
         manifest=manifest,

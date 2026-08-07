@@ -582,6 +582,182 @@ def test_generation_result_unwrap_preserves_existing_inner_shape(tmp_path: Path)
     assert checked["pairGenerationResult"] == inner
 
 
+def _generation_progress_result(
+    manifest: dict[str, object], config: dict[str, object]
+) -> dict[str, object]:
+    inner = {
+        "schemaVersion": native.PAIR_GENERATION_PROGRESS_SCHEMA,
+        "configSha256": config["configSha256"],
+        "proposalCount": 0,
+        "acceptedCount": 0,
+        "maxProposalAttempts": 1,
+        "terminationReason": "max_new_proposals_reached",
+        "completed": False,
+    }
+    result: dict[str, object] = {
+        "schemaVersion": native.NATIVE_GENERATION_RESULT_SCHEMA,
+        "contractVersion": native.NATIVE_CONTRACT_VERSION,
+        "operation": native.NATIVE_GENERATION_OPERATION,
+        "status": "progress",
+        "authoritySha256": manifest["authoritySha256"],
+        "manifestSha256": manifest["manifestSha256"],
+        "runtimeAuthoritySha256": manifest["runtimeAuthoritySha256"],
+        "parentArchiveSha256": manifest["parentArchiveSha256"],
+        "inputIdentityLedgerSha256": manifest["identityLedgerSha256"],
+        "outputIdentityLedgerSha256": manifest["identityLedgerSha256"],
+        "generationConfigSha256": manifest["generationConfigSha256"],
+        "pairGenerationResult": inner,
+    }
+    result["resultSha256"] = sha256(canonical_json_bytes(result))
+    return result
+
+
+def _native_generation_call_args(
+    manifest: dict[str, object], config: dict[str, object]
+) -> dict[str, object]:
+    publication = manifest["publicationPolicy"]
+    assert isinstance(publication, dict)
+    return {
+        "output_root": manifest["outputRoot"],
+        "parent_archive_path": manifest["parentArchivePath"],
+        "parent_archive_sha256": manifest["parentArchiveSha256"],
+        "runtime_authority": manifest["runtimeAuthority"],
+        "generation_config": config,
+        "identity_ledger_path": manifest["identityLedgerPath"],
+        "max_new_proposals": manifest["maxNewProposals"],
+        "native_execution_timeout_seconds": manifest[
+            "nativeExecutionTimeoutSeconds"
+        ],
+        "allow_empty_quality_bootstrap": manifest["allowEmptyQualityBootstrap"],
+        "g0_evaluation_width": manifest["g0EvaluationWidth"],
+        "frozen_construction_catalog": manifest["frozenConstructionCatalog"],
+        "qd_version": publication["qdVersion"],
+        "policy_name": publication["policyName"],
+        "policy_sha256": publication["policySha256"],
+        "frozen_policy": publication["frozenPolicy"],
+    }
+
+
+def _stub_native_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str]:
+    binary = tmp_path / "temporal-qd-batch.exe"
+    binary.write_bytes(b"native test binary")
+    authority = {
+        "authoritySha256": AUTHORITY_SHA256,
+        "executableSha256": native._sha256_file(binary),
+    }
+    monkeypatch.setattr(native, "ensure_native_batch", lambda: (binary, authority))
+    return authority
+
+
+def _generation_result_path(manifest: dict[str, object]) -> Path:
+    return (
+        Path(str(manifest["outputRoot"]))
+        / "native-batch"
+        / str(manifest["manifestSha256"]).removeprefix("sha256:")
+        / native.NATIVE_GENERATION_RESULT_FILENAME
+    )
+
+
+def test_native_generation_uses_valid_immutable_result_without_guard_or_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, config = _generation_material(tmp_path)
+    authority = _stub_native_batch(tmp_path, monkeypatch)
+    result = _generation_progress_result(manifest, config)
+    result_path = _generation_result_path(manifest)
+    result_path.parent.mkdir(parents=True)
+    result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+    monkeypatch.setattr(
+        native,
+        "_assert_native_prelaunch_resources",
+        lambda **_kwargs: pytest.fail("cached result must skip the prelaunch guard"),
+    )
+    monkeypatch.setattr(
+        native,
+        "_run_checked",
+        lambda *_args, **_kwargs: pytest.fail("cached result must skip native execution"),
+    )
+
+    assert native.run_native_generation(**_native_generation_call_args(manifest, config)) == result[
+        "pairGenerationResult"
+    ]
+    assert (result_path.parent / "authority.json").read_bytes() == (
+        canonical_json_bytes(authority) + b"\n"
+    )
+    assert (result_path.parent / "manifest.json").read_bytes() == (
+        canonical_json_bytes(manifest) + b"\n"
+    )
+
+
+def test_native_generation_rejects_cached_result_mismatched_to_exact_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, config = _generation_material(tmp_path)
+    _stub_native_batch(tmp_path, monkeypatch)
+    result = _generation_progress_result(manifest, config)
+    result["manifestSha256"] = "sha256:" + "f" * 64
+    result["resultSha256"] = sha256(
+        canonical_json_bytes(
+            {key: value for key, value in result.items() if key != "resultSha256"}
+        )
+    )
+    result_path = _generation_result_path(manifest)
+    result_path.parent.mkdir(parents=True)
+    result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+    monkeypatch.setattr(
+        native,
+        "_assert_native_prelaunch_resources",
+        lambda **_kwargs: pytest.fail("cached result must validate before guarding"),
+    )
+    monkeypatch.setattr(
+        native,
+        "_run_checked",
+        lambda *_args, **_kwargs: pytest.fail("mismatched cached result must not execute"),
+    )
+
+    with pytest.raises(native.TemporalQDNativeError, match="result is incompatible"):
+        native.run_native_generation(**_native_generation_call_args(manifest, config))
+
+
+def test_native_generation_without_result_still_guards_then_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, config = _generation_material(tmp_path)
+    _stub_native_batch(tmp_path, monkeypatch)
+    result = _generation_progress_result(manifest, config)
+    guard_calls: list[dict[str, object]] = []
+    execution_calls: list[tuple[str, ...]] = []
+
+    def guard(**kwargs: object) -> None:
+        guard_calls.append(dict(kwargs))
+
+    def execute(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        execution_calls.append(command)
+        manifest_path = Path(command[2])
+        assert manifest_path.read_bytes() == canonical_json_bytes(manifest) + b"\n"
+        result_path = manifest_path.parent / native.NATIVE_GENERATION_RESULT_FILENAME
+        result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+        return subprocess.CompletedProcess(
+            command, 0, stdout=canonical_json_bytes(result) + b"\n", stderr=b""
+        )
+
+    monkeypatch.setattr(native, "_assert_native_prelaunch_resources", guard)
+    monkeypatch.setattr(native, "_run_checked", execute)
+
+    assert native.run_native_generation(**_native_generation_call_args(manifest, config)) == result[
+        "pairGenerationResult"
+    ]
+    assert guard_calls == [
+        {
+            "output_root": Path(str(manifest["outputRoot"])),
+            "target_unique_candidates": 1,
+        }
+    ]
+    assert len(execution_calls) == 1
+
+
 @pytest.mark.skipif(
     os.name != "nt",
     reason="the committed runtime oracle freezes Windows Dashboard authority paths",
