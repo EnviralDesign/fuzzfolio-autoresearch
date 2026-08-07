@@ -349,9 +349,9 @@ semantic projections are identical:
 - public byte-tree SHA-256:
   `sha256:892a9b03c0d93d4fca7021e6e7639eea85607fed41d37529c51f8a020daf654c`;
 - native source SHA-256:
-  `sha256:3c11970e7b8049a732170b7512a48f50bb8993c36ab54e3ec255f6c222c6bd44`;
+  `sha256:cb0011580a8f17c95a1aa01156d68eb9a7b17d872613812aae2570880211bc8a`;
 - Windows release executable SHA-256:
-  `sha256:725ee541a79fa1f78f35b0e56f8c0960daa632471fc7d2c6686b7634d415aa1c`;
+  `sha256:b113880b0d6ed97846cf3e1c834710dc95538511eef213602a441a0a8b41f448`;
 - Rust wall time: 420.50 seconds;
 - Rust batch peak RSS: 7,983,169,536 bytes (7.44 GiB); and
 - complete isolated process-tree peak RSS: 8,118,317,056 bytes (7.56 GiB).
@@ -362,12 +362,29 @@ for selectable parents, shares it by reference, streams archive self-hashes,
 drops raw staging values before proposal production, and keeps compact ledger
 identity material for the full archive.
 
-The remaining integrated gate is the same non-empty-parent shape-64 run in
-uninterrupted and bounded split/restart forms for both engines. It must retain
-the exact publication, mutation/crossover evidence, and same-engine restart
-parity shown by the uninterrupted canary. The production 12 GiB host-headroom
-guard is authoritative for that run; it is not weakened to force admission
-while unrelated host work consumes memory.
+The final integrated non-empty-parent admission passed on 2026-08-07. Both
+engines ran uninterrupted, stopped after 32 proposals, and resumed from the
+same durable split root. Full and resumed result identities, public semantic
+trees, public bytes, proposal/candidate/ledger identities, and parent-origin
+evidence were exact within each engine and across engines. Full and restarted
+trees share the same public byte-tree SHA-256 shown above. Both engines recorded
+55 structural and 13 immigrant proposals, including 45 accepted mutations and
+6 accepted crossovers. The immutable admission report is:
+
+`C:\fuzzfolio-research\temporal-qd-native-parent-admission-64-20260807-v6\admission-report.json`
+
+with report SHA-256
+`sha256:f8dd5987182c2c9eff87428d04d0515ab11d2a00c921fd3123fc3c4347de30c9`.
+
+| Engine | Full | Split | Resume | Three-leg total | Peak process-tree RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Python oracle | 1,025.84 s | 873.12 s | 1,038.76 s | 2,937.72 s | 6.95 GiB |
+| Rust native | 397.70 s | 273.81 s | 360.95 s | 1,032.47 s | 7.56 GiB |
+
+Rust completed the full admission matrix 2.85x faster. Its measured peak stayed
+below the 12 GiB canary ceiling. This closes the final front-half cutover gate;
+`rust_native_v1` is admitted for the next economic campaign while
+`python_optimized_v1` remains the explicit exact oracle.
 
 ## Explicit non-goals
 
