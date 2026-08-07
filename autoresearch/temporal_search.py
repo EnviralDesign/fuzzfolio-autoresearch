@@ -36,6 +36,7 @@ TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY = (
     "temporal_graph_bidirectional_replay_v1"
 )
 TEMPORAL_SEARCH_RESULT_SCHEMA = "temporal_graph_candidate_window_result_v1"
+TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA = "temporal_graph_candidate_window_rejected_result_v1"
 TEMPORAL_SEARCH_CHECKPOINT_SCHEMA = "temporal_graph_candidate_window_checkpoint_v1"
 TEMPORAL_SEARCH_MANIFEST_SCHEMA = "temporal_graph_candidate_window_manifest_v1"
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -67,6 +68,10 @@ class TemporalSearchContractError(TemporalSearchError):
 
 class TemporalSearchTimeout(TemporalSearchError):
     pass
+
+
+_WARMUP_REJECTION_CODE = "aligned_scoring_warmup_insufficient"
+_WARMUP_ERROR_TYPE = "AlignedScoringWarmupInsufficientError"
 
 
 class LabGatewayClientProtocol(Protocol):
@@ -1431,17 +1436,181 @@ def materialize_plan(
     return manifest
 
 
-def _result_material(
+def _require_completion_routing(
     task: Mapping[str, Any], completion: Mapping[str, Any]
-) -> dict[str, Any]:
-    if str(completion.get("status") or "").lower() != "success":
-        raise TemporalSearchContractError("worker completion is not successful")
+) -> None:
     if (
         completion.get("task_id") != task.get("task_id")
         or completion.get("lane_id") != task.get("lane_id")
         or completion.get("attempt_id") != task.get("attempt_id")
     ):
         raise TemporalSearchContractError("completion routing identity mismatch")
+
+
+def _classified_aligned_warmup_failure(
+    completion: Mapping[str, Any],
+) -> Any | None:
+    """Recognize only the explicit deterministic scoring exhaustion signal.
+
+    A worker failure remains infrastructure-fatal by default.  The one exception
+    is deliberately tied to the exact core exception field emitted by the
+    gateway; matching a phrase in a traceback would hide worker bugs.
+    """
+
+    nested = completion.get("result")
+    if isinstance(nested, Mapping) and (
+        nested.get("status") == "failed"
+        and nested.get("error_type") == _WARMUP_ERROR_TYPE
+    ):
+        return _clone(nested, name="nested worker warmup failure")
+    # Older gateway versions supplied the same exact type in the top-level
+    # error mapping.  Retain that compatible closed form, not a substring scan.
+    top_level = completion.get("error")
+    if isinstance(top_level, Mapping) and top_level.get("type") == _WARMUP_ERROR_TYPE:
+        return _clone(top_level, name="top-level worker warmup failure")
+    return None
+
+
+def _finalize_rejected_material(material: dict[str, Any]) -> dict[str, Any]:
+    """Bind a no-replay rejection to the same immutable artifact convention."""
+
+    artifact = _clone(material, name="rejected candidate-window material")
+    artifact["artifact_sha256"] = canonical_sha256(artifact)
+    artifact_size = 1
+    for _ in range(16):
+        artifact["artifact_size_bytes"] = artifact_size
+        next_size = len(
+            json.dumps(
+                artifact,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if next_size == artifact_size:
+            return artifact
+        artifact_size = next_size
+    raise TemporalSearchContractError("could not stabilize rejected result byte count")
+
+
+def _rejected_result_material(
+    task: Mapping[str, Any], completion: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Materialize the sole permitted terminal non-replay outcome.
+
+    This is intentionally not a successful replay result: it carries no stream,
+    execution identity, observation count, or economic metric.  Its immutable
+    provenance makes the deterministic rejection restart-safe and auditable.
+    """
+
+    _require_completion_routing(task, completion)
+    classified_error = _classified_aligned_warmup_failure(completion)
+    if classified_error is None:
+        raise TemporalSearchContractError("worker failure is not a classified warmup rejection")
+    job = _mapping(task.get("payload"), name="task payload")
+    error = classified_error
+    return _finalize_rejected_material(
+        {
+            "schema_version": TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA,
+            "task_kind": TEMPORAL_SEARCH_TASK_KIND,
+            "job_id": job["job_id"],
+            "authority_id": job["authority_id"],
+            "candidate_id": job["candidate_id"],
+            "evidence_plan_id": job["evidence_plan"]["plan_id"],
+            "lake_window_semantic_sha256": job["lake_window_semantic_sha256"],
+            "shared_observation_stream_id": job["shared_observation_stream_id"],
+            "analysis_window_start": job["analysis_window_start"],
+            "analysis_window_end": job["analysis_window_end"],
+            "evaluation_outcome": {
+                "schema_version": "temporal_candidate_window_rejection_v1",
+                "disposition": "rejected",
+                "reason_code": _WARMUP_REJECTION_CODE,
+                "replay_executed": False,
+                "worker_attempt_id": completion["attempt_id"],
+                "worker_lease_id": completion["lease_id"],
+                "worker_error": error,
+                "worker_error_sha256": canonical_sha256(error),
+                "worker_completion_sha256": canonical_sha256(completion),
+            },
+        }
+    )
+
+
+def is_warmup_rejected_candidate_window_result(material: Mapping[str, Any]) -> bool:
+    return material.get("schema_version") == TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA
+
+
+def validate_warmup_rejected_candidate_window_result(
+    material: Mapping[str, Any], *, task_payload: Mapping[str, Any] | None = None
+) -> None:
+    """Validate a deterministic, no-replay warmup rejection artifact."""
+
+    if material.get("schema_version") != TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA:
+        raise TemporalSearchContractError("candidate-window result is not a warmup rejection")
+    if material.get("task_kind") != TEMPORAL_SEARCH_TASK_KIND:
+        raise TemporalSearchContractError("warmup rejection task kind is invalid")
+    outcome = _mapping(material.get("evaluation_outcome"), name="warmup rejection outcome")
+    expected_outcome = {
+        "schema_version",
+        "disposition",
+        "reason_code",
+        "replay_executed",
+        "worker_attempt_id",
+        "worker_lease_id",
+        "worker_error",
+        "worker_error_sha256",
+        "worker_completion_sha256",
+    }
+    if set(outcome) != expected_outcome or (
+        outcome.get("disposition") != "rejected"
+        or outcome.get("reason_code") != _WARMUP_REJECTION_CODE
+        or outcome.get("replay_executed") is not False
+    ):
+        raise TemporalSearchContractError("warmup rejection outcome is invalid")
+    _safe(outcome.get("worker_attempt_id"), name="warmup rejection worker attempt")
+    _safe(outcome.get("worker_lease_id"), name="warmup rejection worker lease")
+    error = _clone(outcome.get("worker_error"), name="warmup rejection worker error")
+    if canonical_sha256(error) != _sha(outcome.get("worker_error_sha256"), name="warmup rejection error hash"):
+        raise TemporalSearchContractError("warmup rejection error identity mismatch")
+    _sha(outcome.get("worker_completion_sha256"), name="warmup rejection completion hash")
+    for key in (
+        "job_id", "authority_id", "candidate_id", "evidence_plan_id",
+        "lake_window_semantic_sha256", "shared_observation_stream_id",
+        "analysis_window_start", "analysis_window_end",
+    ):
+        if not isinstance(material.get(key), str) or not material[key]:
+            raise TemporalSearchContractError(f"warmup rejection {key} is required")
+    if task_payload is not None:
+        expected = {
+            "job_id": task_payload.get("job_id"),
+            "authority_id": task_payload.get("authority_id"),
+            "candidate_id": task_payload.get("candidate_id"),
+            "evidence_plan_id": (task_payload.get("evidence_plan") or {}).get("plan_id"),
+            "lake_window_semantic_sha256": task_payload.get("lake_window_semantic_sha256"),
+            "shared_observation_stream_id": task_payload.get("shared_observation_stream_id"),
+            "analysis_window_start": task_payload.get("analysis_window_start"),
+            "analysis_window_end": task_payload.get("analysis_window_end"),
+        }
+        if any(material.get(key) != value for key, value in expected.items()):
+            raise TemporalSearchContractError("warmup rejection does not match task")
+    artifact = _clone(material, name="warmup rejection artifact")
+    supplied_sha = _sha(artifact.pop("artifact_sha256", None), name="warmup rejection artifact hash")
+    supplied_size = artifact.pop("artifact_size_bytes", None)
+    if not isinstance(supplied_size, int) or supplied_size < 1:
+        raise TemporalSearchContractError("warmup rejection artifact byte count is invalid")
+    if canonical_sha256(artifact) != supplied_sha:
+        raise TemporalSearchContractError("warmup rejection artifact identity mismatch")
+    if len(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")) != supplied_size:
+        raise TemporalSearchContractError("warmup rejection artifact byte count mismatch")
+
+
+def _result_material(
+    task: Mapping[str, Any], completion: Mapping[str, Any]
+) -> dict[str, Any]:
+    if str(completion.get("status") or "").lower() != "success":
+        raise TemporalSearchContractError("worker completion is not successful")
+    _require_completion_routing(task, completion)
     envelope = _mapping(completion.get("result"), name="worker envelope")
     if (
         envelope.get("status") != "success"
@@ -1621,12 +1790,47 @@ def run_temporal_search_tasks(
     tasks = {item["task_id"]: item for item in manifest["tasks"]}
     completed = _mapping(checkpoint["completed"], name="checkpoint.completed")
 
+    def persist(task: Mapping[str, Any], material: Mapping[str, Any]) -> None:
+        digest = canonical_sha256(material)
+        task_id = str(task["task_id"])
+        prior = completed.get(task_id)
+        if prior is not None:
+            if not isinstance(prior, Mapping) or prior.get("resultSha256") != digest:
+                raise TemporalSearchContractError("conflicting duplicate temporal search result")
+            persisted = _read_checkpoint_result(prior)
+            if canonical_sha256(persisted) != digest:
+                raise TemporalSearchContractError("conflicting duplicate temporal search result")
+            return
+        result_path = root / "results" / f"{task_id}.json.gz"
+        try:
+            metadata = write_gzip_json_once(result_path, material)
+        except ResultCodecError as exc:
+            raise TemporalSearchContractError(
+                f"could not materialize compressed temporal result: {result_path}"
+            ) from exc
+        record = {
+            "resultSha256": digest,
+            "resultPath": str(result_path),
+            "candidateId": task["payload"]["candidate_id"],
+            **_result_codec_fields(metadata),
+        }
+        if is_warmup_rejected_candidate_window_result(material):
+            record["outcome"] = "rejected"
+            record["rejectionCode"] = _WARMUP_REJECTION_CODE
+        completed[task_id] = record
+        checkpoint["completed"] = completed
+        checkpoint["journal"] = list(checkpoint.get("journal") or []) + [
+            {"taskId": task_id, **record}
+        ]
+        _write_checkpoint(checkpoint_path, checkpoint)
+
     def consume(completion: Mapping[str, Any]) -> None:
         task_id = str(completion.get("task_id") or "")
         task = tasks.get(task_id)
         if task is None:
             raise TemporalSearchContractError("unrelated Lab result encountered")
         if str(completion.get("status") or "").lower() != "success":
+            _require_completion_routing(task, completion)
             lease = _safe(completion.get("lease_id"), name="completion.lease_id")
             failure = _mapping(completion, name="failed worker completion")
             _write_json(root / "failures" / f"{task_id}.json", failure)
@@ -1634,6 +1838,19 @@ def run_temporal_search_tasks(
                 raise TemporalSearchContractError(
                     "gateway did not acknowledge failed temporal search result"
                 )
+            if _classified_aligned_warmup_failure(failure) is not None:
+                persist(task, _rejected_result_material(task, failure))
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "taskId": task_id,
+                            "completedTaskCount": len(completed),
+                            "taskCount": len(tasks),
+                            "outcome": "rejected",
+                            "rejectionCode": _WARMUP_REJECTION_CODE,
+                        }
+                    )
+                return
             detail = (
                 failure.get("error") or failure.get("result") or failure.get("status")
             )
@@ -1649,40 +1866,7 @@ def run_temporal_search_tasks(
             )
         material = _result_material(task, completion)
         lease = _safe(completion.get("lease_id"), name="completion.lease_id")
-        digest = canonical_sha256(material)
-        prior = completed.get(task_id)
-        if prior is not None:
-            if not isinstance(prior, Mapping) or prior.get("resultSha256") != digest:
-                raise TemporalSearchContractError(
-                    "conflicting duplicate temporal search result"
-                )
-            persisted = _read_checkpoint_result(prior)
-            if canonical_sha256(persisted) != digest:
-                raise TemporalSearchContractError(
-                    "conflicting duplicate temporal search result"
-                )
-        if prior is None:
-            result_path = root / "results" / f"{task_id}.json.gz"
-            # The immutable representation is fully fsynced, decoded, and
-            # hash-verified before its checkpoint record can make it durable.
-            try:
-                metadata = write_gzip_json_once(result_path, material)
-            except ResultCodecError as exc:
-                raise TemporalSearchContractError(
-                    f"could not materialize compressed temporal result: {result_path}"
-                ) from exc
-            record = {
-                "resultSha256": digest,
-                "resultPath": str(result_path),
-                "candidateId": task["payload"]["candidate_id"],
-                **_result_codec_fields(metadata),
-            }
-            completed[task_id] = record
-            checkpoint["completed"] = completed
-            checkpoint["journal"] = list(checkpoint.get("journal") or []) + [
-                {"taskId": task_id, **record}
-            ]
-            _write_checkpoint(checkpoint_path, checkpoint)
+        persist(task, material)
         if client.ack_results([lease]) != 1:
             raise TemporalSearchContractError(
                 "gateway did not acknowledge temporal search result"
@@ -1695,6 +1879,22 @@ def run_temporal_search_tasks(
                     "taskCount": len(tasks),
                 }
             )
+
+    # Recover an already-acknowledged deterministic failure before enqueue.  The
+    # failure receipt is durable independently of the checkpoint write, so a
+    # crash between acknowledgement and checkpointing cannot resurrect a task.
+    for task_id, task in tasks.items():
+        if task_id in completed:
+            continue
+        failure_path = root / "failures" / f"{task_id}.json"
+        if not failure_path.is_file():
+            continue
+        failure = _mapping(
+            json.loads(failure_path.read_text(encoding="utf-8")),
+            name="persisted failed worker completion",
+        )
+        if _classified_aligned_warmup_failure(failure) is not None:
+            persist(task, _rejected_result_material(task, failure))
 
     # Consume a prior delivery before enqueue so restart after materialization is
     # idempotent and does not create a second economic evaluation.

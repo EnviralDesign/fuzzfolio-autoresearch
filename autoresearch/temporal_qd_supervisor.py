@@ -2652,10 +2652,19 @@ def _complete_rotating_generation_transaction(
         rich_candidates[candidate_id] = _clone(candidate, name="provisional rich candidate")
 
     current_records: dict[str, list[dict[str, Any]]] = {}
+    # Deterministic insufficient-warmup outcomes are deliberately absent from
+    # ``current_members``.  Do not demand rotating evidence for a candidate
+    # which has no replay evidence and is ineligible for provisional/breeder
+    # selection.
+    evaluated_new_candidates = {
+        candidate_id: candidate
+        for candidate_id, candidate in new_candidates.items()
+        if candidate_id in current_members
+    }
     new_records = _campaign_window_evidence(
         campaign_root=proposal_campaign_root,
         panel=panel,
-        candidates=new_candidates,
+        candidates=evaluated_new_candidates,
         tail_result_index=proposal_tail_index,
     )
     current_records.update(new_records)

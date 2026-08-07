@@ -21,6 +21,63 @@ from autoresearch.temporal_search_policy_v2 import (
 )
 
 
+def test_mixed_warmup_rejection_is_accounted_but_cannot_enter_qd_members_or_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-replay warmup outcome remains in the result set but has no QD row."""
+
+    candidate_a = {"candidateId": "candidate_a"}
+    candidate_b = {"candidateId": "candidate_b"}
+    staged = {
+        "candidate_a": [{"evaluationRejected": False, "v3Admissible": True, "windowId": "a"}],
+        "candidate_b": [{
+            "evaluationRejected": True,
+            "windowId": "b",
+            "rejection": {
+                "schema_version": "temporal_candidate_window_rejection_v1",
+                "disposition": "rejected",
+                "reason_code": "aligned_scoring_warmup_insufficient",
+                "replay_executed": False,
+            },
+        }],
+    }
+    monkeypatch.setattr(qd_module, "_load_population", lambda _path: ([candidate_a, candidate_b], "sha256:" + "a" * 64))
+    monkeypatch.setattr(qd_module, "load_stage_results", lambda *_args, **_kwargs: staged)
+    monkeypatch.setattr(qd_module, "_require_candidate_execution_binding", lambda *_args: {
+        "authoredProgramSha256": "sha256:" + "1" * 64,
+        "sourceProfileSnapshotSha256": "sha256:" + "2" * 64,
+        "resolvedProfileSnapshotSha256": "sha256:" + "3" * 64,
+        "resolvedProgramSha256": "sha256:" + "4" * 64,
+    })
+    aggregate = {
+        "authoredProgramSha256": "sha256:" + "1" * 64,
+        "sourceProfileSnapshotSha256": "sha256:" + "2" * 64,
+        "resolvedProfileSnapshotSha256": "sha256:" + "3" * 64,
+        "resolvedProgramSha256": "sha256:" + "4" * 64,
+        "totalTrades": 10,
+        "tradeCountsByWindow": [10],
+        "totalObservations": 100,
+        "worstWindowConservativeNetR": 1.0,
+        "maxWindowDrawdownR": 0.5,
+    }
+    monkeypatch.setattr(qd_module, "_aggregate_candidate", lambda *_args: aggregate)
+    monkeypatch.setattr(qd_module, "qd_behavior_descriptor", lambda *_args: {"cellId": "fixture"})
+    monkeypatch.setattr(qd_module, "_objective_row", lambda *_args: {"worstWindowConservativeNetR": 1.0, "maximumDrawdownR": 0.5, "structuralComplexity": 1.0})
+    monkeypatch.setattr(qd_module, "_finite_data_validity", lambda *_args, **_kwargs: {"validForQuality": True})
+
+    reduced = qd_module.load_qd_evaluated_members(
+        population_path=tmp_path / "population.json",
+        result_root=tmp_path / "results",
+        generation_index=1,
+    )
+
+    assert reduced["resultSetSha256"] == qd_module._result_set_sha256(staged)
+    assert [member["candidateId"] for member in reduced["members"]] == ["candidate_a"]
+    assert reduced["evaluationRejectionCount"] == 1
+    assert reduced["evaluationRejectedCandidates"][0]["candidateId"] == "candidate_b"
+    assert {member["candidateId"] for cell in select_qd_archive(reduced["members"], cell_capacity=4) for member in cell["members"]} == {"candidate_a"}
+
+
 def test_selected_pair_hydration_preserves_prior_archive_members(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

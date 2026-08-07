@@ -1009,6 +1009,81 @@ def test_controller_persists_and_acknowledges_failed_completion_before_tripwire(
     assert failure["error"]["type"] == "fixture_failure"
 
 
+def test_controller_persists_and_recovers_terminal_aligned_warmup_rejection(tmp_path: Path) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+
+    class WarmupFailedGateway:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+            self.acks: list[str] = []
+            self.delivered = False
+
+        def enqueue_tasks(self, tasks):
+            self.enqueued.extend(tasks)
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit):
+            if self.delivered:
+                return []
+            self.delivered = True
+            return [{
+                "status": "failed",
+                "task_id": task["task_id"],
+                "lane_id": task["lane_id"],
+                "attempt_id": task["attempt_id"],
+                "lease_id": "warmup-lease",
+                "result": {
+                    "status": "failed",
+                    "error_type": "AlignedScoringWarmupInsufficientError",
+                    "error": "analysis-window warmup insufficient after retry",
+                    "error_repr": "AlignedScoringWarmupInsufficientError('analysis-window warmup insufficient after retry')",
+                    "attempt_number": 8,
+                },
+            }]
+
+        def ack_results(self, lease_ids):
+            self.acks.extend(lease_ids)
+            return len(lease_ids)
+
+    first_gateway = WarmupFailedGateway()
+    result = run_temporal_search_tasks(first_gateway, authority, output_root=tmp_path, timeout_seconds=1)
+    assert result["completedTaskCount"] == 1
+    assert first_gateway.acks == ["warmup-lease"]
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    record = checkpoint["completed"][task["task_id"]]
+    assert record["outcome"] == "rejected"
+    assert record["rejectionCode"] == "aligned_scoring_warmup_insufficient"
+
+    # A crash after acknowledgement but before checkpoint materialization must
+    # recover from failures/<task>.json without submitting a ninth attempt.
+    (tmp_path / "results" / f"{task['task_id']}.json.gz").unlink()
+    checkpoint["completed"] = {}
+    checkpoint["journal"] = []
+    (tmp_path / "checkpoint.json").write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    class NoDeliveryGateway:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def enqueue_tasks(self, tasks):
+            self.enqueued.extend(tasks)
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit):
+            return []
+
+        def ack_results(self, lease_ids):
+            raise AssertionError("recovered failure was already acknowledged")
+
+    resumed_gateway = NoDeliveryGateway()
+    resumed = run_temporal_search_tasks(
+        resumed_gateway, authority, output_root=tmp_path, timeout_seconds=1, resume=True
+    )
+    assert resumed["completedTaskCount"] == 1
+    assert resumed_gateway.enqueued == []
+
+
 def test_procman_normal_operations_is_prebroad_admission_topology() -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "scripts" / "processes.json"

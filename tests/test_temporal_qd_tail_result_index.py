@@ -31,6 +31,7 @@ from autoresearch.temporal_search import (
     TEMPORAL_SEARCH_CHECKPOINT_SCHEMA,
     TEMPORAL_SEARCH_MANIFEST_SCHEMA,
     _cost_view_path_sha256,
+    _rejected_result_material,
     build_authority,
     build_task_matrix,
     canonical_sha256,
@@ -485,6 +486,43 @@ def _build(
         checkpoint=checkpoint,
         include_funnel_projection=funnel,
     )
+
+
+def test_index_projects_deterministic_warmup_rejection_without_replay_metrics(tmp_path: Path) -> None:
+    root, authority, manifest, checkpoint, _candidates, _panel, paths = _fixture(tmp_path)
+    task = manifest["tasks"][0]
+    failure = {
+        "status": "failed",
+        "task_id": task["task_id"],
+        "lane_id": task["lane_id"],
+        "attempt_id": task["attempt_id"],
+        "lease_id": "fixture-warmup-lease",
+        "error": {"type": "AlignedScoringWarmupInsufficientError", "attempt": 8},
+    }
+    rejected = _rejected_result_material(task, failure)
+    paths[0].unlink()
+    metadata = write_gzip_json_once(paths[0], rejected)
+    checkpoint["completed"][task["task_id"]] = {
+        **_checkpoint_record(
+            result_path=paths[0], metadata=metadata, candidate_id=task["payload"]["candidate_id"]
+        ),
+        "outcome": "rejected",
+        "rejectionCode": "aligned_scoring_warmup_insufficient",
+    }
+    checkpoint["journal"] = [
+        {"taskId": task_id, **record}
+        for task_id, record in sorted(checkpoint["completed"].items())
+    ]
+
+    index = _build(root, authority, manifest, checkpoint, funnel=True)
+    indexed = load_indexed_stage_results(index)
+    record = indexed[task["payload"]["candidate_id"]][0]
+    assert record["evaluationRejected"] is True
+    assert record["rejection"]["reason_code"] == "aligned_scoring_warmup_insufficient"
+    rejected_entry = next(entry for entry in index["entries"] if "rejection" in entry)
+    assert "rotatingEvidenceMetrics" not in rejected_entry
+    assert "funnelProjection" not in rejected_entry
+    assert rejected_entry["task"]["taskId"] not in load_indexed_funnel_projections(index)
 
 
 def test_index_is_byte_equivalent_to_legacy_stage_and_provenance_projections(

@@ -15,6 +15,11 @@ from typing import Any
 
 from .result_codec import ResultCodecError, read_json_object
 from .temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
+from .temporal_search import (
+    TemporalSearchContractError,
+    is_warmup_rejected_candidate_window_result,
+    validate_warmup_rejected_candidate_window_result,
+)
 from .temporal_generation_funnel import (
     GenerationFunnelContractError,
     build_generation_funnel_artifact,
@@ -345,7 +350,7 @@ def build_qd_generation_funnel(
                 for task_id, task in planned.items()
             },
         )
-        if set(indexed_funnel_rows) != set(planned):
+        if not set(indexed_funnel_rows) <= set(planned):
             raise TemporalDiscoveryContractError(
                 "indexed QD funnel projection task matrix drifted"
             )
@@ -368,6 +373,20 @@ def build_qd_generation_funnel(
             result_sha = canonical_sha256(material)
             if record.get("resultSha256") != result_sha:
                 raise TemporalDiscoveryContractError("QD checkpoint result semantic identity mismatch")
+            if is_warmup_rejected_candidate_window_result(material):
+                try:
+                    validate_warmup_rejected_candidate_window_result(
+                        material,
+                        task_payload=task["payload"],
+                    )
+                except TemporalSearchContractError as exc:
+                    raise TemporalDiscoveryContractError(
+                        "QD warmup rejection does not match its task"
+                    ) from exc
+                # A deterministic no-replay rejection is represented by an
+                # empty observed set, yielding the funnel's existing
+                # candidate-level ``rejected`` disposition.
+                continue
             behavior = _result_behavior(material, result_sha=result_sha, window_id=task["windowId"])
         else:
             assert indexed_entries is not None
@@ -383,6 +402,12 @@ def build_qd_generation_funnel(
                 raise TemporalDiscoveryContractError(
                     "indexed QD funnel result binding drifted"
                 )
+            if "rejection" in entry:
+                if task_id in indexed_funnel_rows:
+                    raise TemporalDiscoveryContractError(
+                        "indexed warmup rejection unexpectedly has funnel behavior"
+                    )
+                continue
             indexed_row = indexed_funnel_rows[str(task_id)]
             behavior = dict(indexed_row["resultBehavior"])
             result_sha = str(raw_ref["resultSha256"])

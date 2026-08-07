@@ -44,11 +44,13 @@ from .temporal_discovery_results import _window_record
 from .temporal_search import (
     TEMPORAL_SEARCH_CHECKPOINT_SCHEMA,
     TEMPORAL_SEARCH_MANIFEST_SCHEMA,
+    TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA,
     TEMPORAL_SEARCH_RESULT_SCHEMA,
     TemporalSearchContractError,
     build_task_matrix,
     validate_authority,
     validate_v3_candidate_window_result,
+    validate_warmup_rejected_candidate_window_result,
 )
 
 TAIL_RESULT_INDEX_SCHEMA = "temporal_qd_tail_result_index_v3"
@@ -549,7 +551,7 @@ def _validate_result_binding(
             "checkpoint candidate identity does not match its task"
         )
     expected = {
-        "schema_version": TEMPORAL_SEARCH_RESULT_SCHEMA,
+        "schema_version": result.get("schema_version"),
         "task_kind": task.get("task_kind"),
         "job_id": payload.get("job_id"),
         "authority_id": payload.get("authority_id"),
@@ -574,10 +576,15 @@ def _validate_result_binding(
             "checkpoint result semantic identity does not match its raw blob"
         )
     try:
-        validate_v3_candidate_window_result(result, task_payload=payload)
+        if result.get("schema_version") == TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA:
+            validate_warmup_rejected_candidate_window_result(result, task_payload=payload)
+        elif result.get("schema_version") == TEMPORAL_SEARCH_RESULT_SCHEMA:
+            validate_v3_candidate_window_result(result, task_payload=payload)
+        else:
+            raise TemporalSearchContractError("raw result schema is unsupported")
     except TemporalSearchContractError as exc:
         raise TemporalQDTailResultIndexError(
-            "raw result failed Stage 5E7-v3 task validation"
+            "raw result failed its candidate-window task validation"
         ) from exc
 
 
@@ -672,14 +679,19 @@ def _entry(
             "taskPayloadSha256": semantic_sha256(payload),
         },
         "rawResultRef": _raw_ref(relative_path=relative_path, metadata=metadata),
-        "stageProjection": _stage_projection(record),
-        "rotatingEvidenceMetrics": _rotating_metrics(record),
         "rawTaskProvenance": {
             "taskId": task_id,
             "resultSha256": result_sha,
         },
     }
-    if include_funnel_projection:
+    if record.get("evaluationRejected") is True:
+        output["rejection"] = _canonical_clone(
+            record.get("rejection"), name="tail warmup rejection"
+        )
+    else:
+        output["stageProjection"] = _stage_projection(record)
+        output["rotatingEvidenceMetrics"] = _rotating_metrics(record)
+    if include_funnel_projection and record.get("evaluationRejected") is not True:
         output["funnelProjection"] = _funnel_projection(
             result=result, result_sha256=result_sha, record=record
         )
@@ -697,12 +709,15 @@ def _validate_entry(
         "schemaVersion",
         "task",
         "rawResultRef",
-        "stageProjection",
-        "rotatingEvidenceMetrics",
         "rawTaskProvenance",
         "entrySha256",
     }
-    if include_funnel:
+    rejected = "rejection" in entry
+    if rejected:
+        required.add("rejection")
+    else:
+        required.update({"stageProjection", "rotatingEvidenceMetrics"})
+    if include_funnel and not rejected:
         required.add("funnelProjection")
     if set(entry) != required or entry.get("schemaVersion") != TAIL_RESULT_ENTRY_SCHEMA:
         raise TemporalQDTailResultIndexError(
@@ -731,13 +746,24 @@ def _validate_entry(
     _sha(task.get("evidencePlanSemanticSha256"), name="tail result task plan identity")
     _sha(task.get("taskPayloadSha256"), name="tail result task payload identity")
     raw_ref = _validate_raw_ref(entry.get("rawResultRef"), name="tail raw result ref")
-    _validate_stage_projection(
-        entry.get("stageProjection"), name="tail stage projection"
-    )
-    metrics = _mapping_view(
-        entry.get("rotatingEvidenceMetrics"), name="tail rotating metrics"
-    )
-    if set(metrics) != {
+    if rejected:
+        rejection = _mapping_view(entry.get("rejection"), name="tail warmup rejection")
+        if (
+            rejection.get("disposition") != "rejected"
+            or rejection.get("reason_code") != "aligned_scoring_warmup_insufficient"
+            or rejection.get("replay_executed") is not False
+        ):
+            raise TemporalQDTailResultIndexError("tail warmup rejection is invalid")
+        _sha(rejection.get("worker_error_sha256"), name="tail warmup rejection error hash")
+        _sha(rejection.get("worker_completion_sha256"), name="tail warmup rejection completion hash")
+    else:
+        _validate_stage_projection(
+            entry.get("stageProjection"), name="tail stage projection"
+        )
+        metrics = _mapping_view(
+            entry.get("rotatingEvidenceMetrics"), name="tail rotating metrics"
+        )
+        if set(metrics) != {
         "conservativeNetR",
         "noCostNetR",
         "maxDrawdownR",
@@ -747,20 +773,20 @@ def _validate_entry(
         "resolvedProgramSha256",
         "resolvedProfileSnapshotSha256",
         "sourceProfileSnapshotSha256",
-    }:
-        raise TemporalQDTailResultIndexError("tail rotating metrics schema is invalid")
-    if metrics.get("v3Admissible") is not True:
-        raise TemporalQDTailResultIndexError(
-            "tail rotating metrics are not v3-admissible"
-        )
-    for field in (
+        }:
+            raise TemporalQDTailResultIndexError("tail rotating metrics schema is invalid")
+        if metrics.get("v3Admissible") is not True:
+            raise TemporalQDTailResultIndexError(
+                "tail rotating metrics are not v3-admissible"
+            )
+        for field in (
         "resolvedProgramSha256",
         "resolvedProfileSnapshotSha256",
         "sourceProfileSnapshotSha256",
-    ):
-        _sha(metrics.get(field), name=f"tail rotating metrics {field}")
-    for field in ("closedTrades", "observations"):
-        _integer(metrics.get(field), name=f"tail rotating metrics {field}")
+        ):
+            _sha(metrics.get(field), name=f"tail rotating metrics {field}")
+        for field in ("closedTrades", "observations"):
+            _integer(metrics.get(field), name=f"tail rotating metrics {field}")
     provenance = _mapping_view(
         entry.get("rawTaskProvenance"), name="tail raw provenance"
     )
@@ -771,7 +797,7 @@ def _validate_entry(
         or provenance.get("resultSha256") != raw_ref["resultSha256"]
     ):
         raise TemporalQDTailResultIndexError("tail raw provenance binding drifted")
-    if include_funnel:
+    if include_funnel and not rejected:
         funnel = _mapping_view(
             entry.get("funnelProjection"), name="tail funnel projection"
         )
@@ -1211,9 +1237,23 @@ def load_indexed_stage_results(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for entry in payload["entries"]:
         task = entry["task"]
-        record = _decode_stage_projection(
-            entry["stageProjection"], name="indexed stage projection"
-        )
+        if "rejection" in entry:
+            record = {
+                "economicsBasis": "not_evaluated_warmup_insufficient",
+                "v3Admissible": False,
+                "evaluationRejected": True,
+                "rejection": _canonical_clone(
+                    entry["rejection"], name="indexed warmup rejection"
+                ),
+                "candidateId": task["candidateId"],
+                "windowId": task["analysisWindowStart"] + "/" + task["analysisWindowEnd"],
+                "analysisWindowStart": task["analysisWindowStart"],
+                "analysisWindowEnd": task["analysisWindowEnd"],
+            }
+        else:
+            record = _decode_stage_projection(
+                entry["stageProjection"], name="indexed stage projection"
+            )
         candidate_id = record.get("candidateId")
         if (
             not isinstance(candidate_id, str)
@@ -1226,7 +1266,10 @@ def load_indexed_stage_results(
             candidate_id != task["candidateId"]
             or record.get("analysisWindowStart") != task["analysisWindowStart"]
             or record.get("analysisWindowEnd") != task["analysisWindowEnd"]
-            or _rotating_metrics(record) != entry["rotatingEvidenceMetrics"]
+            or (
+                "rejection" not in entry
+                and _rotating_metrics(record) != entry["rotatingEvidenceMetrics"]
+            )
         ):
             raise TemporalQDTailResultIndexError(
                 "indexed stage projection drifted from compact task evidence"
@@ -1279,6 +1322,10 @@ def load_indexed_provenance_bound_window_evidence(
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for entry in payload["entries"]:
+        if "rejection" in entry:
+            # No replay occurred, so this candidate is intentionally omitted
+            # from rotating evidence and breeder/provisional eligibility.
+            continue
         task = entry["task"]
         candidate_id = str(task["candidateId"])
         candidate = candidates.get(candidate_id)
@@ -1343,6 +1390,8 @@ def load_indexed_funnel_projections(
         )
     output: dict[str, dict[str, Any]] = {}
     for entry in payload["entries"]:
+        if "rejection" in entry:
+            continue
         task_id = str(entry["task"]["taskId"])
         funnel = _mapping(entry["funnelProjection"], name="indexed funnel projection")
         behavior = _mapping(funnel["resultBehavior"], name="indexed funnel behavior")

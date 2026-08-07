@@ -16,12 +16,15 @@ from typing import Any, Protocol
 
 from .temporal_search import (
     TEMPORAL_SEARCH_PREPARATION_SCHEMA,
+    TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA,
     TemporalSearchContractError,
     build_authority,
     canonical_sha256,
     is_v3_candidate_window_result,
+    is_warmup_rejected_candidate_window_result,
     validate_authority,
     validate_v3_candidate_window_result,
+    validate_warmup_rejected_candidate_window_result,
 )
 
 from .temporal_discovery_base import *
@@ -144,6 +147,24 @@ def _terminal_window_economics(
 
 
 def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
+    if is_warmup_rejected_candidate_window_result(result):
+        try:
+            validate_warmup_rejected_candidate_window_result(result)
+        except TemporalSearchContractError as exc:
+            raise TemporalDiscoveryContractError(
+                "invalid deterministic candidate/window warmup rejection"
+            ) from exc
+        outcome = _mapping(result.get("evaluation_outcome"), name="warmup rejection outcome")
+        return {
+            "economicsBasis": "not_evaluated_warmup_insufficient",
+            "v3Admissible": False,
+            "evaluationRejected": True,
+            "rejection": _clone(outcome, name="warmup rejection provenance"),
+            "candidateId": str(result.get("candidate_id") or ""),
+            "windowId": str(result.get("analysis_window_start")) + "/" + str(result.get("analysis_window_end")),
+            "analysisWindowStart": result.get("analysis_window_start"),
+            "analysisWindowEnd": result.get("analysis_window_end"),
+        }
     v3_admissible = is_v3_candidate_window_result(result)
     if v3_admissible:
         try:
@@ -452,7 +473,10 @@ def load_stage_results(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for path in _result_files(result_root):
         result = _read_json(path, name="candidate/window result")
-        if result.get("schema_version") != "temporal_graph_candidate_window_result_v1":
+        if result.get("schema_version") not in {
+            "temporal_graph_candidate_window_result_v1",
+            TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA,
+        }:
             raise TemporalDiscoveryContractError(
                 f"unexpected result schema: {path}"
             )

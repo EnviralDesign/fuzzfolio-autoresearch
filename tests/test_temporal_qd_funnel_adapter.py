@@ -7,6 +7,7 @@ import pytest
 
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
 from autoresearch.temporal_qd_funnel_adapter import _result_behavior, build_qd_generation_funnel
+from autoresearch.temporal_search import _rejected_result_material
 
 
 def _sha(letter: str) -> str:
@@ -173,6 +174,52 @@ def test_adapter_partial_candidate_is_terminal_and_has_no_stale_archive_row(tmp_
     assert row["terminalDisposition"] == "evaluation_rejected"
     assert "activationQuality" not in row["stages"]
     assert "archiveRetention" not in row["stages"]
+
+
+def test_adapter_treats_warmup_rejection_as_terminal_without_activation_or_retention(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    record = inputs["checkpoint"]["completed"]["task-qd_retained"]
+    task = next(task for task in inputs["task_manifest"]["tasks"] if task["task_id"] == "task-qd_retained")
+    task.update({"lane_id": "qd_retained", "attempt_id": "task-qd_retained", "task_kind": "temporal_graph_candidate_window"})
+    task["payload"].update({
+        "job_id": "task-qd_retained",
+        "authority_id": "sha256:" + "a" * 64,
+        "evidence_plan": {"plan_id": "sha256:" + "b" * 64},
+        "lake_window_semantic_sha256": "sha256:" + "c" * 64,
+        "shared_observation_stream_id": "sha256:" + "d" * 64,
+    })
+    rejected = _rejected_result_material(task, {
+        "status": "failed",
+        "task_id": task["task_id"],
+        "lane_id": task["lane_id"],
+        "attempt_id": task["attempt_id"],
+        "lease_id": "warmup-lease",
+        "error": {"type": "AlignedScoringWarmupInsufficientError", "attempt": 8},
+    })
+    Path(record["resultPath"]).write_text(json.dumps(rejected), encoding="utf-8")
+    record["resultSha256"] = canonical_sha256(rejected)
+
+    artifact = build_qd_generation_funnel(**inputs)
+
+    row = next(item for item in artifact["candidates"] if item["candidateId"] == "qd_retained")
+    assert row["terminalDisposition"] == "evaluation_rejected"
+    assert "activationQuality" not in row["stages"]
+    assert "archiveRetention" not in row["stages"]
+
+
+def test_adapter_refuses_tampered_warmup_rejection(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    record = inputs["checkpoint"]["completed"]["task-qd_retained"]
+    # Merely claiming the rejection schema is not enough: every binding and
+    # immutable artifact identity must validate before the funnel can skip it.
+    malformed = {"schema_version": "temporal_graph_candidate_window_rejected_result_v1"}
+    Path(record["resultPath"]).write_text(json.dumps(malformed), encoding="utf-8")
+    record["resultSha256"] = canonical_sha256(malformed)
+
+    with pytest.raises(TemporalDiscoveryContractError, match="warmup rejection does not match its task"):
+        build_qd_generation_funnel(**inputs)
 
 
 def test_adapter_is_reordered_checkpoint_exact_and_refuses_tampered_blob(tmp_path: Path) -> None:

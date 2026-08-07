@@ -1152,6 +1152,7 @@ def build_qd_archive(
             "QD result set must exactly cover the source population"
         )
     members: dict[str, dict[str, Any]] = {}
+    evaluation_rejections: list[dict[str, Any]] = []
     previous_sha = None
     previous_cell_ids: set[str] = set()
     prior_cell_accounting: dict[str, dict[str, int]] = {}
@@ -1177,6 +1178,29 @@ def build_qd_archive(
     for candidate_id in sorted(candidate_map):
         candidate = candidate_map[candidate_id]
         windows = results[candidate_id]
+        rejected = [
+            window for window in windows if window.get("evaluationRejected") is True
+        ]
+        if rejected:
+            # A deterministic lack of aligned-history is a candidate/window
+            # evaluation outcome, not economic evidence.  It must never be
+            # given a synthetic score, execution identity, archive cell, or
+            # breeding right; retain all window receipts for audit instead.
+            evaluation_rejections.append(
+                {
+                    "candidateId": candidate_id,
+                    "disposition": "rejected",
+                    "reasonCode": "aligned_scoring_warmup_insufficient",
+                    "windowRejections": [
+                        {
+                            "windowId": window["windowId"],
+                            "rejection": _clone(window["rejection"], name="warmup rejection"),
+                        }
+                        for window in rejected
+                    ],
+                }
+            )
+            continue
         execution_binding = _require_candidate_execution_binding(candidate, windows)
         if any(window.get("v3Admissible") is not True for window in windows):
             raise TemporalDiscoveryContractError(
@@ -1331,6 +1355,8 @@ def build_qd_archive(
             {"name": name, "direction": direction} for name, direction in QD_OBJECTIVES
         ],
         "candidateCountSeen": prior_candidate_count_seen + len(candidate_map),
+        "evaluationRejectionCount": len(evaluation_rejections),
+        "evaluationRejectedCandidates": evaluation_rejections,
         "candidateCountReducedThisGeneration": len(candidate_map),
         "authoredCandidateCountBeforeResolvedDeduplication": len(
             members_before_resolved_deduplication
@@ -1446,9 +1472,29 @@ def load_qd_evaluated_members(
             "QD evaluated member result set must exactly cover its population"
         )
     members: list[dict[str, Any]] = []
+    evaluation_rejections: list[dict[str, Any]] = []
     for candidate_id in sorted(candidate_map):
         candidate = candidate_map[candidate_id]
         windows = results[candidate_id]
+        rejected = [
+            window for window in windows if window.get("evaluationRejected") is True
+        ]
+        if rejected:
+            evaluation_rejections.append(
+                {
+                    "candidateId": candidate_id,
+                    "disposition": "rejected",
+                    "reasonCode": "aligned_scoring_warmup_insufficient",
+                    "windowRejections": [
+                        {
+                            "windowId": window["windowId"],
+                            "rejection": _clone(window["rejection"], name="warmup rejection"),
+                        }
+                        for window in rejected
+                    ],
+                }
+            )
+            continue
         execution_binding = _require_candidate_execution_binding(candidate, windows)
         if any(window.get("v3Admissible") is not True for window in windows):
             raise TemporalDiscoveryContractError(
@@ -1503,6 +1549,8 @@ def load_qd_evaluated_members(
         ),
         "resultSetSha256": _result_set_sha256(results),
         "memberCount": len(members),
+        "evaluationRejectionCount": len(evaluation_rejections),
+        "evaluationRejectedCandidates": evaluation_rejections,
         "members": members,
     }
 
