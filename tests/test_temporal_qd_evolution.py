@@ -27,19 +27,13 @@ def test_mixed_warmup_rejection_is_accounted_but_cannot_enter_qd_members_or_arch
     """A no-replay warmup outcome remains in the result set but has no QD row."""
 
     candidate_a = {"candidateId": "candidate_a"}
-    candidate_b = {"candidateId": "candidate_b"}
+    candidate_b = {"candidateId": "candidate_b", "sourceProfile": {"directionMode": "long", "graph": {"transitions": [
+        {"sourceStateId": "position", "actions": [{"kind": "move_stop_to_break_even_next_open"}]},
+        {"sourceStateId": "position", "actions": [{"kind": "move_stop_to_break_even_next_open"}]},
+    ]}}}
     staged = {
         "candidate_a": [{"evaluationRejected": False, "v3Admissible": True, "windowId": "a"}],
-        "candidate_b": [{
-            "evaluationRejected": True,
-            "windowId": "b",
-            "rejection": {
-                "schema_version": "temporal_candidate_window_rejection_v1",
-                "disposition": "rejected",
-                "reason_code": "aligned_scoring_warmup_insufficient",
-                "replay_executed": False,
-            },
-        }],
+        "candidate_b": [{"evaluationRejected": False, "v3Admissible": True, "windowId": "b"}],
     }
     monkeypatch.setattr(qd_module, "_load_population", lambda _path: ([candidate_a, candidate_b], "sha256:" + "a" * 64))
     monkeypatch.setattr(qd_module, "load_stage_results", lambda *_args, **_kwargs: staged)
@@ -74,8 +68,34 @@ def test_mixed_warmup_rejection_is_accounted_but_cannot_enter_qd_members_or_arch
     assert reduced["resultSetSha256"] == qd_module._result_set_sha256(staged)
     assert [member["candidateId"] for member in reduced["members"]] == ["candidate_a"]
     assert reduced["evaluationRejectionCount"] == 1
-    assert reduced["evaluationRejectedCandidates"][0]["candidateId"] == "candidate_b"
+    assert reduced["evaluationRejectedCandidates"] == [{
+        "candidateId": "candidate_b", "disposition": "rejected",
+        "reasonCode": "duplicate_break_even_execution_invariant",
+        "structuralProvenance": {"modules": [{"direction": "long", "breakEvenActionCount": 2}]},
+    }]
     assert {member["candidateId"] for cell in select_qd_archive(reduced["members"], cell_capacity=4) for member in cell["members"]} == {"candidate_a"}
+
+
+def test_duplicate_break_even_is_excluded_per_entry_arbitration_module() -> None:
+    candidate = {
+        "sourceProfile": {
+            "directionMode": "both",
+            "graph": {
+                "entryArbitration": {"modules": [
+                    {"direction": "long", "stateIds": ["long_position"]},
+                    {"direction": "short", "stateIds": ["short_position"]},
+                ]},
+                "transitions": [
+                    {"sourceStateId": "long_position", "actions": [{"kind": "move_stop_to_break_even_next_open"}]},
+                    {"sourceStateId": "long_position", "actions": [{"kind": "move_stop_to_break_even_next_open"}]},
+                    {"sourceStateId": "short_position", "actions": [{"kind": "move_stop_to_break_even_next_open"}]},
+                ],
+            },
+        },
+    }
+    assert qd_module._duplicate_break_even_modules(candidate) == [
+        {"direction": "long", "breakEvenActionCount": 2}
+    ]
 
 
 def test_selected_pair_hydration_preserves_prior_archive_members(

@@ -12,6 +12,7 @@ from autoresearch.temporal_search import (
     TEMPORAL_SEARCH_TASK_KIND,
     TemporalSearchContractError,
     TemporalSearchTimeout,
+    _classified_deterministic_rejection,
     _cost_view_path_sha256,
     build_authority,
     build_task_matrix,
@@ -20,6 +21,23 @@ from autoresearch.temporal_search import (
     run_temporal_search_tasks,
     validate_authority,
 )
+
+
+def test_execution_invariant_rejection_requires_exact_nested_shape() -> None:
+    completion = {
+        "status": "failed",
+        "result": {
+            "status": "failed",
+            "error_type": "TemporalExecutionInvariantError",
+            "error": "TemporalExecutionInvariantError: break-even may be applied only once",
+            "attempt_number": 8,
+        },
+    }
+    classified = _classified_deterministic_rejection(completion)
+    assert classified is not None
+    assert classified[0] == "duplicate_break_even_execution_invariant"
+    completion["result"]["error"] = "TemporalExecutionInvariantError: another invariant"
+    assert _classified_deterministic_rejection(completion) is None
 
 
 def _profile() -> dict:

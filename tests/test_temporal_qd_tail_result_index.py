@@ -519,10 +519,43 @@ def test_index_projects_deterministic_warmup_rejection_without_replay_metrics(tm
     record = indexed[task["payload"]["candidate_id"]][0]
     assert record["evaluationRejected"] is True
     assert record["rejection"]["reason_code"] == "aligned_scoring_warmup_insufficient"
+    assert record["rejection"]["replay_executed"] is False
+    assert "replay_completed" not in record["rejection"]
     rejected_entry = next(entry for entry in index["entries"] if "rejection" in entry)
     assert "rotatingEvidenceMetrics" not in rejected_entry
     assert "funnelProjection" not in rejected_entry
     assert rejected_entry["task"]["taskId"] not in load_indexed_funnel_projections(index)
+
+
+def test_index_projects_exact_duplicate_break_even_rejection(tmp_path: Path) -> None:
+    root, authority, manifest, checkpoint, _candidates, _panel, paths = _fixture(tmp_path)
+    task = manifest["tasks"][0]
+    rejected = _rejected_result_material(task, {
+        "status": "failed", "task_id": task["task_id"], "lane_id": task["lane_id"],
+        "attempt_id": task["attempt_id"], "lease_id": "fixture-be-lease",
+        "result": {
+            "status": "failed", "error_type": "TemporalExecutionInvariantError",
+            "error": "TemporalExecutionInvariantError: break-even may be applied only once",
+            "attempt_number": 8,
+        },
+    })
+    paths[0].unlink()
+    metadata = write_gzip_json_once(paths[0], rejected)
+    checkpoint["completed"][task["task_id"]] = _checkpoint_record(result_path=paths[0], metadata=metadata, candidate_id=task["payload"]["candidate_id"])
+    checkpoint["journal"] = [{"taskId": task_id, **record} for task_id, record in sorted(checkpoint["completed"].items())]
+    index = _build(root, authority, manifest, checkpoint, funnel=True)
+    record = load_indexed_stage_results(index)[task["payload"]["candidate_id"]][0]
+    assert record["economicsBasis"] == "not_evaluated_duplicate_break_even_execution_invariant"
+    assert record["rejection"]["reason_code"] == "duplicate_break_even_execution_invariant"
+    assert record["rejection"]["replay_executed"] is True
+    assert record["rejection"]["replay_completed"] is False
+    rejected_entry = next(entry for entry in index["entries"] if "rejection" in entry)
+    tampered = copy.deepcopy(rejected_entry)
+    tampered["rejection"]["unexpected"] = True
+    tampered.pop("entrySha256")
+    tampered["entrySha256"] = semantic_sha256(tampered)
+    with pytest.raises(TemporalQDTailResultIndexError, match="tail warmup rejection is invalid"):
+        tail_index._validate_entry(tampered, include_funnel=True)
 
 
 def test_index_is_byte_equivalent_to_legacy_stage_and_provenance_projections(

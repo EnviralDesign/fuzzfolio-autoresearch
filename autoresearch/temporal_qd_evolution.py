@@ -581,6 +581,42 @@ def _graph_structure(candidate: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _duplicate_break_even_modules(candidate: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return exact direction-module violations without changing frozen grammar."""
+
+    profile = candidate.get("sourceProfile") or {}
+    graph = profile.get("graph") or {}
+    transitions = [row for row in graph.get("transitions") or [] if isinstance(row, Mapping)]
+    arbitration = graph.get("entryArbitration") or {}
+    modules = arbitration.get("modules") if isinstance(arbitration, Mapping) else None
+    owners: list[tuple[str, set[str]]] = []
+    if isinstance(modules, list):
+        for module in modules:
+            if not isinstance(module, Mapping):
+                continue
+            direction = module.get("direction")
+            states = module.get("stateIds") or []
+            if direction in {"long", "short"} and isinstance(states, list):
+                owners.append((str(direction), {str(state) for state in states}))
+    if not owners:
+        direction = profile.get("directionMode")
+        if direction in {"long", "short"}:
+            owners.append((str(direction), set()))
+    violations: list[dict[str, Any]] = []
+    for direction, states in owners:
+        count = sum(
+            1
+            for transition in transitions
+            if (not states or str(transition.get("sourceStateId")) in states)
+            for action in (transition.get("actions") or [])
+            if isinstance(action, Mapping)
+            and action.get("kind") == "move_stop_to_break_even_next_open"
+        )
+        if count > 1:
+            violations.append({"direction": direction, "breakEvenActionCount": count})
+    return violations
+
+
 def qd_behavior_descriptor(
     candidate: Mapping[str, Any], aggregate: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1178,6 +1214,15 @@ def build_qd_archive(
     for candidate_id in sorted(candidate_map):
         candidate = candidate_map[candidate_id]
         windows = results[candidate_id]
+        structural_violations = _duplicate_break_even_modules(candidate)
+        if structural_violations:
+            evaluation_rejections.append({
+                "candidateId": candidate_id,
+                "disposition": "rejected",
+                "reasonCode": "duplicate_break_even_execution_invariant",
+                "structuralProvenance": {"modules": structural_violations},
+            })
+            continue
         rejected = [
             window for window in windows if window.get("evaluationRejected") is True
         ]
@@ -1190,7 +1235,7 @@ def build_qd_archive(
                 {
                     "candidateId": candidate_id,
                     "disposition": "rejected",
-                    "reasonCode": "aligned_scoring_warmup_insufficient",
+                    "reasonCode": str((rejected[0]["rejection"] or {}).get("reason_code")),
                     "windowRejections": [
                         {
                             "windowId": window["windowId"],
@@ -1476,6 +1521,15 @@ def load_qd_evaluated_members(
     for candidate_id in sorted(candidate_map):
         candidate = candidate_map[candidate_id]
         windows = results[candidate_id]
+        structural_violations = _duplicate_break_even_modules(candidate)
+        if structural_violations:
+            evaluation_rejections.append({
+                "candidateId": candidate_id,
+                "disposition": "rejected",
+                "reasonCode": "duplicate_break_even_execution_invariant",
+                "structuralProvenance": {"modules": structural_violations},
+            })
+            continue
         rejected = [
             window for window in windows if window.get("evaluationRejected") is True
         ]
@@ -1484,7 +1538,7 @@ def load_qd_evaluated_members(
                 {
                     "candidateId": candidate_id,
                     "disposition": "rejected",
-                    "reasonCode": "aligned_scoring_warmup_insufficient",
+                    "reasonCode": str((rejected[0]["rejection"] or {}).get("reason_code")),
                     "windowRejections": [
                         {
                             "windowId": window["windowId"],

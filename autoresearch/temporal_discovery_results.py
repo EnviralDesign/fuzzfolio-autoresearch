@@ -155,8 +155,9 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
                 "invalid deterministic candidate/window warmup rejection"
             ) from exc
         outcome = _mapping(result.get("evaluation_outcome"), name="warmup rejection outcome")
+        reason_code = str(outcome["reason_code"])
         return {
-            "economicsBasis": "not_evaluated_warmup_insufficient",
+            "economicsBasis": f"not_evaluated_{reason_code}",
             "v3Admissible": False,
             "evaluationRejected": True,
             "rejection": _clone(outcome, name="warmup rejection provenance"),

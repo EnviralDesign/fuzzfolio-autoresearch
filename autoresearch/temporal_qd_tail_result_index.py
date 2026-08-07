@@ -748,10 +748,17 @@ def _validate_entry(
     raw_ref = _validate_raw_ref(entry.get("rawResultRef"), name="tail raw result ref")
     if rejected:
         rejection = _mapping_view(entry.get("rejection"), name="tail warmup rejection")
-        if (
-            rejection.get("disposition") != "rejected"
-            or rejection.get("reason_code") != "aligned_scoring_warmup_insufficient"
-            or rejection.get("replay_executed") is not False
+        common_rejection_fields = {
+            "schema_version", "disposition", "reason_code", "replay_executed",
+            "worker_attempt_id", "worker_lease_id", "worker_error",
+            "worker_error_sha256", "worker_completion_sha256",
+        }
+        v1 = rejection.get("schema_version") == "temporal_candidate_window_rejection_v1"
+        v2 = rejection.get("schema_version") == "temporal_candidate_window_rejection_v2"
+        expected_rejection_fields = common_rejection_fields | ({"replay_completed"} if v2 else set())
+        if set(rejection) != expected_rejection_fields or rejection.get("disposition") != "rejected" or not (
+            (v1 and rejection.get("reason_code") == "aligned_scoring_warmup_insufficient" and rejection.get("replay_executed") is False)
+            or (v2 and rejection.get("reason_code") == "duplicate_break_even_execution_invariant" and rejection.get("replay_executed") is True and rejection.get("replay_completed") is False)
         ):
             raise TemporalQDTailResultIndexError("tail warmup rejection is invalid")
         _sha(rejection.get("worker_error_sha256"), name="tail warmup rejection error hash")
@@ -1239,7 +1246,7 @@ def load_indexed_stage_results(
         task = entry["task"]
         if "rejection" in entry:
             record = {
-                "economicsBasis": "not_evaluated_warmup_insufficient",
+                "economicsBasis": "not_evaluated_" + str(entry["rejection"]["reason_code"]),
                 "v3Admissible": False,
                 "evaluationRejected": True,
                 "rejection": _canonical_clone(

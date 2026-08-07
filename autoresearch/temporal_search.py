@@ -72,6 +72,9 @@ class TemporalSearchTimeout(TemporalSearchError):
 
 _WARMUP_REJECTION_CODE = "aligned_scoring_warmup_insufficient"
 _WARMUP_ERROR_TYPE = "AlignedScoringWarmupInsufficientError"
+_BREAK_EVEN_REJECTION_CODE = "duplicate_break_even_execution_invariant"
+_BREAK_EVEN_ERROR_TYPE = "TemporalExecutionInvariantError"
+_BREAK_EVEN_ERROR = "TemporalExecutionInvariantError: break-even may be applied only once"
 
 
 class LabGatewayClientProtocol(Protocol):
@@ -1447,7 +1450,7 @@ def _require_completion_routing(
         raise TemporalSearchContractError("completion routing identity mismatch")
 
 
-def _classified_aligned_warmup_failure(
+def _classified_deterministic_rejection(
     completion: Mapping[str, Any],
 ) -> Any | None:
     """Recognize only the explicit deterministic scoring exhaustion signal.
@@ -1462,12 +1465,18 @@ def _classified_aligned_warmup_failure(
         nested.get("status") == "failed"
         and nested.get("error_type") == _WARMUP_ERROR_TYPE
     ):
-        return _clone(nested, name="nested worker warmup failure")
+        return (_WARMUP_REJECTION_CODE, _clone(nested, name="nested worker warmup failure"))
+    if isinstance(nested, Mapping) and (
+        nested.get("status") == "failed"
+        and nested.get("error_type") == _BREAK_EVEN_ERROR_TYPE
+        and nested.get("error") == _BREAK_EVEN_ERROR
+    ):
+        return (_BREAK_EVEN_REJECTION_CODE, _clone(nested, name="nested worker invariant failure"))
     # Older gateway versions supplied the same exact type in the top-level
     # error mapping.  Retain that compatible closed form, not a substring scan.
     top_level = completion.get("error")
     if isinstance(top_level, Mapping) and top_level.get("type") == _WARMUP_ERROR_TYPE:
-        return _clone(top_level, name="top-level worker warmup failure")
+        return (_WARMUP_REJECTION_CODE, _clone(top_level, name="top-level worker warmup failure"))
     return None
 
 
@@ -1505,11 +1514,29 @@ def _rejected_result_material(
     """
 
     _require_completion_routing(task, completion)
-    classified_error = _classified_aligned_warmup_failure(completion)
-    if classified_error is None:
+    classified = _classified_deterministic_rejection(completion)
+    if classified is None:
         raise TemporalSearchContractError("worker failure is not a classified warmup rejection")
+    reason_code, error = classified
+    replay_executed = reason_code == _BREAK_EVEN_REJECTION_CODE
+    outcome = {
+        "schema_version": (
+            "temporal_candidate_window_rejection_v2"
+            if replay_executed
+            else "temporal_candidate_window_rejection_v1"
+        ),
+        "disposition": "rejected",
+        "reason_code": reason_code,
+        "replay_executed": replay_executed,
+        "worker_attempt_id": completion["attempt_id"],
+        "worker_lease_id": completion["lease_id"],
+        "worker_error": error,
+        "worker_error_sha256": canonical_sha256(error),
+        "worker_completion_sha256": canonical_sha256(completion),
+    }
+    if replay_executed:
+        outcome["replay_completed"] = False
     job = _mapping(task.get("payload"), name="task payload")
-    error = classified_error
     return _finalize_rejected_material(
         {
             "schema_version": TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA,
@@ -1522,17 +1549,7 @@ def _rejected_result_material(
             "shared_observation_stream_id": job["shared_observation_stream_id"],
             "analysis_window_start": job["analysis_window_start"],
             "analysis_window_end": job["analysis_window_end"],
-            "evaluation_outcome": {
-                "schema_version": "temporal_candidate_window_rejection_v1",
-                "disposition": "rejected",
-                "reason_code": _WARMUP_REJECTION_CODE,
-                "replay_executed": False,
-                "worker_attempt_id": completion["attempt_id"],
-                "worker_lease_id": completion["lease_id"],
-                "worker_error": error,
-                "worker_error_sha256": canonical_sha256(error),
-                "worker_completion_sha256": canonical_sha256(completion),
-            },
+            "evaluation_outcome": outcome,
         }
     )
 
@@ -1551,7 +1568,7 @@ def validate_warmup_rejected_candidate_window_result(
     if material.get("task_kind") != TEMPORAL_SEARCH_TASK_KIND:
         raise TemporalSearchContractError("warmup rejection task kind is invalid")
     outcome = _mapping(material.get("evaluation_outcome"), name="warmup rejection outcome")
-    expected_outcome = {
+    expected_common = {
         "schema_version",
         "disposition",
         "reason_code",
@@ -1562,12 +1579,16 @@ def validate_warmup_rejected_candidate_window_result(
         "worker_error_sha256",
         "worker_completion_sha256",
     }
-    if set(outcome) != expected_outcome or (
-        outcome.get("disposition") != "rejected"
-        or outcome.get("reason_code") != _WARMUP_REJECTION_CODE
-        or outcome.get("replay_executed") is not False
-    ):
+    v1 = outcome.get("schema_version") == "temporal_candidate_window_rejection_v1"
+    v2 = outcome.get("schema_version") == "temporal_candidate_window_rejection_v2"
+    expected = expected_common | ({"replay_completed"} if v2 else set())
+    if set(outcome) != expected or outcome.get("disposition") != "rejected":
         raise TemporalSearchContractError("warmup rejection outcome is invalid")
+    if not (
+        (v1 and outcome.get("reason_code") == _WARMUP_REJECTION_CODE and outcome.get("replay_executed") is False)
+        or (v2 and outcome.get("reason_code") == _BREAK_EVEN_REJECTION_CODE and outcome.get("replay_executed") is True and outcome.get("replay_completed") is False)
+    ):
+        raise TemporalSearchContractError("rejection replay execution state is invalid")
     _safe(outcome.get("worker_attempt_id"), name="warmup rejection worker attempt")
     _safe(outcome.get("worker_lease_id"), name="warmup rejection worker lease")
     error = _clone(outcome.get("worker_error"), name="warmup rejection worker error")
@@ -1816,7 +1837,7 @@ def run_temporal_search_tasks(
         }
         if is_warmup_rejected_candidate_window_result(material):
             record["outcome"] = "rejected"
-            record["rejectionCode"] = _WARMUP_REJECTION_CODE
+            record["rejectionCode"] = material["evaluation_outcome"]["reason_code"]
         completed[task_id] = record
         checkpoint["completed"] = completed
         checkpoint["journal"] = list(checkpoint.get("journal") or []) + [
@@ -1838,8 +1859,9 @@ def run_temporal_search_tasks(
                 raise TemporalSearchContractError(
                     "gateway did not acknowledge failed temporal search result"
                 )
-            if _classified_aligned_warmup_failure(failure) is not None:
-                persist(task, _rejected_result_material(task, failure))
+            if _classified_deterministic_rejection(failure) is not None:
+                rejected = _rejected_result_material(task, failure)
+                persist(task, rejected)
                 if progress_callback is not None:
                     progress_callback(
                         {
@@ -1847,7 +1869,7 @@ def run_temporal_search_tasks(
                             "completedTaskCount": len(completed),
                             "taskCount": len(tasks),
                             "outcome": "rejected",
-                            "rejectionCode": _WARMUP_REJECTION_CODE,
+                            "rejectionCode": rejected["evaluation_outcome"]["reason_code"],
                         }
                     )
                 return
@@ -1893,7 +1915,7 @@ def run_temporal_search_tasks(
             json.loads(failure_path.read_text(encoding="utf-8")),
             name="persisted failed worker completion",
         )
-        if _classified_aligned_warmup_failure(failure) is not None:
+        if _classified_deterministic_rejection(failure) is not None:
             persist(task, _rejected_result_material(task, failure))
 
     # Consume a prior delivery before enqueue so restart after materialization is
