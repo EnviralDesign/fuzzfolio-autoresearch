@@ -2444,6 +2444,158 @@ def _complete_rotating_generation_transaction(
     cumulative_path = evidence_root / "cumulative-archive.json"
     ledger_path = evidence_root / "generation-ledger.json"
 
+    completed_paths = (
+        cohort_path,
+        provisional_path,
+        cumulative_path,
+        checkpoint_path,
+        ledger_path,
+        archive_path,
+    )
+    if all(path.is_file() for path in completed_paths):
+        cohort = _canonical_file(cohort_path, name="rotating evaluation cohort")
+        cohort_sha = _identity_payload(
+            cohort, "cohortSha256", name="rotating evaluation cohort"
+        )
+        provisional = _canonical_file(
+            provisional_path, name="rotating provisional survivors"
+        )
+        provisional_sha = _identity_payload(
+            provisional,
+            "provisionalSha256",
+            name="rotating provisional survivors",
+        )
+        cumulative = _canonical_file(
+            cumulative_path, name="cumulative breeder archive"
+        )
+        cumulative_sha = _identity_payload(
+            cumulative, "archiveSha256", name="cumulative breeder archive"
+        )
+        checkpoint = _canonical_file(
+            checkpoint_path, name="rotating generation checkpoint"
+        )
+        checkpoint_sha = _identity_payload(
+            checkpoint,
+            "checkpointSha256",
+            name="rotating generation checkpoint",
+        )
+        ledger = _canonical_file(
+            ledger_path, name="rotating generation ledger"
+        )
+        ledger_sha = _identity_payload(
+            ledger, "ledgerSha256", name="rotating generation ledger"
+        )
+        archive, archive_sha = _load_archive(archive_path)
+        _previous, previous_sha = _load_archive(parent_archive_path)
+        campaigns = ledger.get("campaigns")
+        stage_artifacts = checkpoint.get("stageArtifacts")
+        transaction = archive.get("rotatingEvidenceTransaction")
+        if (
+            cohort.get("generationIndex") != generation_index
+            or cohort.get("rotatingEvidenceSha256")
+            != contract["rotatingEvidenceSha256"]
+            or provisional.get("generationIndex") != generation_index
+            or provisional.get("cohortSha256") != cohort_sha
+            or cumulative.get("generationIndex") != generation_index
+            or cumulative.get("rotatingEvidenceSha256")
+            != contract["rotatingEvidenceSha256"]
+            or checkpoint.get("generationIndex") != generation_index
+            or checkpoint.get("rotatingEvidenceSha256")
+            != contract["rotatingEvidenceSha256"]
+            or checkpoint.get("stage") != "cumulative_archive"
+            or checkpoint.get("cohortSha256") != cohort_sha
+            or checkpoint.get("cumulativeArchiveSha256") != cumulative_sha
+            or not isinstance(stage_artifacts, Mapping)
+            or not isinstance(campaigns, list)
+            or stage_artifacts.get("campaignsSha256")
+            != canonical_sha256(campaigns)
+            or stage_artifacts.get("parentArchiveSha256") != archive_sha
+            or ledger.get("generationIndex") != generation_index
+            or ledger.get("rotatingEvidenceSha256")
+            != contract["rotatingEvidenceSha256"]
+            or ledger.get("cohortSha256") != cohort_sha
+            or ledger.get("provisionalSha256") != provisional_sha
+            or ledger.get("cumulativeArchiveSha256") != cumulative_sha
+            or ledger.get("parentArchiveSha256") != archive_sha
+            or ledger.get("checkpointSha256") != checkpoint_sha
+            or ledger.get("proposalOnlyFunnelReporting") is not True
+            or archive.get("generationIndex") != generation_index
+            or archive.get("previousArchiveSha256") != previous_sha
+            or not isinstance(transaction, Mapping)
+            or transaction.get("cumulativeArchiveSha256") != cumulative_sha
+            or transaction.get("rotatingEvidenceSha256")
+            != contract["rotatingEvidenceSha256"]
+            or transaction.get("requiredPanelIds")
+            != checkpoint.get("requiredPanelIds")
+        ):
+            raise TemporalDiscoveryContractError(
+                "completed rotating generation transaction drifted"
+            )
+        additional_worker_task_count = 0
+        for binding in campaigns:
+            if not isinstance(binding, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "completed rotating campaign binding is invalid"
+                )
+            campaign_root = Path(str(binding.get("campaignRoot") or ""))
+            if binding.get("role") == "proposal_current_panel":
+                if campaign_root.resolve() != proposal_campaign_root.resolve():
+                    raise TemporalDiscoveryContractError(
+                        "completed rotating proposal campaign root drifted"
+                    )
+                continue
+            try:
+                campaign_root.resolve().relative_to(evidence_root.resolve())
+            except ValueError as exc:
+                raise TemporalDiscoveryContractError(
+                    "completed rotating auxiliary campaign escaped its generation"
+                ) from exc
+            campaign = _canonical_file(
+                campaign_root / "campaign.json",
+                name="completed rotating auxiliary campaign",
+            )
+            if campaign.get("campaignSha256") != binding.get("campaignSha256"):
+                raise TemporalDiscoveryContractError(
+                    "completed rotating auxiliary campaign identity drifted"
+                )
+            additional_worker_task_count += int(campaign.get("taskCount") or 0)
+        parent_schedule = transaction.get("parentSchedule")
+        if not isinstance(parent_schedule, Mapping):
+            raise TemporalDiscoveryContractError(
+                "completed rotating parent schedule is missing"
+            )
+        frontier_member_count = sum(
+            member.get("archiveLane") == "rotating_frontier"
+            for cell in archive.get("cells") or []
+            if isinstance(cell, Mapping)
+            for member in cell.get("members") or []
+            if isinstance(member, Mapping)
+        )
+        return {
+            "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
+            "archiveSha256": archive_sha,
+            "parentSchedule": _clone(
+                parent_schedule, name="completed rotating parent schedule"
+            ),
+            "cumulativeArchiveSha256": cumulative_sha,
+            "occupiedCellCount": int(archive["occupiedCellCount"]),
+            "memberCount": int(archive["memberCount"]),
+            "qualityMemberCount": int(archive["qualityMemberCount"]),
+            "frontierMemberCount": int(frontier_member_count),
+            "newCellCount": int(archive["newCellCount"]),
+            "paretoAdmissionCount": int(archive["paretoAdmissionCount"]),
+            "paretoEvictionCount": int(archive["paretoEvictionCount"]),
+            "observationalMemberCount": int(
+                archive["observationalMemberCount"]
+            ),
+            "negativeNoveltyMemberCount": int(
+                archive["negativeNoveltyMemberCount"]
+            ),
+            "rotatingEvidenceLedgerSha256": ledger_sha,
+            "rotatingEvidenceCheckpointSha256": checkpoint_sha,
+            "additionalWorkerTaskCount": additional_worker_task_count,
+        }
+
     projection = load_evaluation_population(
         population_path=proposal_root / "population.json",
         journal_path=proposal_root / "generation-journal.json",
@@ -2859,6 +3011,55 @@ def _complete_rotating_generation_transaction(
             for binding in campaign_bindings
             if binding["role"] != "proposal_current_panel"
         ),
+    }
+
+
+def _g0_generation_record_fields(
+    *,
+    generation_result: Mapping[str, Any],
+    config: Mapping[str, Any],
+    generation_index: int,
+) -> dict[str, Any]:
+    binding = generation_result.get("g0Bootstrap")
+    if binding is None:
+        return {}
+    frozen = config.get("g0Bootstrap")
+    if generation_index != 1 or not isinstance(frozen, Mapping):
+        raise TemporalDiscoveryContractError(
+            "G0 bootstrap result appeared outside its frozen generation-1 boundary"
+        )
+    configured_pool_size = frozen.get("initialConstructionPoolSize")
+    constructed_accepted_count = generation_result.get(
+        "constructedAcceptedCount"
+    )
+    reported_pool_size = generation_result.get("constructionPoolSize")
+    if (
+        isinstance(configured_pool_size, bool)
+        or not isinstance(configured_pool_size, int)
+        or configured_pool_size < 1
+        or isinstance(constructed_accepted_count, bool)
+        or not isinstance(constructed_accepted_count, int)
+        or constructed_accepted_count != configured_pool_size
+        or (
+            reported_pool_size is not None
+            and (
+                isinstance(reported_pool_size, bool)
+                or not isinstance(reported_pool_size, int)
+                or reported_pool_size != configured_pool_size
+            )
+        )
+    ):
+        raise TemporalDiscoveryContractError(
+            "G0 construction counts drifted from the frozen bootstrap authority"
+        )
+    return {
+        "g0Bootstrap": _clone(binding, name="G0 bootstrap result binding"),
+        # Early native-v1 results omitted this redundant top-level value even
+        # though both the frozen construction width and accepted count were
+        # identity-bound.  Reconstruct only after proving those authorities
+        # agree; never guess from the selected evaluation width.
+        "constructionPoolSize": configured_pool_size,
+        "constructedAcceptedCount": constructed_accepted_count,
     }
 
 
@@ -3380,8 +3581,11 @@ def run_qd_supervisor(
                 "journalSha256": journal_sha,
                 "proposalCount": generation_result["proposalCount"],
                 "candidateCount": generation_result["candidateCount"],
-                **({"g0Bootstrap": generation_result["g0Bootstrap"]} if generation_result.get("g0Bootstrap") is not None else {}),
-                **({"constructionPoolSize": generation_result["constructionPoolSize"], "constructedAcceptedCount": generation_result["constructedAcceptedCount"]} if generation_result.get("g0Bootstrap") is not None else {}),
+                **_g0_generation_record_fields(
+                    generation_result=generation_result,
+                    config=config,
+                    generation_index=generation_index,
+                ),
                 "originProposalCounts": generation_result["originProposalCounts"],
                 "originAcceptedCounts": generation_result["originAcceptedCounts"],
                 "campaignSha256": campaign_result["campaignSha256"],

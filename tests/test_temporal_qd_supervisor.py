@@ -46,6 +46,45 @@ def _write(path: Path, value: dict | list) -> None:
     )
 
 
+def test_g0_record_counts_recover_legacy_native_pool_size_only_from_authority() -> None:
+    binding = {
+        "acceptedPoolSha256": "sha256:" + "a" * 64,
+        "constructionPoolIdentitySha256": "sha256:" + "b" * 64,
+        "ledgerSha256": "sha256:" + "c" * 64,
+        "selectionSha256": "sha256:" + "d" * 64,
+    }
+    result = {
+        "g0Bootstrap": binding,
+        "constructedAcceptedCount": 4000,
+    }
+    config = {
+        "g0Bootstrap": {
+            "initialConstructionPoolSize": 4000,
+            "evaluationPopulationSize": 1024,
+        }
+    }
+
+    assert supervisor._g0_generation_record_fields(
+        generation_result=result,
+        config=config,
+        generation_index=1,
+    ) == {
+        "g0Bootstrap": binding,
+        "constructionPoolSize": 4000,
+        "constructedAcceptedCount": 4000,
+    }
+
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="construction counts drifted",
+    ):
+        supervisor._g0_generation_record_fields(
+            generation_result={**result, "constructedAcceptedCount": 3999},
+            config=config,
+            generation_index=1,
+        )
+
+
 def test_completed_generation_counter_uses_total_rotating_worker_tasks(
     tmp_path: Path, monkeypatch
 ) -> None:

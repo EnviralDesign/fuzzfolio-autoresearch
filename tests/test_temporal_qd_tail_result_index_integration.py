@@ -679,6 +679,11 @@ def test_rotating_transaction_legacy_to_indexed_resume_is_exact_and_worker_free(
         archive_path,
     ]
     legacy_bytes = {path: path.read_bytes() for path in transaction_paths}
+    # Remove the completed transaction to exercise a real indexed rebuild;
+    # once all final artifacts exist, the production restart path correctly
+    # reuses them without rebuilding or retaining an in-memory tail index.
+    for path in transaction_paths:
+        path.unlink()
     retained: dict[Path, dict] = {}
     indexed = supervisor._complete_rotating_generation_transaction(
         root=root,
