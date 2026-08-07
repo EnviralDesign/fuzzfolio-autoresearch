@@ -1193,8 +1193,15 @@ mod tests {
         fn hard_link(&self, source: &Path, target: &Path) -> io::Result<()> {
             self.events.borrow_mut().push("publish-link");
             if self.swap_temporary_during_link {
+                // Materialize the attacker's file while the owned temporary
+                // still exists, then rename it into place.  Creating the
+                // replacement only after unlinking the temporary lets Unix
+                // filesystems immediately reuse the same inode and makes the
+                // injected swap indistinguishable from the owned file.
+                let replacement = source.with_extension("unknown-replacement");
+                fs::write(&replacement, b"unknown temporary")?;
                 fs::remove_file(source)?;
-                fs::write(source, b"unknown temporary")?;
+                fs::rename(replacement, source)?;
                 return Err(io::Error::other("injected temporary swap"));
             }
             if self.swap_target_during_link {
