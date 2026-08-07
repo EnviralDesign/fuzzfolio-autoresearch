@@ -466,6 +466,49 @@ def test_indexed_provenance_refuses_extra_candidate_coverage(
         )
 
 
+def test_indexed_and_raw_provenance_accept_admitted_candidate_subset(
+    tmp_path: Path,
+) -> None:
+    (
+        _campaign_root,
+        result_root,
+        authority,
+        manifest,
+        checkpoint,
+        candidates,
+        panel,
+    ) = _campaign_fixture(tmp_path, candidate_count=2, window_count=2)
+    index = tail_index.build_tail_result_index(
+        result_root=result_root,
+        authority=authority,
+        task_manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    admitted_id = sorted(candidates)[0]
+    admitted = {admitted_id: candidates[admitted_id]}
+
+    raw_evidence = load_provenance_bound_window_evidence(
+        result_root=result_root,
+        task_manifest=manifest,
+        checkpoint=checkpoint,
+        panel=panel,
+        candidates=admitted,
+    )
+    indexed_evidence = load_provenance_bound_window_evidence(
+        result_root=result_root,
+        task_manifest=manifest,
+        checkpoint=checkpoint,
+        panel=panel,
+        candidates=admitted,
+        tail_result_index=index,
+    )
+
+    assert set(raw_evidence) == {admitted_id}
+    assert canonical_json_bytes(indexed_evidence) == canonical_json_bytes(
+        raw_evidence
+    )
+
+
 def test_indexed_funnel_matches_raw_without_a_second_result_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

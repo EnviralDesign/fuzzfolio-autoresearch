@@ -1336,6 +1336,12 @@ def load_indexed_provenance_bound_window_evidence(
         task = entry["task"]
         candidate_id = str(task["candidateId"])
         candidate = candidates.get(candidate_id)
+        if candidate is None:
+            # Archive eligibility may deliberately narrow a completed task
+            # matrix (for example, after a structural execution invariant is
+            # detected).  The index itself has already verified every entry;
+            # only project evidence for the caller's admitted candidate set.
+            continue
         if not isinstance(candidate, Mapping):
             raise TemporalQDTailResultIndexError(
                 "indexed rotating evidence candidate provenance mismatch"

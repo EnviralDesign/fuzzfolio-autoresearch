@@ -570,8 +570,14 @@ def load_provenance_bound_window_evidence(
             raise TemporalDiscoveryContractError("rotating evidence task record is invalid")
         candidate_id = str(payload.get("candidate_id") or "")
         candidate = candidates.get(candidate_id)
-        if candidate is None or record.get("candidateId") != candidate_id:
+        if record.get("candidateId") != candidate_id:
             raise TemporalDiscoveryContractError("rotating evidence candidate provenance mismatch")
+        if candidate is None:
+            # The requested evidence population may be a strict, explicit
+            # subset of the completed matrix after archive eligibility
+            # filtering.  Preserve task/checkpoint provenance validation while
+            # omitting candidates which cannot receive breeding rights.
+            continue
         raw_path = record.get("resultPath")
         if not isinstance(raw_path, str):
             raise TemporalDiscoveryContractError("rotating evidence result path is missing")
