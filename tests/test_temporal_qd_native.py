@@ -210,7 +210,7 @@ def test_native_prelaunch_resource_guard_binds_memory_and_output_volume(
     )
     assert admitted == {
         "hostAvailableBytes": 64 * 1024**3,
-        "minimumHostAvailableBytes": 12 * 1024**3,
+        "minimumHostAvailableBytes": 1 * 1024**3,
         "outputFreeBytes": 256 * 1024**3,
         "requiredOutputFreeBytes": 4 * 1024**3 + 4000 * 8 * 1024**2,
         "targetUniqueCandidates": 4000,
@@ -219,7 +219,7 @@ def test_native_prelaunch_resource_guard_binds_memory_and_output_volume(
     monkeypatch.setattr(
         native.psutil,
         "virtual_memory",
-        lambda: SimpleNamespace(available=11 * 1024**3),
+        lambda: SimpleNamespace(available=512 * 1024**2),
     )
     with pytest.raises(
         native.TemporalQDNativeError,
