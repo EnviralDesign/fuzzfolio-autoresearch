@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -152,6 +153,10 @@ def _write_completed_root(root: Path) -> dict[str, Any]:
     }
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="the committed runtime oracle freezes Windows Dashboard authority paths",
+)
 def test_default_shape_one_uses_injected_native_runner_and_writes_self_hashed_report(
     tmp_path: Path,
 ) -> None:

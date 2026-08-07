@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -19,7 +20,9 @@ from autoresearch.temporal_discovery_validation import (
 )
 
 
-TRADING_DASHBOARD = Path(r"C:\repos\Trading-Dashboard")
+TRADING_DASHBOARD = Path(
+    os.environ.get("FUZZFOLIO_DASHBOARD_ROOT", r"C:\repos\Trading-Dashboard")
+)
 VALIDATOR_SCRIPT = TRADING_DASHBOARD / "scripts" / "temporal_search_validate_candidate.py"
 CORE_TEST = (
     TRADING_DASHBOARD
@@ -157,6 +160,8 @@ for line in sys.stdin:
 def test_persistent_validator_reuses_real_server_and_matches_one_shot_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if not CORE_TEST.is_file() or not CORE_PYTHON.is_file():
+        pytest.skip("a live Dashboard checkout is required for validator integration")
     profile = _valid_profile()
     raw_sha = _sha(profile)
     with _real_validator(monkeypatch) as persistent:

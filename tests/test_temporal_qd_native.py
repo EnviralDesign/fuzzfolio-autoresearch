@@ -582,6 +582,10 @@ def test_generation_result_unwrap_preserves_existing_inner_shape(tmp_path: Path)
     assert checked["pairGenerationResult"] == inner
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="the committed runtime oracle freezes Windows Dashboard authority paths",
+)
 def test_qd_batch_progress_injects_path_inputs_and_repairs_caller_ledger(
     tmp_path: Path,
 ) -> None:
@@ -892,8 +896,10 @@ def test_owned_temp_cleanup_refuses_a_swapped_unknown_file(
 
     def adversarial_link(source: Path, _destination: Path) -> None:
         nonlocal swapped_temporary
+        replacement = tmp_path / "attacker-replacement.tmp"
+        replacement.write_bytes(b"unknown-file")
         source.unlink()
-        source.write_bytes(b"unknown-file")
+        replacement.replace(source)
         swapped_temporary = source
         raise OSError("injected link failure after temp swap")
 

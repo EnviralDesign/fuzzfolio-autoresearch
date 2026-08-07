@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -247,8 +248,12 @@ def test_hold_plans_are_frozen_finite_native_choices_and_skip_noops() -> None:
 
 
 def test_hold_mutations_are_admitted_by_dashboard_native_management_validator() -> None:
-    dashboard_root = Path("C:/repos/Trading-Dashboard")
+    dashboard_root = Path(
+        os.environ.get("FUZZFOLIO_DASHBOARD_ROOT", "C:/repos/Trading-Dashboard")
+    )
     fixture = dashboard_root / "shared/python/fuzzfolio_core/tests/test_temporal_search_candidate_validation.py"
+    if not fixture.is_file():
+        pytest.skip("a live Dashboard checkout is required for native management admission")
     tree = ast.parse(fixture.read_text(encoding="utf-8"))
     functions = [
         node for node in tree.body
