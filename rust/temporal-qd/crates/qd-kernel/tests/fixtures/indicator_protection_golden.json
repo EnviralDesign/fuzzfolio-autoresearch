@@ -1,0 +1,13 @@
+{
+  "applicationSha256": "sha256:4fa8ecf16a111dae028da4daa36c374f22e17117f9efcc6361908ea1c400d434",
+  "childSha256": "sha256:7ec8cc787ac7fb104af87b4b0da23c5a917345fc02fd3f39036c207319f3fb7c",
+  "indicator": {
+    "catalogSha256": "sha256:c2192575d6518591407917426897513820e5d34347a60ca0760dba97f4ddb4c4",
+    "firstPlanSha256": "sha256:6c93a90c6e2beefafc2782b78166eb770d596700ba0f64a8d042ea6574473cc4",
+    "lastPlanSha256": "sha256:da6ed5e5d1ee384975ab1777dc877ec68f3051c763fba2dc2400b814d32f0c79",
+    "planCount": 2
+  },
+  "firstPlanSha256": "sha256:06469fea7b5a3c1a1cf92f7725c0fe5f7e362322d46cd4001ebab6d6ad7711f5",
+  "lastPlanSha256": "sha256:ffc64685afe6d3d65c6f032c8b1ed3487c4b74969cea1e95438015f52ee7a7e4",
+  "planCount": 41
+}

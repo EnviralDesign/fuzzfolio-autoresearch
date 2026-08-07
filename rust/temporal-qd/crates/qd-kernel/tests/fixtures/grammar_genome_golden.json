@@ -1,0 +1,22 @@
+{
+  "source": "autoresearch.temporal_typed_motif_grammar + temporal_bidirectional_genome",
+  "program": {
+    "direction": "long",
+    "fragments": [
+      {"choices": {"threshold": 35.0}, "productionId": "arm_level", "resources": {"group": "g_breakout"}},
+      {"choices": {"age": 0}, "productionId": "gate_event_window", "resources": {"event": "e_breakout"}},
+      {"choices": {"threshold": 45.0}, "productionId": "enter_on_level_and_event", "resources": {"event": "e_breakout", "group": "g_breakout", "plan": "base"}},
+      {"choices": {"bars": 5}, "productionId": "exit_on_age", "resources": {}}
+    ],
+    "grammarVersion": "3",
+    "schemaVersion": "temporal_typed_fragment_grammar_v2"
+  },
+  "programSha256": "sha256:1de0dc5d173342fe9f1a8a50cd10b6e461f3a27146d1e1c5582d646d599ec484",
+  "profileSha256": "sha256:e58b05fca8c7a082b2845e217e381d8ee62d9d6c9ef35a69bbfa8f1e8d7bb351",
+  "graphSha256": "sha256:9f7a1202bd99c88f3ba51bca2f09bd5ae1f997cad70ab7d4dc230ef6f1d38a70",
+  "moduleIdentitySha256": "sha256:7be74694a9879ca880bdae4c29f4b2a1870684341ed66e491c8d64668c8b8464",
+  "pairIdentitySha256": "sha256:81b2ac121e284eda09f3aefb18b78ea0d795d0f38e5c39460193a13c1466ceb6",
+  "holdMarketBarsSha256": "sha256:7bd1f5d644185903fdd2d653a0909e65c96dc34b8e74246267e8d2a0a50c45e4",
+  "proposalSides": {"42": "long", "golden": "long", "proposal-42": "long"},
+  "operationCount": 57
+}

@@ -1,0 +1,17 @@
+[package]
+name = "temporal-qd-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-kernel = { path = "../qd-kernel" }
+temporal-qd-dashboard-jsonl = { path = "../qd-dashboard-jsonl" }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+num-bigint = "0.4"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing", "formatting"] }

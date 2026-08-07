@@ -61,3 +61,6 @@ wheels/
 # Generated native temporal verification evidence
 /temporal-stage4-verification/
 /temporal-stage5b-distributed-verification/
+# Native Temporal QD build outputs (source and Cargo.lock remain tracked).
+/rust/temporal-qd/target/
+/rust/temporal-qd/**/target/

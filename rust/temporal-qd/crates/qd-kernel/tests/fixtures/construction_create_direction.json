@@ -1,0 +1,9 @@
+{
+  "version": "v2", "name": "Generator v3 management create and direction fixture", "description": "Repository-only valid parent for plan creation and direction change.", "instruments": ["EURUSD"], "directionMode": "long", "isActive": false, "indicators": [],
+  "executionConfig": {"managementLibrary": {"version": "temporal_management_v1", "defaultPlanId": "core_plan", "plans": [{"id": "core_plan", "initialStop": {"kind": "fixed_percent", "percent": 1.0}, "initialTarget": {"kind": "reward_multiple", "multiple": 2.0}}]}},
+  "graph": {"kind": "temporal_graph_v1", "semanticPolicy": "temporal_graph_semantics_v1", "eventSchema": "temporal_event_v1", "factLibrary": "temporal_market_facts_v1", "guardLibrary": "temporal_guards_v1", "actionLibrary": "temporal_market_actions_v1", "clockRequirement": "clock.completed_bar", "fidelityRequirements": ["data.completed_ohlc"], "initialStateId": "flat", "states": [{"id": "flat"}, {"id": "entry_requested"}, {"id": "open"}, {"id": "done"}], "evidenceGroups": [], "eventBindings": [], "transitions": [
+    {"id": "flat_to_entry", "sourceStateId": "flat", "destinationStateId": "entry_requested", "eventClass": "decision", "priority": 10, "guard": {"kind": "position_exists", "expected": false}, "actions": [{"kind": "enter_next_open", "managementPlanId": "core_plan"}], "reasonCode": "enter"},
+    {"id": "entry_filled", "sourceStateId": "entry_requested", "destinationStateId": "open", "eventClass": "execution", "priority": 10, "guard": {"kind": "execution_status_is", "status": "filled"}, "actions": [], "reasonCode": "filled"},
+    {"id": "open_closed", "sourceStateId": "open", "destinationStateId": "done", "eventClass": "execution", "priority": 10, "guard": {"kind": "execution_status_is", "status": "closed"}, "actions": [], "reasonCode": "closed"}
+  ]}
+}

@@ -8,7 +8,10 @@ import sys
 
 import pytest
 
-from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+from autoresearch.temporal_discovery_base import (
+    TemporalDiscoveryContractError,
+    TemporalDiscoveryInfrastructureError,
+)
 from autoresearch.temporal_discovery_validation import (
     DashboardBidirectionalPairCompiler,
     SubprocessCandidateValidator,
@@ -204,7 +207,7 @@ def test_persistent_validator_fails_closed_on_bad_server_responses(
         timeout_seconds=1,
         persistent_max_line_bytes=1024,
     )
-    with pytest.raises(TemporalDiscoveryContractError, match=match):
+    with pytest.raises(TemporalDiscoveryInfrastructureError, match=match):
         validator.validate(
             candidate_id=candidate_id,
             source_profile={"fixture": candidate_id},

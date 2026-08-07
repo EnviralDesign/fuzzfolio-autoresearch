@@ -197,11 +197,11 @@ class _PersistentJsonlValidator:
                 except OSError:
                     pass
 
-    def _fail(self, message: str) -> TemporalDiscoveryContractError:
+    def _fail(self, message: str) -> TemporalDiscoveryInfrastructureError:
         stderr = self._stderr_summary()
         self.close()
         suffix = f"; stderr={stderr!r}" if stderr else ""
-        return TemporalDiscoveryContractError(message + suffix)
+        return TemporalDiscoveryInfrastructureError(message + suffix)
 
     def validate(
         self,

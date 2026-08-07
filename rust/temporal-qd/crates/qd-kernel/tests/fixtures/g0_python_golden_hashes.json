@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "temporal_qd_g0_rust_hash_fixture_v1",
+  "producer": "autoresearch.temporal_qd_g0_bootstrap Python oracle",
+  "defaultPolicySha256": "sha256:cd9ffa18a7f7aede3e81007e482c2c79a98c2249bdd7a86acf1a97d1c4a2ab85",
+  "singleReference": {
+    "constructionPoolIdentitySha256": "sha256:16243f336a96b1e2af311eb3f17105f5987ffdc1b24b4b3ee705130f274cab45",
+    "referenceSha256": "sha256:4e4d28dfcc24f5d8f89504543ab997395084aadf72ab3e6a9e4ca680cb670237",
+    "acceptedPoolSha256": "sha256:2481d32b80c02bb83ae85f28ab24c162d7a51ef381e5f1af04d5674c43d7d776",
+    "ledgerSha256": "sha256:8c1f8a953562cca15de9f19979aae1801740d4c74cb2eb3debb105ea07360e86",
+    "selectionSha256": "sha256:f633446766f67c1342044be863f6b678530195b87edbfa4abfb4cb83a525a230"
+  }
+}

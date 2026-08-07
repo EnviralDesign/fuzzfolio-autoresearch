@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import autoresearch.temporal_qd_evolution as qd
 import autoresearch.temporal_qd_pair_generation as pair_generation
+import autoresearch.temporal_qd_native as native
 from autoresearch.temporal_discovery_base import canonical_sha256
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 import pytest
@@ -63,6 +64,112 @@ def test_live_pair_generation_forwards_the_validated_qd_parent_archive(tmp_path,
     assert seen["parent_archive"] is archive
     assert seen["identity_ledger_path"] == tmp_path / "out" / "identity-ledger.json"
     assert seen["max_proposal_attempts"] == qd.DEFAULT_QD_PARAMETERS["maxProposalAttempts"]
+
+
+def test_native_pair_selection_precomputes_config_and_never_falls_back(
+    tmp_path, monkeypatch
+) -> None:
+    archive = {"cells": [], "archiveSha256": "sha256:" + "a" * 64}
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": {"fixture": True},
+        "policySha256": "sha256:" + "b" * 64,
+    }
+
+    def forbidden_archive_load(*_args, **_kwargs):
+        pytest.fail("native generation must not load or materialize the parent archive")
+
+    def forbidden_pair_materialization(_cls, *_args, **_kwargs):
+        pytest.fail("native generation must not materialize FrozenPair parents in Python")
+
+    monkeypatch.setattr(qd, "_load_archive", forbidden_archive_load)
+    monkeypatch.setattr(
+        qd.FrozenPair,
+        "from_payload",
+        classmethod(forbidden_pair_materialization),
+    )
+    monkeypatch.setattr(qd, "_bidirectional_pair_policy", lambda _: policy)
+    monkeypatch.setattr(
+        qd,
+        "_load_identity_ledger",
+        lambda _path: {"ledgerSha256": "sha256:" + "c" * 64},
+    )
+    python_calls = 0
+
+    def python_population(**_kwargs):
+        nonlocal python_calls
+        python_calls += 1
+        return {"completed": True}
+
+    seen = {}
+
+    def native_generation(**kwargs):
+        seen.update(kwargs)
+        raise native.TemporalQDNativeError("injected native failure")
+
+    monkeypatch.setattr(pair_generation, "generate_pair_population", python_population)
+    monkeypatch.setattr(qd, "run_native_generation", native_generation)
+    pair_run_config = {
+        "pairRunConfigSha256": canonical_sha256({}),
+    }
+    parent_schedule = _rotating_schedule_archive(
+        parent_count=1, breeder_width=1
+    )["rotatingEvidenceTransaction"]["parentSchedule"]
+    with pytest.raises(TemporalDiscoveryContractError, match="injected native failure"):
+        qd.generate_qd_generation(
+            parent_archive_path=tmp_path / "parent.json",
+            parent_archive_sha256=archive["archiveSha256"],
+            parent_schedule=parent_schedule,
+            output_root=tmp_path / "out",
+            generation_index=1,
+            parameters={**qd.DEFAULT_QD_PARAMETERS, "targetUniqueCandidates": 1},
+            bidirectional_pair_run_config=pair_run_config,
+            qd_publication_authority={
+                "qdVersion": qd.QD_VERSION,
+                "policyName": qd.QD_POLICY_NAME,
+                "policySha256": qd.QD_POLICY_SHA256,
+                "frozenPolicy": qd.QD_POLICY,
+            },
+            bidirectional_pair_policy=policy,
+            bidirectional_operator_implementation_identity={"fixture": True},
+        )
+
+    assert python_calls == 0
+    assert seen["native_execution_timeout_seconds"] == 3600
+    config = seen["generation_config"]
+    assert config["parentSchedule"] == parent_schedule
+    assert seen["runtime_authority"]["pairGenerationConfigSha256"] == config[
+        "configSha256"
+    ]
+    assert seen["parent_archive_sha256"] == archive["archiveSha256"]
+
+
+def test_native_pair_selection_requires_prevalidated_parent_archive_identity(
+    tmp_path,
+) -> None:
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": {"fixture": True},
+        "policySha256": "sha256:" + "b" * 64,
+    }
+    runtime = native.build_pair_generation_runtime_config(
+        engine=native.PAIR_GENERATION_RUNTIME_RUST,
+    )
+
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="native QD parent archive identity",
+    ):
+        qd.generate_qd_generation(
+            parent_archive_path=tmp_path / "parent.json",
+            output_root=tmp_path / "out",
+            generation_index=1,
+            parameters={**qd.DEFAULT_QD_PARAMETERS, "targetUniqueCandidates": 1},
+            pair_generation_runtime=runtime,
+            bidirectional_pair_policy=policy,
+        )
 
 
 def test_legacy_parent_archive_keeps_exact_four_to_one_origin_schedule() -> None:

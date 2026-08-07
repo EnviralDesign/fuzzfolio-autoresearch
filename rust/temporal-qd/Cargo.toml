@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/qd-contract",
+    "crates/qd-kernel",
+    "crates/qd-dashboard-jsonl",
+    "crates/qd-runtime",
+    "crates/qd-batch",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+ryu = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"

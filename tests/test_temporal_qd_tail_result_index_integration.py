@@ -695,6 +695,9 @@ def test_post_save_validation_receives_the_live_indexed_tail_cache(
     worker_contract = "sha256:" + "a" * 64
     config = {
         "configSha256": canonical_sha256({"postSave": "fixture"}),
+        "initialArchive": {
+            "archiveSha256": canonical_sha256({"initialArchive": "fixture"})
+        },
         "generationPlan": {
             "firstGenerationIndex": 1,
             "lastGenerationIndex": 1,
@@ -708,8 +711,11 @@ def test_post_save_validation_receives_the_live_indexed_tail_cache(
             "enqueueBatchSize": 1,
         },
         "repositories": {"executionEngineCommit": "b" * 40},
+        "qdVersion": supervisor.QD_VERSION,
+        "policyName": supervisor.QD_POLICY_NAME,
         "workerContractSha256": worker_contract,
         "policySha256": supervisor.QD_POLICY_SHA256,
+        "frozenPolicy": supervisor.QD_POLICY,
         "validator": {"timeoutSeconds": 1.0},
         "frozenSearchPolicy": {},
         "broadAdmission": False,
@@ -919,6 +925,9 @@ def test_indexed_post_save_validation_avoids_historical_raw_reopens(
     }
     config = {
         "configSha256": canonical_sha256({"postSave": "two-generation"}),
+        "initialArchive": {
+            "archiveSha256": canonical_sha256({"initialArchive": "fixture"})
+        },
         "generationPlan": {
             "firstGenerationIndex": 1,
             "lastGenerationIndex": 2,
@@ -932,8 +941,11 @@ def test_indexed_post_save_validation_avoids_historical_raw_reopens(
             "enqueueBatchSize": 1,
         },
         "repositories": {"executionEngineCommit": "b" * 40},
+        "qdVersion": supervisor.QD_VERSION,
+        "policyName": supervisor.QD_POLICY_NAME,
         "workerContractSha256": worker_contract,
         "policySha256": supervisor.QD_POLICY_SHA256,
+        "frozenPolicy": supervisor.QD_POLICY,
         "validator": {"timeoutSeconds": 1.0},
         "frozenSearchPolicy": {},
         "broadAdmission": False,

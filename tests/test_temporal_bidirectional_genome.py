@@ -42,7 +42,10 @@ from autoresearch.temporal_qd_pair_generation import _propose_crossover
 from autoresearch.temporal_qd_pair_generation import _propose_pair_sequence
 from autoresearch.temporal_qd_pair_generation import _mutation_depth_from_bucket
 from autoresearch.temporal_qd_pair_generation import _explicit_parent_draw_count
-from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+from autoresearch.temporal_discovery_base import (
+    TemporalDiscoveryContractError,
+    TemporalDiscoveryInfrastructureError,
+)
 from autoresearch.temporal_discovery_validation import DashboardV2ModuleValidator, SubprocessCandidateValidator
 
 
@@ -387,6 +390,18 @@ class _RejectingCrossoverPairOps(_PairOps):
         raise TemporalDiscoveryContractError("expected test crossover rejection")
 
 
+class _InfrastructureFailingPairOps(_PairOps):
+    """Model a dead external authority, which must never become evidence."""
+
+    def apply_grammar(self, module: FrozenModule, plan, *, candidate_id: str):
+        del module, plan, candidate_id
+        raise TemporalDiscoveryInfrastructureError("validator transport died")
+
+    def compile_program(self, template: FrozenModule, program, *, candidate_id: str):
+        del template, program, candidate_id
+        raise TemporalDiscoveryInfrastructureError("compiler transport died")
+
+
 class _MaterializingCrossoverPairOps(_PairOps):
     def compile_program(self, template: FrozenModule, program, *, candidate_id: str):
         del program, candidate_id
@@ -499,6 +514,43 @@ def test_pair_generation_immigrant_side_mutation_replay_and_no_eligible_are_exac
         native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(),
     )
     assert none is None and no_entry["disposition"] == "no_eligible_side_operation"
+
+
+def test_pair_generation_propagates_infrastructure_failures_instead_of_rejecting() -> None:
+    parent = _pair()
+    side = proposal_side("infrastructure-mutation")
+    with pytest.raises(
+        TemporalDiscoveryInfrastructureError, match="validator transport died"
+    ):
+        propose_pair(
+            proposal_seed="infrastructure-mutation",
+            parent=parent,
+            pair_factory=None,
+            module_authority=_InfrastructureFailingPairOps(),
+            native_validator=FakeNativeValidator(),
+            pair_compiler=FakePairCompiler(),
+            replay_operation={
+                "kind": "typed_grammar",
+                "plan": {"op": "grammar", "side": side},
+            },
+        )
+
+    with pytest.raises(
+        TemporalDiscoveryInfrastructureError, match="compiler transport died"
+    ):
+        _propose_crossover(
+            proposal_seed="infrastructure-crossover",
+            parent=parent,
+            mate=_pair(
+                _module("long", marker="second"),
+                _module("short", marker="second"),
+            ),
+            module_authority=_InfrastructureFailingPairOps(),
+            pair_compiler=FakePairCompiler(),
+            parent_selection=None,
+            mate_selection=None,
+            mate_selection_attempts=[],
+        )
 
 
 def test_pair_generation_same_side_crossover_never_crosses_modules() -> None:
@@ -697,13 +749,26 @@ def test_pair_mutation_depth_buckets_prove_exact_frozen_70_25_5_schedule() -> No
     assert {depth: depths.count(depth) for depth in (1, 2, 3)} == {1: 14, 2: 5, 3: 1}
 
 
-def test_archive_parent_selection_resume_matches_uninterrupted_across_crossover(tmp_path) -> None:
+@pytest.mark.parametrize("implementation", ["legacy", "optimized"])
+def test_single_cell_multi_parent_archive_schedules_restart_exact_crossover(
+    tmp_path, implementation
+) -> None:
     first, second = _pair(_module("long", marker="first"), _module("short", marker="first")), _pair(_module("long", marker="second"), _module("short", marker="second"))
     def member(pair, candidate_id):
         return {"candidateId": candidate_id, "candidate": {"candidateId": candidate_id, "bidirectionalGenome": pair.canonical_payload()}, "archiveLane": "quality", "finiteDataValidity": {"isFiniteData": True, "passesSupportGate": True, "validForQuality": True}, "objectives": {"worstWindowConservativeNetR": 1.0, "maximumDrawdownR": 1.0, "structuralComplexity": 1.0}, "paretoFront": 0, "crowdingDistance": 1.0}
-    archive = {"cells": [{"cellId": "cell-a", "members": [member(first, "archive-a")]}, {"cellId": "cell-b", "members": [member(second, "archive-b")]}]}
+    archive = {
+        "cells": [
+            {
+                "cellId": "cell-a",
+                "members": [
+                    member(first, "archive-a"),
+                    member(second, "archive-b"),
+                ],
+            }
+        ]
+    }
     policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": first.pair_compiler.canonical_payload()}
-    common = dict(generation_index=1, target_unique_candidates=100, run_config={"seed": "archive-resume"}, pair_policy=policy, parent_archive=archive, pair_factory=_PairFactory(), module_authority=_PairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"})
+    common = dict(generation_index=1, target_unique_candidates=100, run_config={"seed": "archive-resume"}, pair_policy=policy, parent_archive=archive, pair_factory=_PairFactory(), module_authority=_PairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"}, implementation=implementation)
     generate_pair_population(output_root=tmp_path / "split", max_new_proposals=7, **common)
     generate_pair_population(output_root=tmp_path / "split", max_new_proposals=7, **common)
     generate_pair_population(output_root=tmp_path / "full", max_new_proposals=14, **common)

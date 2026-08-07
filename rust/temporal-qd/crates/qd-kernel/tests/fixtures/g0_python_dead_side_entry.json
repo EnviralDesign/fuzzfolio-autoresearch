@@ -1,0 +1,2018 @@
+{
+  "candidate": {
+    "activationAwareRepairs": [],
+    "bidirectionalGenome": {
+      "identities": {
+        "pairIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+        "profileSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+        "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+        "rawPairSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+        "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+      },
+      "long": {
+        "catalog": {
+          "kind": "catalog",
+          "payload": {
+            "catalog": {
+              "indicators": [
+                {
+                  "implementation": "RSI_IMPL",
+                  "meta": {
+                    "id": "RSI_IMPL"
+                  }
+                },
+                {
+                  "implementation": "RSI_IMPL_EVENT",
+                  "meta": {
+                    "id": "RSI_IMPL_EVENT"
+                  }
+                }
+              ]
+            },
+            "catalogSha256": "sha256:c9a000f878ae734dda1b840b50a62c074ddc7d7e4e7a4987ee9740a63eb561ab"
+          },
+          "schemaVersion": "catalog_v1",
+          "sha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878"
+        },
+        "direction": "long",
+        "grammarContext": {
+          "kind": "grammarContext",
+          "payload": {
+            "context": "fixture"
+          },
+          "schemaVersion": "grammarContext_v1",
+          "sha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158"
+        },
+        "identities": {
+          "moduleIdentitySha256": "sha256:12237b4479894c33679002c8e54c29882806622bdad9171df89414fc991b1c32",
+          "nativeProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+          "nativeSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+          "nativeValidationReportSha256": "sha256:bdec68de36f81761e65f358f40b8b086c0ba573cb0af92c30cafd84a6d38062d",
+          "profileSha256": "sha256:38859c0220e95574cf0eed83730cd6fb5c1c6a41799740ca36d2a367efdb3231",
+          "programSha256": "sha256:4972955072ce934799f585af4280c27986b1df1fb53fe0997b3cea495e8ef312"
+        },
+        "lineage": [],
+        "nativeAuthority": {
+          "kind": "nativeAuthority",
+          "payload": {
+            "authority": "fixture"
+          },
+          "schemaVersion": "nativeAuthority_v1",
+          "sha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85"
+        },
+        "nativeReport": {
+          "candidateAcceptable": true,
+          "candidateId": "module-1-long",
+          "profileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+          "programSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+          "rawSourceProfileSha256": "sha256:38859c0220e95574cf0eed83730cd6fb5c1c6a41799740ca36d2a367efdb3231",
+          "schemaVersion": "temporal_search_candidate_validation_v1",
+          "status": "valid_evaluable",
+          "validationReportSha256": "sha256:bdec68de36f81761e65f358f40b8b086c0ba573cb0af92c30cafd84a6d38062d"
+        },
+        "policy": {
+          "kind": "policy",
+          "payload": {
+            "policy": "fixture"
+          },
+          "schemaVersion": "policy_v1",
+          "sha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+        },
+        "profile": {
+          "directionMode": "long",
+          "executionConfig": {
+            "managementLibrary": {
+              "defaultPlanId": "base",
+              "plans": [
+                {
+                  "holdPolicy": {
+                    "bars": 8,
+                    "kind": "market_bars"
+                  },
+                  "id": "base",
+                  "initialStop": {
+                    "kind": "fixed_percent",
+                    "percent": 1.0
+                  },
+                  "initialTarget": {
+                    "kind": "reward_multiple",
+                    "multiple": 2.0
+                  }
+                }
+              ]
+            }
+          },
+          "graph": {
+            "eventBindings": [],
+            "evidenceGroups": [],
+            "states": [
+              {
+                "id": "rust-dead-manifest_ready"
+              }
+            ],
+            "transitions": []
+          },
+          "indicators": [
+            {
+              "config": {},
+              "meta": {
+                "baseIndicatorId": "RSI",
+                "id": "RSI_IMPL",
+                "instanceId": "rust-dead-manifest_long_setup"
+              }
+            },
+            {
+              "config": {},
+              "meta": {
+                "id": "RSI_IMPL_EVENT",
+                "instanceId": "rust-dead-manifest_long_trigger"
+              }
+            }
+          ],
+          "name": "rust-dead-manifest_long",
+          "version": "v2"
+        },
+        "program": {
+          "direction": "long",
+          "fragments": [],
+          "grammarVersion": "3",
+          "schemaVersion": "temporal_typed_fragment_grammar_v2"
+        },
+        "schemaVersion": "temporal_bidirectional_module_snapshot_v1"
+      },
+      "pairCompiler": {
+        "kind": "pairCompiler",
+        "payload": {
+          "compiler": "g0-fixture",
+          "mode": "live"
+        },
+        "schemaVersion": "pairCompiler_v1",
+        "sha256": "sha256:260fe07d08e8eaa6a6166b0a5b70c15331f52963cac1d8268d486656ebe01379"
+      },
+      "profile": {
+        "directionMode": "both",
+        "executionConfig": {
+          "managementLibrary": {
+            "defaultPlanId": "long_base",
+            "plans": [
+              {
+                "holdPolicy": {
+                  "bars": 8,
+                  "kind": "market_bars"
+                },
+                "id": "long_base",
+                "initialStop": {
+                  "kind": "fixed_percent",
+                  "percent": 1.0
+                },
+                "initialTarget": {
+                  "kind": "reward_multiple",
+                  "multiple": 2.0
+                }
+              },
+              {
+                "holdPolicy": {
+                  "bars": 8,
+                  "kind": "market_bars"
+                },
+                "id": "short_base",
+                "initialStop": {
+                  "kind": "fixed_percent",
+                  "percent": 1.0
+                },
+                "initialTarget": {
+                  "kind": "reward_multiple",
+                  "multiple": 2.0
+                }
+              }
+            ]
+          }
+        },
+        "graph": {
+          "entryArbitration": {
+            "modules": [
+              {
+                "direction": "long",
+                "eventBindingIds": [
+                  "long_event"
+                ],
+                "evidenceGroupIds": [
+                  "long_group"
+                ],
+                "id": "opaque-long",
+                "indicatorIds": [
+                  "rust-dead-manifest_long_setup",
+                  "rust-dead-manifest_long_trigger"
+                ],
+                "sourceProfileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+                "sourceProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+                "stateIds": [
+                  "long_watch",
+                  "long_pending",
+                  "long_open"
+                ],
+                "transitionIds": [
+                  "long_arm",
+                  "long_fill",
+                  "long_exit"
+                ]
+              },
+              {
+                "direction": "short",
+                "eventBindingIds": [
+                  "short_event"
+                ],
+                "evidenceGroupIds": [
+                  "short_group"
+                ],
+                "id": "opaque-short",
+                "indicatorIds": [
+                  "rust-dead-manifest_short_setup",
+                  "rust-dead-manifest_short_trigger"
+                ],
+                "sourceProfileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+                "sourceProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+                "stateIds": [
+                  "short_watch",
+                  "short_pending",
+                  "short_open"
+                ],
+                "transitionIds": [
+                  "short_arm",
+                  "short_enter",
+                  "short_fill",
+                  "short_exit"
+                ]
+              }
+            ]
+          },
+          "eventBindings": [
+            {
+              "id": "long_event",
+              "indicatorInstanceId": "rust-dead-manifest_long_trigger",
+              "longOutput": "bullish",
+              "shortOutput": "bearish"
+            },
+            {
+              "id": "short_event",
+              "indicatorInstanceId": "rust-dead-manifest_short_trigger",
+              "longOutput": "bullish",
+              "shortOutput": "bearish"
+            }
+          ],
+          "evidenceGroups": [
+            {
+              "id": "long_group",
+              "indicatorInstanceIds": [
+                "rust-dead-manifest_long_setup"
+              ]
+            },
+            {
+              "id": "short_group",
+              "indicatorInstanceIds": [
+                "rust-dead-manifest_short_setup"
+              ]
+            }
+          ],
+          "initialStateId": "flat",
+          "states": [
+            {
+              "id": "flat"
+            },
+            {
+              "id": "long_watch"
+            },
+            {
+              "id": "long_pending"
+            },
+            {
+              "id": "long_open"
+            },
+            {
+              "id": "short_watch"
+            },
+            {
+              "id": "short_pending"
+            },
+            {
+              "id": "short_open"
+            }
+          ],
+          "transitions": [
+            {
+              "actions": [],
+              "destinationStateId": "long_watch",
+              "eventClass": "decision",
+              "guard": {
+                "eventId": "long_event",
+                "kind": "fresh_event"
+              },
+              "id": "long_arm",
+              "sourceStateId": "flat"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "enter_next_open",
+                  "managementPlanId": "long_base"
+                }
+              ],
+              "destinationStateId": "long_pending",
+              "eventClass": "decision",
+              "guard": {
+                "groupId": "long_group",
+                "kind": "evidence_at_least",
+                "thresholdPercent": 55
+              },
+              "id": "long_enter",
+              "sourceStateId": "long_watch"
+            },
+            {
+              "actions": [],
+              "destinationStateId": "long_open",
+              "eventClass": "execution",
+              "guard": {
+                "kind": "execution_status_is",
+                "status": "filled"
+              },
+              "id": "long_fill",
+              "sourceStateId": "long_pending"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "exit_next_open"
+                }
+              ],
+              "destinationStateId": "flat",
+              "eventClass": "decision",
+              "guard": {
+                "events": 4,
+                "kind": "state_age_at_least"
+              },
+              "id": "long_exit",
+              "priority": 7,
+              "sourceStateId": "long_open"
+            },
+            {
+              "actions": [],
+              "destinationStateId": "short_watch",
+              "eventClass": "decision",
+              "guard": {
+                "eventId": "short_event",
+                "kind": "fresh_event"
+              },
+              "id": "short_arm",
+              "sourceStateId": "flat"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "enter_next_open",
+                  "managementPlanId": "short_base"
+                }
+              ],
+              "destinationStateId": "short_pending",
+              "eventClass": "decision",
+              "guard": {
+                "groupId": "short_group",
+                "kind": "evidence_at_least",
+                "thresholdPercent": 55
+              },
+              "id": "short_enter",
+              "sourceStateId": "short_watch"
+            },
+            {
+              "actions": [],
+              "destinationStateId": "short_open",
+              "eventClass": "execution",
+              "guard": {
+                "kind": "execution_status_is",
+                "status": "filled"
+              },
+              "id": "short_fill",
+              "sourceStateId": "short_pending"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "exit_next_open"
+                }
+              ],
+              "destinationStateId": "flat",
+              "eventClass": "decision",
+              "guard": {
+                "events": 4,
+                "kind": "state_age_at_least"
+              },
+              "id": "short_exit",
+              "priority": 7,
+              "sourceStateId": "short_open"
+            }
+          ]
+        },
+        "name": "pair-dead",
+        "version": "v3"
+      },
+      "schemaVersion": "temporal_bidirectional_pair_snapshot_v1",
+      "short": {
+        "catalog": {
+          "kind": "catalog",
+          "payload": {
+            "catalog": {
+              "indicators": [
+                {
+                  "implementation": "RSI_IMPL",
+                  "meta": {
+                    "id": "RSI_IMPL"
+                  }
+                },
+                {
+                  "implementation": "RSI_IMPL_EVENT",
+                  "meta": {
+                    "id": "RSI_IMPL_EVENT"
+                  }
+                }
+              ]
+            },
+            "catalogSha256": "sha256:c9a000f878ae734dda1b840b50a62c074ddc7d7e4e7a4987ee9740a63eb561ab"
+          },
+          "schemaVersion": "catalog_v1",
+          "sha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878"
+        },
+        "direction": "short",
+        "grammarContext": {
+          "kind": "grammarContext",
+          "payload": {
+            "context": "fixture"
+          },
+          "schemaVersion": "grammarContext_v1",
+          "sha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158"
+        },
+        "identities": {
+          "moduleIdentitySha256": "sha256:89e1242d5e78c0d618dbe8f9f440879d6c397f3d049eff750851eb7a4db6d020",
+          "nativeProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+          "nativeSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+          "nativeValidationReportSha256": "sha256:3be8a1f8b72c342c97a09fb1fa280c1be9da9fbd58641ef4cb9d38a16d04986c",
+          "profileSha256": "sha256:9f3a730c30e77a6513b74a313629534ccc7646e5015ee1cc82669b5c398f9fb4",
+          "programSha256": "sha256:10c603882256d1adcc5df3a757ae8b360643660783d05ad31f72144483eab684"
+        },
+        "lineage": [],
+        "nativeAuthority": {
+          "kind": "nativeAuthority",
+          "payload": {
+            "authority": "fixture"
+          },
+          "schemaVersion": "nativeAuthority_v1",
+          "sha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85"
+        },
+        "nativeReport": {
+          "candidateAcceptable": true,
+          "candidateId": "module-1-short",
+          "profileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+          "programSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+          "rawSourceProfileSha256": "sha256:9f3a730c30e77a6513b74a313629534ccc7646e5015ee1cc82669b5c398f9fb4",
+          "schemaVersion": "temporal_search_candidate_validation_v1",
+          "status": "valid_evaluable",
+          "validationReportSha256": "sha256:3be8a1f8b72c342c97a09fb1fa280c1be9da9fbd58641ef4cb9d38a16d04986c"
+        },
+        "policy": {
+          "kind": "policy",
+          "payload": {
+            "policy": "fixture"
+          },
+          "schemaVersion": "policy_v1",
+          "sha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+        },
+        "profile": {
+          "directionMode": "short",
+          "executionConfig": {
+            "managementLibrary": {
+              "defaultPlanId": "base",
+              "plans": [
+                {
+                  "holdPolicy": {
+                    "bars": 8,
+                    "kind": "market_bars"
+                  },
+                  "id": "base",
+                  "initialStop": {
+                    "kind": "fixed_percent",
+                    "percent": 1.0
+                  },
+                  "initialTarget": {
+                    "kind": "reward_multiple",
+                    "multiple": 2.0
+                  }
+                }
+              ]
+            }
+          },
+          "graph": {
+            "eventBindings": [],
+            "evidenceGroups": [],
+            "states": [
+              {
+                "id": "rust-dead-manifest_ready"
+              }
+            ],
+            "transitions": []
+          },
+          "indicators": [
+            {
+              "config": {},
+              "meta": {
+                "baseIndicatorId": "RSI",
+                "id": "RSI_IMPL",
+                "instanceId": "rust-dead-manifest_short_setup"
+              }
+            },
+            {
+              "config": {},
+              "meta": {
+                "id": "RSI_IMPL_EVENT",
+                "instanceId": "rust-dead-manifest_short_trigger"
+              }
+            }
+          ],
+          "name": "rust-dead-manifest_short",
+          "version": "v2"
+        },
+        "program": {
+          "direction": "short",
+          "fragments": [],
+          "grammarVersion": "3",
+          "schemaVersion": "temporal_typed_fragment_grammar_v2"
+        },
+        "schemaVersion": "temporal_bidirectional_module_snapshot_v1"
+      },
+      "sideTargetedLineage": [],
+      "validation": {
+        "candidateAcceptable": true,
+        "profileSnapshotSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+        "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+        "rawSourceProfileSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+        "schemaVersion": "temporal_search_candidate_validation_v1",
+        "status": "valid_evaluable",
+        "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+      }
+    },
+    "birthOrdinal": 1,
+    "candidateId": "qd_ed7a43db5368c3c39902882d0a49",
+    "candidateIdentityMaterial": {
+      "bidirectionalGenomeIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+      "compiledProfileSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+      "compiledProgramSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+      "compiledRawPairSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+      "compiledValidationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1",
+      "longCatalogSha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878",
+      "longGrammarContextSha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158",
+      "longModuleIdentitySha256": "sha256:12237b4479894c33679002c8e54c29882806622bdad9171df89414fc991b1c32",
+      "longNativeAuthoritySha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85",
+      "longPolicySha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c",
+      "materializedPairProposalSha256": "sha256:a97a4c0eba44ee941f49754807075a0ecb6f9139fb549dc16bf57a43688bbb48",
+      "orderedSideLineage": [],
+      "originKind": "random_immigrant",
+      "pairCompilerAuthoritySha256": "sha256:260fe07d08e8eaa6a6166b0a5b70c15331f52963cac1d8268d486656ebe01379",
+      "pairPolicySha256": "sha256:00bb8fd026c8e8c499685a41b654a586e1bf57a8c381f8d4a9ea7407ae05d138",
+      "qdEngineVersion": "temporal_qd_evolution_v3",
+      "schemaVersion": "temporal_qd_bidirectional_candidate_identity_v1",
+      "shortCatalogSha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878",
+      "shortGrammarContextSha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158",
+      "shortModuleIdentitySha256": "sha256:89e1242d5e78c0d618dbe8f9f440879d6c397f3d049eff750851eb7a4db6d020",
+      "shortNativeAuthoritySha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85",
+      "shortPolicySha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+    },
+    "candidateIdentitySha256": "sha256:ed7a43db5368c3c39902882d0a49ba9a93a7d5775d9002610f1bb6a3546158de",
+    "constructionEvidenceScope": {
+      "evidencePlanRotationRequired": false,
+      "evidenceScopeSha256": "sha256:0b025b8d537ffcff0517daf2a9b975f5f2efe488096c010793fcdc48d5ba9104",
+      "lakeScopeRegenerationRequired": false,
+      "reasons": [],
+      "schemaVersion": "temporal_qd_construction_evidence_scope_v1",
+      "timeframeMutationTraceSha256s": []
+    },
+    "generationIndex": 0,
+    "lineage": {
+      "candidateId": "qd_ed7a43db5368c3c39902882d0a49",
+      "candidateIdentitySha256": "sha256:ed7a43db5368c3c39902882d0a49ba9a93a7d5775d9002610f1bb6a3546158de",
+      "orderedSideLineage": [],
+      "pairIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+      "schemaVersion": "temporal_qd_bidirectional_candidate_lineage_v1"
+    },
+    "mutationTrace": [],
+    "pairProposal": {
+      "disposition": "materialized",
+      "factoryPair": {
+        "identities": {
+          "pairIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+          "profileSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+          "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+          "rawPairSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+          "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+        },
+        "long": {
+          "catalog": {
+            "kind": "catalog",
+            "payload": {
+              "catalog": {
+                "indicators": [
+                  {
+                    "implementation": "RSI_IMPL",
+                    "meta": {
+                      "id": "RSI_IMPL"
+                    }
+                  },
+                  {
+                    "implementation": "RSI_IMPL_EVENT",
+                    "meta": {
+                      "id": "RSI_IMPL_EVENT"
+                    }
+                  }
+                ]
+              },
+              "catalogSha256": "sha256:c9a000f878ae734dda1b840b50a62c074ddc7d7e4e7a4987ee9740a63eb561ab"
+            },
+            "schemaVersion": "catalog_v1",
+            "sha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878"
+          },
+          "direction": "long",
+          "grammarContext": {
+            "kind": "grammarContext",
+            "payload": {
+              "context": "fixture"
+            },
+            "schemaVersion": "grammarContext_v1",
+            "sha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158"
+          },
+          "identities": {
+            "moduleIdentitySha256": "sha256:12237b4479894c33679002c8e54c29882806622bdad9171df89414fc991b1c32",
+            "nativeProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+            "nativeSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+            "nativeValidationReportSha256": "sha256:bdec68de36f81761e65f358f40b8b086c0ba573cb0af92c30cafd84a6d38062d",
+            "profileSha256": "sha256:38859c0220e95574cf0eed83730cd6fb5c1c6a41799740ca36d2a367efdb3231",
+            "programSha256": "sha256:4972955072ce934799f585af4280c27986b1df1fb53fe0997b3cea495e8ef312"
+          },
+          "lineage": [],
+          "nativeAuthority": {
+            "kind": "nativeAuthority",
+            "payload": {
+              "authority": "fixture"
+            },
+            "schemaVersion": "nativeAuthority_v1",
+            "sha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85"
+          },
+          "nativeReport": {
+            "candidateAcceptable": true,
+            "candidateId": "module-1-long",
+            "profileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+            "programSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+            "rawSourceProfileSha256": "sha256:38859c0220e95574cf0eed83730cd6fb5c1c6a41799740ca36d2a367efdb3231",
+            "schemaVersion": "temporal_search_candidate_validation_v1",
+            "status": "valid_evaluable",
+            "validationReportSha256": "sha256:bdec68de36f81761e65f358f40b8b086c0ba573cb0af92c30cafd84a6d38062d"
+          },
+          "policy": {
+            "kind": "policy",
+            "payload": {
+              "policy": "fixture"
+            },
+            "schemaVersion": "policy_v1",
+            "sha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+          },
+          "profile": {
+            "directionMode": "long",
+            "executionConfig": {
+              "managementLibrary": {
+                "defaultPlanId": "base",
+                "plans": [
+                  {
+                    "holdPolicy": {
+                      "bars": 8,
+                      "kind": "market_bars"
+                    },
+                    "id": "base",
+                    "initialStop": {
+                      "kind": "fixed_percent",
+                      "percent": 1.0
+                    },
+                    "initialTarget": {
+                      "kind": "reward_multiple",
+                      "multiple": 2.0
+                    }
+                  }
+                ]
+              }
+            },
+            "graph": {
+              "eventBindings": [],
+              "evidenceGroups": [],
+              "states": [
+                {
+                  "id": "rust-dead-manifest_ready"
+                }
+              ],
+              "transitions": []
+            },
+            "indicators": [
+              {
+                "config": {},
+                "meta": {
+                  "baseIndicatorId": "RSI",
+                  "id": "RSI_IMPL",
+                  "instanceId": "rust-dead-manifest_long_setup"
+                }
+              },
+              {
+                "config": {},
+                "meta": {
+                  "id": "RSI_IMPL_EVENT",
+                  "instanceId": "rust-dead-manifest_long_trigger"
+                }
+              }
+            ],
+            "name": "rust-dead-manifest_long",
+            "version": "v2"
+          },
+          "program": {
+            "direction": "long",
+            "fragments": [],
+            "grammarVersion": "3",
+            "schemaVersion": "temporal_typed_fragment_grammar_v2"
+          },
+          "schemaVersion": "temporal_bidirectional_module_snapshot_v1"
+        },
+        "pairCompiler": {
+          "kind": "pairCompiler",
+          "payload": {
+            "compiler": "g0-fixture",
+            "mode": "live"
+          },
+          "schemaVersion": "pairCompiler_v1",
+          "sha256": "sha256:260fe07d08e8eaa6a6166b0a5b70c15331f52963cac1d8268d486656ebe01379"
+        },
+        "profile": {
+          "directionMode": "both",
+          "executionConfig": {
+            "managementLibrary": {
+              "defaultPlanId": "long_base",
+              "plans": [
+                {
+                  "holdPolicy": {
+                    "bars": 8,
+                    "kind": "market_bars"
+                  },
+                  "id": "long_base",
+                  "initialStop": {
+                    "kind": "fixed_percent",
+                    "percent": 1.0
+                  },
+                  "initialTarget": {
+                    "kind": "reward_multiple",
+                    "multiple": 2.0
+                  }
+                },
+                {
+                  "holdPolicy": {
+                    "bars": 8,
+                    "kind": "market_bars"
+                  },
+                  "id": "short_base",
+                  "initialStop": {
+                    "kind": "fixed_percent",
+                    "percent": 1.0
+                  },
+                  "initialTarget": {
+                    "kind": "reward_multiple",
+                    "multiple": 2.0
+                  }
+                }
+              ]
+            }
+          },
+          "graph": {
+            "entryArbitration": {
+              "modules": [
+                {
+                  "direction": "long",
+                  "eventBindingIds": [
+                    "long_event"
+                  ],
+                  "evidenceGroupIds": [
+                    "long_group"
+                  ],
+                  "id": "opaque-long",
+                  "indicatorIds": [
+                    "rust-dead-manifest_long_setup",
+                    "rust-dead-manifest_long_trigger"
+                  ],
+                  "sourceProfileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+                  "sourceProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+                  "stateIds": [
+                    "long_watch",
+                    "long_pending",
+                    "long_open"
+                  ],
+                  "transitionIds": [
+                    "long_arm",
+                    "long_fill",
+                    "long_exit"
+                  ]
+                },
+                {
+                  "direction": "short",
+                  "eventBindingIds": [
+                    "short_event"
+                  ],
+                  "evidenceGroupIds": [
+                    "short_group"
+                  ],
+                  "id": "opaque-short",
+                  "indicatorIds": [
+                    "rust-dead-manifest_short_setup",
+                    "rust-dead-manifest_short_trigger"
+                  ],
+                  "sourceProfileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+                  "sourceProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+                  "stateIds": [
+                    "short_watch",
+                    "short_pending",
+                    "short_open"
+                  ],
+                  "transitionIds": [
+                    "short_arm",
+                    "short_enter",
+                    "short_fill",
+                    "short_exit"
+                  ]
+                }
+              ]
+            },
+            "eventBindings": [
+              {
+                "id": "long_event",
+                "indicatorInstanceId": "rust-dead-manifest_long_trigger",
+                "longOutput": "bullish",
+                "shortOutput": "bearish"
+              },
+              {
+                "id": "short_event",
+                "indicatorInstanceId": "rust-dead-manifest_short_trigger",
+                "longOutput": "bullish",
+                "shortOutput": "bearish"
+              }
+            ],
+            "evidenceGroups": [
+              {
+                "id": "long_group",
+                "indicatorInstanceIds": [
+                  "rust-dead-manifest_long_setup"
+                ]
+              },
+              {
+                "id": "short_group",
+                "indicatorInstanceIds": [
+                  "rust-dead-manifest_short_setup"
+                ]
+              }
+            ],
+            "initialStateId": "flat",
+            "states": [
+              {
+                "id": "flat"
+              },
+              {
+                "id": "long_watch"
+              },
+              {
+                "id": "long_pending"
+              },
+              {
+                "id": "long_open"
+              },
+              {
+                "id": "short_watch"
+              },
+              {
+                "id": "short_pending"
+              },
+              {
+                "id": "short_open"
+              }
+            ],
+            "transitions": [
+              {
+                "actions": [],
+                "destinationStateId": "long_watch",
+                "eventClass": "decision",
+                "guard": {
+                  "eventId": "long_event",
+                  "kind": "fresh_event"
+                },
+                "id": "long_arm",
+                "sourceStateId": "flat"
+              },
+              {
+                "actions": [
+                  {
+                    "kind": "enter_next_open",
+                    "managementPlanId": "long_base"
+                  }
+                ],
+                "destinationStateId": "long_pending",
+                "eventClass": "decision",
+                "guard": {
+                  "groupId": "long_group",
+                  "kind": "evidence_at_least",
+                  "thresholdPercent": 55
+                },
+                "id": "long_enter",
+                "sourceStateId": "long_watch"
+              },
+              {
+                "actions": [],
+                "destinationStateId": "long_open",
+                "eventClass": "execution",
+                "guard": {
+                  "kind": "execution_status_is",
+                  "status": "filled"
+                },
+                "id": "long_fill",
+                "sourceStateId": "long_pending"
+              },
+              {
+                "actions": [
+                  {
+                    "kind": "exit_next_open"
+                  }
+                ],
+                "destinationStateId": "flat",
+                "eventClass": "decision",
+                "guard": {
+                  "events": 4,
+                  "kind": "state_age_at_least"
+                },
+                "id": "long_exit",
+                "priority": 7,
+                "sourceStateId": "long_open"
+              },
+              {
+                "actions": [],
+                "destinationStateId": "short_watch",
+                "eventClass": "decision",
+                "guard": {
+                  "eventId": "short_event",
+                  "kind": "fresh_event"
+                },
+                "id": "short_arm",
+                "sourceStateId": "flat"
+              },
+              {
+                "actions": [
+                  {
+                    "kind": "enter_next_open",
+                    "managementPlanId": "short_base"
+                  }
+                ],
+                "destinationStateId": "short_pending",
+                "eventClass": "decision",
+                "guard": {
+                  "groupId": "short_group",
+                  "kind": "evidence_at_least",
+                  "thresholdPercent": 55
+                },
+                "id": "short_enter",
+                "sourceStateId": "short_watch"
+              },
+              {
+                "actions": [],
+                "destinationStateId": "short_open",
+                "eventClass": "execution",
+                "guard": {
+                  "kind": "execution_status_is",
+                  "status": "filled"
+                },
+                "id": "short_fill",
+                "sourceStateId": "short_pending"
+              },
+              {
+                "actions": [
+                  {
+                    "kind": "exit_next_open"
+                  }
+                ],
+                "destinationStateId": "flat",
+                "eventClass": "decision",
+                "guard": {
+                  "events": 4,
+                  "kind": "state_age_at_least"
+                },
+                "id": "short_exit",
+                "priority": 7,
+                "sourceStateId": "short_open"
+              }
+            ]
+          },
+          "name": "pair-dead",
+          "version": "v3"
+        },
+        "schemaVersion": "temporal_bidirectional_pair_snapshot_v1",
+        "short": {
+          "catalog": {
+            "kind": "catalog",
+            "payload": {
+              "catalog": {
+                "indicators": [
+                  {
+                    "implementation": "RSI_IMPL",
+                    "meta": {
+                      "id": "RSI_IMPL"
+                    }
+                  },
+                  {
+                    "implementation": "RSI_IMPL_EVENT",
+                    "meta": {
+                      "id": "RSI_IMPL_EVENT"
+                    }
+                  }
+                ]
+              },
+              "catalogSha256": "sha256:c9a000f878ae734dda1b840b50a62c074ddc7d7e4e7a4987ee9740a63eb561ab"
+            },
+            "schemaVersion": "catalog_v1",
+            "sha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878"
+          },
+          "direction": "short",
+          "grammarContext": {
+            "kind": "grammarContext",
+            "payload": {
+              "context": "fixture"
+            },
+            "schemaVersion": "grammarContext_v1",
+            "sha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158"
+          },
+          "identities": {
+            "moduleIdentitySha256": "sha256:89e1242d5e78c0d618dbe8f9f440879d6c397f3d049eff750851eb7a4db6d020",
+            "nativeProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+            "nativeSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+            "nativeValidationReportSha256": "sha256:3be8a1f8b72c342c97a09fb1fa280c1be9da9fbd58641ef4cb9d38a16d04986c",
+            "profileSha256": "sha256:9f3a730c30e77a6513b74a313629534ccc7646e5015ee1cc82669b5c398f9fb4",
+            "programSha256": "sha256:10c603882256d1adcc5df3a757ae8b360643660783d05ad31f72144483eab684"
+          },
+          "lineage": [],
+          "nativeAuthority": {
+            "kind": "nativeAuthority",
+            "payload": {
+              "authority": "fixture"
+            },
+            "schemaVersion": "nativeAuthority_v1",
+            "sha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85"
+          },
+          "nativeReport": {
+            "candidateAcceptable": true,
+            "candidateId": "module-1-short",
+            "profileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+            "programSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+            "rawSourceProfileSha256": "sha256:9f3a730c30e77a6513b74a313629534ccc7646e5015ee1cc82669b5c398f9fb4",
+            "schemaVersion": "temporal_search_candidate_validation_v1",
+            "status": "valid_evaluable",
+            "validationReportSha256": "sha256:3be8a1f8b72c342c97a09fb1fa280c1be9da9fbd58641ef4cb9d38a16d04986c"
+          },
+          "policy": {
+            "kind": "policy",
+            "payload": {
+              "policy": "fixture"
+            },
+            "schemaVersion": "policy_v1",
+            "sha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+          },
+          "profile": {
+            "directionMode": "short",
+            "executionConfig": {
+              "managementLibrary": {
+                "defaultPlanId": "base",
+                "plans": [
+                  {
+                    "holdPolicy": {
+                      "bars": 8,
+                      "kind": "market_bars"
+                    },
+                    "id": "base",
+                    "initialStop": {
+                      "kind": "fixed_percent",
+                      "percent": 1.0
+                    },
+                    "initialTarget": {
+                      "kind": "reward_multiple",
+                      "multiple": 2.0
+                    }
+                  }
+                ]
+              }
+            },
+            "graph": {
+              "eventBindings": [],
+              "evidenceGroups": [],
+              "states": [
+                {
+                  "id": "rust-dead-manifest_ready"
+                }
+              ],
+              "transitions": []
+            },
+            "indicators": [
+              {
+                "config": {},
+                "meta": {
+                  "baseIndicatorId": "RSI",
+                  "id": "RSI_IMPL",
+                  "instanceId": "rust-dead-manifest_short_setup"
+                }
+              },
+              {
+                "config": {},
+                "meta": {
+                  "id": "RSI_IMPL_EVENT",
+                  "instanceId": "rust-dead-manifest_short_trigger"
+                }
+              }
+            ],
+            "name": "rust-dead-manifest_short",
+            "version": "v2"
+          },
+          "program": {
+            "direction": "short",
+            "fragments": [],
+            "grammarVersion": "3",
+            "schemaVersion": "temporal_typed_fragment_grammar_v2"
+          },
+          "schemaVersion": "temporal_bidirectional_module_snapshot_v1"
+        },
+        "sideTargetedLineage": [],
+        "validation": {
+          "candidateAcceptable": true,
+          "profileSnapshotSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+          "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+          "rawSourceProfileSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+          "schemaVersion": "temporal_search_candidate_validation_v1",
+          "status": "valid_evaluable",
+          "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+        }
+      },
+      "originKind": "random_immigrant",
+      "pairIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+      "proposalSeed": "seed-dead",
+      "proposalSha256": "sha256:a97a4c0eba44ee941f49754807075a0ecb6f9139fb549dc16bf57a43688bbb48",
+      "schemaVersion": "temporal_qd_pair_proposal_v2",
+      "side": "long"
+    },
+    "pairProposalSha256": "sha256:a97a4c0eba44ee941f49754807075a0ecb6f9139fb549dc16bf57a43688bbb48",
+    "profileSnapshotSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+    "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+    "proposalOrdinal": 1,
+    "seedId": "bidirectional_pair",
+    "sourceMode": "qd_random_immigrant_bidirectional_pair",
+    "sourceProfile": {
+      "directionMode": "both",
+      "executionConfig": {
+        "managementLibrary": {
+          "defaultPlanId": "long_base",
+          "plans": [
+            {
+              "holdPolicy": {
+                "bars": 8,
+                "kind": "market_bars"
+              },
+              "id": "long_base",
+              "initialStop": {
+                "kind": "fixed_percent",
+                "percent": 1.0
+              },
+              "initialTarget": {
+                "kind": "reward_multiple",
+                "multiple": 2.0
+              }
+            },
+            {
+              "holdPolicy": {
+                "bars": 8,
+                "kind": "market_bars"
+              },
+              "id": "short_base",
+              "initialStop": {
+                "kind": "fixed_percent",
+                "percent": 1.0
+              },
+              "initialTarget": {
+                "kind": "reward_multiple",
+                "multiple": 2.0
+              }
+            }
+          ]
+        }
+      },
+      "graph": {
+        "entryArbitration": {
+          "modules": [
+            {
+              "direction": "long",
+              "eventBindingIds": [
+                "long_event"
+              ],
+              "evidenceGroupIds": [
+                "long_group"
+              ],
+              "id": "opaque-long",
+              "indicatorIds": [
+                "rust-dead-manifest_long_setup",
+                "rust-dead-manifest_long_trigger"
+              ],
+              "sourceProfileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+              "sourceProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+              "stateIds": [
+                "long_watch",
+                "long_pending",
+                "long_open"
+              ],
+              "transitionIds": [
+                "long_arm",
+                "long_fill",
+                "long_exit"
+              ]
+            },
+            {
+              "direction": "short",
+              "eventBindingIds": [
+                "short_event"
+              ],
+              "evidenceGroupIds": [
+                "short_group"
+              ],
+              "id": "opaque-short",
+              "indicatorIds": [
+                "rust-dead-manifest_short_setup",
+                "rust-dead-manifest_short_trigger"
+              ],
+              "sourceProfileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+              "sourceProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+              "stateIds": [
+                "short_watch",
+                "short_pending",
+                "short_open"
+              ],
+              "transitionIds": [
+                "short_arm",
+                "short_enter",
+                "short_fill",
+                "short_exit"
+              ]
+            }
+          ]
+        },
+        "eventBindings": [
+          {
+            "id": "long_event",
+            "indicatorInstanceId": "rust-dead-manifest_long_trigger",
+            "longOutput": "bullish",
+            "shortOutput": "bearish"
+          },
+          {
+            "id": "short_event",
+            "indicatorInstanceId": "rust-dead-manifest_short_trigger",
+            "longOutput": "bullish",
+            "shortOutput": "bearish"
+          }
+        ],
+        "evidenceGroups": [
+          {
+            "id": "long_group",
+            "indicatorInstanceIds": [
+              "rust-dead-manifest_long_setup"
+            ]
+          },
+          {
+            "id": "short_group",
+            "indicatorInstanceIds": [
+              "rust-dead-manifest_short_setup"
+            ]
+          }
+        ],
+        "initialStateId": "flat",
+        "states": [
+          {
+            "id": "flat"
+          },
+          {
+            "id": "long_watch"
+          },
+          {
+            "id": "long_pending"
+          },
+          {
+            "id": "long_open"
+          },
+          {
+            "id": "short_watch"
+          },
+          {
+            "id": "short_pending"
+          },
+          {
+            "id": "short_open"
+          }
+        ],
+        "transitions": [
+          {
+            "actions": [],
+            "destinationStateId": "long_watch",
+            "eventClass": "decision",
+            "guard": {
+              "eventId": "long_event",
+              "kind": "fresh_event"
+            },
+            "id": "long_arm",
+            "sourceStateId": "flat"
+          },
+          {
+            "actions": [
+              {
+                "kind": "enter_next_open",
+                "managementPlanId": "long_base"
+              }
+            ],
+            "destinationStateId": "long_pending",
+            "eventClass": "decision",
+            "guard": {
+              "groupId": "long_group",
+              "kind": "evidence_at_least",
+              "thresholdPercent": 55
+            },
+            "id": "long_enter",
+            "sourceStateId": "long_watch"
+          },
+          {
+            "actions": [],
+            "destinationStateId": "long_open",
+            "eventClass": "execution",
+            "guard": {
+              "kind": "execution_status_is",
+              "status": "filled"
+            },
+            "id": "long_fill",
+            "sourceStateId": "long_pending"
+          },
+          {
+            "actions": [
+              {
+                "kind": "exit_next_open"
+              }
+            ],
+            "destinationStateId": "flat",
+            "eventClass": "decision",
+            "guard": {
+              "events": 4,
+              "kind": "state_age_at_least"
+            },
+            "id": "long_exit",
+            "priority": 7,
+            "sourceStateId": "long_open"
+          },
+          {
+            "actions": [],
+            "destinationStateId": "short_watch",
+            "eventClass": "decision",
+            "guard": {
+              "eventId": "short_event",
+              "kind": "fresh_event"
+            },
+            "id": "short_arm",
+            "sourceStateId": "flat"
+          },
+          {
+            "actions": [
+              {
+                "kind": "enter_next_open",
+                "managementPlanId": "short_base"
+              }
+            ],
+            "destinationStateId": "short_pending",
+            "eventClass": "decision",
+            "guard": {
+              "groupId": "short_group",
+              "kind": "evidence_at_least",
+              "thresholdPercent": 55
+            },
+            "id": "short_enter",
+            "sourceStateId": "short_watch"
+          },
+          {
+            "actions": [],
+            "destinationStateId": "short_open",
+            "eventClass": "execution",
+            "guard": {
+              "kind": "execution_status_is",
+              "status": "filled"
+            },
+            "id": "short_fill",
+            "sourceStateId": "short_pending"
+          },
+          {
+            "actions": [
+              {
+                "kind": "exit_next_open"
+              }
+            ],
+            "destinationStateId": "flat",
+            "eventClass": "decision",
+            "guard": {
+              "events": 4,
+              "kind": "state_age_at_least"
+            },
+            "id": "short_exit",
+            "priority": 7,
+            "sourceStateId": "short_open"
+          }
+        ]
+      },
+      "name": "pair-dead",
+      "version": "v3"
+    },
+    "sourceProfileSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+    "structuralDepth": 0,
+    "structuralOperatorHistory": [],
+    "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+  },
+  "configSha256": "sha256:06816d5bfedbd60d6564150c14670c7516c1ffc174d82c868b0d189ea2bc0d35",
+  "disposition": "accepted",
+  "entrySha256": "sha256:e213117afa1588e456d4e082372ff6d6cccdc05c2d725b472e1b0a950865d6d6",
+  "generationIndex": 0,
+  "operatorImplementationSha256": "sha256:5e6bad204c4b47b6ed4f5bd28d284e633efaaef96e32afbf51e1a323a3f26dfc",
+  "originKind": "random_immigrant",
+  "proposal": {
+    "disposition": "materialized",
+    "factoryPair": {
+      "identities": {
+        "pairIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+        "profileSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+        "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+        "rawPairSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+        "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+      },
+      "long": {
+        "catalog": {
+          "kind": "catalog",
+          "payload": {
+            "catalog": {
+              "indicators": [
+                {
+                  "implementation": "RSI_IMPL",
+                  "meta": {
+                    "id": "RSI_IMPL"
+                  }
+                },
+                {
+                  "implementation": "RSI_IMPL_EVENT",
+                  "meta": {
+                    "id": "RSI_IMPL_EVENT"
+                  }
+                }
+              ]
+            },
+            "catalogSha256": "sha256:c9a000f878ae734dda1b840b50a62c074ddc7d7e4e7a4987ee9740a63eb561ab"
+          },
+          "schemaVersion": "catalog_v1",
+          "sha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878"
+        },
+        "direction": "long",
+        "grammarContext": {
+          "kind": "grammarContext",
+          "payload": {
+            "context": "fixture"
+          },
+          "schemaVersion": "grammarContext_v1",
+          "sha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158"
+        },
+        "identities": {
+          "moduleIdentitySha256": "sha256:12237b4479894c33679002c8e54c29882806622bdad9171df89414fc991b1c32",
+          "nativeProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+          "nativeSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+          "nativeValidationReportSha256": "sha256:bdec68de36f81761e65f358f40b8b086c0ba573cb0af92c30cafd84a6d38062d",
+          "profileSha256": "sha256:38859c0220e95574cf0eed83730cd6fb5c1c6a41799740ca36d2a367efdb3231",
+          "programSha256": "sha256:4972955072ce934799f585af4280c27986b1df1fb53fe0997b3cea495e8ef312"
+        },
+        "lineage": [],
+        "nativeAuthority": {
+          "kind": "nativeAuthority",
+          "payload": {
+            "authority": "fixture"
+          },
+          "schemaVersion": "nativeAuthority_v1",
+          "sha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85"
+        },
+        "nativeReport": {
+          "candidateAcceptable": true,
+          "candidateId": "module-1-long",
+          "profileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+          "programSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+          "rawSourceProfileSha256": "sha256:38859c0220e95574cf0eed83730cd6fb5c1c6a41799740ca36d2a367efdb3231",
+          "schemaVersion": "temporal_search_candidate_validation_v1",
+          "status": "valid_evaluable",
+          "validationReportSha256": "sha256:bdec68de36f81761e65f358f40b8b086c0ba573cb0af92c30cafd84a6d38062d"
+        },
+        "policy": {
+          "kind": "policy",
+          "payload": {
+            "policy": "fixture"
+          },
+          "schemaVersion": "policy_v1",
+          "sha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+        },
+        "profile": {
+          "directionMode": "long",
+          "executionConfig": {
+            "managementLibrary": {
+              "defaultPlanId": "base",
+              "plans": [
+                {
+                  "holdPolicy": {
+                    "bars": 8,
+                    "kind": "market_bars"
+                  },
+                  "id": "base",
+                  "initialStop": {
+                    "kind": "fixed_percent",
+                    "percent": 1.0
+                  },
+                  "initialTarget": {
+                    "kind": "reward_multiple",
+                    "multiple": 2.0
+                  }
+                }
+              ]
+            }
+          },
+          "graph": {
+            "eventBindings": [],
+            "evidenceGroups": [],
+            "states": [
+              {
+                "id": "rust-dead-manifest_ready"
+              }
+            ],
+            "transitions": []
+          },
+          "indicators": [
+            {
+              "config": {},
+              "meta": {
+                "baseIndicatorId": "RSI",
+                "id": "RSI_IMPL",
+                "instanceId": "rust-dead-manifest_long_setup"
+              }
+            },
+            {
+              "config": {},
+              "meta": {
+                "id": "RSI_IMPL_EVENT",
+                "instanceId": "rust-dead-manifest_long_trigger"
+              }
+            }
+          ],
+          "name": "rust-dead-manifest_long",
+          "version": "v2"
+        },
+        "program": {
+          "direction": "long",
+          "fragments": [],
+          "grammarVersion": "3",
+          "schemaVersion": "temporal_typed_fragment_grammar_v2"
+        },
+        "schemaVersion": "temporal_bidirectional_module_snapshot_v1"
+      },
+      "pairCompiler": {
+        "kind": "pairCompiler",
+        "payload": {
+          "compiler": "g0-fixture",
+          "mode": "live"
+        },
+        "schemaVersion": "pairCompiler_v1",
+        "sha256": "sha256:260fe07d08e8eaa6a6166b0a5b70c15331f52963cac1d8268d486656ebe01379"
+      },
+      "profile": {
+        "directionMode": "both",
+        "executionConfig": {
+          "managementLibrary": {
+            "defaultPlanId": "long_base",
+            "plans": [
+              {
+                "holdPolicy": {
+                  "bars": 8,
+                  "kind": "market_bars"
+                },
+                "id": "long_base",
+                "initialStop": {
+                  "kind": "fixed_percent",
+                  "percent": 1.0
+                },
+                "initialTarget": {
+                  "kind": "reward_multiple",
+                  "multiple": 2.0
+                }
+              },
+              {
+                "holdPolicy": {
+                  "bars": 8,
+                  "kind": "market_bars"
+                },
+                "id": "short_base",
+                "initialStop": {
+                  "kind": "fixed_percent",
+                  "percent": 1.0
+                },
+                "initialTarget": {
+                  "kind": "reward_multiple",
+                  "multiple": 2.0
+                }
+              }
+            ]
+          }
+        },
+        "graph": {
+          "entryArbitration": {
+            "modules": [
+              {
+                "direction": "long",
+                "eventBindingIds": [
+                  "long_event"
+                ],
+                "evidenceGroupIds": [
+                  "long_group"
+                ],
+                "id": "opaque-long",
+                "indicatorIds": [
+                  "rust-dead-manifest_long_setup",
+                  "rust-dead-manifest_long_trigger"
+                ],
+                "sourceProfileSnapshotSha256": "sha256:9ebfb9d14d17461dd0d03ba2c14536b677702929e103229ad2fd09a43c333291",
+                "sourceProgramSha256": "sha256:ba2da6fcf10aded0e85f4310c5b04b3c293100608ad572df2e7fda53da635b54",
+                "stateIds": [
+                  "long_watch",
+                  "long_pending",
+                  "long_open"
+                ],
+                "transitionIds": [
+                  "long_arm",
+                  "long_fill",
+                  "long_exit"
+                ]
+              },
+              {
+                "direction": "short",
+                "eventBindingIds": [
+                  "short_event"
+                ],
+                "evidenceGroupIds": [
+                  "short_group"
+                ],
+                "id": "opaque-short",
+                "indicatorIds": [
+                  "rust-dead-manifest_short_setup",
+                  "rust-dead-manifest_short_trigger"
+                ],
+                "sourceProfileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+                "sourceProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+                "stateIds": [
+                  "short_watch",
+                  "short_pending",
+                  "short_open"
+                ],
+                "transitionIds": [
+                  "short_arm",
+                  "short_enter",
+                  "short_fill",
+                  "short_exit"
+                ]
+              }
+            ]
+          },
+          "eventBindings": [
+            {
+              "id": "long_event",
+              "indicatorInstanceId": "rust-dead-manifest_long_trigger",
+              "longOutput": "bullish",
+              "shortOutput": "bearish"
+            },
+            {
+              "id": "short_event",
+              "indicatorInstanceId": "rust-dead-manifest_short_trigger",
+              "longOutput": "bullish",
+              "shortOutput": "bearish"
+            }
+          ],
+          "evidenceGroups": [
+            {
+              "id": "long_group",
+              "indicatorInstanceIds": [
+                "rust-dead-manifest_long_setup"
+              ]
+            },
+            {
+              "id": "short_group",
+              "indicatorInstanceIds": [
+                "rust-dead-manifest_short_setup"
+              ]
+            }
+          ],
+          "initialStateId": "flat",
+          "states": [
+            {
+              "id": "flat"
+            },
+            {
+              "id": "long_watch"
+            },
+            {
+              "id": "long_pending"
+            },
+            {
+              "id": "long_open"
+            },
+            {
+              "id": "short_watch"
+            },
+            {
+              "id": "short_pending"
+            },
+            {
+              "id": "short_open"
+            }
+          ],
+          "transitions": [
+            {
+              "actions": [],
+              "destinationStateId": "long_watch",
+              "eventClass": "decision",
+              "guard": {
+                "eventId": "long_event",
+                "kind": "fresh_event"
+              },
+              "id": "long_arm",
+              "sourceStateId": "flat"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "enter_next_open",
+                  "managementPlanId": "long_base"
+                }
+              ],
+              "destinationStateId": "long_pending",
+              "eventClass": "decision",
+              "guard": {
+                "groupId": "long_group",
+                "kind": "evidence_at_least",
+                "thresholdPercent": 55
+              },
+              "id": "long_enter",
+              "sourceStateId": "long_watch"
+            },
+            {
+              "actions": [],
+              "destinationStateId": "long_open",
+              "eventClass": "execution",
+              "guard": {
+                "kind": "execution_status_is",
+                "status": "filled"
+              },
+              "id": "long_fill",
+              "sourceStateId": "long_pending"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "exit_next_open"
+                }
+              ],
+              "destinationStateId": "flat",
+              "eventClass": "decision",
+              "guard": {
+                "events": 4,
+                "kind": "state_age_at_least"
+              },
+              "id": "long_exit",
+              "priority": 7,
+              "sourceStateId": "long_open"
+            },
+            {
+              "actions": [],
+              "destinationStateId": "short_watch",
+              "eventClass": "decision",
+              "guard": {
+                "eventId": "short_event",
+                "kind": "fresh_event"
+              },
+              "id": "short_arm",
+              "sourceStateId": "flat"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "enter_next_open",
+                  "managementPlanId": "short_base"
+                }
+              ],
+              "destinationStateId": "short_pending",
+              "eventClass": "decision",
+              "guard": {
+                "groupId": "short_group",
+                "kind": "evidence_at_least",
+                "thresholdPercent": 55
+              },
+              "id": "short_enter",
+              "sourceStateId": "short_watch"
+            },
+            {
+              "actions": [],
+              "destinationStateId": "short_open",
+              "eventClass": "execution",
+              "guard": {
+                "kind": "execution_status_is",
+                "status": "filled"
+              },
+              "id": "short_fill",
+              "sourceStateId": "short_pending"
+            },
+            {
+              "actions": [
+                {
+                  "kind": "exit_next_open"
+                }
+              ],
+              "destinationStateId": "flat",
+              "eventClass": "decision",
+              "guard": {
+                "events": 4,
+                "kind": "state_age_at_least"
+              },
+              "id": "short_exit",
+              "priority": 7,
+              "sourceStateId": "short_open"
+            }
+          ]
+        },
+        "name": "pair-dead",
+        "version": "v3"
+      },
+      "schemaVersion": "temporal_bidirectional_pair_snapshot_v1",
+      "short": {
+        "catalog": {
+          "kind": "catalog",
+          "payload": {
+            "catalog": {
+              "indicators": [
+                {
+                  "implementation": "RSI_IMPL",
+                  "meta": {
+                    "id": "RSI_IMPL"
+                  }
+                },
+                {
+                  "implementation": "RSI_IMPL_EVENT",
+                  "meta": {
+                    "id": "RSI_IMPL_EVENT"
+                  }
+                }
+              ]
+            },
+            "catalogSha256": "sha256:c9a000f878ae734dda1b840b50a62c074ddc7d7e4e7a4987ee9740a63eb561ab"
+          },
+          "schemaVersion": "catalog_v1",
+          "sha256": "sha256:465f35be047d62410e2fa1a21a9f23dd855c9db276d534fd4de178928b00e878"
+        },
+        "direction": "short",
+        "grammarContext": {
+          "kind": "grammarContext",
+          "payload": {
+            "context": "fixture"
+          },
+          "schemaVersion": "grammarContext_v1",
+          "sha256": "sha256:677c86008a0e230d6bdc0e4aa41886cc7849be1c5c9255e4bce98c1d989b4158"
+        },
+        "identities": {
+          "moduleIdentitySha256": "sha256:89e1242d5e78c0d618dbe8f9f440879d6c397f3d049eff750851eb7a4db6d020",
+          "nativeProgramSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+          "nativeSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+          "nativeValidationReportSha256": "sha256:3be8a1f8b72c342c97a09fb1fa280c1be9da9fbd58641ef4cb9d38a16d04986c",
+          "profileSha256": "sha256:9f3a730c30e77a6513b74a313629534ccc7646e5015ee1cc82669b5c398f9fb4",
+          "programSha256": "sha256:10c603882256d1adcc5df3a757ae8b360643660783d05ad31f72144483eab684"
+        },
+        "lineage": [],
+        "nativeAuthority": {
+          "kind": "nativeAuthority",
+          "payload": {
+            "authority": "fixture"
+          },
+          "schemaVersion": "nativeAuthority_v1",
+          "sha256": "sha256:cbd1f12faaaf6e6d3984038814731ed7dd2ad0d2f86b9bff0e94a0ae418b4b85"
+        },
+        "nativeReport": {
+          "candidateAcceptable": true,
+          "candidateId": "module-1-short",
+          "profileSnapshotSha256": "sha256:1b823940d0ee8db963b4febe8867c2469b1053d54a54a9d4695c6310b9d49fc8",
+          "programSha256": "sha256:19e4bb2e20289f3a05200de67b5c29f3cacf3ea77fb2782e98a57f88d12d5caf",
+          "rawSourceProfileSha256": "sha256:9f3a730c30e77a6513b74a313629534ccc7646e5015ee1cc82669b5c398f9fb4",
+          "schemaVersion": "temporal_search_candidate_validation_v1",
+          "status": "valid_evaluable",
+          "validationReportSha256": "sha256:3be8a1f8b72c342c97a09fb1fa280c1be9da9fbd58641ef4cb9d38a16d04986c"
+        },
+        "policy": {
+          "kind": "policy",
+          "payload": {
+            "policy": "fixture"
+          },
+          "schemaVersion": "policy_v1",
+          "sha256": "sha256:673996abca39e5ab63138113c9b0923be5c1a2bccc46aac1970e88002f5fda5c"
+        },
+        "profile": {
+          "directionMode": "short",
+          "executionConfig": {
+            "managementLibrary": {
+              "defaultPlanId": "base",
+              "plans": [
+                {
+                  "holdPolicy": {
+                    "bars": 8,
+                    "kind": "market_bars"
+                  },
+                  "id": "base",
+                  "initialStop": {
+                    "kind": "fixed_percent",
+                    "percent": 1.0
+                  },
+                  "initialTarget": {
+                    "kind": "reward_multiple",
+                    "multiple": 2.0
+                  }
+                }
+              ]
+            }
+          },
+          "graph": {
+            "eventBindings": [],
+            "evidenceGroups": [],
+            "states": [
+              {
+                "id": "rust-dead-manifest_ready"
+              }
+            ],
+            "transitions": []
+          },
+          "indicators": [
+            {
+              "config": {},
+              "meta": {
+                "baseIndicatorId": "RSI",
+                "id": "RSI_IMPL",
+                "instanceId": "rust-dead-manifest_short_setup"
+              }
+            },
+            {
+              "config": {},
+              "meta": {
+                "id": "RSI_IMPL_EVENT",
+                "instanceId": "rust-dead-manifest_short_trigger"
+              }
+            }
+          ],
+          "name": "rust-dead-manifest_short",
+          "version": "v2"
+        },
+        "program": {
+          "direction": "short",
+          "fragments": [],
+          "grammarVersion": "3",
+          "schemaVersion": "temporal_typed_fragment_grammar_v2"
+        },
+        "schemaVersion": "temporal_bidirectional_module_snapshot_v1"
+      },
+      "sideTargetedLineage": [],
+      "validation": {
+        "candidateAcceptable": true,
+        "profileSnapshotSha256": "sha256:70441a7648ceae5376900b56dd011e1146847df286fb0880376821215fcd3080",
+        "programSha256": "sha256:29b41b5fa4816f4fd594928ed30b60249d0484d1f810f15a652bccccc2933caa",
+        "rawSourceProfileSha256": "sha256:63f154e6a0211f65bf1393b01ed287cdf3fa8870e7c326fe40357df93d78b67b",
+        "schemaVersion": "temporal_search_candidate_validation_v1",
+        "status": "valid_evaluable",
+        "validationReportSha256": "sha256:ec6af31ee832aa527e187a1bdcfa5284a8e956c6fbddf4415d4a69e47b8f60d1"
+      }
+    },
+    "originKind": "random_immigrant",
+    "pairIdentitySha256": "sha256:77e7b7ebf84a1da436090e1966e033c6643f7eaf71d9081dc7afbda0363a61f8",
+    "proposalSeed": "seed-dead",
+    "proposalSha256": "sha256:a97a4c0eba44ee941f49754807075a0ecb6f9139fb549dc16bf57a43688bbb48",
+    "schemaVersion": "temporal_qd_pair_proposal_v2",
+    "side": "long"
+  },
+  "proposalOrdinal": 1,
+  "schemaVersion": "temporal_qd_proposal_entry_v3"
+}

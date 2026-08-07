@@ -864,6 +864,46 @@ def test_fresh_broad_admission_rejects_legacy_four_generation_shape(
         )
 
 
+def test_pair_supervisor_freezes_rust_runtime_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    pair_config = {
+        "schemaVersion": "fixture_pair_run_config_v1",
+        "operatorImplementation": {"implementation": "fixture"},
+    }
+    monkeypatch.setattr(
+        supervisor, "load_pair_run_config", lambda value: pair_config
+    )
+
+    config, _warnings = supervisor._frozen_config(
+        initial_archive_path=inputs["initial_archive_path"],
+        source_preparation_path=None,
+        base_generator_root=None,
+        confirmed_entry_admission_root=None,
+        template_preparation_path=inputs["template_preparation_path"],
+        validator_command_file=None,
+        parameters=inputs["parameters"],
+        generation_count=1,
+        first_generation_index=1,
+        initial_immigrant_continuation_ordinal=0,
+        autoresearch_commit=inputs["autoresearch_commit"],
+        execution_engine_commit=inputs["execution_engine_commit"],
+        worker_contract_sha256=inputs["worker_contract_sha256"],
+        gateway_url=inputs["gateway_url"],
+        evaluation_timeout_seconds=60.0,
+        enqueue_batch_size=100,
+        broad_admission=False,
+        construction_catalog_path=inputs["construction_catalog_path"],
+        bidirectional_pair_config=pair_config,
+    )
+
+    assert config["pairGenerationRuntime"]["engine"] == (
+        supervisor.PAIR_GENERATION_RUNTIME_RUST
+    )
+    assert config["pairGenerationRuntime"]["fallbackPolicy"] == "forbidden"
+
+
 def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -945,9 +985,10 @@ def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
             "source_preparation_path": None,
             "base_generator_root": None,
             "confirmed_entry_admission_root": None,
-            "validator_command_file": None,
-            "bidirectional_pair_config": pair_config,
-        }
+                "validator_command_file": None,
+                "bidirectional_pair_config": pair_config,
+                "pair_generation_engine": supervisor.PAIR_GENERATION_RUNTIME_PYTHON,
+            }
     )
     with pytest.raises(StopAfterPairGeneration):
         supervisor.run_qd_supervisor(run_root=tmp_path / "pair", **inputs)
@@ -969,6 +1010,9 @@ def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
     }
     config = json.loads((tmp_path / "pair" / "config.json").read_text())
     assert "validator" not in config
+    assert generation_kwargs["parent_archive_sha256"] == config["initialArchive"][
+        "archiveSha256"
+    ]
 
 
 def test_broad_admission_refuses_missing_frozen_evidence_ladder(tmp_path: Path) -> None:
@@ -1303,6 +1347,14 @@ def test_pair_g0_64_to_32_rotating_supervisor_restart_never_reschedules_construc
     immutable campaign artifacts still bind the exact 32-candidate, four-panel
     task matrix that the supervisor later reopens on restart.
     """
+    # This bounded fixture proves supervisor restart semantics, not host
+    # admission. Keep the production resource guard intact while making the
+    # unit test independent of unrelated host workloads and CI machine size.
+    monkeypatch.setattr(
+        pair_generation.PerformanceTrace,
+        "assert_resource_guard",
+        lambda _self: None,
+    )
 
     curriculum_path = tmp_path / "curriculum.json"
     seed_population_path = tmp_path / "seed-population.json"
@@ -1721,9 +1773,10 @@ def test_pair_g0_64_to_32_rotating_supervisor_restart_never_reschedules_construc
         "execution_engine_commit": "b" * 40,
         "worker_contract_sha256": "sha256:" + "c" * 64,
         "gateway_url": "http://127.0.0.1:8799",
-        "gateway_token": "fixture",
-        "bidirectional_pair_config": pair_config,
-        "rotating_evidence_config": rotating_input,
+            "gateway_token": "fixture",
+            "bidirectional_pair_config": pair_config,
+            "pair_generation_engine": supervisor.PAIR_GENERATION_RUNTIME_PYTHON,
+            "rotating_evidence_config": rotating_input,
         "initial_construction_pool_size": 64,
         "evaluation_population_size": 32,
         "generation_funnel_enabled": True,

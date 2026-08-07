@@ -33,6 +33,25 @@ ENTRY_ROUTE_DECISION_INDICATOR_CAP = 3
 ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION = "temporal_entry_route_decision_indicator_cap_v1"
 
 
+def _thaw_lineage_snapshot(value: Any) -> Any:
+    """Render immutable snapshot containers as ordinary JSON-compatible values.
+
+    Pair operators deliberately retain frozen module lineage.  A same-side
+    crossover therefore feeds ``mappingproxy`` snapshots back through this
+    grammar's compiled-module boundary.  The native/proposal contract is
+    canonical JSON, not object identity, so thaw only those containers here
+    before the existing strict canonical clone validates them.
+    """
+
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_lineage_snapshot(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_lineage_snapshot(item) for item in value]
+    if isinstance(value, list):
+        return [_thaw_lineage_snapshot(item) for item in value]
+    return value
+
+
 class GrammarError(TemporalDiscoveryContractError):
     pass
 
@@ -826,7 +845,11 @@ class TypedFragmentGrammar:
             raise GrammarError("Dashboard native validator rejected or failed to bind module identity")
         identities = {"contextSha256": self.context_sha256, "programSha256": canonical_sha256(canonical), "rawModuleSha256": raw_sha, "nativeProgramSha256": str(report["programSha256"]), "nativeValidationReportSha256": str(report["validationReportSha256"]), "compiledGraphStructureSha256": compiled_graph_signature(profile)}
         witnesses = tuple({"schemaVersion": WITNESS_SCHEMA, "productionId": item["productionId"], "recipe": REGISTRY[item["productionId"]].activation_recipe, "fragment": item} for item in canonical["fragments"])
-        return CompiledModule(profile, canonical, tuple(_clone(dict(item), name="lineage") for item in program.lineage), identities, witnesses, report)
+        lineage = tuple(
+            _clone(_thaw_lineage_snapshot(item), name="lineage")
+            for item in program.lineage
+        )
+        return CompiledModule(profile, canonical, lineage, identities, witnesses, report)
 
     def compile_module(self, program: ModuleProgram, *, candidate_id: str) -> CompiledModule:
         canonical, _built, profile = self._profile_payload(program)

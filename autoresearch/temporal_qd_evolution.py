@@ -51,6 +51,16 @@ from .temporal_qd_evaluation_population import (
     is_optimized_pair_population,
     load_evaluation_population,
 )
+from .temporal_qd_native import (
+    PAIR_GENERATION_RUNTIME_DEFAULT,
+    PAIR_GENERATION_RUNTIME_PYTHON,
+    PAIR_GENERATION_RUNTIME_RUST,
+    TemporalQDNativeError,
+    build_pair_generation_runtime_config,
+    build_generation_runtime_authority,
+    run_native_generation,
+    validate_pair_generation_runtime_config,
+)
 from .result_codec import fsync_directory
 from .lake_window import (
     LakeWindowBinding,
@@ -1687,6 +1697,9 @@ def build_rotating_qd_parent_archive(
     return {
         "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
         "archiveSha256": archive["archiveSha256"],
+        "parentSchedule": _clone(
+            parent_schedule, name="rotating parent archive schedule"
+        ),
         "cumulativeArchiveSha256": cumulative_sha,
         "occupiedCellCount": archive["occupiedCellCount"],
         "memberCount": archive["memberCount"],
@@ -3547,6 +3560,8 @@ def _proposal_accounting(
 def generate_qd_generation(
     *,
     parent_archive_path: Path | str,
+    parent_archive_sha256: str | None = None,
+    parent_schedule: Mapping[str, Any] | None = None,
     source_preparation_path: Path | str | None = None,
     base_generator_root: Path | str | None = None,
     confirmed_entry_admission_root: Path | str | None = None,
@@ -3562,6 +3577,9 @@ def generate_qd_generation(
     max_new_proposals: int | None = None,
     construction_catalog_path: Path | str | None = None,
     generation_funnel_enabled: bool = False,
+    pair_generation_runtime: Mapping[str, Any] | None = None,
+    bidirectional_pair_run_config: Mapping[str, Any] | None = None,
+    qd_publication_authority: Mapping[str, Any] | None = None,
     bidirectional_pair_policy: Mapping[str, Any] | None = None,
     bidirectional_pair_factory: Any | None = None,
     bidirectional_module_authority: Any | None = None,
@@ -3576,8 +3594,46 @@ def generate_qd_generation(
     if immigrant_continuation_start < 0:
         raise TemporalDiscoveryContractError("immigrant continuation start is negative")
     root = Path(output_root)
-    archive, archive_sha = _load_archive(Path(parent_archive_path))
-    archive_pair_policy = _bidirectional_pair_policy(archive)
+    try:
+        runtime = (
+            validate_pair_generation_runtime_config(pair_generation_runtime)
+            if pair_generation_runtime is not None
+            else build_pair_generation_runtime_config(
+                engine=(
+                    PAIR_GENERATION_RUNTIME_DEFAULT
+                    if bidirectional_pair_run_config is not None
+                    else PAIR_GENERATION_RUNTIME_PYTHON
+                ),
+            )
+        )
+    except TemporalQDNativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    native_pair_generation = runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST
+    if native_pair_generation:
+        if bidirectional_pair_policy is None:
+            raise TemporalDiscoveryContractError(
+                "native bidirectional QD generation requires its frozen pair policy"
+            )
+        archive = None
+        archive_sha = _sha(
+            parent_archive_sha256,
+            name="native QD parent archive identity",
+        )
+        archive_pair_policy = None
+    else:
+        archive, archive_sha = _load_archive(Path(parent_archive_path))
+        if (
+            parent_archive_sha256 is not None
+            and _sha(
+                parent_archive_sha256,
+                name="QD parent archive identity",
+            )
+            != archive_sha
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD parent archive identity differs from its supplied binding"
+            )
+        archive_pair_policy = _bidirectional_pair_policy(archive)
     supplied_pair_policy = (
         _bidirectional_pair_policy({"bidirectionalPairPolicy": bidirectional_pair_policy})
         if bidirectional_pair_policy is not None
@@ -3587,16 +3643,31 @@ def generate_qd_generation(
         raise TemporalDiscoveryContractError("bidirectional QD generation policy differs from parent archive")
     pair_policy = archive_pair_policy or supplied_pair_policy
     if pair_policy is not None:
-        if any(value is None for value in (bidirectional_pair_factory, bidirectional_module_authority, bidirectional_native_validator, bidirectional_pair_compiler, bidirectional_operator_implementation_identity)):
+        if runtime["engine"] == PAIR_GENERATION_RUNTIME_PYTHON and any(
+            value is None
+            for value in (
+                bidirectional_pair_factory,
+                bidirectional_module_authority,
+                bidirectional_native_validator,
+                bidirectional_pair_compiler,
+                bidirectional_operator_implementation_identity,
+            )
+        ):
             raise TemporalDiscoveryContractError("bidirectional QD generation requires explicit frozen pair factory and native authorities")
-        from .temporal_qd_pair_generation import generate_pair_population
+        if runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST and (
+            bidirectional_pair_run_config is None
+            or bidirectional_operator_implementation_identity is None
+            or qd_publication_authority is None
+        ):
+            raise TemporalDiscoveryContractError(
+                "native bidirectional QD generation requires its frozen pair run config"
+            )
+        from .temporal_qd_pair_generation import (
+            _frozen_catalog_for_predeclared_scope,
+            build_pair_generation_config,
+            generate_pair_population,
+        )
 
-        parents = []
-        for cell in archive.get("cells") or []:
-            for member in cell.get("members") or []:
-                candidate = member.get("candidate") if isinstance(member, Mapping) else None
-                if isinstance(candidate, Mapping):
-                    parents.append(FrozenPair.from_payload(candidate["bidirectionalGenome"]))
         pair_ledger_file = (
             Path(identity_ledger_path)
             if identity_ledger_path is not None
@@ -3614,16 +3685,130 @@ def generate_qd_generation(
             generation_index != 1
             or int(evaluation_population_size) != requested_width
             or int(initial_construction_pool_size) < requested_width
-            or any((cell.get("members") or []) for cell in (archive.get("cells") or []) if isinstance(cell, Mapping))
         ):
             raise TemporalDiscoveryContractError("G0 requires an empty generation-1 archive and must bind the normal evaluation width")
         construction_width = int(initial_construction_pool_size) if is_g0 else requested_width
+        pair_run_config = {
+            "parentArchiveSha256": archive_sha,
+            "parameters": _normalize_parameters(parameters),
+            "evidenceIdentityContext": pair_evidence_context,
+            **(
+                {
+                    "g0Bootstrap": {
+                        "initialConstructionPoolSize": construction_width,
+                        "evaluationPopulationSize": requested_width,
+                    }
+                }
+                if is_g0
+                else {}
+            ),
+        }
+        public_pair_policy = {
+            key: value for key, value in pair_policy.items() if key != "policySha256"
+        }
+        if runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST:
+            _load_identity_ledger(pair_ledger_file)
+            publication_authority = _clone(
+                qd_publication_authority,
+                name="native QD publication authority",
+            )
+            if set(publication_authority) != {
+                "qdVersion",
+                "policyName",
+                "policySha256",
+                "frozenPolicy",
+            } or canonical_sha256(publication_authority["frozenPolicy"]) != publication_authority.get(
+                "policySha256"
+            ):
+                raise TemporalDiscoveryContractError(
+                    "native QD publication authority is invalid"
+                )
+            immigrant_policy = bidirectional_pair_run_config.get(
+                "immigrantConstructionPolicy"
+            )
+            if immigrant_policy is not None and not isinstance(
+                immigrant_policy, Mapping
+            ):
+                raise TemporalDiscoveryContractError(
+                    "frozen pair immigrant construction policy is invalid"
+                )
+            generation_config = build_pair_generation_config(
+                generation_index=generation_index,
+                target_unique_candidates=construction_width,
+                max_proposal_attempts=int(
+                    _normalize_parameters(parameters)["maxProposalAttempts"]
+                ),
+                run_config=pair_run_config,
+                pair_policy=public_pair_policy,
+                operator_implementation_identity=bidirectional_operator_implementation_identity,
+                parent_archive=None,
+                immigrant_construction_policy=immigrant_policy,
+                global_identity_ledger_enabled=True,
+                parent_schedule=parent_schedule,
+            )
+            runtime_authority = build_generation_runtime_authority(
+                pair_run_config=bidirectional_pair_run_config,
+                pair_policy=public_pair_policy,
+                evidence_identity_context=pair_evidence_context,
+                generation_config=generation_config,
+            )
+            try:
+                result = run_native_generation(
+                    output_root=root,
+                    parent_archive_path=parent_archive_path,
+                    parent_archive_sha256=archive_sha,
+                    runtime_authority=runtime_authority,
+                    generation_config=generation_config,
+                    identity_ledger_path=pair_ledger_file,
+                    max_new_proposals=max_new_proposals,
+                    native_execution_timeout_seconds=int(
+                        runtime["executionTimeoutSeconds"]
+                    ),
+                    allow_empty_quality_bootstrap=(
+                        bool(allow_empty_quality_bootstrap) or is_g0
+                    ),
+                    g0_evaluation_width=(requested_width if is_g0 else None),
+                    frozen_construction_catalog=_frozen_catalog_for_predeclared_scope(
+                        pair_evidence_context
+                    ),
+                    qd_version=publication_authority["qdVersion"],
+                    policy_name=publication_authority["policyName"],
+                    policy_sha256=publication_authority["policySha256"],
+                    frozen_policy=publication_authority["frozenPolicy"],
+                )
+            except TemporalQDNativeError as exc:
+                # Native selection is terminal for this invocation. There is
+                # deliberately no Python generation fallback in this branch.
+                raise TemporalDiscoveryContractError(str(exc)) from exc
+            return result
+        if runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON:
+            raise TemporalDiscoveryContractError(
+                "pair generation runtime selected an unknown engine"
+            )
+        if is_g0 and any(
+            (cell.get("members") or [])
+            for cell in (archive.get("cells") or [])
+            if isinstance(cell, Mapping)
+        ):
+            raise TemporalDiscoveryContractError(
+                "G0 requires an empty generation-1 archive and must bind the normal evaluation width"
+            )
+        parents = []
+        for cell in archive.get("cells") or []:
+            for member in cell.get("members") or []:
+                candidate = (
+                    member.get("candidate") if isinstance(member, Mapping) else None
+                )
+                if isinstance(candidate, Mapping):
+                    parents.append(
+                        FrozenPair.from_payload(candidate["bidirectionalGenome"])
+                    )
         return generate_pair_population(
             output_root=root,
             generation_index=generation_index,
             target_unique_candidates=construction_width,
-            run_config={"parentArchiveSha256": archive_sha, "parameters": _normalize_parameters(parameters), "evidenceIdentityContext": pair_evidence_context, **({"g0Bootstrap": {"initialConstructionPoolSize": construction_width, "evaluationPopulationSize": requested_width}} if is_g0 else {})},
-            pair_policy={key: value for key, value in pair_policy.items() if key != "policySha256"},
+            run_config=pair_run_config,
+            pair_policy=public_pair_policy,
             parent_pairs=parents,
             pair_factory=bidirectional_pair_factory,
             module_authority=bidirectional_module_authority,

@@ -87,6 +87,17 @@ class TemporalDiscoveryContractError(TemporalDiscoveryError):
     pass
 
 
+class TemporalDiscoveryInfrastructureError(TemporalDiscoveryContractError):
+    """An external authority or transport failed outside candidate semantics.
+
+    Callers may treat an ordinary contract error as a deterministic rejected
+    operator.  Infrastructure failures must instead abort the transaction so
+    a dead validator cannot become immutable research evidence.
+    """
+
+    pass
+
+
 class TemporalDiscoveryGenerationExhausted(TemporalDiscoveryError):
     pass
 
@@ -317,4 +328,4 @@ def _ensure_explicit_management(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 
-__all__ = ['TEMPORAL_DISCOVERY_PREPARATION_SCHEMA', 'TEMPORAL_DISCOVERY_AUTHORITY_SCHEMA', 'TEMPORAL_DISCOVERY_POPULATION_SCHEMA', 'TEMPORAL_DISCOVERY_GENERATION_JOURNAL_SCHEMA', 'TEMPORAL_DISCOVERY_INITIAL_SELECTION_SCHEMA', 'TEMPORAL_DISCOVERY_FINAL_REPORT_SCHEMA', 'TEMPORAL_DISCOVERY_MANIFEST_SCHEMA', 'TEMPORAL_DISCOVERY_GENERATOR_VERSION', 'TEMPORAL_DISCOVERY_SELECTION_VERSION', 'TEMPORAL_SEARCH_VALIDATION_SCHEMA', '_SAFE', '_CANDIDATE', '_SHA', '_MUTATION_FAMILIES', '_THRESHOLD_GRID', '_EVENT_GRID', '_POS_AGE_GRID', '_R_GRID', '_STOP_PERCENT_GRID', '_TARGET_R_GRID', '_TARGET_PERCENT_GRID', '_DISTANCE_MULTIPLE_GRID', '_TRAIL_R_GRID', '_TRAIL_PERCENT_GRID', '_MIN_STEP_GRID', '_TIME_WINDOWS', 'TemporalDiscoveryError', 'TemporalDiscoveryContractError', 'TemporalDiscoveryGenerationExhausted', 'CandidateValidatorProtocol', '_clone', '_mapping', '_safe', '_sha', '_integer', '_number', '_write_immutable', '_read_json', '_pointer', '_walk', '_get', '_set', '_mutation', '_different', '_ensure_explicit_management', 'TEMPORAL_SEARCH_PREPARATION_SCHEMA', 'TemporalSearchContractError', 'build_authority', 'canonical_sha256', 'validate_authority']
+__all__ = ['TEMPORAL_DISCOVERY_PREPARATION_SCHEMA', 'TEMPORAL_DISCOVERY_AUTHORITY_SCHEMA', 'TEMPORAL_DISCOVERY_POPULATION_SCHEMA', 'TEMPORAL_DISCOVERY_GENERATION_JOURNAL_SCHEMA', 'TEMPORAL_DISCOVERY_INITIAL_SELECTION_SCHEMA', 'TEMPORAL_DISCOVERY_FINAL_REPORT_SCHEMA', 'TEMPORAL_DISCOVERY_MANIFEST_SCHEMA', 'TEMPORAL_DISCOVERY_GENERATOR_VERSION', 'TEMPORAL_DISCOVERY_SELECTION_VERSION', 'TEMPORAL_SEARCH_VALIDATION_SCHEMA', '_SAFE', '_CANDIDATE', '_SHA', '_MUTATION_FAMILIES', '_THRESHOLD_GRID', '_EVENT_GRID', '_POS_AGE_GRID', '_R_GRID', '_STOP_PERCENT_GRID', '_TARGET_R_GRID', '_TARGET_PERCENT_GRID', '_DISTANCE_MULTIPLE_GRID', '_TRAIL_R_GRID', '_TRAIL_PERCENT_GRID', '_MIN_STEP_GRID', '_TIME_WINDOWS', 'TemporalDiscoveryError', 'TemporalDiscoveryContractError', 'TemporalDiscoveryInfrastructureError', 'TemporalDiscoveryGenerationExhausted', 'CandidateValidatorProtocol', '_clone', '_mapping', '_safe', '_sha', '_integer', '_number', '_write_immutable', '_read_json', '_pointer', '_walk', '_get', '_set', '_mutation', '_different', '_ensure_explicit_management', 'TEMPORAL_SEARCH_PREPARATION_SCHEMA', 'TemporalSearchContractError', 'build_authority', 'canonical_sha256', 'validate_authority']

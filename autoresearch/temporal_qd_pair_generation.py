@@ -32,7 +32,10 @@ from .temporal_bidirectional_genome import (
     deterministic_same_side_crossover,
     proposal_side,
 )
-from .temporal_discovery_base import TemporalDiscoveryContractError
+from .temporal_discovery_base import (
+    TemporalDiscoveryContractError,
+    TemporalDiscoveryInfrastructureError,
+)
 from .temporal_qd_initial_protection import (
     apply_initial_protection_plan,
     default_initial_protection_policy,
@@ -86,30 +89,9 @@ DEFAULT_POPULATION_FINALIZER = POPULATION_FINALIZER_RUST
 ROTATING_PARENT_SCHEDULE_SCHEMA = "temporal_qd_rotating_parent_schedule_v1"
 
 
-def _rotating_parent_schedule(
-    parent_archive: Mapping[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Validate the opt-in robust-parent proposal schedule.
-
-    Archives without this transaction retain the historical four-offspring /
-    one-immigrant cadence exactly.  Rotating archives bind a rational share so
-    sparse evidence cannot silently produce an 80% offspring generation.
-    """
-
-    if not isinstance(parent_archive, Mapping):
-        return None
-    transaction = parent_archive.get("rotatingEvidenceTransaction")
-    if transaction is None:
-        return None
-    if not isinstance(transaction, Mapping):
-        raise TemporalDiscoveryContractError(
-            "rotating parent projection transaction is invalid"
-        )
-    raw = transaction.get("parentSchedule")
-    if not isinstance(raw, Mapping):
-        raise TemporalDiscoveryContractError(
-            "rotating parent projection lacks its bound parent schedule"
-        )
+def _validate_rotating_parent_schedule(
+    raw: Mapping[str, Any], *, actual_parent_count: int | None
+) -> dict[str, Any]:
     schedule = _clone(raw)
     required = {
         "schemaVersion",
@@ -166,16 +148,45 @@ def _rotating_parent_schedule(
         != "deterministic_rational_prefix_balance"
     ):
         raise TemporalDiscoveryContractError("rotating parent schedule policy is invalid")
+    if actual_parent_count is not None and actual_parent_count != parent_count:
+        raise TemporalDiscoveryContractError(
+            "rotating parent schedule disagrees with available parents"
+        )
+    return schedule
+
+
+def _rotating_parent_schedule(
+    parent_archive: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate the opt-in robust-parent proposal schedule.
+
+    Archives without this transaction retain the historical four-offspring /
+    one-immigrant cadence exactly.  Rotating archives bind a rational share so
+    sparse evidence cannot silently produce an 80% offspring generation.
+    """
+
+    if not isinstance(parent_archive, Mapping):
+        return None
+    transaction = parent_archive.get("rotatingEvidenceTransaction")
+    if transaction is None:
+        return None
+    if not isinstance(transaction, Mapping):
+        raise TemporalDiscoveryContractError(
+            "rotating parent projection transaction is invalid"
+        )
+    raw = transaction.get("parentSchedule")
+    if not isinstance(raw, Mapping):
+        raise TemporalDiscoveryContractError(
+            "rotating parent projection lacks its bound parent schedule"
+        )
     actual_parent_count = sum(
         len(cell.get("members") or [])
         for cell in parent_archive.get("cells") or []
         if isinstance(cell, Mapping)
     )
-    if actual_parent_count != parent_count:
-        raise TemporalDiscoveryContractError(
-            "rotating parent schedule disagrees with available parents"
-        )
-    return schedule
+    return _validate_rotating_parent_schedule(
+        raw, actual_parent_count=actual_parent_count
+    )
 
 
 def _scheduled_immigrant(
@@ -590,6 +601,75 @@ def _mutable(value: Any) -> Any:
     return value
 
 
+def build_pair_generation_config(
+    *,
+    generation_index: int,
+    target_unique_candidates: int,
+    max_proposal_attempts: int,
+    run_config: Mapping[str, Any],
+    pair_policy: Mapping[str, Any],
+    operator_implementation_identity: Mapping[str, Any],
+    parent_archive: Mapping[str, Any] | None,
+    immigrant_construction_policy: Mapping[str, Any] | None,
+    global_identity_ledger_enabled: bool,
+    parent_schedule: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze the sole pair-generation config consumed by Python and Rust."""
+
+    archive_schedule = _rotating_parent_schedule(parent_archive)
+    supplied_schedule = (
+        _validate_rotating_parent_schedule(
+            parent_schedule,
+            actual_parent_count=None,
+        )
+        if parent_schedule is not None
+        else None
+    )
+    if (
+        parent_archive is not None
+        and parent_schedule is not None
+        and supplied_schedule != archive_schedule
+    ):
+        raise TemporalDiscoveryContractError(
+            "explicit parent schedule differs from parent archive"
+        )
+    resolved_parent_schedule = (
+        supplied_schedule if parent_schedule is not None else archive_schedule
+    )
+    config = {
+        "schemaVersion": PAIR_GENERATION_SCHEMA,
+        "generationIndex": int(generation_index),
+        "targetUniqueCandidates": int(target_unique_candidates),
+        "maxProposalAttempts": int(max_proposal_attempts),
+        "runConfig": _clone(run_config),
+        "pairPolicy": _clone(pair_policy),
+        "operatorImplementation": _clone(operator_implementation_identity),
+        "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
+        **(
+            {"parentSchedule": resolved_parent_schedule}
+            if resolved_parent_schedule is not None
+            else {}
+        ),
+        **(
+            {"immigrantConstructionPolicy": _clone(immigrant_construction_policy)}
+            if immigrant_construction_policy is not None
+            else {}
+        ),
+        **(
+            {
+                "globalIdentityLedger": {
+                    "schemaVersion": "temporal_qd_identity_ledger_v3",
+                    "locationPolicy": "caller_supplied_generation_global_ledger",
+                }
+            }
+            if global_identity_ledger_enabled
+            else {}
+        ),
+    }
+    config["configSha256"] = canonical_sha256(config)
+    return config
+
+
 def _sorted(plans: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return sorted((_clone(dict(plan)) for plan in plans), key=canonical_sha256)
 
@@ -822,6 +902,8 @@ def propose_pair(
         payload = {**base, "disposition": "materialized", "operation": selected, "operationAudit": _clone(audit), "changedModule": changed.canonical_payload(), "pair": pair.canonical_payload(), "pairIdentitySha256": pair.identity_sha256}
         payload["proposalSha256"] = canonical_sha256(payload)
         return pair, payload
+    except TemporalDiscoveryInfrastructureError:
+        raise
     except (BidirectionalGenomeError, TemporalDiscoveryContractError) as exc:
         # Exception messages commonly include subprocess text.  Persist a
         # stable typed reason/audit instead of making replay depend on it.
@@ -951,6 +1033,8 @@ def _propose_crossover(
             module_authority=module_authority,
             pair_compiler=pair_compiler,
         )
+    except TemporalDiscoveryInfrastructureError:
+        raise
     except (BidirectionalGenomeError, TemporalDiscoveryContractError) as exc:
         payload = {
             **base,
@@ -1009,6 +1093,37 @@ def _replay_payload_for_schema(
     return result
 
 
+def _first_replay_difference(expected: Any, actual: Any, *, path: str = "$") -> str:
+    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
+        expected_keys = set(expected)
+        actual_keys = set(actual)
+        if expected_keys != actual_keys:
+            return (
+                f"{path} keys expected={sorted(expected_keys)!r} "
+                f"actual={sorted(actual_keys)!r}"
+            )
+        for key in sorted(expected_keys):
+            difference = _first_replay_difference(
+                expected[key], actual[key], path=f"{path}.{key}"
+            )
+            if difference:
+                return difference
+        return ""
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            return f"{path} length expected={len(expected)} actual={len(actual)}"
+        for index, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            difference = _first_replay_difference(
+                expected_item, actual_item, path=f"{path}[{index}]"
+            )
+            if difference:
+                return difference
+        return ""
+    if expected != actual:
+        return f"{path} expected={expected!r} actual={actual!r}"
+    return ""
+
+
 def replay_pair_proposal(*, payload: Mapping[str, Any], module_authority: PairModuleOperator, native_validator: NativeModuleValidator, pair_compiler: CanonicalPairCompiler) -> FrozenPair | None:
     """Replay only persisted material; factories/catalog aliases are never read."""
     data = _clone(payload)
@@ -1032,8 +1147,16 @@ def replay_pair_proposal(*, payload: Mapping[str, Any], module_authority: PairMo
             parent_selection=data.get("parentSelection"), replay_steps=data["mutationSteps"],
         )
         expected = _replay_payload_for_schema(replayed, schema_version=data["schemaVersion"])
-        if expected != {**data, "proposalSha256": supplied}:
-            raise TemporalDiscoveryContractError("pair multi-operation proposal replay diverged")
+        actual = {**data, "proposalSha256": supplied}
+        if expected != actual:
+            difference = _first_replay_difference(
+                expected.get("mutationSteps"), actual.get("mutationSteps"),
+                path="$.mutationSteps",
+            ) or _first_replay_difference(expected, actual)
+            raise TemporalDiscoveryContractError(
+                "pair multi-operation proposal replay diverged: "
+                f"{difference}"
+            )
         return pair
     if data.get("proposalKind") == CROSSOVER_PROPOSAL_KIND:
         parent = FrozenPair.from_payload(data["parentPair"])
@@ -2305,37 +2428,17 @@ def _generate_pair_population_legacy_impl(
                 "pair immigrant collision tripwire policy is invalid"
             )
     with timed_span("generation.build_config"):
-        config = {
-            "schemaVersion": PAIR_GENERATION_SCHEMA,
-            "generationIndex": generation_index,
-            "targetUniqueCandidates": target_unique_candidates,
-            "maxProposalAttempts": max_proposal_attempts,
-            "runConfig": _clone(run_config),
-            "pairPolicy": policy,
-            "operatorImplementation": _clone(operator_implementation_identity),
-            "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
-            **(
-                {"parentSchedule": parent_schedule}
-                if parent_schedule is not None
-                else {}
-            ),
-            **(
-                {"immigrantConstructionPolicy": factory_construction_policy}
-                if factory_construction_policy is not None
-                else {}
-            ),
-            **(
-                {
-                    "globalIdentityLedger": {
-                        "schemaVersion": "temporal_qd_identity_ledger_v3",
-                        "locationPolicy": "caller_supplied_generation_global_ledger",
-                    }
-                }
-                if identity_ledger_path is not None
-                else {}
-            ),
-        }
-        config["configSha256"] = canonical_sha256(config)
+        config = build_pair_generation_config(
+            generation_index=generation_index,
+            target_unique_candidates=target_unique_candidates,
+            max_proposal_attempts=max_proposal_attempts,
+            run_config=run_config,
+            pair_policy=policy,
+            operator_implementation_identity=operator_implementation_identity,
+            parent_archive=parent_archive,
+            immigrant_construction_policy=factory_construction_policy,
+            global_identity_ledger_enabled=identity_ledger_path is not None,
+        )
     with timed_span("generation.persist_config"):
         _write_once(root / "pair-config.json", config)
     with timed_span("generation.resume.scan_journal") as span:
@@ -2450,6 +2553,11 @@ def _generate_pair_population_legacy_impl(
                 selection_state[cell_id]["selectionVisitCount"] += 1
                 selection_state[cell_id]["offspringAttemptCount"] += 1
     immigrant_only_bootstrap = not archive_cells and not parents
+    eligible_parent_count = (
+        sum(len(cell.get("members") or []) for cell in archive_cells)
+        if archive_cells
+        else len(parents)
+    )
     if archive_cells:
         structural_parent_selections = sum(
             1
@@ -2491,7 +2599,7 @@ def _generate_pair_population_legacy_impl(
             use_crossover = (
                 not use_immigrant
                 and ordinal % 7 == 6
-                and (len(archive_cells) > 1 or len(parents) > 1)
+                and eligible_parent_count > 1
             )
             scheduled_origin = (
                 "random_immigrant"
@@ -2513,8 +2621,10 @@ def _generate_pair_population_legacy_impl(
                     parent, parent_selection = select_parent("crossover_parent")
                     mate, mate_selection = select_parent("crossover_mate")
                     mate_attempts: list[dict[str, Any] | None] = []
-                    eligible_count = sum(len(cell.get("members") or []) for cell in archive_cells) if archive_cells else len(parents)
-                    while mate.identity_sha256 == parent.identity_sha256 and eligible_count > 1:
+                    while (
+                        mate.identity_sha256 == parent.identity_sha256
+                        and eligible_parent_count > 1
+                    ):
                         mate_attempts.append(mate_selection)
                         mate, mate_selection = select_parent(f"crossover_mate_retry_{len(mate_attempts)}")
                     pair, proposal = _propose_crossover(
@@ -2849,37 +2959,17 @@ def _generate_pair_population_optimized_impl(
                 "pair immigrant collision tripwire policy is invalid"
             )
     with timed_span("generation.build_config"):
-        config = {
-            "schemaVersion": PAIR_GENERATION_SCHEMA,
-            "generationIndex": generation_index,
-            "targetUniqueCandidates": target_unique_candidates,
-            "maxProposalAttempts": max_proposal_attempts,
-            "runConfig": _clone(run_config),
-            "pairPolicy": policy,
-            "operatorImplementation": _clone(operator_implementation_identity),
-            "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
-            **(
-                {"parentSchedule": parent_schedule}
-                if parent_schedule is not None
-                else {}
-            ),
-            **(
-                {"immigrantConstructionPolicy": factory_construction_policy}
-                if factory_construction_policy is not None
-                else {}
-            ),
-            **(
-                {
-                    "globalIdentityLedger": {
-                        "schemaVersion": "temporal_qd_identity_ledger_v3",
-                        "locationPolicy": "caller_supplied_generation_global_ledger",
-                    }
-                }
-                if identity_ledger_path is not None
-                else {}
-            ),
-        }
-        config["configSha256"] = canonical_sha256(config)
+        config = build_pair_generation_config(
+            generation_index=generation_index,
+            target_unique_candidates=target_unique_candidates,
+            max_proposal_attempts=max_proposal_attempts,
+            run_config=run_config,
+            pair_policy=policy,
+            operator_implementation_identity=operator_implementation_identity,
+            parent_archive=parent_archive,
+            immigrant_construction_policy=factory_construction_policy,
+            global_identity_ledger_enabled=identity_ledger_path is not None,
+        )
     with timed_span("generation.persist_config"):
         _write_once(root / "pair-config.json", config)
     with timed_span("generation.resume.scan_journal") as span:
@@ -2895,12 +2985,18 @@ def _generate_pair_population_optimized_impl(
                     raise TemporalDiscoveryContractError(
                         "pair proposal entry lacks immutable proposal material"
                     )
-                replayed = replay_pair_proposal(
-                    payload=proposal,
-                    module_authority=module_authority,
-                    native_validator=native_validator,
-                    pair_compiler=pair_compiler,
-                )
+                try:
+                    replayed = replay_pair_proposal(
+                        payload=proposal,
+                        module_authority=module_authority,
+                        native_validator=native_validator,
+                        pair_compiler=pair_compiler,
+                    )
+                except TemporalDiscoveryContractError as exc:
+                    raise TemporalDiscoveryContractError(
+                        "pair proposal resume replay failed at "
+                        f"ordinal {ordinal} ({path.name}): {exc}"
+                    ) from exc
                 if row.get("disposition") == "accepted":
                     candidate = row.get("candidate")
                     if (
@@ -2993,6 +3089,11 @@ def _generate_pair_population_optimized_impl(
             selection_state[cell_id]["selectionVisitCount"] += 1
             selection_state[cell_id]["offspringAttemptCount"] += 1
     immigrant_only_bootstrap = not archive_cells and not parents
+    eligible_parent_count = (
+        sum(len(cell.get("members") or []) for cell in archive_cells)
+        if archive_cells
+        else len(parents)
+    )
     if archive_cells:
         structural_parent_selections = len(state.archive_parent_selection_cell_ids)
     else:
@@ -3066,7 +3167,7 @@ def _generate_pair_population_optimized_impl(
             use_crossover = (
                 not use_immigrant
                 and ordinal % 7 == 6
-                and (len(archive_cells) > 1 or len(parents) > 1)
+                and eligible_parent_count > 1
             )
             scheduled_origin = (
                 "random_immigrant"
@@ -3095,14 +3196,9 @@ def _generate_pair_population_optimized_impl(
                     parent, parent_selection = select_parent("crossover_parent")
                     mate, mate_selection = select_parent("crossover_mate")
                     mate_attempts: list[dict[str, Any] | None] = []
-                    eligible_count = (
-                        sum(len(cell.get("members") or []) for cell in archive_cells)
-                        if archive_cells
-                        else len(parents)
-                    )
                     while (
                         mate.identity_sha256 == parent.identity_sha256
-                        and eligible_count > 1
+                        and eligible_parent_count > 1
                     ):
                         mate_attempts.append(mate_selection)
                         mate, mate_selection = select_parent(

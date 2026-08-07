@@ -1,0 +1,18 @@
+[package]
+name = "temporal-qd-batch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "temporal-qd-batch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-kernel = { path = "../qd-kernel" }
+temporal-qd-runtime = { path = "../qd-runtime" }

@@ -30,6 +30,7 @@ from .temporal_qd_pair_factory import (
     load_pair_run_config,
     pair_policy_from_config,
 )
+from .temporal_qd_pair_generation import _rotating_parent_schedule
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
     QD_IDENTITY_LEDGER_SCHEMA,
@@ -53,6 +54,14 @@ from .temporal_qd_evolution import (
     qd_canonical_evidence_identity,
 )
 from .temporal_qd_funnel_adapter import build_qd_generation_funnel
+from .temporal_qd_native import (
+    PAIR_GENERATION_RUNTIME_DEFAULT,
+    PAIR_GENERATION_RUNTIME_PYTHON,
+    PAIR_GENERATION_RUNTIME_RUST,
+    TemporalQDNativeError,
+    build_pair_generation_runtime_config,
+    validate_pair_generation_runtime_config,
+)
 from .temporal_qd_evidence_ladder import (
     build_evidence_ladder,
     validate_template_discovery_windows,
@@ -1766,13 +1775,46 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     archive_binding = config.get("initialArchive")
     if not isinstance(archive_binding, Mapping):
         raise TemporalDiscoveryContractError("QD supervisor initial archive binding is invalid")
-    archive, archive_sha = _load_archive(Path(str(archive_binding.get("path") or "")))
-    if archive_sha != archive_binding.get("archiveSha256") or (
-        archive.get("resultSetSha256") != archive_binding.get("resultSetSha256")
-    ):
-        raise TemporalDiscoveryContractError("QD supervisor initial archive drifted")
-
     pair_config = config.get("bidirectionalPairGeneration")
+    pair_runtime = None
+    if pair_config is not None:
+        try:
+            pair_runtime = validate_pair_generation_runtime_config(
+                config.get("pairGenerationRuntime")
+            )
+        except TemporalQDNativeError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+    native_pair_generation = bool(
+        pair_runtime is not None
+        and pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST
+    )
+    if native_pair_generation:
+        archive_path = Path(str(archive_binding.get("path") or ""))
+        if (
+            not archive_path.is_file()
+            or _sha256(
+                archive_binding.get("archiveSha256"),
+                name="frozen native initial archive",
+            )
+            != archive_binding.get("archiveSha256")
+            or _sha256(
+                archive_binding.get("resultSetSha256"),
+                name="frozen native initial result set",
+            )
+            != archive_binding.get("resultSetSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD supervisor native initial archive binding is invalid"
+            )
+    else:
+        archive, archive_sha = _load_archive(
+            Path(str(archive_binding.get("path") or ""))
+        )
+        if archive_sha != archive_binding.get("archiveSha256") or (
+            archive.get("resultSetSha256") != archive_binding.get("resultSetSha256")
+        ):
+            raise TemporalDiscoveryContractError("QD supervisor initial archive drifted")
+
     if pair_config is None:
         source_binding = config.get("immigrantSource")
         if not isinstance(source_binding, Mapping):
@@ -1788,8 +1830,9 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     else:
         # Rebuilds the concrete typed/native authorities and validates every
         # frozen registry/catalog/transport identity before a resume can run.
-        with PairAuthorityBundle(_clone(pair_config, name="frozen pair authority")):
-            pass
+        if not native_pair_generation:
+            with PairAuthorityBundle(_clone(pair_config, name="frozen pair authority")):
+                pass
         if config.get("broadAdmission") is True:
             contract = config.get("broadAdmissionContract")
             if not isinstance(contract, Mapping):
@@ -1918,6 +1961,8 @@ def _frozen_config(
     generation_funnel_enabled: bool = False,
     construction_catalog_path: Path | str | None = None,
     bidirectional_pair_config: Mapping[str, Any] | None = None,
+    pair_generation_engine: str | None = None,
+    pair_generation_timeout_seconds: int = 3600,
     evidence_ladder_config: Mapping[str, Any] | None = None,
     rotating_evidence_config: Mapping[str, Any] | None = None,
     continuation_from: Mapping[str, Any] | None = None,
@@ -1956,6 +2001,7 @@ def _frozen_config(
                 "fresh broad admission requires a frozen evidence ladder or rotating evidence contract and the frozen five-generation x 1,024-candidate contract; a continuation requires exactly four generations"
         )
     initial_archive, initial_archive_sha = _load_archive(initial_archive_path)
+    initial_parent_schedule = _rotating_parent_schedule(initial_archive)
     template = _read(template_preparation_path, name="QD template preparation")
     evidence_ladder = (
         build_evidence_ladder(evidence_ladder_config)
@@ -2032,6 +2078,21 @@ def _frozen_config(
             ),
         )
     pair_authority = load_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
+    if pair_authority is None and pair_generation_engine is not None:
+        raise TemporalDiscoveryContractError(
+            "pair generation engine requires bidirectional pair mode"
+        )
+    try:
+        pair_generation_runtime = (
+            build_pair_generation_runtime_config(
+                engine=pair_generation_engine or PAIR_GENERATION_RUNTIME_DEFAULT,
+                execution_timeout_seconds=pair_generation_timeout_seconds,
+            )
+            if pair_authority is not None
+            else None
+        )
+    except TemporalQDNativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
     g0_enabled = bool(pair_authority is not None and not is_continuation and first_generation_index == 1)
     if g0_enabled and initial_construction_pool_size is None and evaluation_population_size is None:
         evaluation_population_size = int(normalized_parameters["targetUniqueCandidates"])
@@ -2180,6 +2241,16 @@ def _frozen_config(
             "archiveSha256": initial_archive_sha,
             "generationIndex": int(initial_archive["generationIndex"]),
             "resultSetSha256": initial_archive["resultSetSha256"],
+            **(
+                {
+                    "parentSchedule": _clone(
+                        initial_parent_schedule,
+                        name="initial archive parent schedule",
+                    )
+                }
+                if initial_parent_schedule is not None
+                else {}
+            ),
         },
         **({"continuationFrom": _clone(continuation_from, name="QD continuation binding")} if continuation_from is not None else {}),
         **({
@@ -2188,7 +2259,10 @@ def _frozen_config(
                 "confirmedEntryAdmissionRoot": str(confirmed_entry_admission_root.resolve()), "sourceIdentity": source.source_identity,
                 "initialContinuationOrdinal": initial_immigrant_continuation_ordinal,
             }
-        } if source is not None else {"bidirectionalPairGeneration": pair_authority}),
+        } if source is not None else {
+            "bidirectionalPairGeneration": pair_authority,
+            "pairGenerationRuntime": pair_generation_runtime,
+        }),
         **({"validator": {"commandFile": str(validator_command_file.resolve()), "command": validator_command, "commandSha256": canonical_sha256(validator_command), "timeoutSeconds": 60.0}} if pair_authority is None else {}),
         "evaluation": {
             "templatePreparationPath": str(template_preparation_path.resolve()),
@@ -2804,6 +2878,8 @@ def run_qd_supervisor(
     construction_catalog_path: Path | str | None = None,
     generation_funnel_enabled: bool = False,
     bidirectional_pair_config: Mapping[str, Any] | None = None,
+    pair_generation_engine: str | None = None,
+    pair_generation_timeout_seconds: int = 3600,
     evidence_ladder_config: Mapping[str, Any] | None = None,
     rotating_evidence_config: Mapping[str, Any] | None = None,
     continuation_from: Mapping[str, Any] | None = None,
@@ -2843,6 +2919,8 @@ def run_qd_supervisor(
         generation_funnel_enabled=generation_funnel_enabled,
         construction_catalog_path=construction_catalog_path,
         bidirectional_pair_config=bidirectional_pair_config,
+        pair_generation_engine=pair_generation_engine,
+        pair_generation_timeout_seconds=pair_generation_timeout_seconds,
         evidence_ladder_config=evidence_ladder_config,
         rotating_evidence_config=rotating_evidence_config,
         continuation_from=continuation_from,
@@ -2939,6 +3017,8 @@ def run_qd_supervisor(
         first = int(config["generationPlan"]["firstGenerationIndex"])
         last = int(config["generationPlan"]["lastGenerationIndex"])
         parent_archive_path = initial_archive_file
+        parent_archive_sha256 = config["initialArchive"]["archiveSha256"]
+        parent_schedule = config["initialArchive"].get("parentSchedule")
         immigrant_cursor = int(initial_immigrant_continuation_ordinal)
         if completed_by_index:
             latest = max(completed_by_index)
@@ -2947,6 +3027,8 @@ def run_qd_supervisor(
                     "completed QD generations are not contiguous"
                 )
             parent_archive_path = Path(completed_by_index[latest]["archivePath"])
+            parent_archive_sha256 = completed_by_index[latest]["archiveSha256"]
+            parent_schedule = completed_by_index[latest].get("parentSchedule")
             immigrant_cursor = int(
                 completed_by_index[latest]["nextImmigrantContinuationOrdinal"]
             )
@@ -2990,6 +3072,8 @@ def run_qd_supervisor(
             validator_command = _validate_frozen_sources(config)
             generation_kwargs = dict(
                 parent_archive_path=parent_archive_path,
+                parent_archive_sha256=parent_archive_sha256,
+                parent_schedule=parent_schedule,
                 output_root=proposal_root,
                 generation_index=generation_index,
                 immigrant_continuation_start=immigrant_cursor,
@@ -3005,6 +3089,12 @@ def run_qd_supervisor(
                 generation_funnel_enabled=bool(
                     (config.get("generationFunnel") or {}).get("enabled")
                 ),
+                qd_publication_authority={
+                    "qdVersion": config["qdVersion"],
+                    "policyName": config["policyName"],
+                    "policySha256": config["policySha256"],
+                    "frozenPolicy": config["frozenPolicy"],
+                },
             )
             if config.get("bidirectionalPairGeneration") is None:
                 # Legacy generation owns the file-backed source and command
@@ -3021,18 +3111,42 @@ def run_qd_supervisor(
                 )
                 generation_result = generate_qd_generation(**generation_kwargs)
             else:
-                with PairAuthorityBundle(config["bidirectionalPairGeneration"]) as pair_authority:
+                try:
+                    pair_runtime = validate_pair_generation_runtime_config(
+                        config.get("pairGenerationRuntime")
+                    )
+                except TemporalQDNativeError as exc:
+                    raise TemporalDiscoveryContractError(str(exc)) from exc
+                if pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_PYTHON:
+                    with PairAuthorityBundle(config["bidirectionalPairGeneration"]) as pair_authority:
+                        g0 = config.get("g0Bootstrap")
+                        generation_result = generate_qd_generation(
+                            **generation_kwargs,
+                            pair_generation_runtime=pair_runtime,
+                            bidirectional_pair_run_config=config["bidirectionalPairGeneration"],
+                            bidirectional_pair_policy=pair_policy_from_config(config["bidirectionalPairGeneration"]),
+                            bidirectional_pair_factory=pair_authority.factory,
+                            bidirectional_module_authority=pair_authority.operator,
+                            bidirectional_native_validator=pair_authority.validator,
+                            bidirectional_pair_compiler=pair_authority.compiler,
+                            bidirectional_operator_implementation_identity=config["bidirectionalPairGeneration"]["operatorImplementation"],
+                            initial_construction_pool_size=(int(g0["initialConstructionPoolSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
+                            evaluation_population_size=(int(g0["evaluationPopulationSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
+                        )
+                elif pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST:
                     g0 = config.get("g0Bootstrap")
                     generation_result = generate_qd_generation(
                         **generation_kwargs,
+                        pair_generation_runtime=pair_runtime,
+                        bidirectional_pair_run_config=config["bidirectionalPairGeneration"],
                         bidirectional_pair_policy=pair_policy_from_config(config["bidirectionalPairGeneration"]),
-                        bidirectional_pair_factory=pair_authority.factory,
-                        bidirectional_module_authority=pair_authority.operator,
-                        bidirectional_native_validator=pair_authority.validator,
-                        bidirectional_pair_compiler=pair_authority.compiler,
                         bidirectional_operator_implementation_identity=config["bidirectionalPairGeneration"]["operatorImplementation"],
                         initial_construction_pool_size=(int(g0["initialConstructionPoolSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
                         evaluation_population_size=(int(g0["evaluationPopulationSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
+                    )
+                else:
+                    raise TemporalDiscoveryContractError(
+                        "pair generation runtime selected an unknown engine"
                     )
             if generation_result.get("completed") is not True:
                 raise TemporalDiscoveryContractError(
@@ -3268,6 +3382,11 @@ def run_qd_supervisor(
                 "totalGenerationTaskCount": int(campaign_result["taskCount"])
                 + int(archive_result.get("additionalWorkerTaskCount") or 0),
                 "archiveSha256": archive_result["archiveSha256"],
+                **(
+                    {"parentSchedule": archive_result["parentSchedule"]}
+                    if archive_result.get("parentSchedule") is not None
+                    else {}
+                ),
                 "resultSetSha256": _sha256(
                     _canonical_file(
                         archive_path, name="QD generation archive"
@@ -3362,6 +3481,8 @@ def run_qd_supervisor(
             )
             completed_by_index[generation_index] = generation_record
             parent_archive_path = archive_path
+            parent_archive_sha256 = archive_result["archiveSha256"]
+            parent_schedule = archive_result.get("parentSchedule")
             immigrant_cursor = int(
                 generation_result["nextImmigrantContinuationOrdinal"]
             )
@@ -3660,6 +3781,18 @@ def main() -> None:
     )
     parser.add_argument("--stop-after-generation", type=int)
     parser.add_argument("--bidirectional-pair-config", type=Path, help="closed temporal_qd_bidirectional_pair_run_config_v1 JSON; opt-in only")
+    parser.add_argument(
+        "--pair-generation-engine",
+        choices=(PAIR_GENERATION_RUNTIME_PYTHON, PAIR_GENERATION_RUNTIME_RUST),
+        default=PAIR_GENERATION_RUNTIME_DEFAULT,
+        help="frozen pair-generation engine; Rust is the admitted default and forbids fallback; Python remains the explicit oracle",
+    )
+    parser.add_argument(
+        "--pair-generation-timeout-seconds",
+        type=int,
+        default=3600,
+        help="frozen whole-process timeout for one native pair generation",
+    )
     args = parser.parse_args()
     if args.bidirectional_pair_config is None and any(value is None for value in (args.source_preparation, args.base_generator_root, args.confirmed_entry_admission_root, args.validator_command_file)):
         parser.error("legacy mode requires --source-preparation, --base-generator-root, --confirmed-entry-admission-root, and --validator-command-file")
@@ -3692,6 +3825,12 @@ def main() -> None:
                 _read(args.bidirectional_pair_config, name="bidirectional pair run config")
                 if args.bidirectional_pair_config is not None else None
             ),
+            pair_generation_engine=(
+                args.pair_generation_engine
+                if args.bidirectional_pair_config is not None
+                else None
+            ),
+            pair_generation_timeout_seconds=args.pair_generation_timeout_seconds,
             evidence_ladder_config=(
                 _read(args.evidence_ladder_config, name="QD evidence ladder config")
                 if args.evidence_ladder_config is not None else None
@@ -3739,6 +3878,12 @@ def main() -> None:
             _read(args.bidirectional_pair_config, name="bidirectional pair run config")
             if args.bidirectional_pair_config is not None else None
         ),
+        pair_generation_engine=(
+            args.pair_generation_engine
+            if args.bidirectional_pair_config is not None
+            else None
+        ),
+        pair_generation_timeout_seconds=args.pair_generation_timeout_seconds,
         evidence_ladder_config=(
             _read(args.evidence_ladder_config, name="QD evidence ladder config")
             if args.evidence_ladder_config is not None

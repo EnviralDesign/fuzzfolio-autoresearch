@@ -1,0 +1,148 @@
+name: Temporal QD Rust front half
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "rust/temporal-qd/**"
+      - "rust-toolchain.toml"
+      - "autoresearch/temporal_qd_native.py"
+      - "autoresearch/temporal_qd_evolution.py"
+      - "autoresearch/temporal_qd_pair_generation.py"
+      - "autoresearch/temporal_qd_pair_factory.py"
+      - "autoresearch/temporal_qd_supervisor.py"
+      - "autoresearch/temporal_typed_motif_grammar.py"
+      - "autoresearch/temporal_bidirectional_genome.py"
+      - "autoresearch/temporal_initial_protection.py"
+      - "autoresearch/temporal_discovery_base.py"
+      - "autoresearch/temporal_discovery_validation.py"
+      - "scripts/build-temporal-qd-native.ps1"
+      - "scripts/temporal_qd_front_half_oracle.py"
+      - "scripts/temporal_qd_front_half_python_oracle_corpus.py"
+      - "scripts/temporal_qd_native_admission.py"
+      - "scripts/temporal_qd_runtime_oracle_fixture.py"
+      - "tests/fixtures/temporal_qd_runtime_oracle/**"
+      - "tests/fixtures/temporal_qd_front_half_python_oracle_corpus.json"
+      - "tests/test_temporal_qd_native.py"
+      - "tests/test_temporal_qd_native_admission.py"
+      - "tests/test_temporal_qd_front_half_oracle.py"
+      - "tests/test_temporal_qd_front_half_python_oracle_corpus.py"
+      - "tests/test_temporal_qd_runtime_oracle_fixture.py"
+      - "tests/test_temporal_qd_pair_factory.py"
+      - "tests/test_temporal_qd_pair_parent_archive.py"
+      - "tests/test_temporal_bidirectional_genome.py"
+      - "tests/test_temporal_discovery_validation_persistent.py"
+      - "tests/test_temporal_qd_supervisor.py"
+      - "tests/test_temporal_typed_motif_grammar_lineage.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/temporal-qd-rust-front-half.yml"
+  pull_request:
+    paths:
+      - "rust/temporal-qd/**"
+      - "rust-toolchain.toml"
+      - "autoresearch/temporal_qd_native.py"
+      - "autoresearch/temporal_qd_evolution.py"
+      - "autoresearch/temporal_qd_pair_generation.py"
+      - "autoresearch/temporal_qd_pair_factory.py"
+      - "autoresearch/temporal_qd_supervisor.py"
+      - "autoresearch/temporal_typed_motif_grammar.py"
+      - "autoresearch/temporal_bidirectional_genome.py"
+      - "autoresearch/temporal_initial_protection.py"
+      - "autoresearch/temporal_discovery_base.py"
+      - "autoresearch/temporal_discovery_validation.py"
+      - "scripts/build-temporal-qd-native.ps1"
+      - "scripts/temporal_qd_front_half_oracle.py"
+      - "scripts/temporal_qd_front_half_python_oracle_corpus.py"
+      - "scripts/temporal_qd_native_admission.py"
+      - "scripts/temporal_qd_runtime_oracle_fixture.py"
+      - "tests/fixtures/temporal_qd_runtime_oracle/**"
+      - "tests/fixtures/temporal_qd_front_half_python_oracle_corpus.json"
+      - "tests/test_temporal_qd_native.py"
+      - "tests/test_temporal_qd_native_admission.py"
+      - "tests/test_temporal_qd_front_half_oracle.py"
+      - "tests/test_temporal_qd_front_half_python_oracle_corpus.py"
+      - "tests/test_temporal_qd_runtime_oracle_fixture.py"
+      - "tests/test_temporal_qd_pair_factory.py"
+      - "tests/test_temporal_qd_pair_parent_archive.py"
+      - "tests/test_temporal_bidirectional_genome.py"
+      - "tests/test_temporal_discovery_validation_persistent.py"
+      - "tests/test_temporal_qd_supervisor.py"
+      - "tests/test_temporal_typed_motif_grammar_lineage.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/temporal-qd-rust-front-half.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporal-qd-rust-front-half-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-front-half:
+    name: Rust front half contract and oracle gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync frozen Python environment
+        run: uv sync --frozen
+
+      # With no toolchain override, this action reads rust-toolchain.toml.
+      - name: Set up Rust from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Check Rust formatting
+        working-directory: rust/temporal-qd
+        run: cargo fmt --check
+
+      - name: Run Rust workspace tests
+        working-directory: rust/temporal-qd
+        run: cargo test --workspace --all-targets --jobs 2
+
+      - name: Lint Rust workspace
+        working-directory: rust/temporal-qd
+        run: cargo clippy --workspace --all-targets --jobs 2 -- -D warnings
+
+      - name: Compile Python seam and oracle scripts
+        run: >-
+          uv run --frozen python -m py_compile
+          autoresearch/temporal_qd_native.py
+          autoresearch/temporal_qd_evolution.py
+          autoresearch/temporal_qd_pair_generation.py
+          autoresearch/temporal_qd_pair_factory.py
+          autoresearch/temporal_qd_supervisor.py
+          scripts/temporal_qd_front_half_oracle.py
+          scripts/temporal_qd_front_half_python_oracle_corpus.py
+          scripts/temporal_qd_native_admission.py
+          scripts/temporal_qd_runtime_oracle_fixture.py
+
+      - name: Run focused Python contract, oracle, and native tests
+        run: >-
+          uv run --frozen python -m pytest -q
+          tests/test_temporal_qd_native.py
+          tests/test_temporal_qd_native_admission.py
+          tests/test_temporal_qd_front_half_oracle.py
+          tests/test_temporal_qd_front_half_python_oracle_corpus.py
+          tests/test_temporal_qd_runtime_oracle_fixture.py
+          tests/test_temporal_qd_pair_factory.py
+          tests/test_temporal_qd_pair_parent_archive.py
+          tests/test_temporal_bidirectional_genome.py
+          tests/test_temporal_discovery_validation_persistent.py
+          tests/test_temporal_typed_motif_grammar_lineage.py
+          tests/test_temporal_qd_supervisor.py::test_pair_supervisor_freezes_rust_runtime_by_default
+          tests/test_temporal_qd_supervisor.py::test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator
+          tests/test_temporal_qd_supervisor.py::test_pair_g0_64_to_32_rotating_supervisor_restart_never_reschedules_construction
