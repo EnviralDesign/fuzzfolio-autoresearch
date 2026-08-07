@@ -101,9 +101,19 @@ jobs:
       - name: Sync frozen Python environment
         run: uv sync --frozen
 
-      # With no toolchain override, this action reads rust-toolchain.toml.
+      - name: Read pinned Rust channel
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - name: Set up Rust from rust-toolchain.toml
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: rustfmt, clippy
 
       - name: Check Rust formatting
         working-directory: rust/temporal-qd
