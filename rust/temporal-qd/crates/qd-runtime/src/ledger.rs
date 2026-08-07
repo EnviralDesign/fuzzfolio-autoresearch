@@ -14,8 +14,15 @@ use temporal_qd_kernel::proposal::{
 pub const IDENTITY_LEDGER_SCHEMA: &str = "temporal_qd_identity_ledger_v3";
 pub const PAIR_EXECUTABLE_SEMANTIC_RECORD_SCHEMA: &str =
     "temporal_qd_pair_executable_semantic_record_v1";
-pub const DELTA_SCHEMA: &str = "temporal_qd_global_identity_ledger_delta_v1";
-pub const COMPACT_STATE_SCHEMA: &str = "temporal_qd_global_identity_ledger_compact_v1";
+pub const DELTA_SCHEMA: &str = "temporal_qd_global_identity_ledger_delta_v2";
+pub const COMPACT_STATE_SCHEMA: &str = "temporal_qd_global_identity_ledger_compact_v2";
+
+// v1 journal receipts were emitted before proposal ordinals were explicitly
+// bound to a generation.  They remain readable only for the original
+// zero-based generation; a nonzero public ledger must never replay one into a
+// later generation.
+const LEGACY_DELTA_SCHEMA: &str = "temporal_qd_global_identity_ledger_delta_v1";
+const LEGACY_COMPACT_STATE_SCHEMA: &str = "temporal_qd_global_identity_ledger_compact_v1";
 
 const FIELDS: [(&str, &str); 5] = [
     ("candidateIdentity", "candidateIdentitySha256"),
@@ -195,6 +202,7 @@ pub struct ArchiveBootstrapInput {
 /// serialized into the sealed proposal segment before it mutates ledger state.
 #[derive(Clone, Debug)]
 struct Delta {
+    generation_proposal_ordinal_base: Option<u64>,
     proposal_ordinal: u64,
     disposition: String,
     checks: BTreeMap<String, bool>,
@@ -215,6 +223,13 @@ impl Delta {
             (
                 "ledgerAuthoritySha256",
                 Value::String(authority_sha256.to_owned()),
+            ),
+            (
+                "generationProposalOrdinalBase",
+                Value::from(
+                    self.generation_proposal_ordinal_base
+                        .expect("newly prepared deltas always bind a generation base"),
+                ),
             ),
             ("proposalOrdinal", Value::from(self.proposal_ordinal)),
             ("disposition", Value::String(self.disposition.clone())),
@@ -243,23 +258,54 @@ impl Delta {
         let map = value
             .as_object()
             .ok_or_else(|| contract("identity ledger delta must be an object"))?;
-        exact_keys(
-            map,
-            &[
-                "schemaVersion",
-                "ledgerAuthoritySha256",
-                "proposalOrdinal",
-                "disposition",
-                "identityChecks",
-                "record",
-                "executableSemanticSha256",
-                "preparedDeltaSha256",
-            ],
-            "identity ledger delta",
-        )?;
-        if member(map, "schemaVersion", "identity ledger delta")?.as_str() != Some(DELTA_SCHEMA) {
-            return Err(contract("identity ledger delta schema is incompatible"));
-        }
+        let schema = member(map, "schemaVersion", "identity ledger delta")?
+            .as_str()
+            .ok_or_else(|| contract("identity ledger delta schema is invalid"))?;
+        let generation_proposal_ordinal_base = match schema {
+            DELTA_SCHEMA => {
+                exact_keys(
+                    map,
+                    &[
+                        "schemaVersion",
+                        "ledgerAuthoritySha256",
+                        "generationProposalOrdinalBase",
+                        "proposalOrdinal",
+                        "disposition",
+                        "identityChecks",
+                        "record",
+                        "executableSemanticSha256",
+                        "preparedDeltaSha256",
+                    ],
+                    "identity ledger delta",
+                )?;
+                Some(integer(
+                    member(
+                        map,
+                        "generationProposalOrdinalBase",
+                        "identity ledger delta",
+                    )?,
+                    "generation proposal ordinal base",
+                )?)
+            }
+            LEGACY_DELTA_SCHEMA => {
+                exact_keys(
+                    map,
+                    &[
+                        "schemaVersion",
+                        "ledgerAuthoritySha256",
+                        "proposalOrdinal",
+                        "disposition",
+                        "identityChecks",
+                        "record",
+                        "executableSemanticSha256",
+                        "preparedDeltaSha256",
+                    ],
+                    "identity ledger delta",
+                )?;
+                None
+            }
+            _ => return Err(contract("identity ledger delta schema is incompatible")),
+        };
         if sha(
             member(map, "ledgerAuthoritySha256", "identity ledger delta")?,
             "ledger authority",
@@ -314,6 +360,7 @@ impl Delta {
             return Err(contract("accepted identity ledger delta lacks record"));
         }
         Ok(Self {
+            generation_proposal_ordinal_base,
             proposal_ordinal: integer(
                 member(map, "proposalOrdinal", "identity ledger delta")?,
                 "proposal ordinal",
@@ -340,6 +387,11 @@ pub struct GlobalIdentityLedger {
     pair_semantic_order: Vec<String>,
     duplicate_counters: BTreeMap<String, u64>,
     proposal_slot_counters: BTreeMap<String, u64>,
+    // The public counter is campaign-global and intentionally survives every
+    // generation.  Proposal journal ordinals are generation-local.  Preserve
+    // their immutable difference privately so a compact restart still knows
+    // that a local ordinal K follows a public count of base + K.
+    generation_proposal_ordinal_base: u64,
 }
 
 impl GlobalIdentityLedger {
@@ -516,6 +568,7 @@ impl GlobalIdentityLedger {
             }
             let _ = rejections;
         }
+        let generation_proposal_ordinal_base = proposal_slot_counters["proposalsObserved"];
         let mut parsed = Self {
             policy_identity,
             authority_sha256,
@@ -526,6 +579,7 @@ impl GlobalIdentityLedger {
             pair_semantic_order,
             duplicate_counters,
             proposal_slot_counters,
+            generation_proposal_ordinal_base,
         };
         parsed.indices = record_indices(&parsed.records);
         parsed.refresh_public()?;
@@ -833,6 +887,7 @@ impl GlobalIdentityLedger {
             let _ = record;
         }
         let delta = Delta {
+            generation_proposal_ordinal_base: Some(self.generation_proposal_ordinal_base),
             proposal_ordinal: proposal.proposal_ordinal,
             disposition: disposition.clone(),
             checks: checks.clone(),
@@ -867,7 +922,27 @@ impl IdentityLedger for GlobalIdentityLedger {
 
     fn commit_prepared_delta(&mut self, prepared_delta: &Value) -> Result<()> {
         let delta = Delta::parse(prepared_delta, &self.authority_sha256)?;
-        let expected = self.proposal_slot_counters["proposalsObserved"];
+        match delta.generation_proposal_ordinal_base {
+            Some(base) if base == self.generation_proposal_ordinal_base => {}
+            Some(_) => {
+                return Err(contract(
+                    "identity ledger delta belongs to another generation scope",
+                ));
+            }
+            // A v1 receipt was not generation-bound.  It is only safe to
+            // recover it in the original zero-based campaign generation.
+            None if self.generation_proposal_ordinal_base == 0 => {}
+            None => {
+                return Err(contract(
+                    "legacy identity ledger delta is not bound to this generation scope",
+                ));
+            }
+        }
+        let expected = self.proposal_slot_counters["proposalsObserved"]
+            .checked_sub(self.generation_proposal_ordinal_base)
+            .ok_or_else(|| {
+                contract("identity ledger public proposal counter predates generation base")
+            })?;
         if delta.proposal_ordinal != expected {
             return Err(contract(
                 "identity ledger delta proposal ordinal is stale or out of order",
@@ -954,6 +1029,10 @@ impl IdentityLedger for GlobalIdentityLedger {
                 "ledgerAuthoritySha256",
                 Value::String(self.authority_sha256.clone()),
             ),
+            (
+                "generationProposalOrdinalBase",
+                Value::from(self.generation_proposal_ordinal_base),
+            ),
             ("publicLedger", self.public.clone()),
         ])
     }
@@ -962,18 +1041,44 @@ impl IdentityLedger for GlobalIdentityLedger {
         let map = state
             .as_object()
             .ok_or_else(|| contract("identity ledger compact state must be an object"))?;
-        exact_keys(
-            map,
-            &["schemaVersion", "ledgerAuthoritySha256", "publicLedger"],
-            "identity ledger compact state",
-        )?;
-        if member(map, "schemaVersion", "identity ledger compact state")?.as_str()
-            != Some(COMPACT_STATE_SCHEMA)
-        {
-            return Err(contract(
-                "identity ledger compact state schema is incompatible",
-            ));
-        }
+        let schema = member(map, "schemaVersion", "identity ledger compact state")?
+            .as_str()
+            .ok_or_else(|| contract("identity ledger compact state schema is invalid"))?;
+        let generation_proposal_ordinal_base = match schema {
+            COMPACT_STATE_SCHEMA => {
+                exact_keys(
+                    map,
+                    &[
+                        "schemaVersion",
+                        "ledgerAuthoritySha256",
+                        "generationProposalOrdinalBase",
+                        "publicLedger",
+                    ],
+                    "identity ledger compact state",
+                )?;
+                Some(integer(
+                    member(
+                        map,
+                        "generationProposalOrdinalBase",
+                        "identity ledger compact state",
+                    )?,
+                    "generation proposal ordinal base",
+                )?)
+            }
+            LEGACY_COMPACT_STATE_SCHEMA => {
+                exact_keys(
+                    map,
+                    &["schemaVersion", "ledgerAuthoritySha256", "publicLedger"],
+                    "identity ledger compact state",
+                )?;
+                None
+            }
+            _ => {
+                return Err(contract(
+                    "identity ledger compact state schema is incompatible",
+                ));
+            }
+        };
         if sha(
             member(
                 map,
@@ -987,7 +1092,7 @@ impl IdentityLedger for GlobalIdentityLedger {
                 "identity ledger compact state is bound to another authority",
             ));
         }
-        let restored = Self::from_public(
+        let mut restored = Self::from_public(
             member(map, "publicLedger", "identity ledger compact state")?.clone(),
         )?;
         if restored.authority_sha256 != self.authority_sha256 {
@@ -995,6 +1100,14 @@ impl IdentityLedger for GlobalIdentityLedger {
                 "identity ledger compact policy mismatched checkpoint",
             ));
         }
+        let generation_proposal_ordinal_base = generation_proposal_ordinal_base.unwrap_or_default();
+        let observed = restored.proposal_slot_counters["proposalsObserved"];
+        if observed < generation_proposal_ordinal_base {
+            return Err(contract(
+                "identity ledger compact generation base exceeds public proposal counter",
+            ));
+        }
+        restored.generation_proposal_ordinal_base = generation_proposal_ordinal_base;
         *self = restored;
         Ok(())
     }

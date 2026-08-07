@@ -133,6 +133,49 @@ fn python_empty_pair_ledger() -> Value {
     ledger
 }
 
+fn with_proposal_slot_counters(
+    mut ledger: Value,
+    proposals_observed: u64,
+    accepted_unique_proposal_slots: u64,
+    duplicate_rejections: u64,
+) -> Value {
+    let fields = ledger.as_object_mut().expect("ledger object");
+    fields.remove("ledgerSha256");
+    fields.insert(
+        "proposalSlotCounters".to_owned(),
+        object([
+            ("proposalsObserved", Value::from(proposals_observed)),
+            (
+                "acceptedUniqueProposalSlots",
+                Value::from(accepted_unique_proposal_slots),
+            ),
+            ("duplicateRejections", Value::from(duplicate_rejections)),
+        ]),
+    );
+    let hash = canonical_sha256(&ledger).expect("canonical seeded Python-shaped ledger");
+    ledger
+        .as_object_mut()
+        .expect("ledger object")
+        .insert("ledgerSha256".to_owned(), Value::String(hash));
+    ledger
+}
+
+fn as_legacy_unbound_delta(mut delta: Value) -> Value {
+    let fields = delta.as_object_mut().expect("delta object");
+    fields.remove("preparedDeltaSha256");
+    fields.remove("generationProposalOrdinalBase");
+    fields.insert(
+        "schemaVersion".to_owned(),
+        Value::String("temporal_qd_global_identity_ledger_delta_v1".to_owned()),
+    );
+    let hash = canonical_sha256(&delta).expect("canonical legacy delta");
+    delta
+        .as_object_mut()
+        .expect("delta object")
+        .insert("preparedDeltaSha256".to_owned(), Value::String(hash));
+    delta
+}
+
 #[test]
 fn python_v3_empty_ledger_golden_is_accepted() {
     let ledger = python_empty_ledger();
@@ -159,6 +202,136 @@ fn python_v3_empty_pair_ledger_golden_is_preserved_at_cp0() {
     let mut restored = GlobalIdentityLedger::from_public(python_empty_ledger()).unwrap();
     restored.restore_compact_state(&checkpoint).unwrap();
     assert_eq!(restored.public_ledger(), parsed.public_ledger());
+}
+
+#[test]
+fn nonzero_python_public_counter_starts_a_new_local_generation_at_zero() {
+    let seeded = with_proposal_slot_counters(python_empty_ledger(), 4_021, 0, 0);
+    let mut ledger = GlobalIdentityLedger::from_public(seeded.clone()).unwrap();
+    assert_eq!(ledger.public_ledger(), Some(seeded));
+
+    let first = candidate('a', 'b', 'c', 'd', 'e');
+    let first_delta = ledger
+        .prepare_proposal(LedgerProposal {
+            proposal_ordinal: 0,
+            candidate: Some(&first),
+            executable_semantic_sha256: Some(&sha('9')),
+            tentative_disposition: "accepted",
+        })
+        .unwrap();
+    assert_eq!(
+        first_delta.prepared_delta["generationProposalOrdinalBase"],
+        Value::from(4_021_u64)
+    );
+    ledger
+        .commit_prepared_delta(&first_delta.prepared_delta)
+        .unwrap();
+    assert_eq!(
+        ledger.public_ledger().unwrap()["proposalSlotCounters"]["proposalsObserved"],
+        Value::from(4_022_u64)
+    );
+
+    let second = candidate('f', 'a', 'b', 'c', 'd');
+    let second_delta = ledger
+        .prepare_proposal(LedgerProposal {
+            proposal_ordinal: 1,
+            candidate: Some(&second),
+            executable_semantic_sha256: Some(&sha('8')),
+            tentative_disposition: "accepted",
+        })
+        .unwrap();
+    ledger
+        .commit_prepared_delta(&second_delta.prepared_delta)
+        .unwrap();
+    assert_eq!(
+        ledger.public_ledger().unwrap()["proposalSlotCounters"]["proposalsObserved"],
+        Value::from(4_023_u64)
+    );
+    assert!(
+        ledger
+            .commit_prepared_delta(&first_delta.prepared_delta)
+            .is_err()
+    );
+}
+
+#[test]
+fn compact_restart_keeps_the_nonzero_generation_base_and_local_ordering() {
+    let seeded = with_proposal_slot_counters(python_empty_ledger(), 4_021, 0, 0);
+    let mut ledger = GlobalIdentityLedger::from_public(seeded).unwrap();
+    for (ordinal, (candidate, semantic)) in [
+        (candidate('a', 'b', 'c', 'd', 'e'), sha('9')),
+        (candidate('f', 'a', 'b', 'c', 'd'), sha('8')),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let decision = ledger
+            .prepare_proposal(LedgerProposal {
+                proposal_ordinal: ordinal as u64,
+                candidate: Some(&candidate),
+                executable_semantic_sha256: Some(&semantic),
+                tentative_disposition: "accepted",
+            })
+            .unwrap();
+        ledger
+            .commit_prepared_delta(&decision.prepared_delta)
+            .unwrap();
+    }
+    let compact = ledger.compact_state();
+    assert_eq!(
+        compact["generationProposalOrdinalBase"],
+        Value::from(4_021_u64)
+    );
+    let mut restored = GlobalIdentityLedger::from_public(python_empty_ledger()).unwrap();
+    restored.restore_compact_state(&compact).unwrap();
+    assert_eq!(restored.public_ledger(), ledger.public_ledger());
+
+    let third = candidate('b', 'c', 'd', 'e', 'f');
+    let decision = restored
+        .prepare_proposal(LedgerProposal {
+            proposal_ordinal: 2,
+            candidate: Some(&third),
+            executable_semantic_sha256: Some(&sha('7')),
+            tentative_disposition: "accepted",
+        })
+        .unwrap();
+    restored
+        .commit_prepared_delta(&decision.prepared_delta)
+        .unwrap();
+    assert_eq!(
+        restored.public_ledger().unwrap()["proposalSlotCounters"]["proposalsObserved"],
+        Value::from(4_024_u64)
+    );
+}
+
+#[test]
+fn unbound_legacy_delta_cannot_cross_into_a_later_generation() {
+    let first = candidate('a', 'b', 'c', 'd', 'e');
+    let zero_generation = GlobalIdentityLedger::from_public(python_empty_ledger()).unwrap();
+    let legacy_delta = as_legacy_unbound_delta(
+        zero_generation
+            .prepare_proposal(LedgerProposal {
+                proposal_ordinal: 0,
+                candidate: Some(&first),
+                executable_semantic_sha256: Some(&sha('9')),
+                tentative_disposition: "accepted",
+            })
+            .unwrap()
+            .prepared_delta,
+    );
+
+    let mut zero_generation = zero_generation;
+    zero_generation
+        .commit_prepared_delta(&legacy_delta)
+        .unwrap();
+
+    let seeded = with_proposal_slot_counters(python_empty_ledger(), 4_021, 0, 0);
+    let mut later_generation = GlobalIdentityLedger::from_public(seeded).unwrap();
+    assert!(
+        later_generation
+            .commit_prepared_delta(&legacy_delta)
+            .is_err()
+    );
 }
 
 #[test]
