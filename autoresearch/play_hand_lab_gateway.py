@@ -535,6 +535,8 @@ class PlayHandLabGateway:
         self._recent_completed_order: deque[str] = deque()
         self._recent_terminal_task_ids: set[str] = set()
         self._recent_terminal_task_order: deque[str] = deque()
+        self._lake_retry_not_before = 0.0
+        self._lake_retry_reason: str | None = None
         self._metrics: dict[str, int] = {
             "tasks_enqueued": 0,
             "duplicate_task_enqueues": 0,
@@ -549,6 +551,8 @@ class PlayHandLabGateway:
             "expired_leases_requeued": 0,
             "retry_delayed_requeues": 0,
             "retry_preserved_attempt_requeues": 0,
+            "lake_circuit_breaker_activations": 0,
+            "lake_circuit_breaker_claims": 0,
             "slot_limited_claims": 0,
             "incompatible_claims": 0,
             "results_acked": 0,
@@ -706,6 +710,20 @@ class PlayHandLabGateway:
             if capabilities is not None:
                 worker.capabilities = {str(item) for item in capabilities if str(item)}
             worker.status_detail = "claiming"
+            now = _now()
+            if self._lake_retry_not_before > now:
+                retry_after = self._lake_retry_not_before - now
+                worker.status_detail = "lake_retry_delay"
+                self._metrics["no_work_claims"] += 1
+                self._metrics["lake_circuit_breaker_claims"] += 1
+                return {
+                    "status": "no_work",
+                    "retry_after_seconds": max(
+                        retry_after, self.config.no_work_retry_after_seconds
+                    ),
+                    "reason": "lake_retry_delay",
+                    "retry_reason": self._lake_retry_reason,
+                }
             if len(worker.active_lease_ids) >= max(int(worker.slots), 1):
                 worker.status_detail = "slot_limited"
                 self._metrics["slot_limited_claims"] += 1
@@ -928,6 +946,19 @@ class PlayHandLabGateway:
                 if retry_delay > 0:
                     self._metrics["retry_delayed_requeues"] += 1
                 if preserve_attempt_budget:
+                    self._lake_retry_not_before = max(
+                        self._lake_retry_not_before,
+                        now + retry_delay,
+                    )
+                    self._lake_retry_reason = (
+                        "mutation"
+                        if (
+                            "mutation" in str(error).lower()
+                            or "409" in str(error).lower()
+                        )
+                        else "unavailable"
+                    )
+                    self._metrics["lake_circuit_breaker_activations"] += 1
                     self._metrics["retry_preserved_attempt_requeues"] += 1
                 return {
                     "status": "requeued",
@@ -1094,6 +1125,14 @@ class PlayHandLabGateway:
                 "recent_completion_receipts": len(self._completed_by_lease),
                 "recent_terminal_task_ids": len(self._recent_terminal_task_ids),
                 "result_backpressure_active": self._result_backpressure_active_locked(),
+                "lake_retry_after_seconds": max(
+                    self._lake_retry_not_before - now, 0.0
+                ),
+                "lake_retry_reason": (
+                    self._lake_retry_reason
+                    if self._lake_retry_not_before > now
+                    else None
+                ),
                 "metrics": dict(self._metrics),
             }
             if include_workers:

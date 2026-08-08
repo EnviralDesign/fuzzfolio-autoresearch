@@ -345,10 +345,12 @@ def test_lab_gateway_delays_lake_mutation_retryable_failure() -> None:
 
     delayed_claim = gateway.claim("worker-1")
     assert delayed_claim["status"] == "no_work"
-    assert delayed_claim["reason"] == "retry_delay"
+    assert delayed_claim["reason"] == "lake_retry_delay"
+    assert delayed_claim["retry_reason"] == "mutation"
     assert delayed_claim["retry_after_seconds"] >= 29.0
 
     gateway._tasks["task-1"].available_at = time.monotonic() - 0.001
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
     second_claim = gateway.claim("worker-1")
     assert second_claim["status"] == "leased"
     assert second_claim["task_id"] == "task-1"
@@ -379,6 +381,7 @@ def test_lab_gateway_lake_mutation_retries_do_not_exhaust_attempt_cap() -> None:
     assert first_failed["attempt_budget_preserved"] is True
 
     gateway._tasks["task-1"].available_at = time.monotonic() - 0.001
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
     second_claim = gateway.claim("worker-1")
     second_failed = gateway.fail(
         "worker-1",
@@ -503,6 +506,50 @@ def test_lab_gateway_translated_attestation_conflict_uses_mutation_cadence() -> 
     assert snapshot["queued_tasks"] == 1
     assert snapshot["metrics"]["retry_delayed_requeues"] == 1
     assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
+
+
+def test_lab_gateway_lake_retry_stops_claiming_unrelated_tasks() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(lake_mutation_retry_after_seconds=30.0)
+    )
+    for index in range(2):
+        gateway.enqueue(
+            LabTask(
+                task_id=f"task-{index}",
+                lane_id="lane-1",
+                attempt_id=f"attempt-{index}",
+                max_attempts=1,
+            )
+        )
+    gateway.register_worker("worker-1")
+    gateway.register_worker("worker-2")
+
+    claim = gateway.claim("worker-1")
+    gateway.fail(
+        "worker-1",
+        claim["lease_id"],
+        error=(
+            "LazyLakeCacheError: Remote market data lake window attestation "
+            "conflict; retry after the mutation completes"
+        ),
+        retryable=True,
+    )
+
+    blocked = gateway.claim("worker-2")
+    snapshot = gateway.snapshot()
+    assert blocked["status"] == "no_work"
+    assert blocked["reason"] == "lake_retry_delay"
+    assert blocked["retry_reason"] == "mutation"
+    assert blocked["retry_after_seconds"] >= 29.0
+    assert snapshot["lake_retry_after_seconds"] >= 29.0
+    assert snapshot["lake_retry_reason"] == "mutation"
+    assert snapshot["metrics"]["lake_circuit_breaker_activations"] == 1
+    assert snapshot["metrics"]["lake_circuit_breaker_claims"] == 1
+
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
+    resumed = gateway.claim("worker-2")
+    assert resumed["status"] == "leased"
+    assert resumed["task_id"] == "task-1"
 
 
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
