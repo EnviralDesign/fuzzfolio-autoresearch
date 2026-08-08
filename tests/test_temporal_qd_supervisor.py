@@ -2505,6 +2505,7 @@ def test_native_publication_converges_after_every_step_without_new_batch(
     }
     for name, destination in destinations.items():
         assert json.loads(destination.read_text(encoding="utf-8")) == outputs[name]
+        assert destination.read_bytes() == (native_root / name).read_bytes()
     assert (native_root / "manifest.json").read_bytes() == manifest_bytes
     assert batch_marker.read_text(encoding="utf-8") == "1\n"
     journal = json.loads(
@@ -2514,6 +2515,56 @@ def test_native_publication_converges_after_every_step_without_new_batch(
     assert journal["journalSha256"] == canonical_sha256(
         {key: value for key, value in journal.items() if key != "journalSha256"}
     )
+
+
+def test_native_rotating_archive_result_uses_compact_committed_record(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    native_root = supervisor._native_finalization_root(root, 2)
+    _write(native_root / "manifest.json", {"schemaVersion": "fixture_manifest"})
+    record = {
+        "generationIndex": 2,
+        "archiveSha256": "sha256:" + "a" * 64,
+        "cumulativeArchiveSha256": "sha256:" + "b" * 64,
+        "occupiedCellCount": 3,
+        "qualityMemberCount": 1,
+        "frontierMemberCount": 2,
+        "observationalMemberCount": 0,
+        "negativeNoveltyMemberCount": 0,
+        "newCellCount": 2,
+        "paretoAdmissionCount": 3,
+        "paretoEvictionCount": 1,
+        "rotatingEvidenceLedgerSha256": "sha256:" + "c" * 64,
+        "rotatingEvidenceCheckpointSha256": "sha256:" + "d" * 64,
+        "taskCount": 16,
+        "totalGenerationTaskCount": 21,
+        "parentSchedule": {"schemaVersion": "fixture_schedule"},
+    }
+    record["generationRecordSha256"] = canonical_sha256(record)
+    state_patch = {
+        "generationIndex": 2,
+        "generationRecordSha256": record["generationRecordSha256"],
+        "generationRecord": record,
+    }
+    state_patch["statePatchSha256"] = canonical_sha256(state_patch)
+    commit = {"generationIndex": 2, "commitSha256": "sha256:" + "e" * 64}
+
+    result = supervisor._native_rotating_archive_result(
+        root=root,
+        generation_index=2,
+        published={
+            "generation-record.json": record,
+            "generation-state-patch.json": state_patch,
+            "generation-commit.json": commit,
+        },
+    )
+
+    assert result["archiveSha256"] == record["archiveSha256"]
+    assert result["memberCount"] == 3
+    assert result["additionalWorkerTaskCount"] == 5
+    assert result["nativeGenerationRecord"] == record
+    assert result["nativeStatePatch"] == state_patch
 
 
 def test_native_production_binding_joins_record_commit_and_state_patch(

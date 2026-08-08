@@ -14,6 +14,7 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -616,6 +617,66 @@ def _write_durable_new(path: Path, encoded: str) -> None:
                     f"refusing to change frozen broad-run input: {path}"
                 )
         _sync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _publish_committed_file(
+    source: Path,
+    destination: Path,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    """Durably publish the exact bytes of one immutable native output."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_sha256 = _native_binary_file_sha256(source)
+    if destination.is_file():
+        if _native_binary_file_sha256(destination) == source_sha256:
+            return
+        if not replace_existing:
+            source_payload = _canonical_file(
+                source, name=f"committed native {source.name}"
+            )
+            existing_payload = _canonical_file(
+                destination, name=f"published {source.name}"
+            )
+            if existing_payload != source_payload:
+                raise TemporalDiscoveryContractError(
+                    f"native publication destination diverged: {destination}"
+                )
+
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            dir=destination.parent,
+            prefix=destination.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            with source.open("rb") as source_handle:
+                shutil.copyfileobj(source_handle, handle, length=1024 * 1024)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        if _native_binary_file_sha256(temporary) != source_sha256:
+            raise TemporalDiscoveryContractError(
+                f"native publication copy hash drifted: {destination}"
+            )
+        if destination.is_file():
+            os.replace(temporary, destination)
+            temporary = None
+        else:
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                if _native_binary_file_sha256(destination) != source_sha256:
+                    raise TemporalDiscoveryContractError(
+                        f"native publication destination raced: {destination}"
+                    )
+        _sync_directory(destination.parent)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -3804,6 +3865,7 @@ def _publish_native_generation_outputs(
     *,
     root: Path,
     generation_index: int,
+    load_published_payloads: bool = True,
     _after_step: Any | None = None,
 ) -> dict[str, Any]:
     """Publish one committed native boundary to legacy authority paths.
@@ -3860,36 +3922,46 @@ def _publish_native_generation_outputs(
     completed_steps = list(journal["completedSteps"])
     published: dict[str, Any] = {}
     for source_name, destination in destinations.items():
-        payload = _canonical_file(
-            native_root / source_name, name=f"committed native {source_name}"
-        )
+        source_path = native_root / source_name
         if destination.is_file():
-            if _canonical_file(destination, name=f"published {source_name}") != payload:
+            source_file_sha256 = _native_binary_file_sha256(source_path)
+            if _native_binary_file_sha256(destination) != source_file_sha256:
+                payload = _canonical_file(
+                    source_path, name=f"committed native {source_name}"
+                )
                 existing = _canonical_file(
                     destination, name=f"pre-final published {source_name}"
                 )
-                replaceable_checkpoint = (
-                    source_name == "checkpoint.json"
-                    and source_name not in completed_steps
-                    and existing.get("generationIndex") == generation_index
-                    and existing.get("rotatingEvidenceSha256")
-                    == payload.get("rotatingEvidenceSha256")
-                    and existing.get("cohortSha256") == payload.get("cohortSha256")
-                    and existing.get("stage")
-                    in {
-                        "current_panel_evaluation",
-                        "provisional_reduction",
-                        "cumulative_backfill",
-                    }
-                )
-                if not replaceable_checkpoint:
-                    raise TemporalDiscoveryContractError(
-                        f"native publication destination diverged: {destination}"
+                if existing != payload:
+                    replaceable_checkpoint = (
+                        source_name == "checkpoint.json"
+                        and source_name not in completed_steps
+                        and existing.get("generationIndex") == generation_index
+                        and existing.get("rotatingEvidenceSha256")
+                        == payload.get("rotatingEvidenceSha256")
+                        and existing.get("cohortSha256") == payload.get("cohortSha256")
+                        and existing.get("stage")
+                        in {
+                            "current_panel_evaluation",
+                            "provisional_reduction",
+                            "cumulative_backfill",
+                        }
                     )
-                _replace(destination, payload)
+                    if not replaceable_checkpoint:
+                        raise TemporalDiscoveryContractError(
+                            f"native publication destination diverged: {destination}"
+                        )
+                _publish_committed_file(
+                    source_path,
+                    destination,
+                    replace_existing=True,
+                )
         else:
-            _write_once(destination, payload)
-        published[source_name] = payload
+            _publish_committed_file(source_path, destination)
+        if load_published_payloads:
+            published[source_name] = _canonical_file(
+                source_path, name=f"committed native {source_name}"
+            )
         if source_name not in completed_steps:
             completed_steps.append(source_name)
             journal = {
@@ -3902,10 +3974,11 @@ def _publish_native_generation_outputs(
             _replace(journal_path, journal)
         if _after_step is not None:
             _after_step(source_name, len(completed_steps))
-    published["generation-funnel-snapshot.json"] = _canonical_file(
-        native_root / "generation-funnel-snapshot.json",
-        name="committed native generation funnel snapshot",
-    )
+    if load_published_payloads:
+        published["generation-funnel-snapshot.json"] = _canonical_file(
+            native_root / "generation-funnel-snapshot.json",
+            name="committed native generation funnel snapshot",
+        )
     published["generation-record.json"] = _canonical_file(
         native_root / "generation-record.json", name="committed native generation record"
     )
@@ -3914,6 +3987,93 @@ def _publish_native_generation_outputs(
     )
     published["generation-commit.json"] = commit
     return published
+
+
+def _native_rotating_archive_result(
+    *,
+    root: Path,
+    generation_index: int,
+    published: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the small committed native record into the supervisor result."""
+
+    record = published.get("generation-record.json")
+    state_patch = published.get("generation-state-patch.json")
+    commit = published.get("generation-commit.json")
+    if not isinstance(record, Mapping) or not isinstance(state_patch, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native generation publication omitted its committed record or state patch"
+        )
+    if not isinstance(commit, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native generation publication omitted its committed commit"
+        )
+    record_sha256 = _identity_payload(
+        record, "generationRecordSha256", name="committed native generation record"
+    )
+    _identity_payload(
+        state_patch,
+        "statePatchSha256",
+        name="committed native generation state patch",
+    )
+    if (
+        int(record.get("generationIndex") or -1) != generation_index
+        or int(state_patch.get("generationIndex") or -1) != generation_index
+        or state_patch.get("generationRecordSha256") != record_sha256
+        or state_patch.get("generationRecord") != record
+    ):
+        raise TemporalDiscoveryContractError(
+            "native generation record and state patch disagree"
+        )
+    count_fields = (
+        "qualityMemberCount",
+        "frontierMemberCount",
+        "observationalMemberCount",
+        "negativeNoveltyMemberCount",
+    )
+    member_count = sum(int(record.get(field) or 0) for field in count_fields)
+    total_task_count = int(record.get("totalGenerationTaskCount") or 0)
+    proposal_task_count = int(record.get("taskCount") or 0)
+    if total_task_count < proposal_task_count:
+        raise TemporalDiscoveryContractError(
+            "native generation task accounting is invalid"
+        )
+    parent_schedule = record.get("parentSchedule")
+    if not isinstance(parent_schedule, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native generation parent schedule is missing"
+        )
+    manifest_path = _native_finalization_root(root, generation_index) / "manifest.json"
+    return {
+        "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
+        "archiveSha256": record["archiveSha256"],
+        "parentSchedule": _clone(
+            parent_schedule, name="native committed parent schedule"
+        ),
+        "cumulativeArchiveSha256": record["cumulativeArchiveSha256"],
+        "occupiedCellCount": int(record["occupiedCellCount"]),
+        "memberCount": member_count,
+        "qualityMemberCount": int(record["qualityMemberCount"]),
+        "frontierMemberCount": int(record["frontierMemberCount"]),
+        "newCellCount": int(record["newCellCount"]),
+        "paretoAdmissionCount": int(record["paretoAdmissionCount"]),
+        "paretoEvictionCount": int(record["paretoEvictionCount"]),
+        "observationalMemberCount": int(record["observationalMemberCount"]),
+        "negativeNoveltyMemberCount": int(record["negativeNoveltyMemberCount"]),
+        "rotatingEvidenceLedgerSha256": record[
+            "rotatingEvidenceLedgerSha256"
+        ],
+        "rotatingEvidenceCheckpointSha256": record[
+            "rotatingEvidenceCheckpointSha256"
+        ],
+        "additionalWorkerTaskCount": total_task_count - proposal_task_count,
+        "nativeManifest": _canonical_file(
+            manifest_path, name="native generation finalization manifest"
+        ),
+        "nativeCommit": dict(commit),
+        "nativeGenerationRecord": dict(record),
+        "nativeStatePatch": dict(state_patch),
+    }
 
 
 def _validate_native_migration_outputs(
@@ -5601,8 +5761,15 @@ def _run_rotating_generation_transaction(
             raise TemporalDiscoveryContractError(
                 "native generation recovery did not reopen compact commit authority"
             )
-        _publish_native_generation_outputs(
-            root=root, generation_index=generation_index
+        published = _publish_native_generation_outputs(
+            root=root,
+            generation_index=generation_index,
+            load_published_payloads=False,
+        )
+        return _native_rotating_archive_result(
+            root=root,
+            generation_index=generation_index,
+            published=published,
         )
     if all(path.is_file() for path in completed_paths):
         cohort = _canonical_file(cohort_path, name="rotating evaluation cohort")
@@ -6227,56 +6394,20 @@ def _run_rotating_generation_transaction(
             binary=native_finalizer_binary, manifest_path=manifest_path
         )
         published = _publish_native_generation_outputs(
-            root=root, generation_index=generation_index
+            root=root,
+            generation_index=generation_index,
+            load_published_payloads=False,
         )
         commit = published["generation-commit.json"]
         if execution.get("commitSha256") != commit.get("commitSha256"):
             raise TemporalDiscoveryContractError(
                 "native execution and committed publication identity disagree"
             )
-        archive = published["archive.json"]
-        checkpoint = published["checkpoint.json"]
-        ledger = published["generation-ledger.json"]
-        frontier_count = sum(
-            member.get("archiveLane") == "rotating_frontier"
-            for cell in archive.get("cells") or []
-            if isinstance(cell, Mapping)
-            for member in cell.get("members") or []
-            if isinstance(member, Mapping)
+        return _native_rotating_archive_result(
+            root=root,
+            generation_index=generation_index,
+            published=published,
         )
-        return {
-            "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
-            "archiveSha256": archive["archiveSha256"],
-            "parentSchedule": _clone(
-                archive["rotatingEvidenceTransaction"]["parentSchedule"],
-                name="native parent schedule",
-            ),
-            "cumulativeArchiveSha256": published["cumulative-archive.json"][
-                "archiveSha256"
-            ],
-            "occupiedCellCount": int(archive["occupiedCellCount"]),
-            "memberCount": int(archive["memberCount"]),
-            "qualityMemberCount": int(archive["qualityMemberCount"]),
-            "frontierMemberCount": int(frontier_count),
-            "newCellCount": int(archive["newCellCount"]),
-            "paretoAdmissionCount": int(archive["paretoAdmissionCount"]),
-            "paretoEvictionCount": int(archive["paretoEvictionCount"]),
-            "observationalMemberCount": int(archive["observationalMemberCount"]),
-            "negativeNoveltyMemberCount": int(archive["negativeNoveltyMemberCount"]),
-            "rotatingEvidenceLedgerSha256": ledger["ledgerSha256"],
-            "rotatingEvidenceCheckpointSha256": checkpoint["checkpointSha256"],
-            "additionalWorkerTaskCount": total_task_count
-            - len(
-                _canonical_file(
-                    proposal_campaign_root / "screening-run" / "task-manifest.json",
-                    name="proposal task manifest",
-                )["tasks"]
-            ),
-            "nativeManifest": manifest,
-            "nativeCommit": commit,
-            "nativeGenerationRecord": published["generation-record.json"],
-            "nativeStatePatch": published["generation-state-patch.json"],
-        }
 
     cumulative = build_cumulative_breeder_archive(
         contract=contract,
