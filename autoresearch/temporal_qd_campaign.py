@@ -79,6 +79,12 @@ def freeze_qd_screening_campaign(
     panel_id: str | None = None,
 ) -> dict[str, Any]:
     population_file = Path(population_path)
+    if campaign_role not in {
+        "proposal_current_panel",
+        "retained_parent_current_panel",
+        "prior_panel_backfill",
+    }:
+        raise TemporalDiscoveryContractError("unknown QD screening campaign role")
     projection_file = evaluation_population_path(population_file)
     evaluation_population_sha256: str | None = None
     if projection_file.is_file():
@@ -96,7 +102,10 @@ def freeze_qd_screening_campaign(
             {"bidirectionalPairPolicy": population_payload["bidirectionalPairPolicy"]}
         )
     else:
-        if population_file.stat().st_size > _SMALL_POPULATION_FALLBACK_BYTES:
+        if (
+            campaign_role == "proposal_current_panel"
+            and population_file.stat().st_size > _SMALL_POPULATION_FALLBACK_BYTES
+        ):
             raise TemporalDiscoveryContractError(
                 "optimized pre-sidecar QD pair population requires a fresh truthful root"
             )
@@ -114,12 +123,6 @@ def freeze_qd_screening_campaign(
             )
         candidates, population_sha = _load_population(population_file)
         bidirectional_policy = _bidirectional_pair_policy(population_payload)
-    if campaign_role not in {
-        "proposal_current_panel",
-        "retained_parent_current_panel",
-        "prior_panel_backfill",
-    }:
-        raise TemporalDiscoveryContractError("unknown QD screening campaign role")
     if population_schema == ROTATING_COHORT_POPULATION_SCHEMA:
         if rotating_evidence is None:
             raise TemporalDiscoveryContractError(

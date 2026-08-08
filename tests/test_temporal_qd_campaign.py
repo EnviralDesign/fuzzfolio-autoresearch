@@ -341,6 +341,42 @@ def test_optimized_pre_sidecar_population_requires_a_fresh_truthful_root(
         )
 
 
+def test_large_rotating_cohort_reaches_schema_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ReachedPopulationLoader(Exception):
+        pass
+
+    population_path = tmp_path / "population.json"
+    template_path = tmp_path / "template.json"
+    rotating_sha = "sha256:" + "b" * 64
+    _write(
+        population_path,
+        {
+            "schemaVersion": "temporal_qd_rotating_cohort_population_v1",
+            "cohortRole": "retained_parent_current_panel",
+            "proposalPopulation": False,
+            "rotatingEvidenceSha256": rotating_sha,
+        },
+    )
+    _write(template_path, _template())
+    monkeypatch.setattr(qd_campaign, "_SMALL_POPULATION_FALLBACK_BYTES", 0)
+
+    def reached_loader(_path: Path) -> tuple[list[dict], str]:
+        raise ReachedPopulationLoader
+
+    monkeypatch.setattr(qd_campaign, "_load_population", reached_loader)
+    with pytest.raises(ReachedPopulationLoader):
+        freeze_qd_screening_campaign(
+            population_path=population_path,
+            template_preparation_path=template_path,
+            output_root=tmp_path / "campaign",
+            execution_engine_commit="a" * 40,
+            rotating_evidence={"rotatingEvidenceSha256": rotating_sha},
+            campaign_role="retained_parent_current_panel",
+        )
+
+
 @pytest.mark.parametrize("replacement", ["M1", "M30"])
 def test_qd_campaign_refuses_timeframe_child_outside_pre_attested_scope(
     tmp_path: Path, replacement: str
