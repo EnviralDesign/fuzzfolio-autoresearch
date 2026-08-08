@@ -977,6 +977,7 @@ def _capture_screening_artifacts(
     label: str,
     generation_journal_path: Path | None = None,
     tail_result_index: Mapping[str, Any] | None = None,
+    verify_population_file: bool = True,
 ) -> dict[str, Any]:
     """Reopen the immutable outputs common to every frozen screening campaign."""
 
@@ -996,6 +997,7 @@ def _capture_screening_artifacts(
         evaluation_population = load_evaluation_population(
             population_path=population_path,
             journal_path=generation_journal_path,
+            verify_population_file=verify_population_file,
         )
         population = evaluation_population
     else:
@@ -1160,6 +1162,7 @@ def _capture_generation_artifacts(
     generation_funnel_enabled: bool = False,
     tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
     tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
+    verify_population_file: bool = True,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
     indexes = tail_result_indexes if tail_result_indexes is not None else {}
@@ -1186,6 +1189,7 @@ def _capture_generation_artifacts(
         label="QD generation",
         generation_journal_path=journal_path,
         tail_result_index=proposal_tail_index,
+        verify_population_file=verify_population_file,
     )
     journal = _canonical_file(journal_path, name="QD generation journal")
     if int(journal.get("generationIndex", -1)) != generation_index:
@@ -1335,21 +1339,25 @@ def _validate_generation_artifacts(
             "completed generation lacks its immutable artifact ledger"
         )
     funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
+    native_binding = generation_record.get("nativeGenerationFinalization")
+    native_production = (
+        isinstance(native_binding, Mapping)
+        and native_binding.get("authorityMode")
+        == "native_production_compact_commit"
+    )
     current = _capture_generation_artifacts(
         root=root,
         generation_index=generation_index,
         generation_funnel_enabled=funnel_enabled,
         tail_result_mode=tail_result_mode,
         tail_result_indexes=tail_result_indexes,
+        verify_population_file=not native_production,
     )
-    native_binding = generation_record.get("nativeGenerationFinalization")
     if not _generation_artifact_ledgers_match(
         recorded=recorded,
         current=current,
         allow_native_result_authority_identity_projection=(
-            isinstance(native_binding, Mapping)
-            and native_binding.get("authorityMode")
-            == "native_production_compact_commit"
+            native_production
         ),
     ):
         raise TemporalDiscoveryContractError(
@@ -7078,6 +7086,10 @@ def run_qd_supervisor(
                 generation_funnel_enabled=funnel_enabled,
                 tail_result_mode=tail_result_mode,
                 tail_result_indexes=tail_result_indexes,
+                verify_population_file=(
+                    generation_finalization_engine
+                    != GENERATION_FINALIZATION_ENGINE_RUST
+                ),
             )
             if (
                 artifacts["population"]["populationSha256"]

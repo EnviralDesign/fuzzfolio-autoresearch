@@ -2081,6 +2081,37 @@ def test_native_artifact_compatibility_accepts_only_result_authority_projection(
     )
 
 
+def test_screening_artifact_capture_can_use_compact_population_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    population_path = tmp_path / "proposal" / "population.json"
+    evaluation_population_path = population_path.with_name(
+        "evaluation-population.json"
+    )
+    evaluation_population_path.parent.mkdir(parents=True)
+    evaluation_population_path.write_text("{}\n", encoding="utf-8")
+    observed: list[bool] = []
+
+    def stop_after_population_resolution(**kwargs):
+        observed.append(kwargs["verify_population_file"])
+        raise RuntimeError("population mode captured")
+
+    monkeypatch.setattr(
+        supervisor, "load_evaluation_population", stop_after_population_resolution
+    )
+    with pytest.raises(RuntimeError, match="population mode captured"):
+        supervisor._capture_screening_artifacts(
+            population_path=population_path,
+            archive_path=tmp_path / "archive.json",
+            campaign_root=tmp_path / "campaign",
+            generation_index=2,
+            label="native restart",
+            verify_population_file=False,
+        )
+
+    assert observed == [False]
+
+
 def test_native_cutover_cannot_silently_downgrade_to_python(tmp_path: Path) -> None:
     supervisor._require_irreversible_native_cutover_engine(
         root=tmp_path,
