@@ -469,6 +469,42 @@ def test_lab_gateway_lake_409_without_retry_header_uses_mutation_cadence() -> No
     assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
 
 
+def test_lab_gateway_translated_attestation_conflict_uses_mutation_cadence() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(lake_mutation_retry_after_seconds=900.0)
+    )
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=1,
+        )
+    )
+    gateway.register_worker("worker-1")
+
+    claim = gateway.claim("worker-1")
+    failed = gateway.fail(
+        "worker-1",
+        claim["lease_id"],
+        error=(
+            "LazyLakeCacheError: Remote market data lake window attestation "
+            "conflict; retry after the mutation completes"
+        ),
+        retryable=True,
+        retry_after_seconds=None,
+    )
+
+    snapshot = gateway.snapshot()
+    assert failed["status"] == "requeued"
+    assert failed["retry_after_seconds"] == 900.0
+    assert failed["attempt_budget_preserved"] is True
+    assert snapshot["failed_tasks"] == 0
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["metrics"]["retry_delayed_requeues"] == 1
+    assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
+
+
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
     gateway = PlayHandLabGateway()
     server = build_lab_gateway_http_server(

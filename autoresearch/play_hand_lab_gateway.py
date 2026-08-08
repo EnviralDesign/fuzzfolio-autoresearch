@@ -188,6 +188,7 @@ def _retry_delay_for_failure(
     normalized = str(error or "").strip().lower()
     if (
         "remote market data lake is mutating" in normalized
+        or "retry after the mutation completes" in normalized
         or _is_lake_mutation_conflict(normalized)
     ):
         return max(float(config.lake_mutation_retry_after_seconds), 0.0)
