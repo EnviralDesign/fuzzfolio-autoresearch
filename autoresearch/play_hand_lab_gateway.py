@@ -133,6 +133,21 @@ def _parse_positive_float(value: Any) -> float | None:
     return parsed
 
 
+def _is_lake_service_unavailable(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    service_unavailable = (
+        "503 server error" in normalized
+        or "503 service unavailable" in normalized
+        or "service unavailable" in normalized
+    )
+    lake_request = (
+        "window-attestations" in normalized
+        or "fuzzfoliodatalake" in normalized
+        or "market data lake" in normalized
+    )
+    return service_unavailable and lake_request
+
+
 def _is_expected_websocket_disconnect_exception(exc: Exception) -> bool:
     exc_type = type(exc)
     exc_name = exc_type.__name__
@@ -161,6 +176,11 @@ def _retry_delay_for_failure(
     normalized = str(error or "").strip().lower()
     if "remote market data lake is mutating" in normalized:
         return max(float(config.lake_mutation_retry_after_seconds), 0.0)
+    if _is_lake_service_unavailable(normalized):
+        # Older frozen workers can lose the lake's Retry-After header when
+        # requests.raise_for_status() constructs the failure.  Preserve the
+        # economic task and use the existing conservative lake retry cadence.
+        return max(float(config.lake_timeout_retry_after_seconds), 0.0)
     if "read timed out" in normalized and ("192.168.1.2" in normalized or "market data lake" in normalized):
         return max(float(config.lake_timeout_retry_after_seconds), 0.0)
     return 0.0
@@ -171,6 +191,7 @@ def _failure_preserves_attempt_budget(error: str) -> bool:
     return (
         "remote market data lake is mutating" in normalized
         or "retry after the mutation completes" in normalized
+        or _is_lake_service_unavailable(normalized)
         or ("read timed out" in normalized and ("192.168.1.2" in normalized or "market data lake" in normalized))
     )
 

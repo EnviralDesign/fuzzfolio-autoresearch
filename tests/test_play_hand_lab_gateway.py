@@ -395,6 +395,44 @@ def test_lab_gateway_lake_mutation_retries_do_not_exhaust_attempt_cap() -> None:
     assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 2
 
 
+def test_lab_gateway_lake_503_without_retry_header_preserves_attempt_budget() -> None:
+    gateway = PlayHandLabGateway(LabGatewayConfig(lake_timeout_retry_after_seconds=45.0))
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=1,
+        )
+    )
+    gateway.register_worker("worker-1")
+
+    claim = gateway.claim("worker-1")
+    failed = gateway.fail(
+        "worker-1",
+        claim["lease_id"],
+        error=(
+            "HTTPError: 503 Server Error: Service Unavailable for url: "
+            "https://fuzzfoliodatalake.example/api/lake/window-attestations/verify"
+        ),
+        retryable=True,
+        retry_after_seconds=None,
+    )
+
+    snapshot = gateway.snapshot()
+    assert failed == {
+        "status": "requeued",
+        "task_id": "task-1",
+        "retry_after_seconds": 45.0,
+        "attempt_budget_preserved": True,
+    }
+    assert snapshot["failed_tasks"] == 0
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["metrics"]["failures_final"] == 0
+    assert snapshot["metrics"]["retry_delayed_requeues"] == 1
+    assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
+
+
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
     gateway = PlayHandLabGateway()
     server = build_lab_gateway_http_server(
