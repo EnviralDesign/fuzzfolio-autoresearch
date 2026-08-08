@@ -2584,3 +2584,165 @@ def test_native_invocation_rejects_binary_replacement_before_publication(
             binary=finalizer,
             manifest_path=manifest_path,
         )
+
+
+def test_native_authority_rotation_preserves_historical_binary_epoch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    suffix = ".exe" if supervisor.os.name == "nt" else ""
+
+    def binaries(path: Path, version: str) -> Path:
+        path.mkdir()
+        finalizer = path / f"temporal-qd-generation-finalizer{suffix}"
+        finalizer.write_bytes(f"finalizer-{version}".encode())
+        (path / f"temporal-qd-campaign-seal{suffix}").write_bytes(
+            f"seal-{version}".encode()
+        )
+        (path / f"temporal-qd-tail-reducer{suffix}").write_bytes(
+            f"reducer-{version}".encode()
+        )
+        return finalizer
+
+    first_binary = binaries(tmp_path / "epoch-1", "v1")
+    second_binary = binaries(tmp_path / "epoch-2", "v2")
+    first = supervisor._freeze_native_finalization_runtime_authority(
+        root=root,
+        finalizer_binary=first_binary,
+        state={
+            "stateSha256": "sha256:" + "1" * 64,
+            "configSha256": "sha256:" + "c" * 64,
+            "currentGenerationIndex": 1,
+            "completedGenerations": [],
+        },
+    )
+    superseded_file = (
+        root
+        / "generations"
+        / "generation-0002"
+        / "native-finalization"
+        / "campaign-seal"
+        / "partial.json"
+    )
+    superseded_file.parent.mkdir(parents=True)
+    superseded_file.write_bytes(b"immutable-partial-attempt")
+    superseded_bytes = superseded_file.read_bytes()
+    rotation_state = {
+        "stateSha256": "sha256:" + "2" * 64,
+        "configSha256": "sha256:" + "c" * 64,
+        "currentGenerationIndex": 2,
+        "completedGenerations": [
+            {"generationIndex": 1, "nativeGenerationFinalization": {}}
+        ],
+    }
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="binary identity drifted from frozen authority",
+    ):
+        supervisor._freeze_native_finalization_runtime_authority(
+            root=root,
+            finalizer_binary=second_binary,
+            state=rotation_state,
+        )
+
+    second = supervisor._freeze_native_finalization_runtime_authority(
+        root=root,
+        finalizer_binary=second_binary,
+        state=rotation_state,
+        authorize_rotation=True,
+    )
+    assert (
+        supervisor._freeze_native_finalization_runtime_authority(
+            root=root,
+            finalizer_binary=second_binary,
+            state=rotation_state,
+        )
+        == second
+    )
+    assert first["authoritySha256"] != second["authoritySha256"]
+    root_authority = json.loads(
+        (root / "native-finalization-authority.json").read_text(encoding="utf-8")
+    )
+    assert root_authority == first
+    assert (
+        supervisor._native_finalization_authority_sha256(root, 1)
+        == first["authoritySha256"]
+    )
+    assert (
+        supervisor._native_finalization_authority_sha256(root, 2)
+        == second["authoritySha256"]
+    )
+    assert superseded_file.read_bytes() == superseded_bytes
+    assert supervisor._native_finalization_root(root, 1).name == "native-finalization"
+    assert supervisor._native_finalization_root(root, 2) == (
+        root
+        / "generations"
+        / "generation-0002"
+        / "native-finalization"
+        / "attempts"
+        / second["authoritySha256"].removeprefix("sha256:")
+    )
+    rotation_files = list(
+        (
+            root
+            / supervisor.NATIVE_FINALIZATION_AUTHORITY_HISTORY_DIR
+            / "rotations"
+        ).glob("*.json")
+    )
+    assert len(rotation_files) == 1
+    rotation = json.loads(rotation_files[0].read_text(encoding="utf-8"))
+    assert rotation["supersededIncompleteAttempt"]["fileCount"] == 1
+    assert rotation["supersededIncompleteAttempt"]["totalBytes"] == len(
+        superseded_bytes
+    )
+    assert (
+        supervisor._pinned_native_authority_binary(
+            root=root,
+            authority_sha256=first["authoritySha256"],
+            role="generationFinalizer",
+        )
+        == first_binary.resolve()
+    )
+    assert (
+        supervisor._pinned_native_authority_binary(
+            root=root,
+            authority_sha256=second["authoritySha256"],
+            role="generationFinalizer",
+        )
+        == second_binary.resolve()
+    )
+
+    manifest_path = (
+        root
+        / "generations"
+        / "generation-0001"
+        / "native-finalization"
+        / "manifest.json"
+    )
+    manifest = supervisor._native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
+            "contractVersion": supervisor.NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "finalize_rotating_generation",
+            "runtimeAuthoritySha256": first["authoritySha256"],
+            "sourcePath": str((manifest_path.parent / "source.json").resolve()),
+            "sourceSha256": "sha256:" + "a" * 64,
+            "resultPath": "generation-commit.json",
+        },
+        "manifestSha256",
+    )
+    _write(manifest_path, manifest)
+    supervisor._verify_pinned_native_invocation_binary(
+        binary=first_binary,
+        manifest_path=manifest_path,
+        role="generationFinalizer",
+    )
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="binary identity drifted during invocation",
+    ):
+        supervisor._verify_pinned_native_invocation_binary(
+            binary=second_binary,
+            manifest_path=manifest_path,
+            role="generationFinalizer",
+        )

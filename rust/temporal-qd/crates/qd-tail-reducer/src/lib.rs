@@ -313,27 +313,34 @@ fn reduce_to_members_file(
             .context("parse evaluation population")?;
     profile.mark("evaluation_read_parse");
     let evaluation_fields = object(&evaluation, "evaluation population")?;
+    let mut expected_evaluation_fields = vec![
+        "schemaVersion",
+        "generationIndex",
+        "populationSha256",
+        "populationFileSha256",
+        "pairGenerationConfigSha256",
+        "policyName",
+        "policySha256",
+        "pairPolicySha256",
+        "bidirectionalPairPolicy",
+        "operatorImplementationSha256",
+        "predeclaredEvidenceContextSha256",
+        "proposalAttempts",
+        "funnelEntries",
+        "candidateCount",
+        "candidates",
+        "evaluationPopulationSha256",
+    ];
+    // The bootstrap descriptor is generation-zero provenance: older/later
+    // population writers may retain it (including as null), while current
+    // later-generation populations omit it.  When present it remains inside
+    // the population identity; every other unexpected field still fails.
+    if evaluation_fields.contains_key("g0Bootstrap") {
+        expected_evaluation_fields.push("g0Bootstrap");
+    }
     exact_keys(
         evaluation_fields,
-        &[
-            "schemaVersion",
-            "generationIndex",
-            "populationSha256",
-            "populationFileSha256",
-            "pairGenerationConfigSha256",
-            "policyName",
-            "policySha256",
-            "pairPolicySha256",
-            "bidirectionalPairPolicy",
-            "operatorImplementationSha256",
-            "predeclaredEvidenceContextSha256",
-            "g0Bootstrap",
-            "proposalAttempts",
-            "funnelEntries",
-            "candidateCount",
-            "candidates",
-            "evaluationPopulationSha256",
-        ],
+        &expected_evaluation_fields,
         "evaluation population",
     )?;
     ensure!(

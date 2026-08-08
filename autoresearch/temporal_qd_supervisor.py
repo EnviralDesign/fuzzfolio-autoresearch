@@ -166,6 +166,10 @@ NATIVE_FOUNDATION_CONTRACT_VERSION = "temporal_qd_native_foundation_v1"
 NATIVE_FINALIZATION_RUNTIME_AUTHORITY_SCHEMA = (
     "temporal_qd_native_finalization_runtime_authority_v1"
 )
+NATIVE_FINALIZATION_AUTHORITY_ROTATION_SCHEMA = (
+    "temporal_qd_native_finalization_authority_rotation_v1"
+)
+NATIVE_FINALIZATION_AUTHORITY_HISTORY_DIR = "native-finalization-authorities"
 NATIVE_FINALIZATION_ADOPTION_AUTHORITY_SCHEMA = (
     "temporal_qd_python_boundary_adoption_authority_v1"
 )
@@ -1988,12 +1992,201 @@ def _native_finalization_runtime_authority(finalizer_binary: Path) -> dict[str, 
     )
 
 
+def _native_runtime_authority_history_path(root: Path, authority_sha256: str) -> Path:
+    authority_sha256 = _sha256(
+        authority_sha256, name="native finalization runtime authority"
+    )
+    return (
+        root
+        / NATIVE_FINALIZATION_AUTHORITY_HISTORY_DIR
+        / f"{authority_sha256.removeprefix('sha256:')}.json"
+    )
+
+
+def _validate_native_runtime_authority(
+    authority: Mapping[str, Any], *, expected_sha256: str | None = None
+) -> dict[str, Any]:
+    checked = _clone(authority, name="native finalization runtime authority")
+    supplied = _identity_payload(
+        checked,
+        "authoritySha256",
+        name="native finalization runtime authority",
+    )
+    material = dict(checked)
+    material.pop("authoritySha256", None)
+    if (
+        checked.get("schemaVersion") != NATIVE_FINALIZATION_RUNTIME_AUTHORITY_SCHEMA
+        or canonical_sha256(material) != supplied
+        or (expected_sha256 is not None and supplied != expected_sha256)
+    ):
+        raise TemporalDiscoveryContractError(
+            "native finalization runtime authority identity drifted"
+        )
+    return checked
+
+
+def _load_native_runtime_authority(
+    *, root: Path, authority_sha256: str
+) -> dict[str, Any]:
+    expected = _sha256(
+        authority_sha256, name="native finalization runtime authority"
+    )
+    current_path = root / "native-finalization-authority.json"
+    history_path = _native_runtime_authority_history_path(root, expected)
+    for path in (current_path, history_path):
+        if not path.is_file():
+            continue
+        authority = _canonical_file(
+            path, name="native finalization runtime authority"
+        )
+        if authority.get("authoritySha256") != expected:
+            if path == current_path:
+                continue
+            raise TemporalDiscoveryContractError(
+                "historical native finalization authority path is misbound"
+            )
+        return _validate_native_runtime_authority(
+            authority, expected_sha256=expected
+        )
+    raise TemporalDiscoveryContractError(
+        "native finalization runtime authority epoch is unavailable"
+    )
+
+
+def _pinned_native_authority_binary(
+    *, root: Path, authority_sha256: str, role: str
+) -> Path:
+    authority = _load_native_runtime_authority(
+        root=root, authority_sha256=authority_sha256
+    )
+    descriptor = (authority.get("binaries") or {}).get(role)
+    if not isinstance(descriptor, Mapping):
+        raise TemporalDiscoveryContractError(
+            f"native finalization authority lacks the {role} binary"
+        )
+    binary = Path(str(descriptor.get("path") or "")).resolve()
+    if (
+        not binary.is_file()
+        or descriptor.get("bytes") != binary.stat().st_size
+        or descriptor.get("fileSha256") != _native_binary_file_sha256(binary)
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native finalization {role} binary identity drifted"
+        )
+    return binary
+
+
+def _native_runtime_authority_for_generation(
+    *, root: Path, generation_index: int
+) -> dict[str, Any]:
+    if generation_index < 1:
+        raise TemporalDiscoveryContractError(
+            "native finalization authority generation must be positive"
+        )
+    root_authority = _validate_native_runtime_authority(
+        _canonical_file(
+            root / "native-finalization-authority.json",
+            name="native finalization root runtime authority",
+        )
+    )
+    active = root_authority
+    chain_sha256 = root_authority["authoritySha256"]
+    prior_effective_generation = 0
+    rotation_root = (
+        root / NATIVE_FINALIZATION_AUTHORITY_HISTORY_DIR / "rotations"
+    )
+    rotations: list[dict[str, Any]] = []
+    if rotation_root.is_dir():
+        for path in sorted(rotation_root.glob("*.json")):
+            rotation = _canonical_file(
+                path, name="native finalization authority rotation"
+            )
+            supplied = _identity_payload(
+                rotation,
+                "rotationSha256",
+                name="native finalization authority rotation",
+            )
+            material = dict(rotation)
+            material.pop("rotationSha256", None)
+            if (
+                rotation.get("schemaVersion")
+                != NATIVE_FINALIZATION_AUTHORITY_ROTATION_SCHEMA
+                or rotation.get("operation")
+                != "activate_successor_runtime_authority"
+                or canonical_sha256(material) != supplied
+            ):
+                raise TemporalDiscoveryContractError(
+                    "native finalization authority rotation identity drifted"
+                )
+            for field_name in (
+                "previousAuthoritySha256",
+                "nextAuthoritySha256",
+                "configSha256",
+                "stateSha256",
+            ):
+                _sha256(
+                    rotation.get(field_name),
+                    name=f"native finalization authority rotation {field_name}",
+                )
+            attempt = rotation.get("supersededIncompleteAttempt")
+            if not isinstance(attempt, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "native finalization authority rotation lacks its superseded attempt"
+                )
+            attempt_material = dict(attempt)
+            attempt_sha256 = _sha256(
+                attempt_material.pop("descriptorSha256", None),
+                name="native superseded incomplete attempt",
+            )
+            if (
+                canonical_sha256(attempt_material) != attempt_sha256
+                or attempt.get("generationIndex")
+                != rotation.get("activeFromGenerationIndex")
+                or attempt.get("runtimeAuthoritySha256")
+                != rotation.get("previousAuthoritySha256")
+            ):
+                raise TemporalDiscoveryContractError(
+                    "native finalization superseded attempt identity drifted"
+                )
+            rotations.append(rotation)
+    rotations.sort(
+        key=lambda value: (
+            int(value.get("activeFromGenerationIndex") or -1),
+            str(value.get("nextAuthoritySha256") or ""),
+        )
+    )
+    for rotation in rotations:
+        effective_generation = int(
+            rotation.get("activeFromGenerationIndex") or -1
+        )
+        if (
+            effective_generation <= prior_effective_generation
+            or rotation.get("previousAuthoritySha256") != chain_sha256
+        ):
+            raise TemporalDiscoveryContractError(
+                "native finalization authority rotation chain drifted"
+            )
+        successor = _load_native_runtime_authority(
+            root=root,
+            authority_sha256=_sha256(
+                rotation.get("nextAuthoritySha256"),
+                name="native finalization successor authority",
+            ),
+        )
+        chain_sha256 = successor["authoritySha256"]
+        prior_effective_generation = effective_generation
+        if effective_generation <= generation_index:
+            active = successor
+    return active
+
+
 def _freeze_native_finalization_runtime_authority(
     *,
     root: Path,
     finalizer_binary: Path,
     state: Mapping[str, Any],
     authorized_adoption_generations: frozenset[int] = frozenset(),
+    authorize_rotation: bool = False,
 ) -> dict[str, Any]:
     authority = _native_finalization_runtime_authority(finalizer_binary)
     authority_path = root / "native-finalization-authority.json"
@@ -2008,20 +2201,93 @@ def _freeze_native_finalization_runtime_authority(
             raise TemporalDiscoveryContractError(
                 "existing run cannot adopt Rust binary authority without native completed boundaries"
             )
-    _write_once(authority_path, authority)
-    frozen = _canonical_file(
-        authority_path, name="native finalization runtime authority"
-    )
-    if (
-        frozen.get("schemaVersion") != NATIVE_FINALIZATION_RUNTIME_AUTHORITY_SCHEMA
-        or _identity_payload(
-            frozen,
-            "authoritySha256",
-            name="native finalization runtime authority",
+    if authority_path.is_file():
+        previous = _validate_native_runtime_authority(
+            _canonical_file(
+                authority_path, name="native finalization runtime authority"
+            )
         )
-        != authority["authoritySha256"]
-        or frozen != authority
-    ):
+        _write_once(
+            _native_runtime_authority_history_path(
+                root, previous["authoritySha256"]
+            ),
+            previous,
+        )
+        current_generation = int(state.get("currentGenerationIndex") or 1)
+        active = _native_runtime_authority_for_generation(
+            root=root, generation_index=current_generation
+        )
+        if active != authority:
+            if not authorize_rotation:
+                raise TemporalDiscoveryContractError(
+                    "native finalization binary identity drifted from frozen authority"
+                )
+            if current_generation < 1 or any(
+                int(record.get("generationIndex") or -1) >= current_generation
+                for record in state.get("completedGenerations") or []
+                if isinstance(record, Mapping)
+            ):
+                raise TemporalDiscoveryContractError(
+                    "native finalization authority rotation is not at an unpublished generation"
+                )
+            current_commit = (
+                _native_finalization_root(root, current_generation)
+                / "generation-commit.json"
+            )
+            if current_commit.is_file():
+                raise TemporalDiscoveryContractError(
+                    "native finalization authority rotation cannot cross a committed generation"
+                )
+            _write_once(
+                _native_runtime_authority_history_path(
+                    root, authority["authoritySha256"]
+                ),
+                authority,
+            )
+            superseded_attempt = _native_incomplete_attempt_descriptor(
+                root=root,
+                generation_index=current_generation,
+                authority_sha256=active["authoritySha256"],
+            )
+            rotation = _native_self_hash(
+                {
+                    "schemaVersion": NATIVE_FINALIZATION_AUTHORITY_ROTATION_SCHEMA,
+                    "operation": "activate_successor_runtime_authority",
+                    "previousAuthoritySha256": active["authoritySha256"],
+                    "nextAuthoritySha256": authority["authoritySha256"],
+                    "activeFromGenerationIndex": current_generation,
+                    "configSha256": _sha256(
+                        state.get("configSha256"),
+                        name="native finalization authority rotation config",
+                    ),
+                    "stateSha256": _sha256(
+                        state.get("stateSha256"),
+                        name="native finalization authority rotation state",
+                    ),
+                    "supersededIncompleteAttempt": superseded_attempt,
+                },
+                "rotationSha256",
+            )
+            _write_once(
+                root
+                / NATIVE_FINALIZATION_AUTHORITY_HISTORY_DIR
+                / "rotations"
+                / f"{authority['authoritySha256'].removeprefix('sha256:')}.json",
+                rotation,
+            )
+    else:
+        _write_once(authority_path, authority)
+        _write_once(
+            _native_runtime_authority_history_path(
+                root, authority["authoritySha256"]
+            ),
+            authority,
+        )
+    frozen = _native_runtime_authority_for_generation(
+        root=root,
+        generation_index=int(state.get("currentGenerationIndex") or 1),
+    )
+    if frozen != authority:
         raise TemporalDiscoveryContractError(
             "native finalization binary identity drifted from frozen authority"
         )
@@ -2151,13 +2417,23 @@ def _prepare_native_finalization_adoption_authority(
         raise TemporalDiscoveryContractError(
             "Python boundary adoption config identity drifted"
         )
-    runtime_authority = _native_finalization_runtime_authority(finalizer_binary)
-    if authority.get("runtimeAuthoritySha256") != runtime_authority.get(
-        "authoritySha256"
-    ):
-        raise TemporalDiscoveryContractError(
-            "Python boundary adoption binary authority drifted"
-        )
+    adoption_runtime_sha256 = _sha256(
+        authority.get("runtimeAuthoritySha256"),
+        name="Python boundary adoption runtime authority",
+    )
+    if unbound:
+        runtime_authority = _native_finalization_runtime_authority(finalizer_binary)
+        if adoption_runtime_sha256 != runtime_authority.get("authoritySha256"):
+            raise TemporalDiscoveryContractError(
+                "Python boundary adoption binary authority drifted"
+            )
+    else:
+        for role in ("campaignSeal", "tailReducer", "generationFinalizer"):
+            _pinned_native_authority_binary(
+                root=root,
+                authority_sha256=adoption_runtime_sha256,
+                role=role,
+            )
     expected_boundaries = [
         _python_boundary_adoption_descriptor(records[index]) for index in authorized
     ]
@@ -2172,13 +2448,13 @@ def _prepare_native_finalization_adoption_authority(
     return authority
 
 
-def _native_finalization_authority_sha256(root: Path) -> str:
-    authority = _canonical_file(
-        root / "native-finalization-authority.json",
-        name="native finalization runtime authority",
-    )
+def _native_finalization_authority_sha256(
+    root: Path, generation_index: int
+) -> str:
     return _identity_payload(
-        authority,
+        _native_runtime_authority_for_generation(
+            root=root, generation_index=generation_index
+        ),
         "authoritySha256",
         name="native finalization runtime authority",
     )
@@ -2207,40 +2483,83 @@ def _verify_pinned_native_invocation_binary(
         raise TemporalDiscoveryContractError(
             f"native {role} manifest has no frozen runtime authority"
         )
-    authority = _canonical_file(
-        authority_path, name="native finalization runtime authority"
-    )
-    if (
-        _identity_payload(
-            authority,
-            "authoritySha256",
-            name="native finalization runtime authority",
+    try:
+        pinned = _pinned_native_authority_binary(
+            root=authority_path.parent,
+            authority_sha256=runtime_authority_sha256,
+            role=role,
         )
-        != runtime_authority_sha256
-    ):
+    except TemporalDiscoveryContractError as exc:
+        if "binary identity drifted" not in str(exc):
+            raise
         raise TemporalDiscoveryContractError(
-            f"native {role} manifest runtime authority drifted"
-        )
-    descriptor = (authority.get("binaries") or {}).get(role)
-    resolved = binary.resolve()
-    if (
-        not isinstance(descriptor, Mapping)
-        or descriptor.get("path") != str(resolved)
-        or not resolved.is_file()
-        or descriptor.get("bytes") != resolved.stat().st_size
-        or descriptor.get("fileSha256") != _native_binary_file_sha256(resolved)
-    ):
+            f"native {role} binary identity drifted during invocation"
+        ) from exc
+    if binary.resolve() != pinned:
         raise TemporalDiscoveryContractError(
             f"native {role} binary identity drifted during invocation"
         )
 
 
 def _native_finalization_root(root: Path, generation_index: int) -> Path:
-    return (
+    base = (
         root
         / "generations"
         / f"generation-{generation_index:04d}"
         / "native-finalization"
+    )
+    authority_path = root / "native-finalization-authority.json"
+    if not authority_path.is_file():
+        return base
+    root_authority = _validate_native_runtime_authority(
+        _canonical_file(
+            authority_path, name="native finalization root runtime authority"
+        )
+    )
+    active = _native_runtime_authority_for_generation(
+        root=root, generation_index=generation_index
+    )
+    if active["authoritySha256"] == root_authority["authoritySha256"]:
+        return base
+    return (
+        base
+        / "attempts"
+        / active["authoritySha256"].removeprefix("sha256:")
+    )
+
+
+def _native_incomplete_attempt_descriptor(
+    *, root: Path, generation_index: int, authority_sha256: str
+) -> dict[str, Any]:
+    attempt_root = _native_finalization_root(root, generation_index)
+    records: list[dict[str, Any]] = []
+    if attempt_root.is_dir():
+        for path in sorted(
+            (item for item in attempt_root.rglob("*") if item.is_file()),
+            key=lambda item: item.relative_to(attempt_root).as_posix(),
+        ):
+            relative = path.relative_to(attempt_root).as_posix()
+            records.append(
+                {
+                    "relativePath": relative,
+                    "bytes": path.stat().st_size,
+                    "fileSha256": _native_binary_file_sha256(path),
+                }
+            )
+    return _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_native_incomplete_attempt_descriptor_v1",
+            "generationIndex": generation_index,
+            "runtimeAuthoritySha256": _sha256(
+                authority_sha256,
+                name="native incomplete attempt runtime authority",
+            ),
+            "rootPath": str(attempt_root.resolve()),
+            "fileCount": len(records),
+            "totalBytes": sum(int(record["bytes"]) for record in records),
+            "files": records,
+        },
+        "descriptorSha256",
     )
 
 
@@ -2377,7 +2696,9 @@ def _native_campaign_seal_manifest(
             "schemaVersion": "temporal_qd_campaign_seal_manifest_v1",
             "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
             "operation": "seal_completed_task_matrix_and_reduce_tail",
-            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(
+                root, generation_index
+            ),
             "sourcePath": str(source_path.resolve()),
             "sourceSha256": source["sourceSha256"],
             "evaluationPopulationPath": str(
@@ -2673,7 +2994,9 @@ def _native_prepared_finalizer_manifest(
             "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
             "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
             "operation": "finalize_rotating_generation",
-            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(
+                root, generation_index
+            ),
             "sourcePath": str(source_path.resolve()),
             "sourceSha256": source["sourceSha256"],
             "resultPath": "generation-commit.json",
@@ -2883,7 +3206,9 @@ def _native_finalizer_manifest(
             "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
             "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
             "operation": "finalize_rotating_generation",
-            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(
+                root, generation_index
+            ),
             "sourcePath": str(source_path.resolve()),
             "sourceSha256": source["sourceSha256"],
             "resultPath": "generation-commit.json",
@@ -3043,7 +3368,9 @@ def _native_independent_finalizer_manifest(
             "schemaVersion": "temporal_qd_native_tail_reduction_manifest_v1",
             "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
             "operation": "reduce_evaluated_members_and_provisional",
-            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(
+                root, generation_index
+            ),
             "evaluationPopulationPath": str(
                 (proposal_root / "evaluation-population.json").resolve()
             ),
@@ -3363,7 +3690,9 @@ def _native_independent_finalizer_manifest(
             "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
             "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
             "operation": "finalize_rotating_generation",
-            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(
+                root, generation_index
+            ),
             "sourcePath": str(source_path.resolve()),
             "sourceSha256": source["sourceSha256"],
             "resultPath": "generation-commit.json",
@@ -3680,7 +4009,9 @@ def _native_production_generation_binding(
         manifest.get("runtimeAuthoritySha256"),
         name="native production runtime authority",
     )
-    if runtime_authority_sha256 != _native_finalization_authority_sha256(root):
+    if runtime_authority_sha256 != _native_finalization_authority_sha256(
+        root, generation_index
+    ):
         raise TemporalDiscoveryContractError(
             "native production manifest runtime authority drifted"
         )
@@ -3727,16 +4058,39 @@ def _validate_native_generation_binding(
         raise TemporalDiscoveryContractError(
             "native generation binding identity mismatch"
         )
+    manifest_path = Path(str(binding.get("manifestPath") or ""))
+    authority_path = next(
+        (
+            parent / "native-finalization-authority.json"
+            for parent in (manifest_path.resolve().parent, *manifest_path.resolve().parents)
+            if (parent / "native-finalization-authority.json").is_file()
+        ),
+        None,
+    )
+    if authority_path is None:
+        raise TemporalDiscoveryContractError(
+            "native generation binding has no runtime authority root"
+        )
+    binding_runtime_sha256 = _sha256(
+        binding.get("runtimeAuthoritySha256"),
+        name="native generation binding runtime authority",
+    )
+    bound_binary = _pinned_native_authority_binary(
+        root=authority_path.parent,
+        authority_sha256=binding_runtime_sha256,
+        role="generationFinalizer",
+    )
+    active_runtime_authority = _native_finalization_runtime_authority(binary)
+    if (
+        binding_runtime_sha256 == active_runtime_authority["authoritySha256"]
+        and bound_binary != binary.resolve()
+    ):
+        raise TemporalDiscoveryContractError(
+            "active native generation binary path drifted"
+        )
     if binding.get("authorityMode") == "native_production_compact_commit":
-        current_runtime_authority = _native_finalization_runtime_authority(binary)
-        if binding.get("runtimeAuthoritySha256") != current_runtime_authority.get(
-            "authoritySha256"
-        ):
-            raise TemporalDiscoveryContractError(
-                "native production binary identity drifted"
-            )
         manifest = _canonical_file(
-            Path(str(binding["manifestPath"])),
+            manifest_path,
             name="native production finalization manifest",
         )
         if (
@@ -3764,7 +4118,7 @@ def _validate_native_generation_binding(
                 "native production generation record identity mismatch"
             )
         execution = _invoke_native_finalizer(
-            binary=binary, manifest_path=Path(str(binding["manifestPath"]))
+            binary=bound_binary, manifest_path=manifest_path
         )
         if (
             execution.get("restart") is not True
@@ -3876,13 +4230,6 @@ def _validate_native_generation_binding(
             raise TemporalDiscoveryContractError(
                 "explicit Python boundary adoption authority drifted"
             )
-        current_runtime_authority = _native_finalization_runtime_authority(binary)
-        if binding.get("runtimeAuthoritySha256") != current_runtime_authority.get(
-            "authoritySha256"
-        ):
-            raise TemporalDiscoveryContractError(
-                "explicit Python boundary adoption binary identity drifted"
-            )
         boundary = next(
             (
                 row
@@ -3933,7 +4280,7 @@ def _validate_native_generation_binding(
                 f"native admission {field} disagrees with completed generation"
             )
     execution = _invoke_native_finalizer(
-        binary=binary, manifest_path=Path(str(binding["manifestPath"]))
+        binary=bound_binary, manifest_path=manifest_path
     )
     if (
         execution.get("restart") is not True
@@ -6056,6 +6403,7 @@ def run_qd_supervisor(
     generation_finalizer_binary: Path | str | None = None,
     native_generation_deep_audit: bool = False,
     adopt_python_completed_generations: tuple[int, ...] = (),
+    authorize_native_finalization_authority_rotation: bool = False,
     stop_before_evaluation_generation: int | None = None,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
@@ -6203,6 +6551,7 @@ def run_qd_supervisor(
             authorized_adoption_generations=frozenset(
                 (adoption_authority or {}).get("generationIndices") or []
             ),
+            authorize_rotation=authorize_native_finalization_authority_rotation,
         )
     # This is deliberately before both the completed fast path and gateway
     # construction.  A restart must never treat a stale source, or a merely
@@ -7310,6 +7659,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--authorize-native-finalization-authority-rotation",
+        action="store_true",
+        help=(
+            "explicitly activate a successor set of native finalization binaries "
+            "at an unpublished generation while preserving prior authority epochs"
+        ),
+    )
+    parser.add_argument(
         "--stop-before-evaluation-generation",
         type=int,
         help="freeze the named generation campaign and stop before enqueueing worker tasks",
@@ -7398,6 +7755,9 @@ def main() -> None:
             adopt_python_completed_generations=tuple(
                 args.adopt_python_completed_generations
             ),
+            authorize_native_finalization_authority_rotation=(
+                args.authorize_native_finalization_authority_rotation
+            ),
             stop_before_evaluation_generation=args.stop_before_evaluation_generation,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -7459,6 +7819,9 @@ def main() -> None:
         native_generation_deep_audit=args.native_generation_deep_audit,
         adopt_python_completed_generations=tuple(
             args.adopt_python_completed_generations
+        ),
+        authorize_native_finalization_authority_rotation=(
+            args.authorize_native_finalization_authority_rotation
         ),
         stop_before_evaluation_generation=args.stop_before_evaluation_generation,
     )

@@ -2,8 +2,9 @@ use std::fs;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::tempdir;
+use temporal_qd_contract::{canonical_json_bytes, canonical_sha256_without_object_field};
 use temporal_qd_tail_reducer::execute_manifest;
 
 fn repo_root() -> std::path::PathBuf {
@@ -156,6 +157,73 @@ fn deterministic_inputs_reproduce_member_and_selection_identities() -> Result<()
         right_result["resultSetSha256"]
     );
     assert_eq!(left_result["provisional"], right_result["provisional"]);
+    Ok(())
+}
+
+#[test]
+fn accepts_later_generation_population_without_g0_bootstrap_metadata() -> Result<()> {
+    let (directory, _) = fixture()?;
+    fs::remove_file(directory.path().join("tail-reduction-result.json"))?;
+    fs::remove_file(directory.path().join("evaluated-members.jsonl"))?;
+
+    let evaluation_path = directory.path().join("evaluation-population.json");
+    let mut evaluation: Value = serde_json::from_slice(&fs::read(&evaluation_path)?)?;
+    evaluation
+        .as_object_mut()
+        .context("evaluation population is not an object")?
+        .remove("g0Bootstrap");
+    evaluation["generationIndex"] = json!(2);
+    let evaluation_sha =
+        canonical_sha256_without_object_field(&evaluation, "evaluationPopulationSha256")?;
+    evaluation["evaluationPopulationSha256"] = Value::String(evaluation_sha.clone());
+    let mut evaluation_bytes = canonical_json_bytes(&evaluation)?;
+    evaluation_bytes.push(b'\n');
+    fs::write(&evaluation_path, evaluation_bytes)?;
+
+    let manifest_path = directory.path().join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    manifest["generationIndex"] = json!(2);
+    manifest["evaluationPopulationSha256"] = Value::String(evaluation_sha);
+    let manifest_sha = canonical_sha256_without_object_field(&manifest, "manifestSha256")?;
+    manifest["manifestSha256"] = Value::String(manifest_sha);
+    let mut manifest_bytes = canonical_json_bytes(&manifest)?;
+    manifest_bytes.push(b'\n');
+    fs::write(&manifest_path, manifest_bytes)?;
+
+    let result = execute_manifest(&manifest_path)?;
+    assert_eq!(result["generationIndex"], json!(2));
+    assert_eq!(result["evaluatedMembers"]["memberCount"], json!(3));
+    Ok(())
+}
+
+#[test]
+fn rejects_unknown_evaluation_population_fields() -> Result<()> {
+    let (directory, _) = fixture()?;
+    fs::remove_file(directory.path().join("tail-reduction-result.json"))?;
+    fs::remove_file(directory.path().join("evaluated-members.jsonl"))?;
+
+    let evaluation_path = directory.path().join("evaluation-population.json");
+    let mut evaluation: Value = serde_json::from_slice(&fs::read(&evaluation_path)?)?;
+    evaluation["unexpectedField"] = json!("must-fail-closed");
+    let evaluation_sha =
+        canonical_sha256_without_object_field(&evaluation, "evaluationPopulationSha256")?;
+    evaluation["evaluationPopulationSha256"] = Value::String(evaluation_sha.clone());
+    let mut evaluation_bytes = canonical_json_bytes(&evaluation)?;
+    evaluation_bytes.push(b'\n');
+    fs::write(&evaluation_path, evaluation_bytes)?;
+
+    let manifest_path = directory.path().join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    manifest["evaluationPopulationSha256"] = Value::String(evaluation_sha);
+    let manifest_sha = canonical_sha256_without_object_field(&manifest, "manifestSha256")?;
+    manifest["manifestSha256"] = Value::String(manifest_sha);
+    let mut manifest_bytes = canonical_json_bytes(&manifest)?;
+    manifest_bytes.push(b'\n');
+    fs::write(&manifest_path, manifest_bytes)?;
+
+    let error = execute_manifest(&manifest_path)
+        .expect_err("unknown evaluation population fields must fail closed");
+    assert!(format!("{error:#}").contains("evaluation population fields are not exact"));
     Ok(())
 }
 
