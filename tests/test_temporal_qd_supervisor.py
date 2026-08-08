@@ -1982,6 +1982,105 @@ def test_generation_finalization_engine_is_closed() -> None:
         supervisor._normalize_generation_finalization_engine("fallback")
 
 
+def test_native_prefinal_artifacts_preserve_result_authority_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generation_root = tmp_path / "generation-0002"
+    campaign_root = generation_root / "campaign"
+    result_root = campaign_root / "screening-run"
+
+    def self_hashed(payload: dict, field: str) -> dict:
+        return supervisor._native_self_hash(payload, field)
+
+    documents = {
+        (generation_root / "proposal" / "generation-journal.json").resolve(): self_hashed(
+            {"generationIndex": 2}, "journalSha256"
+        ),
+        (campaign_root / "preparation.json").resolve(): {"prepared": True},
+        (campaign_root / "authority.json").resolve(): self_hashed(
+            {"role": "campaign"}, "authorityId"
+        ),
+        (campaign_root / "evaluation-identity.json").resolve(): self_hashed(
+            {"role": "identity"}, "evaluationIdentitySha256"
+        ),
+        (campaign_root / "campaign.json").resolve(): self_hashed(
+            {"role": "campaign"}, "campaignSha256"
+        ),
+        (result_root / "task-manifest.json").resolve(): {"tasks": []},
+        (result_root / "authority.json").resolve(): self_hashed(
+            {"role": "result"}, "authorityId"
+        ),
+        (result_root / "checkpoint.json").resolve(): {"completed": {}},
+        (result_root / "summary.json").resolve(): {"completedTaskCount": 0},
+    }
+
+    monkeypatch.setattr(
+        supervisor,
+        "_canonical_file",
+        lambda path, *, name: documents[Path(path).resolve()],
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_results_descriptor",
+        lambda **_kwargs: {"schemaVersion": "fixture_results_v1"},
+    )
+    evaluation_population = self_hashed(
+        {
+            "populationFileSha256": "sha256:" + "1" * 64,
+            "populationSha256": "sha256:" + "2" * 64,
+        },
+        "evaluationPopulationSha256",
+    )
+
+    artifacts = supervisor._native_prefinal_artifact_ledger_base(
+        generation_root=generation_root,
+        generation_index=2,
+        evaluation_population=evaluation_population,
+        tail_result_index={"schemaVersion": "fixture_tail_index_v1"},
+    )
+
+    result_authority = documents[(result_root / "authority.json").resolve()]
+    assert artifacts["resultAuthority"] == supervisor._self_hashed_descriptor(
+        result_root / "authority.json",
+        result_authority,
+        field="authorityId",
+        name="native pre-final result authority",
+    )
+
+
+def test_native_artifact_compatibility_accepts_only_result_authority_projection() -> None:
+    current = {
+        "schemaVersion": "temporal_qd_supervisor_generation_artifacts_v1",
+        "resultAuthority": {
+            "path": "C:/run/authority.json",
+            "sha256": "sha256:" + "1" * 64,
+            "authorityId": "sha256:" + "2" * 64,
+        },
+        "archive": {"archiveSha256": "sha256:" + "3" * 64},
+    }
+    legacy_native = copy.deepcopy(current)
+    legacy_native["resultAuthority"].pop("authorityId")
+
+    assert supervisor._generation_artifact_ledgers_match(
+        recorded=legacy_native,
+        current=current,
+        allow_native_result_authority_identity_projection=True,
+    )
+    assert not supervisor._generation_artifact_ledgers_match(
+        recorded=legacy_native,
+        current=current,
+        allow_native_result_authority_identity_projection=False,
+    )
+
+    tampered = copy.deepcopy(legacy_native)
+    tampered["archive"].pop("archiveSha256")
+    assert not supervisor._generation_artifact_ledgers_match(
+        recorded=tampered,
+        current=current,
+        allow_native_result_authority_identity_projection=True,
+    )
+
+
 def test_native_cutover_cannot_silently_downgrade_to_python(tmp_path: Path) -> None:
     supervisor._require_irreversible_native_cutover_engine(
         root=tmp_path,

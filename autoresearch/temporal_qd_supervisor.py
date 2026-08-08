@@ -1283,6 +1283,39 @@ def _capture_generation_artifacts(
     return output
 
 
+def _generation_artifact_ledgers_match(
+    *,
+    recorded: Any,
+    current: Any,
+    allow_native_result_authority_identity_projection: bool = False,
+) -> bool:
+    """Compare ledgers, including one closed native-production compatibility case.
+
+    The first production native finalizer epoch bound the complete result-authority
+    payload through its canonical file hash but omitted the redundant ``authorityId``
+    projection from that artifact descriptor.  Reopening the authority still verifies
+    the self-hash before this comparison.  Accept only that single-field projection
+    difference so the committed epoch remains usable; all other drift stays closed.
+    """
+
+    if not isinstance(recorded, Mapping) or not isinstance(current, Mapping):
+        return False
+    recorded_ledger = _clone(recorded, name="recorded generation artifacts")
+    current_ledger = _clone(current, name="current generation artifacts")
+    if recorded_ledger == current_ledger:
+        return True
+    if not allow_native_result_authority_identity_projection:
+        return False
+    projected = _clone(
+        current_ledger, name="native result-authority compatibility projection"
+    )
+    result_authority = projected.get("resultAuthority")
+    if not isinstance(result_authority, dict) or "authorityId" not in result_authority:
+        return False
+    result_authority.pop("authorityId")
+    return recorded_ledger == projected
+
+
 def _validate_generation_artifacts(
     *,
     root: Path,
@@ -1309,8 +1342,15 @@ def _validate_generation_artifacts(
         tail_result_mode=tail_result_mode,
         tail_result_indexes=tail_result_indexes,
     )
-    if _clone(current, name="completed generation artifacts") != _clone(
-        recorded, name="recorded completed generation artifacts"
+    native_binding = generation_record.get("nativeGenerationFinalization")
+    if not _generation_artifact_ledgers_match(
+        recorded=recorded,
+        current=current,
+        allow_native_result_authority_identity_projection=(
+            isinstance(native_binding, Mapping)
+            and native_binding.get("authorityMode")
+            == "native_production_compact_commit"
+        ),
     ):
         raise TemporalDiscoveryContractError(
             "completed generation artifact ledger drifted from immutable outputs"
@@ -3289,8 +3329,11 @@ def _native_prefinal_artifact_ledger_base(
             name="native pre-final campaign",
         ),
         "taskManifest": _artifact_descriptor(manifest_path, manifest),
-        "resultAuthority": _artifact_descriptor(
-            result_authority_path, result_authority
+        "resultAuthority": _self_hashed_descriptor(
+            result_authority_path,
+            result_authority,
+            field="authorityId",
+            name="native pre-final result authority",
         ),
         "checkpoint": _artifact_descriptor(checkpoint_path, checkpoint),
         "summary": _artifact_descriptor(summary_path, summary),
@@ -7163,7 +7206,11 @@ def run_qd_supervisor(
                 if (
                     not isinstance(native_record, Mapping)
                     or not isinstance(native_state_patch, Mapping)
-                    or native_record.get("artifacts") != artifacts
+                    or not _generation_artifact_ledgers_match(
+                        recorded=native_record.get("artifacts"),
+                        current=artifacts,
+                        allow_native_result_authority_identity_projection=True,
+                    )
                     or native_state_patch.get("generationRecord") != native_record
                     or native_state_patch.get("generationRecordSha256")
                     != native_record.get("generationRecordSha256")
