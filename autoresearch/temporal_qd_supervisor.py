@@ -1163,6 +1163,7 @@ def _capture_generation_artifacts(
     tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
     tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
     verify_population_file: bool = True,
+    verify_rotating_campaign_artifacts: bool = True,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
     indexes = tail_result_indexes if tail_result_indexes is not None else {}
@@ -1224,40 +1225,43 @@ def _capture_generation_artifacts(
         _identity_payload(
             ledger, "ledgerSha256", name="rotating generation ledger"
         )
-        for binding in ledger.get("campaigns") or []:
-            if not isinstance(binding, Mapping):
-                raise TemporalDiscoveryContractError(
-                    "rotating generation campaign ledger is invalid"
-                )
-            if binding.get("role") == "proposal_current_panel":
-                continue
-            recorded_campaign_artifacts = binding.get("artifacts")
-            if not isinstance(recorded_campaign_artifacts, Mapping):
-                raise TemporalDiscoveryContractError(
-                    "rotating cohort campaign lacks its artifact ledger"
-                )
-            current_campaign_artifacts = _rotating_campaign_artifacts(
-                campaign_root=Path(str(binding.get("campaignRoot") or "")),
-                population_path=Path(str(binding.get("populationPath") or "")),
-                tail_result_index=(
-                    _verified_tail_result_index(
-                        campaign_root=Path(str(binding.get("campaignRoot") or "")),
-                        indexes=indexes,
+        if verify_rotating_campaign_artifacts:
+            for binding in ledger.get("campaigns") or []:
+                if not isinstance(binding, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "rotating generation campaign ledger is invalid"
                     )
-                    if tail_result_mode == TAIL_RESULT_MODE_INDEXED
-                    else None
-                ),
-            )
-            if _clone(
-                current_campaign_artifacts,
-                name="rotating campaign artifacts",
-            ) != _clone(
-                recorded_campaign_artifacts,
-                name="recorded rotating campaign artifacts",
-            ):
-                raise TemporalDiscoveryContractError(
-                    "rotating campaign artifact ledger drifted"
+                if binding.get("role") == "proposal_current_panel":
+                    continue
+                recorded_campaign_artifacts = binding.get("artifacts")
+                if not isinstance(recorded_campaign_artifacts, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "rotating cohort campaign lacks its artifact ledger"
+                    )
+                current_campaign_artifacts = _rotating_campaign_artifacts(
+                    campaign_root=Path(str(binding.get("campaignRoot") or "")),
+                    population_path=Path(str(binding.get("populationPath") or "")),
+                    tail_result_index=(
+                        _verified_tail_result_index(
+                            campaign_root=Path(
+                                str(binding.get("campaignRoot") or "")
+                            ),
+                            indexes=indexes,
+                        )
+                        if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+                        else None
+                    ),
                 )
+                if _clone(
+                    current_campaign_artifacts,
+                    name="rotating campaign artifacts",
+                ) != _clone(
+                    recorded_campaign_artifacts,
+                    name="recorded rotating campaign artifacts",
+                ):
+                    raise TemporalDiscoveryContractError(
+                        "rotating campaign artifact ledger drifted"
+                    )
         output["rotatingEvidenceLedger"] = _self_hashed_descriptor(
             ledger_path,
             ledger,
@@ -1352,6 +1356,7 @@ def _validate_generation_artifacts(
         tail_result_mode=tail_result_mode,
         tail_result_indexes=tail_result_indexes,
         verify_population_file=not native_production,
+        verify_rotating_campaign_artifacts=not native_production,
     )
     if not _generation_artifact_ledgers_match(
         recorded=recorded,
@@ -7087,6 +7092,10 @@ def run_qd_supervisor(
                 tail_result_mode=tail_result_mode,
                 tail_result_indexes=tail_result_indexes,
                 verify_population_file=(
+                    generation_finalization_engine
+                    != GENERATION_FINALIZATION_ENGINE_RUST
+                ),
+                verify_rotating_campaign_artifacts=(
                     generation_finalization_engine
                     != GENERATION_FINALIZATION_ENGINE_RUST
                 ),

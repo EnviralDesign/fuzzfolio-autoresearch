@@ -2112,6 +2112,82 @@ def test_screening_artifact_capture_can_use_compact_population_authority(
     assert observed == [False]
 
 
+def test_native_generation_capture_skips_deep_auxiliary_campaign_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generation_root = tmp_path / "generations" / "generation-0002"
+    evidence_root = generation_root / "evidence"
+    ledger_path = evidence_root / "generation-ledger.json"
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_text("{}\n", encoding="utf-8")
+    journal = supervisor._native_self_hash(
+        {"generationIndex": 2}, "journalSha256"
+    )
+    funnel = supervisor._native_self_hash(
+        {"generationIndex": 2}, "artifactSha256"
+    )
+    ledger = supervisor._native_self_hash(
+        {
+            "campaigns": [
+                {
+                    "role": "prior_panel_backfill",
+                    "campaignRoot": "C:/large-campaign",
+                    "populationPath": "C:/large-population.json",
+                    "artifacts": {"bound": True},
+                }
+            ]
+        },
+        "ledgerSha256",
+    )
+    checkpoint = supervisor._native_self_hash(
+        {"generationIndex": 2}, "checkpointSha256"
+    )
+    cumulative = supervisor._native_self_hash(
+        {"generationIndex": 2}, "archiveSha256"
+    )
+    documents = {
+        (generation_root / "proposal" / "generation-journal.json").resolve(): journal,
+        (generation_root / "generation-funnel.json").resolve(): funnel,
+        ledger_path.resolve(): ledger,
+        (evidence_root / "checkpoint.json").resolve(): checkpoint,
+        (evidence_root / "cumulative-archive.json").resolve(): cumulative,
+    }
+    monkeypatch.setattr(
+        supervisor,
+        "_capture_screening_artifacts",
+        lambda **_kwargs: {
+            "schemaVersion": "temporal_qd_supervisor_generation_artifacts_v1"
+        },
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_canonical_file",
+        lambda path, *, name: documents[Path(path).resolve()],
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "supervisor_funnel_snapshot",
+        lambda _funnel: {"snapshotSha256": "sha256:" + "9" * 64},
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_rotating_campaign_artifacts",
+        lambda **_kwargs: pytest.fail("compact native capture reopened rich campaign"),
+    )
+
+    artifacts = supervisor._capture_generation_artifacts(
+        root=tmp_path,
+        generation_index=2,
+        generation_funnel_enabled=True,
+        verify_population_file=False,
+        verify_rotating_campaign_artifacts=False,
+    )
+
+    assert artifacts["rotatingEvidenceLedger"]["ledgerSha256"] == ledger[
+        "ledgerSha256"
+    ]
+
+
 def test_native_cutover_cannot_silently_downgrade_to_python(tmp_path: Path) -> None:
     supervisor._require_irreversible_native_cutover_engine(
         root=tmp_path,
