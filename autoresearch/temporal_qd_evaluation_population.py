@@ -60,11 +60,15 @@ def load_evaluation_population(
     *,
     population_path: Path | str,
     journal_path: Path | str | None = None,
+    verify_population_file: bool = True,
 ) -> dict[str, Any]:
     """Load a compact sidecar and bind it to unchanged rich-population bytes.
 
     The raw file verification is intentionally streaming: callers can validate
-    provenance without decoding the population-sized JSON document.
+    provenance without decoding the population-sized JSON document.  A caller
+    that consumes only this compact projection may disable that scan, but must
+    still supply the frozen journal so the population byte identity remains
+    authority-bound rather than being inferred from mutable filesystem state.
     """
 
     source = Path(population_path)
@@ -78,7 +82,11 @@ def load_evaluation_population(
     if not isinstance(payload, dict) or payload.get("schemaVersion") != EVALUATION_POPULATION_SCHEMA:
         raise TemporalDiscoveryContractError("QD evaluation population schema is invalid")
     _identity(payload, "evaluationPopulationSha256", name="QD evaluation population")
-    if payload.get("populationFileSha256") != raw_file_sha256(source):
+    if not verify_population_file and journal_path is None:
+        raise TemporalDiscoveryContractError(
+            "skipping QD population byte verification requires its frozen journal"
+        )
+    if verify_population_file and payload.get("populationFileSha256") != raw_file_sha256(source):
         raise TemporalDiscoveryContractError(
             "QD evaluation population raw source file identity mismatch"
         )

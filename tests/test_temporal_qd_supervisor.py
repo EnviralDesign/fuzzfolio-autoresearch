@@ -1952,3 +1952,635 @@ def test_pair_g0_64_to_32_rotating_supervisor_restart_never_reschedules_construc
         path.name: path.read_bytes()
         for path in sorted(g1_journal_root.glob("*.json"))
     } == g1_journal_bytes
+
+
+def test_generation_finalization_engine_branches_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected: list[str] = []
+
+    def capture(**kwargs):
+        selected.append(kwargs["finalization_engine"])
+        return {"engine": kwargs["finalization_engine"]}
+
+    monkeypatch.setattr(supervisor, "_run_rotating_generation_transaction", capture)
+    assert supervisor._complete_rotating_generation_transaction()["engine"] == "python"
+    assert (
+        supervisor._complete_rotating_generation_transaction_native()["engine"]
+        == "rust"
+    )
+    assert selected == ["python", "rust"]
+
+
+def test_generation_finalization_engine_is_closed() -> None:
+    assert supervisor._normalize_generation_finalization_engine("python") == "python"
+    assert supervisor._normalize_generation_finalization_engine("rust") == "rust"
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="generation finalization engine must be one of",
+    ):
+        supervisor._normalize_generation_finalization_engine("fallback")
+
+
+def test_native_cutover_cannot_silently_downgrade_to_python(tmp_path: Path) -> None:
+    supervisor._require_irreversible_native_cutover_engine(
+        root=tmp_path,
+        generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
+    )
+    _write(tmp_path / "native-finalization-authority.json", {"frozen": True})
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="every restart must explicitly select the Rust",
+    ):
+        supervisor._require_irreversible_native_cutover_engine(
+            root=tmp_path,
+            generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
+        )
+    supervisor._require_irreversible_native_cutover_engine(
+        root=tmp_path,
+        generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_RUST,
+    )
+
+    (tmp_path / "native-finalization-authority.json").unlink()
+    state = {
+        "completedGenerations": [
+            {"generationIndex": 1, "nativeGenerationFinalization": {"bound": True}}
+        ]
+    }
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="every restart must explicitly select the Rust",
+    ):
+        supervisor._require_irreversible_native_cutover_engine(
+            root=tmp_path,
+            generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
+            state=state,
+        )
+
+
+def _identity_ledger_fixture(count: int) -> dict:
+    value = {
+        "schemaVersion": "temporal_qd_identity_ledger_v3",
+        "uniqueCounts": {"candidateIdentity": count},
+        "duplicateCounters": {"candidateIdentity": 0},
+        "proposalSlotCounters": {
+            "acceptedUniqueProposalSlots": count,
+            "duplicateRejections": 0,
+            "proposalsObserved": count,
+        },
+        "records": [{"candidateIdentitySha256": "sha256:" + f"{count:064x}"}],
+    }
+    value["ledgerSha256"] = canonical_sha256(value)
+    return value
+
+
+def _identity_ledger_record(ledger: dict) -> dict:
+    return {
+        "uniqueIdentityCounts": ledger["uniqueCounts"],
+        "duplicateCounters": ledger["duplicateCounters"],
+        "proposalSlotCounters": ledger["proposalSlotCounters"],
+    }
+
+
+def test_native_pair_identity_ledger_transaction_rolls_back_then_promotes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "run"
+    state_path = root / "state.json"
+    input_ledger = _identity_ledger_fixture(4)
+    output_ledger = _identity_ledger_fixture(6)
+    monkeypatch.setattr(
+        supervisor,
+        "_native_generation_output_ledger_sha256",
+        lambda **_kwargs: output_ledger["ledgerSha256"],
+    )
+    _write(root / "identity-ledger.json", input_ledger)
+    state = {
+        "schemaVersion": "test_state_v1",
+        "currentGenerationIndex": 2,
+        "completedGenerations": [],
+    }
+    supervisor._save_state(state_path, state)
+
+    supervisor._prepare_native_pair_identity_ledger_transaction(
+        root=root,
+        state=state,
+        state_path=state_path,
+        generation_index=2,
+        input_ledger=input_ledger,
+        input_ledger_sha256=input_ledger["ledgerSha256"],
+    )
+    output_path = supervisor._generation_identity_ledger_path(root, 2)
+    _write(output_path, output_ledger)
+    # Reproduce the native batch's pre-boundary mutable facade publication.
+    _write(root / "identity-ledger.json", output_ledger)
+    sealed, sealed_sha256 = supervisor._seal_native_pair_identity_ledger_output(
+        root=root,
+        state=state,
+        state_path=state_path,
+        generation_index=2,
+        input_ledger=input_ledger,
+        input_ledger_sha256=input_ledger["ledgerSha256"],
+        generation_result=_identity_ledger_record(output_ledger),
+    )
+    assert sealed == output_ledger
+    assert sealed_sha256 == output_ledger["ledgerSha256"]
+    assert json.loads((root / "identity-ledger.json").read_text()) == input_ledger
+    assert state["identityLedgerTransaction"]["phase"] == "proposal_committed"
+
+    # An exact incomplete restart reuses the same frozen input transaction.
+    supervisor._prepare_native_pair_identity_ledger_transaction(
+        root=root,
+        state=state,
+        state_path=state_path,
+        generation_index=2,
+        input_ledger=input_ledger,
+        input_ledger_sha256=input_ledger["ledgerSha256"],
+    )
+    assert state["identityLedgerTransaction"]["phase"] == "proposal_committed"
+
+    supervisor._promote_native_pair_identity_ledger(
+        root=root,
+        state=state,
+        state_path=state_path,
+        generation_index=2,
+        generation_record=_identity_ledger_record(output_ledger),
+    )
+    assert json.loads((root / "identity-ledger.json").read_text()) == output_ledger
+    assert "identityLedgerTransaction" not in state
+
+
+@pytest.mark.parametrize(
+    "crash_point", ["ready_saved", "root_promoted", "transaction_cleared"]
+)
+def test_native_pair_identity_ledger_ready_crash_finishes_on_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: str,
+) -> None:
+    root = tmp_path / crash_point
+    state_path = root / "state.json"
+    input_ledger = _identity_ledger_fixture(4)
+    output_ledger = _identity_ledger_fixture(6)
+    record = {"generationIndex": 2, **_identity_ledger_record(output_ledger)}
+    monkeypatch.setattr(
+        supervisor,
+        "_native_generation_output_ledger_sha256",
+        lambda **_kwargs: output_ledger["ledgerSha256"],
+    )
+    _write(root / "identity-ledger.json", input_ledger)
+    _write(supervisor._generation_identity_ledger_path(root, 2), output_ledger)
+    state = {
+        "schemaVersion": supervisor.SUPERVISOR_STATE_SCHEMA,
+        "configSha256": None,
+        "currentGenerationIndex": 3,
+        "completedGenerations": [record],
+        "identityLedgerTransaction": {
+            "schemaVersion": "temporal_qd_identity_ledger_transaction_v1",
+            "generationIndex": 2,
+            "inputLedgerPath": str(
+                supervisor._identity_ledger_input_snapshot_path(root, 2).resolve()
+            ),
+            "inputLedgerSha256": input_ledger["ledgerSha256"],
+            "outputLedgerPath": str(
+                supervisor._generation_identity_ledger_path(root, 2).resolve()
+            ),
+            "outputLedgerSha256": output_ledger["ledgerSha256"],
+            "phase": "proposal_committed",
+        },
+    }
+    _write(
+        supervisor._identity_ledger_input_snapshot_path(root, 2), input_ledger
+    )
+    supervisor._save_state(state_path, state)
+
+    def crash(step: str) -> None:
+        if step == crash_point:
+            raise RuntimeError("injected identity-ledger boundary crash")
+
+    with pytest.raises(RuntimeError, match="boundary crash"):
+        supervisor._promote_native_pair_identity_ledger(
+            root=root,
+            state=state,
+            state_path=state_path,
+            generation_index=2,
+            generation_record=record,
+            _after_step=crash,
+        )
+    persisted = supervisor._load_state(state_path, config_sha256=None)
+    repaired, repaired_sha256 = supervisor._reconcile_native_pair_identity_ledger(
+        root=root,
+        state=persisted,
+        state_path=state_path,
+        completed_by_index={2: record},
+    )
+    assert repaired == output_ledger
+    assert repaired_sha256 == output_ledger["ledgerSha256"]
+    assert "identityLedgerTransaction" not in persisted
+    assert json.loads((root / "identity-ledger.json").read_text()) == output_ledger
+
+
+def test_native_pair_identity_ledger_restart_repairs_only_bound_crash_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "run"
+    committed = _identity_ledger_fixture(4)
+    incomplete = _identity_ledger_fixture(6)
+    monkeypatch.setattr(
+        supervisor,
+        "_native_generation_output_ledger_sha256",
+        lambda **_kwargs: committed["ledgerSha256"],
+    )
+    committed_path = supervisor._generation_identity_ledger_path(root, 1)
+    incomplete_path = supervisor._generation_identity_ledger_path(root, 2)
+    _write(committed_path, committed)
+    _write(incomplete_path, incomplete)
+    _write(root / "identity-ledger.json", incomplete)
+    record = {"generationIndex": 1, **_identity_ledger_record(committed)}
+    state = {
+        "currentGenerationIndex": 2,
+        "completedGenerations": [record],
+    }
+    repaired, repaired_sha256 = supervisor._reconcile_native_pair_identity_ledger(
+        root=root,
+        state=state,
+        completed_by_index={1: record},
+    )
+    assert repaired == committed
+    assert repaired_sha256 == committed["ledgerSha256"]
+    assert json.loads((root / "identity-ledger.json").read_text()) == committed
+
+    invented = _identity_ledger_fixture(99)
+    _write(root / "identity-ledger.json", invented)
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="neither committed nor a bound crash-window output",
+    ):
+        supervisor._reconcile_native_pair_identity_ledger(
+            root=root,
+            state=state,
+            completed_by_index={1: record},
+        )
+
+
+@pytest.mark.parametrize("crash_after", [1, 2, 3, 4, 5])
+def test_native_publication_converges_after_every_step_without_new_batch(
+    tmp_path: Path, crash_after: int
+) -> None:
+    root = tmp_path / f"run-{crash_after}"
+    generation_root = root / "generations" / "generation-0002"
+    native_root = generation_root / "native-finalization"
+    cohort_sha256 = "sha256:" + "a" * 64
+    rotating_sha256 = "sha256:" + "b" * 64
+    outputs = {
+        "cumulative-archive.json": {"kind": "cumulative", "archiveSha256": "sha256:" + "c" * 64},
+        "archive.json": {"kind": "archive", "archiveSha256": "sha256:" + "d" * 64},
+        "checkpoint.json": {
+            "generationIndex": 2,
+            "rotatingEvidenceSha256": rotating_sha256,
+            "cohortSha256": cohort_sha256,
+            "stage": "cumulative_archive",
+            "checkpointSha256": "sha256:" + "e" * 64,
+        },
+        "generation-ledger.json": {"kind": "ledger", "ledgerSha256": "sha256:" + "f" * 64},
+        "generation-funnel.json": {"kind": "funnel", "artifactSha256": "sha256:" + "1" * 64},
+    }
+    for name, payload in outputs.items():
+        _write(native_root / name, payload)
+    for name in (
+        "generation-funnel-snapshot.json",
+        "generation-record.json",
+        "generation-state-patch.json",
+    ):
+        _write(native_root / name, {"kind": name})
+    commit = {
+        "schemaVersion": "temporal_qd_generation_commit_v1",
+        "generationIndex": 2,
+    }
+    commit["commitSha256"] = canonical_sha256(commit)
+    _write(native_root / "generation-commit.json", commit)
+    manifest = {"schemaVersion": "fixture_manifest", "identity": "fixed"}
+    _write(native_root / "manifest.json", manifest)
+    manifest_bytes = (native_root / "manifest.json").read_bytes()
+    batch_marker = generation_root / "proposal" / "native-batch-count.txt"
+    batch_marker.parent.mkdir(parents=True, exist_ok=True)
+    batch_marker.write_text("1\n", encoding="utf-8")
+    prefinal = {
+        "generationIndex": 2,
+        "rotatingEvidenceSha256": rotating_sha256,
+        "cohortSha256": cohort_sha256,
+        "stage": "cumulative_backfill",
+        "checkpointSha256": "sha256:" + "2" * 64,
+    }
+    _write(generation_root / "evidence" / "checkpoint.json", prefinal)
+
+    def crash(_name: str, step: int) -> None:
+        if step == crash_after:
+            raise RuntimeError("injected publication crash")
+
+    with pytest.raises(RuntimeError, match="injected publication crash"):
+        supervisor._publish_native_generation_outputs(
+            root=root,
+            generation_index=2,
+            _after_step=crash,
+        )
+    published = supervisor._publish_native_generation_outputs(
+        root=root, generation_index=2
+    )
+    assert published["generation-commit.json"] == commit
+    destinations = {
+        "cumulative-archive.json": generation_root / "evidence" / "cumulative-archive.json",
+        "archive.json": generation_root / "archive.json",
+        "checkpoint.json": generation_root / "evidence" / "checkpoint.json",
+        "generation-ledger.json": generation_root / "evidence" / "generation-ledger.json",
+        "generation-funnel.json": generation_root / "generation-funnel.json",
+    }
+    for name, destination in destinations.items():
+        assert json.loads(destination.read_text(encoding="utf-8")) == outputs[name]
+    assert (native_root / "manifest.json").read_bytes() == manifest_bytes
+    assert batch_marker.read_text(encoding="utf-8") == "1\n"
+    journal = json.loads(
+        (native_root / "publication-journal.json").read_text(encoding="utf-8")
+    )
+    assert journal["completedSteps"] == list(outputs)
+    assert journal["journalSha256"] == canonical_sha256(
+        {key: value for key, value in journal.items() if key != "journalSha256"}
+    )
+
+
+def test_native_production_binding_joins_record_commit_and_state_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "run"
+    native_root = supervisor._native_finalization_root(root, 2)
+    record = {"generationIndex": 2, "archiveSha256": "sha256:" + "a" * 64}
+    record["generationRecordSha256"] = canonical_sha256(record)
+    state_patch = {
+        "schemaVersion": "temporal_qd_generation_state_patch_v1",
+        "generationIndex": 2,
+        "generationRecord": record,
+        "generationRecordSha256": record["generationRecordSha256"],
+    }
+    state_patch["statePatchSha256"] = canonical_sha256(state_patch)
+    _write(native_root / "generation-record.json", record)
+    _write(native_root / "generation-state-patch.json", state_patch)
+    binary = tmp_path / "fixture.exe"
+    binary.write_bytes(b"finalizer-v1")
+    suffix = ".exe" if supervisor.os.name == "nt" else ""
+    (tmp_path / f"temporal-qd-campaign-seal{suffix}").write_bytes(b"seal-v1")
+    (tmp_path / f"temporal-qd-tail-reducer{suffix}").write_bytes(b"reducer-v1")
+    authority = supervisor._freeze_native_finalization_runtime_authority(
+        root=root, finalizer_binary=binary, state={"completedGenerations": []}
+    )
+    manifest = supervisor._native_self_hash(
+        {
+            "runtimeAuthoritySha256": authority["authoritySha256"],
+            "sourceSha256": "sha256:" + "e" * 64,
+        },
+        "manifestSha256",
+    )
+    _write(native_root / "manifest.json", manifest)
+    commit = {
+        "commitSha256": "sha256:" + "c" * 64,
+        "generationRecord": {
+            "generationRecordSha256": record["generationRecordSha256"]
+        },
+        "statePatch": {"statePatchSha256": state_patch["statePatchSha256"]},
+    }
+    binding = supervisor._native_production_generation_binding(
+        root=root,
+        generation_index=2,
+        manifest=manifest,
+        commit=commit,
+    )
+    current = {**record, "nativeGenerationFinalization": binding}
+    monkeypatch.setattr(
+        supervisor,
+        "_invoke_native_finalizer",
+        lambda **_kwargs: {
+            "restart": True,
+            "restartValidation": "compact_commit_and_output_hashes",
+            "commitSha256": commit["commitSha256"],
+            "commit": commit,
+        },
+    )
+    supervisor._validate_native_generation_binding(
+        generation_record=current, binary=binary
+    )
+
+    tampered_binding = dict(binding)
+    tampered_binding["generationRecordSha256"] = "sha256:" + "d" * 64
+    tampered_binding.pop("bindingSha256")
+    tampered_binding["bindingSha256"] = canonical_sha256(tampered_binding)
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="generation record binding drifted",
+    ):
+        supervisor._validate_native_generation_binding(
+            generation_record={
+                **record,
+                "nativeGenerationFinalization": tampered_binding,
+            },
+            binary=binary,
+        )
+
+    binary.write_bytes(b"finalizer-v2")
+    with pytest.raises(TemporalDiscoveryContractError, match="binary identity drifted"):
+        supervisor._validate_native_generation_binding(
+            generation_record=current,
+            binary=binary,
+        )
+
+
+def test_python_boundary_adoption_requires_explicit_exact_durable_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    binary_root = tmp_path / "bin"
+    binary_root.mkdir()
+    suffix = ".exe" if supervisor.os.name == "nt" else ""
+    finalizer = binary_root / f"temporal-qd-generation-finalizer{suffix}"
+    finalizer.write_bytes(b"finalizer-v1")
+    (binary_root / f"temporal-qd-campaign-seal{suffix}").write_bytes(b"seal-v1")
+    (binary_root / f"temporal-qd-tail-reducer{suffix}").write_bytes(b"reducer-v1")
+    record = {
+        "generationIndex": 1,
+        "candidateCount": 2,
+        "taskCount": 8,
+        "archiveSha256": "sha256:" + "1" * 64,
+        "resultSetSha256": "sha256:" + "2" * 64,
+        "rotatingEvidenceLedgerSha256": "sha256:" + "3" * 64,
+        "rotatingEvidenceCheckpointSha256": "sha256:" + "4" * 64,
+        "cumulativeArchiveSha256": "sha256:" + "5" * 64,
+        "generationFunnelArtifactSha256": "sha256:" + "6" * 64,
+        "generationFunnelSnapshotSha256": "sha256:" + "7" * 64,
+    }
+    state = {
+        "uniqueCandidatesEvaluated": 2,
+        "workerTasksCompleted": 8,
+        "completedGenerations": [record],
+    }
+    config = {
+        "configSha256": "sha256:" + "a" * 64,
+        "generationPlan": {"firstGenerationIndex": 1, "lastGenerationIndex": 5},
+    }
+
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="explicitly authorize their one-time adoption",
+    ):
+        supervisor._prepare_native_finalization_adoption_authority(
+            root=root,
+            state=state,
+            config=config,
+            finalizer_binary=finalizer,
+            requested_generations=(),
+        )
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="exactly every unbound completed generation",
+    ):
+        supervisor._prepare_native_finalization_adoption_authority(
+            root=root,
+            state=state,
+            config=config,
+            finalizer_binary=finalizer,
+            requested_generations=(2,),
+        )
+
+    authority = supervisor._prepare_native_finalization_adoption_authority(
+        root=root,
+        state=state,
+        config=config,
+        finalizer_binary=finalizer,
+        requested_generations=(1,),
+    )
+    assert authority is not None
+    assert authority["generationIndices"] == [1]
+    assert authority["boundaries"] == [
+        supervisor._python_boundary_adoption_descriptor(record)
+    ]
+    assert authority["authoritySha256"] == canonical_sha256(
+        {key: value for key, value in authority.items() if key != "authoritySha256"}
+    )
+    assert (
+        supervisor._prepare_native_finalization_adoption_authority(
+            root=root,
+            state=state,
+            config=config,
+            finalizer_binary=finalizer,
+            requested_generations=(),
+        )
+        == authority
+    )
+    frozen = supervisor._freeze_native_finalization_runtime_authority(
+        root=root,
+        finalizer_binary=finalizer,
+        state=state,
+        authorized_adoption_generations=frozenset({1}),
+    )
+    assert frozen["authoritySha256"] == authority["runtimeAuthoritySha256"]
+
+    drifted_state = {
+        **state,
+        "completedGenerations": [
+            {**record, "archiveSha256": "sha256:" + "f" * 64}
+        ],
+    }
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="record or artifact identities drifted",
+    ):
+        supervisor._prepare_native_finalization_adoption_authority(
+            root=root,
+            state=drifted_state,
+            config=config,
+            finalizer_binary=finalizer,
+            requested_generations=(),
+        )
+
+
+def test_native_admission_never_retrofits_an_unbound_record_without_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = {"generationIndex": 1}
+    monkeypatch.setattr(
+        supervisor,
+        "_validate_completed_generation_ledger",
+        lambda **_kwargs: {1: record},
+    )
+    audited = False
+
+    def unexpected_audit(**_kwargs):
+        nonlocal audited
+        audited = True
+
+    monkeypatch.setattr(supervisor, "_validate_generation_artifacts", unexpected_audit)
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="cannot silently adopt",
+    ):
+        supervisor._admit_completed_generations_native(
+            root=tmp_path,
+            state={"completedGenerations": [record]},
+            state_path=tmp_path / "state.json",
+            config={},
+            binary=tmp_path / "finalizer.exe",
+            deep_audit=False,
+            tail_result_mode=supervisor.TAIL_RESULT_MODE_INDEXED,
+            tail_result_indexes={},
+        )
+    assert audited is False
+
+
+def test_native_invocation_rejects_binary_replacement_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "run"
+    binary_root = tmp_path / "bin"
+    binary_root.mkdir()
+    suffix = ".exe" if supervisor.os.name == "nt" else ""
+    finalizer = binary_root / f"temporal-qd-generation-finalizer{suffix}"
+    finalizer.write_bytes(b"finalizer-v1")
+    (binary_root / f"temporal-qd-campaign-seal{suffix}").write_bytes(b"seal-v1")
+    (binary_root / f"temporal-qd-tail-reducer{suffix}").write_bytes(b"reducer-v1")
+    authority = supervisor._freeze_native_finalization_runtime_authority(
+        root=root,
+        finalizer_binary=finalizer,
+        state={"completedGenerations": []},
+    )
+    manifest_path = root / "generations" / "generation-0001" / "native-finalization" / "manifest.json"
+    manifest = supervisor._native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
+            "contractVersion": supervisor.NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "finalize_rotating_generation",
+            "runtimeAuthoritySha256": authority["authoritySha256"],
+            "sourcePath": str((manifest_path.parent / "source.json").resolve()),
+            "sourceSha256": "sha256:" + "a" * 64,
+            "resultPath": "generation-commit.json",
+        },
+        "manifestSha256",
+    )
+    _write(manifest_path, manifest)
+
+    def replace_during_run(*_args, **_kwargs):
+        finalizer.write_bytes(b"finalizer-v2")
+        return supervisor.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"status": "committed"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(supervisor.subprocess, "run", replace_during_run)
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="binary identity drifted during invocation",
+    ):
+        supervisor._invoke_native_finalizer(
+            binary=finalizer,
+            manifest_path=manifest_path,
+        )

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "temporal_qd_tail_reducer_ab_evidence_v1",
+  "measuredAt": "2026-08-07",
+  "platform": "Windows",
+  "scope": "full_generation_1_current_panel_tail_reduction",
+  "source": {
+    "kind": "copied_read_only_live_generation_fixture",
+    "path": "C:\\repos\\fuzzfolio-autoresearch\\.tmp\\native-cutover-g1-20260807\\generations\\generation-0001",
+    "liveCampaignTouched": false,
+    "candidateCount": 1024,
+    "taskCount": 4096
+  },
+  "inputs": {
+    "evaluationPopulation": {
+      "bytes": 27002747,
+      "fileSha256": "sha256:89465507a9a0dff61a725640da665a8d06e0d1f42d9699d4b3c9f484c3443539",
+      "evaluationPopulationSha256": "sha256:4d9586b2d64c8393afd251f6735d513f57dfa3534e0585d445b2108ddce2b5e2"
+    },
+    "tailResultIndex": {
+      "bytes": 24329578,
+      "fileSha256": "sha256:a96b1a8f69d76d61b70a2f30d8f97c48547bd57d7013b6cafac42fa006044560",
+      "tailResultIndexSha256": "sha256:92d48121e4bded0088651da04ffb79bfaf07e4f1935f5005f80445896a90e1df"
+    },
+    "manifest": {
+      "bytes": 882,
+      "fileSha256": "sha256:e8e855d38055a20ebce342ebd58f45b2573a649c8d30e5c21db3e09a1af0222d",
+      "manifestSha256": "sha256:3760fa3b8cf9f9269cea641125d368114e48c600419727af4899f91e39afd34f"
+    }
+  },
+  "pythonOracle": {
+    "elapsedSeconds": 14.32904810004402,
+    "peakWorkingSetBytes": 984117248,
+    "tracemallocPeakBytes": 462285911,
+    "oracleFileBytes": 76846637,
+    "oracleFileSha256": "sha256:200679835cf9c831e5cff0525971932536de8d4c571de24bad0003d036a290aa"
+  },
+  "rust": {
+    "threads": 2,
+    "elapsedSeconds": 3.16,
+    "peakWorkingSetBytes": 783421440,
+    "binaryBytes": 1087488,
+    "binaryFileSha256": "sha256:b0993a96a659f77e9e1cbafdb8894cd034ab6b7aed22e16db8fbe326fe9be358",
+    "evaluatedMembersBytes": 76778140,
+    "evaluatedMembersFileSha256": "sha256:9cd87d65d6ea7b6ba604d0c6edbd6032ced85be4e19e783f91899aa86b34d6f1",
+    "resultFileBytes": 69745,
+    "resultFileSha256": "sha256:1b51f2379c0d12b96812225336b3a469a8fdf184663828fbef327c08e55cb0f9",
+    "resultSha256": "sha256:3d90b49477576ab4a29ef9115c31a98aafd1dad9e17bedb9064f93fe3418311c"
+  },
+  "comparison": {
+    "exactParity": true,
+    "memberCount": 1015,
+    "evaluationRejectionCount": 9,
+    "resultSetSha256": "sha256:6e8a9b6a3c60a65fe04609cab23c0b8074cf3dae8f687be56ed8dc13a7c47ad0",
+    "memberRowsEqual": true,
+    "rejectionRowsEqual": true,
+    "provisionalRowsEqual": true,
+    "speedup": 4.534509,
+    "peakWorkingSetReductionPercent": 20.393
+  },
+  "reproduction": {
+    "harness": "rust/temporal-qd/crates/qd-tail-reducer/tests/benchmark_live_subset.py",
+    "rustProfile": "release",
+    "comparisonPolicy": "exact JSON equality for members, deterministic rejections, result-set identity, and provisional candidates"
+  }
+}

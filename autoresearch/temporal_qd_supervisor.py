@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
@@ -60,6 +62,8 @@ from .temporal_qd_native import (
     PAIR_GENERATION_RUNTIME_RUST,
     TemporalQDNativeError,
     build_pair_generation_runtime_config,
+    validate_generation_manifest,
+    validate_generation_result,
     validate_pair_generation_runtime_config,
 )
 from .temporal_qd_evidence_ladder import (
@@ -147,6 +151,32 @@ TAIL_RESULT_MODE_INDEXED = "indexed"
 _TAIL_RESULT_MODES = frozenset(
     {TAIL_RESULT_MODE_LEGACY, TAIL_RESULT_MODE_INDEXED}
 )
+NATIVE_FINALIZATION_VALIDATION_NONE = "none"
+# Retained only to recognize old completed-generation bindings internally.
+# Fresh historical admission is deliberately not an accepted CLI/runtime mode.
+NATIVE_FINALIZATION_VALIDATION_HISTORICAL = "rust_historical_admission"
+_NATIVE_FINALIZATION_VALIDATION_MODES = frozenset({NATIVE_FINALIZATION_VALIDATION_NONE})
+NATIVE_FINALIZATION_BINDING_SCHEMA = (
+    "temporal_qd_native_generation_finalization_binding_v1"
+)
+NATIVE_FINALIZATION_ADMISSION_SCHEMA = (
+    "temporal_qd_native_historical_generation_admission_v1"
+)
+NATIVE_FOUNDATION_CONTRACT_VERSION = "temporal_qd_native_foundation_v1"
+NATIVE_FINALIZATION_RUNTIME_AUTHORITY_SCHEMA = (
+    "temporal_qd_native_finalization_runtime_authority_v1"
+)
+NATIVE_FINALIZATION_ADOPTION_AUTHORITY_SCHEMA = (
+    "temporal_qd_python_boundary_adoption_authority_v1"
+)
+NATIVE_FINALIZATION_ADOPTION_AUTHORITY_FILE = (
+    "native-finalization-adoption-authority.json"
+)
+GENERATION_FINALIZATION_ENGINE_PYTHON = "python"
+GENERATION_FINALIZATION_ENGINE_RUST = "rust"
+_GENERATION_FINALIZATION_ENGINES = frozenset(
+    {GENERATION_FINALIZATION_ENGINE_PYTHON, GENERATION_FINALIZATION_ENGINE_RUST}
+)
 
 
 def _normalize_tail_result_mode(value: str) -> str:
@@ -156,6 +186,54 @@ def _normalize_tail_result_mode(value: str) -> str:
             f"tail result mode must be one of: {allowed}"
         )
     return value
+
+
+def _normalize_native_finalization_validation(value: str) -> str:
+    if value not in _NATIVE_FINALIZATION_VALIDATION_MODES:
+        allowed = ", ".join(sorted(_NATIVE_FINALIZATION_VALIDATION_MODES))
+        raise TemporalDiscoveryContractError(
+            f"native finalization validation must be one of: {allowed}"
+        )
+    return value
+
+
+def _normalize_generation_finalization_engine(value: str) -> str:
+    if value not in _GENERATION_FINALIZATION_ENGINES:
+        allowed = ", ".join(sorted(_GENERATION_FINALIZATION_ENGINES))
+        raise TemporalDiscoveryContractError(
+            f"generation finalization engine must be one of: {allowed}"
+        )
+    return value
+
+
+def _require_irreversible_native_cutover_engine(
+    *,
+    root: Path,
+    generation_finalization_engine: str,
+    state: Mapping[str, Any] | None = None,
+) -> None:
+    native_authority_exists = any(
+        (root / name).is_file()
+        for name in (
+            "native-finalization-authority.json",
+            NATIVE_FINALIZATION_ADOPTION_AUTHORITY_FILE,
+        )
+    )
+    native_boundary_exists = bool(
+        state
+        and any(
+            isinstance(record, Mapping)
+            and isinstance(record.get("nativeGenerationFinalization"), Mapping)
+            for record in state.get("completedGenerations") or []
+        )
+    )
+    if (
+        native_authority_exists or native_boundary_exists
+    ) and generation_finalization_engine != GENERATION_FINALIZATION_ENGINE_RUST:
+        raise TemporalDiscoveryContractError(
+            "run has crossed the native finalization boundary; every restart must "
+            "explicitly select the Rust finalization engine"
+        )
 
 
 def _verified_tail_result_index(
@@ -1429,6 +1507,2550 @@ def _validate_completed_generations(
     return records
 
 
+def _canonical_json_line(value: Mapping[str, Any]) -> str:
+    return (
+        json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+
+
+def _write_canonical_once(path: Path, value: Mapping[str, Any]) -> None:
+    encoded = _canonical_json_line(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_text(encoding="utf-8") != encoded:
+            raise TemporalDiscoveryContractError(
+                f"refusing divergent native finalization input: {path}"
+            )
+        return
+    _write_durable_new(path, encoded)
+
+
+def _validated_identity_ledger(
+    path: Path, *, name: str
+) -> tuple[dict[str, Any], str]:
+    ledger = _canonical_file(path, name=name)
+    ledger_sha256 = _identity_payload(ledger, "ledgerSha256", name=name)
+    return ledger, ledger_sha256
+
+
+def _generation_identity_ledger_path(root: Path, generation_index: int) -> Path:
+    return (
+        root
+        / "generations"
+        / f"generation-{generation_index:04d}"
+        / "proposal"
+        / "identity-ledger.json"
+    )
+
+
+def _identity_ledger_input_snapshot_path(
+    root: Path, generation_index: int
+) -> Path:
+    return (
+        root
+        / "generations"
+        / f"generation-{generation_index:04d}"
+        / "proposal"
+        / "input-identity-ledger.json"
+    )
+
+
+def _native_generation_output_ledger_sha256(
+    *,
+    root: Path,
+    generation_index: int,
+    generation_record: Mapping[str, Any],
+) -> str:
+    native_base = (
+        root
+        / "generations"
+        / f"generation-{generation_index:04d}"
+        / "proposal"
+        / "native-batch"
+    )
+    matches: list[str] = []
+    for result_path in sorted(native_base.glob("*/generation-result.json")):
+        manifest_path = result_path.parent / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = validate_generation_manifest(
+                _canonical_file(
+                    manifest_path, name="native generation ledger manifest"
+                )
+            )
+            if (
+                manifest.get("generationConfig", {}).get("generationIndex")
+                != generation_index
+            ):
+                continue
+            result = validate_generation_result(
+                _canonical_file(
+                    result_path, name="native generation ledger result"
+                ),
+                manifest=manifest,
+            )
+        except (TemporalQDNativeError, TemporalDiscoveryContractError):
+            continue
+        pair_result = result.get("pairGenerationResult")
+        if not isinstance(pair_result, Mapping):
+            continue
+        if any(
+            generation_record.get(field) is not None
+            and pair_result.get(field) != generation_record.get(field)
+            for field in ("populationSha256", "journalSha256")
+        ):
+            continue
+        output_sha256 = result.get("outputIdentityLedgerSha256")
+        if isinstance(output_sha256, str):
+            matches.append(output_sha256)
+    unique_matches = set(matches)
+    if len(unique_matches) != 1:
+        raise TemporalDiscoveryContractError(
+            "generation does not have one unambiguous native output identity ledger"
+        )
+    return unique_matches.pop()
+
+
+def _reconcile_native_pair_identity_ledger(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path | None = None,
+    completed_by_index: Mapping[int, Mapping[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    """Recover the committed ledger facade before another native invocation.
+
+    The native batch maintains a mutable public-ledger facade while it runs.
+    Supervisor state is the commit authority, so an incomplete generation may
+    leave only either its frozen input or its exact native output at the root.
+    Anything else is tampering, not a recoverable crash window.
+    """
+
+    root_ledger_path = root / "identity-ledger.json"
+    transaction = state.get("identityLedgerTransaction")
+    latest = max(completed_by_index) if completed_by_index else None
+    if latest is not None:
+        expected_path = _generation_identity_ledger_path(root, latest)
+        expected, expected_sha256 = _validated_identity_ledger(
+            expected_path, name="latest committed generation identity ledger"
+        )
+        if _native_generation_output_ledger_sha256(
+            root=root,
+            generation_index=latest,
+            generation_record=completed_by_index[latest],
+        ) != expected_sha256:
+            raise TemporalDiscoveryContractError(
+                "latest committed generation identity ledger binding drifted"
+            )
+    elif isinstance(transaction, Mapping):
+        generation_index = int(transaction.get("generationIndex") or 0)
+        expected_path = _identity_ledger_input_snapshot_path(
+            root, generation_index
+        )
+        expected, expected_sha256 = _validated_identity_ledger(
+            expected_path, name="frozen generation input identity ledger"
+        )
+        if transaction.get("inputLedgerSha256") != expected_sha256:
+            raise TemporalDiscoveryContractError(
+                "frozen generation input ledger transaction drifted"
+            )
+    else:
+        return _validated_identity_ledger(
+            root_ledger_path, name="campaign identity ledger"
+        )
+
+    root_ledger, root_sha256 = _validated_identity_ledger(
+        root_ledger_path, name="campaign identity ledger"
+    )
+    if root_sha256 == expected_sha256:
+        if (
+            isinstance(transaction, Mapping)
+            and transaction.get("phase") == "generation_boundary_ready"
+        ):
+            transaction_generation = int(transaction.get("generationIndex") or 0)
+            if (
+                latest is None
+                or transaction_generation != latest
+                or transaction.get("outputLedgerSha256") != expected_sha256
+            ):
+                raise TemporalDiscoveryContractError(
+                    "ready identity-ledger transaction is not the latest committed generation"
+                )
+            state.pop("identityLedgerTransaction", None)
+            if state_path is not None:
+                _save_state(state_path, state)
+        return expected, expected_sha256
+
+    recoverable_sha256: set[str] = set()
+    if isinstance(transaction, Mapping):
+        if transaction.get("phase") == "generation_boundary_ready":
+            transaction_generation = int(transaction.get("generationIndex") or 0)
+            if (
+                latest is None
+                or transaction_generation != latest
+                or transaction.get("outputLedgerSha256") != expected_sha256
+            ):
+                raise TemporalDiscoveryContractError(
+                    "ready identity-ledger transaction is not the latest committed generation"
+                )
+            _input, input_sha256 = _validated_identity_ledger(
+                _identity_ledger_input_snapshot_path(root, transaction_generation),
+                name="ready generation input identity ledger",
+            )
+            if transaction.get("inputLedgerSha256") != input_sha256:
+                raise TemporalDiscoveryContractError(
+                    "ready generation input identity ledger binding drifted"
+                )
+            recoverable_sha256.add(input_sha256)
+        output_sha256 = transaction.get("outputLedgerSha256")
+        if isinstance(output_sha256, str):
+            recoverable_sha256.add(output_sha256)
+        generation_index = int(transaction.get("generationIndex") or 0)
+        output_path = _generation_identity_ledger_path(root, generation_index)
+        if output_path.is_file():
+            _output, output_sha256 = _validated_identity_ledger(
+                output_path, name="incomplete generation output identity ledger"
+            )
+            recoverable_sha256.add(output_sha256)
+    current_generation = int(state.get("currentGenerationIndex") or 0)
+    if current_generation not in completed_by_index and current_generation > 0:
+        output_path = _generation_identity_ledger_path(root, current_generation)
+        if output_path.is_file():
+            _output, output_sha256 = _validated_identity_ledger(
+                output_path, name="uncommitted generation output identity ledger"
+            )
+            recoverable_sha256.add(output_sha256)
+    for completed_index in completed_by_index:
+        prior_path = _generation_identity_ledger_path(root, completed_index)
+        if prior_path.is_file():
+            _prior, prior_sha256 = _validated_identity_ledger(
+                prior_path, name="committed generation identity ledger"
+            )
+            recoverable_sha256.add(prior_sha256)
+    if root_sha256 not in recoverable_sha256:
+        raise TemporalDiscoveryContractError(
+            "campaign identity ledger is neither committed nor a bound crash-window output"
+        )
+    _replace(root_ledger_path, expected)
+    repaired, repaired_sha256 = _validated_identity_ledger(
+        root_ledger_path, name="repaired campaign identity ledger"
+    )
+    if repaired != expected or repaired_sha256 != expected_sha256:
+        raise TemporalDiscoveryContractError(
+            "campaign identity ledger recovery did not converge"
+        )
+    if (
+        isinstance(transaction, Mapping)
+        and transaction.get("phase") == "generation_boundary_ready"
+    ):
+        transaction_generation = int(transaction.get("generationIndex") or 0)
+        if (
+            latest is None
+            or transaction_generation != latest
+            or transaction.get("outputLedgerSha256") != expected_sha256
+        ):
+            raise TemporalDiscoveryContractError(
+                "ready identity-ledger transaction is not the latest committed generation"
+            )
+        state.pop("identityLedgerTransaction", None)
+        if state_path is not None:
+            _save_state(state_path, state)
+    return expected, expected_sha256
+
+
+def _prepare_native_pair_identity_ledger_transaction(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    generation_index: int,
+    input_ledger: Mapping[str, Any],
+    input_ledger_sha256: str,
+) -> None:
+    snapshot_path = _identity_ledger_input_snapshot_path(root, generation_index)
+    _write_once(snapshot_path, input_ledger)
+    snapshot, snapshot_sha256 = _validated_identity_ledger(
+        snapshot_path, name="frozen native generation input identity ledger"
+    )
+    if snapshot != input_ledger or snapshot_sha256 != input_ledger_sha256:
+        raise TemporalDiscoveryContractError(
+            "native generation input ledger snapshot drifted"
+        )
+    expected = {
+        "schemaVersion": "temporal_qd_identity_ledger_transaction_v1",
+        "generationIndex": generation_index,
+        "inputLedgerPath": str(snapshot_path.resolve()),
+        "inputLedgerSha256": input_ledger_sha256,
+        "outputLedgerPath": str(
+            _generation_identity_ledger_path(root, generation_index).resolve()
+        ),
+        "phase": "generation_proposal",
+    }
+    existing = state.get("identityLedgerTransaction")
+    if existing is not None:
+        comparable = {
+            key: value
+            for key, value in dict(existing).items()
+            if key not in {"outputLedgerSha256", "phase"}
+        }
+        expected_comparable = {
+            key: value
+            for key, value in expected.items()
+            if key not in {"outputLedgerSha256", "phase"}
+        }
+        if comparable != expected_comparable:
+            raise TemporalDiscoveryContractError(
+                "incomplete native identity-ledger transaction drifted"
+            )
+        expected.update(
+            {
+                key: existing[key]
+                for key in ("outputLedgerSha256", "phase")
+                if key in existing
+            }
+        )
+    state["identityLedgerTransaction"] = expected
+    _save_state(state_path, state)
+
+
+def _seal_native_pair_identity_ledger_output(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    generation_index: int,
+    input_ledger: Mapping[str, Any],
+    input_ledger_sha256: str,
+    generation_result: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    output_path = _generation_identity_ledger_path(root, generation_index)
+    output, output_sha256 = _validated_identity_ledger(
+        output_path, name="native generation output identity ledger"
+    )
+    if _native_generation_output_ledger_sha256(
+        root=root,
+        generation_index=generation_index,
+        generation_record=generation_result,
+    ) != output_sha256:
+        raise TemporalDiscoveryContractError(
+            "native generation output identity ledger binding disagrees"
+        )
+    root_path = root / "identity-ledger.json"
+    _root_ledger, root_sha256 = _validated_identity_ledger(
+        root_path, name="post-generation campaign identity ledger"
+    )
+    if root_sha256 not in {input_ledger_sha256, output_sha256}:
+        raise TemporalDiscoveryContractError(
+            "native generation changed the campaign identity ledger divergently"
+        )
+    if root_sha256 == output_sha256:
+        _replace(root_path, input_ledger)
+    restored, restored_sha256 = _validated_identity_ledger(
+        root_path, name="restored campaign identity ledger"
+    )
+    if restored != input_ledger or restored_sha256 != input_ledger_sha256:
+        raise TemporalDiscoveryContractError(
+            "native generation input ledger did not restore after proposal commit"
+        )
+    transaction = state.get("identityLedgerTransaction")
+    if not isinstance(transaction, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native generation lost its identity-ledger transaction"
+        )
+    state["identityLedgerTransaction"] = {
+        **dict(transaction),
+        "outputLedgerSha256": output_sha256,
+        "phase": "proposal_committed",
+    }
+    _save_state(state_path, state)
+    return output, output_sha256
+
+
+def _promote_native_pair_identity_ledger(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    generation_index: int,
+    generation_record: Mapping[str, Any],
+    _after_step: Any | None = None,
+) -> None:
+    transaction = state.get("identityLedgerTransaction")
+    if (
+        not isinstance(transaction, Mapping)
+        or transaction.get("generationIndex") != generation_index
+        or transaction.get("phase") != "proposal_committed"
+    ):
+        raise TemporalDiscoveryContractError(
+            "native generation identity ledger is not ready for promotion"
+        )
+    output, output_sha256 = _validated_identity_ledger(
+        _generation_identity_ledger_path(root, generation_index),
+        name="committing generation identity ledger",
+    )
+    if (
+        transaction.get("outputLedgerSha256") != output_sha256
+        or _native_generation_output_ledger_sha256(
+            root=root,
+            generation_index=generation_index,
+            generation_record=generation_record,
+        )
+        != output_sha256
+    ):
+        raise TemporalDiscoveryContractError(
+            "committing generation identity ledger lost its state binding"
+        )
+    state["identityLedgerTransaction"] = {
+        **dict(transaction),
+        "phase": "generation_boundary_ready",
+    }
+    _save_state(state_path, state)
+    if _after_step is not None:
+        _after_step("ready_saved")
+    _replace(root / "identity-ledger.json", output)
+    promoted, promoted_sha256 = _validated_identity_ledger(
+        root / "identity-ledger.json", name="promoted campaign identity ledger"
+    )
+    if promoted != output or promoted_sha256 != output_sha256:
+        raise TemporalDiscoveryContractError(
+            "committed generation identity ledger promotion did not converge"
+        )
+    if _after_step is not None:
+        _after_step("root_promoted")
+    state.pop("identityLedgerTransaction", None)
+    _save_state(state_path, state)
+    if _after_step is not None:
+        _after_step("transaction_cleared")
+
+
+def _native_self_hash(value: Mapping[str, Any], field: str) -> dict[str, Any]:
+    output = _clone(value, name="native finalization identity material")
+    if field in output:
+        raise TemporalDiscoveryContractError(
+            f"native identity material already contains {field}"
+        )
+    output[field] = canonical_sha256(output)
+    return output
+
+
+def _native_binary_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise TemporalDiscoveryContractError(
+            f"could not hash native finalization binary: {path}"
+        ) from exc
+    return "sha256:" + digest.hexdigest()
+
+
+def _native_finalization_runtime_authority(finalizer_binary: Path) -> dict[str, Any]:
+    suffix = ".exe" if os.name == "nt" else ""
+    binaries = {
+        "campaignSeal": finalizer_binary.with_name(
+            f"temporal-qd-campaign-seal{suffix}"
+        ),
+        "tailReducer": finalizer_binary.with_name(
+            f"temporal-qd-tail-reducer{suffix}"
+        ),
+        "generationFinalizer": finalizer_binary,
+    }
+    descriptors: dict[str, Any] = {}
+    for role, binary in binaries.items():
+        resolved = binary.resolve()
+        if not resolved.is_file():
+            raise TemporalDiscoveryContractError(
+                f"native finalization {role} binary is unavailable: {resolved}"
+            )
+        descriptors[role] = {
+            "path": str(resolved),
+            "bytes": resolved.stat().st_size,
+            "fileSha256": _native_binary_file_sha256(resolved),
+        }
+    return _native_self_hash(
+        {
+            "schemaVersion": NATIVE_FINALIZATION_RUNTIME_AUTHORITY_SCHEMA,
+            "generationFinalizationEngine": GENERATION_FINALIZATION_ENGINE_RUST,
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "binaries": descriptors,
+        },
+        "authoritySha256",
+    )
+
+
+def _freeze_native_finalization_runtime_authority(
+    *,
+    root: Path,
+    finalizer_binary: Path,
+    state: Mapping[str, Any],
+    authorized_adoption_generations: frozenset[int] = frozenset(),
+) -> dict[str, Any]:
+    authority = _native_finalization_runtime_authority(finalizer_binary)
+    authority_path = root / "native-finalization-authority.json"
+    if not authority_path.exists() and state.get("completedGenerations"):
+        unbound_generations = {
+            int(record.get("generationIndex") or -1)
+            for record in state["completedGenerations"]
+            if not isinstance(record, Mapping)
+            or not isinstance(record.get("nativeGenerationFinalization"), Mapping)
+        }
+        if not unbound_generations.issubset(authorized_adoption_generations):
+            raise TemporalDiscoveryContractError(
+                "existing run cannot adopt Rust binary authority without native completed boundaries"
+            )
+    _write_once(authority_path, authority)
+    frozen = _canonical_file(
+        authority_path, name="native finalization runtime authority"
+    )
+    if (
+        frozen.get("schemaVersion") != NATIVE_FINALIZATION_RUNTIME_AUTHORITY_SCHEMA
+        or _identity_payload(
+            frozen,
+            "authoritySha256",
+            name="native finalization runtime authority",
+        )
+        != authority["authoritySha256"]
+        or frozen != authority
+    ):
+        raise TemporalDiscoveryContractError(
+            "native finalization binary identity drifted from frozen authority"
+        )
+    return frozen
+
+
+def _python_boundary_adoption_descriptor(
+    generation_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    generation_index = int(generation_record.get("generationIndex") or -1)
+    if generation_index < 1:
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption has an invalid generation index"
+        )
+    material = {
+        key: value
+        for key, value in generation_record.items()
+        if key != "nativeGenerationFinalization"
+    }
+    identities: dict[str, str] = {}
+    for field in (
+        "archiveSha256",
+        "resultSetSha256",
+        "rotatingEvidenceLedgerSha256",
+        "rotatingEvidenceCheckpointSha256",
+        "cumulativeArchiveSha256",
+        "generationFunnelArtifactSha256",
+        "generationFunnelSnapshotSha256",
+    ):
+        identities[field] = _sha256(
+            generation_record.get(field),
+            name=f"Python generation {generation_index} {field}",
+        )
+    return {
+        "generationIndex": generation_index,
+        "pythonGenerationRecordSha256": canonical_sha256(material),
+        "artifactIdentities": identities,
+    }
+
+
+def _prepare_native_finalization_adoption_authority(
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    config: Mapping[str, Any],
+    finalizer_binary: Path,
+    requested_generations: tuple[int, ...],
+) -> dict[str, Any] | None:
+    """Freeze an explicit, one-time authority for adopting Python boundaries.
+
+    The authority is operational rather than part of the research identity.  It
+    makes a crash-resumable operator decision durable while binding the exact
+    pre-adoption generation records, their critical artifact identities, the
+    frozen run config, and the complete native binary authority.
+    """
+
+    records = _validate_completed_generation_ledger(state=state, config=config)
+    unbound = {
+        index
+        for index, record in records.items()
+        if not isinstance(record.get("nativeGenerationFinalization"), Mapping)
+    }
+    requested = tuple(sorted(set(requested_generations)))
+    if any(index < 1 for index in requested):
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption generations must be positive"
+        )
+    authority_path = root / NATIVE_FINALIZATION_ADOPTION_AUTHORITY_FILE
+    if not authority_path.is_file():
+        if not requested:
+            if unbound:
+                raise TemporalDiscoveryContractError(
+                    "Rust resume has Python-completed boundaries; explicitly authorize "
+                    "their one-time adoption"
+                )
+            return None
+        if set(requested) != unbound:
+            raise TemporalDiscoveryContractError(
+                "Python boundary adoption must name exactly every unbound completed generation"
+            )
+        runtime_authority = _native_finalization_runtime_authority(finalizer_binary)
+        authority = _native_self_hash(
+            {
+                "schemaVersion": NATIVE_FINALIZATION_ADOPTION_AUTHORITY_SCHEMA,
+                "operation": "adopt_exact_python_completed_boundaries_once",
+                "configSha256": _sha256(
+                    config.get("configSha256"), name="Python boundary adoption config"
+                ),
+                "runtimeAuthoritySha256": runtime_authority["authoritySha256"],
+                "generationIndices": list(requested),
+                "boundaries": [
+                    _python_boundary_adoption_descriptor(records[index])
+                    for index in requested
+                ],
+            },
+            "authoritySha256",
+        )
+        _write_once(authority_path, authority)
+    authority = _canonical_file(
+        authority_path, name="Python boundary adoption authority"
+    )
+    if authority.get("schemaVersion") != NATIVE_FINALIZATION_ADOPTION_AUTHORITY_SCHEMA:
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption authority schema drifted"
+        )
+    supplied_sha256 = _identity_payload(
+        authority,
+        "authoritySha256",
+        name="Python boundary adoption authority",
+    )
+    material = dict(authority)
+    material.pop("authoritySha256", None)
+    if canonical_sha256(material) != supplied_sha256:
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption authority identity drifted"
+        )
+    authorized = tuple(authority.get("generationIndices") or [])
+    if requested and tuple(requested) != authorized:
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption request conflicts with durable authority"
+        )
+    if not set(authorized).issubset(records):
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption authority names a missing completed generation"
+        )
+    if authority.get("configSha256") != config.get("configSha256"):
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption config identity drifted"
+        )
+    runtime_authority = _native_finalization_runtime_authority(finalizer_binary)
+    if authority.get("runtimeAuthoritySha256") != runtime_authority.get(
+        "authoritySha256"
+    ):
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption binary authority drifted"
+        )
+    expected_boundaries = [
+        _python_boundary_adoption_descriptor(records[index]) for index in authorized
+    ]
+    if authority.get("boundaries") != expected_boundaries:
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption record or artifact identities drifted"
+        )
+    if not unbound.issubset(set(authorized)):
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption authority omits an unbound completed generation"
+        )
+    return authority
+
+
+def _native_finalization_authority_sha256(root: Path) -> str:
+    authority = _canonical_file(
+        root / "native-finalization-authority.json",
+        name="native finalization runtime authority",
+    )
+    return _identity_payload(
+        authority,
+        "authoritySha256",
+        name="native finalization runtime authority",
+    )
+
+
+def _verify_pinned_native_invocation_binary(
+    *, binary: Path, manifest_path: Path, role: str
+) -> None:
+    manifest = _canonical_file(manifest_path, name=f"native {role} manifest")
+    runtime_authority_sha256 = manifest.get("runtimeAuthoritySha256")
+    if runtime_authority_sha256 is None:
+        # Historical compact manifests predate the production runtime pin.
+        return
+    runtime_authority_sha256 = _sha256(
+        runtime_authority_sha256, name=f"native {role} runtime authority"
+    )
+    authority_path = next(
+        (
+            parent / "native-finalization-authority.json"
+            for parent in (manifest_path.resolve().parent, *manifest_path.resolve().parents)
+            if (parent / "native-finalization-authority.json").is_file()
+        ),
+        None,
+    )
+    if authority_path is None:
+        raise TemporalDiscoveryContractError(
+            f"native {role} manifest has no frozen runtime authority"
+        )
+    authority = _canonical_file(
+        authority_path, name="native finalization runtime authority"
+    )
+    if (
+        _identity_payload(
+            authority,
+            "authoritySha256",
+            name="native finalization runtime authority",
+        )
+        != runtime_authority_sha256
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native {role} manifest runtime authority drifted"
+        )
+    descriptor = (authority.get("binaries") or {}).get(role)
+    resolved = binary.resolve()
+    if (
+        not isinstance(descriptor, Mapping)
+        or descriptor.get("path") != str(resolved)
+        or not resolved.is_file()
+        or descriptor.get("bytes") != resolved.stat().st_size
+        or descriptor.get("fileSha256") != _native_binary_file_sha256(resolved)
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native {role} binary identity drifted during invocation"
+        )
+
+
+def _native_finalization_root(root: Path, generation_index: int) -> Path:
+    return (
+        root
+        / "generations"
+        / f"generation-{generation_index:04d}"
+        / "native-finalization"
+    )
+
+
+def _native_campaign_seal_manifest(
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    evaluation_population: Mapping[str, Any],
+    campaign_root: Path | None = None,
+    evaluation_population_file: Path | None = None,
+    seal_root: Path | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Freeze the full immutable task payload before native raw-result admission."""
+
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    selected_campaign_root = campaign_root or generation_root / "campaign"
+    result_root = selected_campaign_root / "screening-run"
+    authority = _canonical_file(result_root / "authority.json", name="tail authority")
+    task_manifest = _canonical_file(
+        result_root / "task-manifest.json", name="tail task manifest"
+    )
+    checkpoint = _canonical_file(
+        result_root / "checkpoint.json", name="tail task checkpoint"
+    )
+    tasks = task_manifest.get("tasks")
+    completed = checkpoint.get("completed")
+    if not isinstance(tasks, list) or not isinstance(completed, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native campaign seal requires a completed immutable task matrix"
+        )
+    by_task = {
+        str(task.get("task_id")): task
+        for task in tasks
+        if isinstance(task, Mapping) and isinstance(task.get("task_id"), str)
+    }
+    if len(by_task) != len(tasks) or set(by_task) != set(completed):
+        raise TemporalDiscoveryContractError(
+            "native campaign seal checkpoint does not cover the exact task matrix"
+        )
+    if task_manifest.get("taskMatrixSha256") != canonical_sha256(tasks):
+        raise TemporalDiscoveryContractError(
+            "native campaign seal task matrix identity drifted"
+        )
+    source_tasks: list[dict[str, Any]] = []
+    for task_id in sorted(by_task):
+        task = by_task[task_id]
+        payload = task.get("payload")
+        record = completed[task_id]
+        if not isinstance(payload, Mapping) or not isinstance(record, Mapping):
+            raise TemporalDiscoveryContractError(
+                "native campaign seal task/checkpoint row is invalid"
+            )
+        evidence_plan = payload.get("evidence_plan")
+        result_path = Path(str(record.get("resultPath") or ""))
+        if (
+            not isinstance(evidence_plan, Mapping)
+            or not result_path.is_file()
+            or result_path.resolve().parent != (result_root / "results").resolve()
+            or record.get("candidateId") != payload.get("candidate_id")
+        ):
+            raise TemporalDiscoveryContractError(
+                "native campaign seal task/result authority drifted"
+            )
+        raw_ref = {
+            "schemaVersion": "temporal_qd_tail_raw_result_ref_v1",
+            "relativePath": result_path.resolve()
+            .relative_to(result_root.resolve())
+            .as_posix(),
+            "resultSha256": record.get("resultSemanticSha256"),
+            "codec": record.get("resultCodec"),
+            "semanticSizeBytes": record.get("resultSemanticSizeBytes"),
+            "uncompressedSha256": record.get("resultUncompressedSha256"),
+            "uncompressedSizeBytes": record.get("resultUncompressedSizeBytes"),
+            "blobSha256": record.get("resultBlobSha256"),
+            "blobSizeBytes": record.get("resultBlobSizeBytes"),
+        }
+        source_tasks.append(
+            {
+                "task": {
+                    "taskId": task_id,
+                    "candidateId": payload.get("candidate_id"),
+                    "analysisWindowStart": payload.get("analysis_window_start"),
+                    "analysisWindowEnd": payload.get("analysis_window_end"),
+                    "evidencePlanSemanticSha256": evidence_plan.get("plan_id"),
+                    "taskPayloadSha256": canonical_sha256(payload),
+                },
+                "taskPayloadBinding": {
+                    "taskPayloadSha256": canonical_sha256(payload),
+                    "barLimit": payload.get("bar_limit"),
+                },
+                "rawResultPath": str(result_path.resolve()),
+                "rawResultRef": raw_ref,
+                "resultBinding": {
+                    "taskKind": task.get("task_kind"),
+                    "jobId": payload.get("job_id"),
+                    "authorityId": payload.get("authority_id"),
+                    "candidateId": payload.get("candidate_id"),
+                    "evidencePlanId": evidence_plan.get("plan_id"),
+                    "lakeWindowSemanticSha256": payload.get(
+                        "lake_window_semantic_sha256"
+                    ),
+                    "sharedObservationStreamId": payload.get(
+                        "shared_observation_stream_id"
+                    ),
+                },
+            }
+        )
+    selected_seal_root = seal_root or (
+        _native_finalization_root(root, generation_index) / "campaign-seal"
+    )
+    source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_campaign_seal_source_v1",
+            "authorityId": authority["authorityId"],
+            "authoritySha256": canonical_sha256(authority),
+            "taskMatrixSha256": task_manifest["taskMatrixSha256"],
+            "taskManifestSha256": canonical_sha256(task_manifest),
+            "taskManifestPath": str(
+                (result_root / "task-manifest.json").resolve()
+            ),
+            "checkpointSha256": canonical_sha256(checkpoint),
+            "taskCount": len(source_tasks),
+            "funnelProjectionIncluded": True,
+            "tasks": source_tasks,
+        },
+        "sourceSha256",
+    )
+    source_path = selected_seal_root / "source.json"
+    _write_canonical_once(source_path, source)
+    contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
+    manifest = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_campaign_seal_manifest_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "seal_completed_task_matrix_and_reduce_tail",
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "sourcePath": str(source_path.resolve()),
+            "sourceSha256": source["sourceSha256"],
+            "evaluationPopulationPath": str(
+                (
+                    evaluation_population_file
+                    or generation_root / "proposal" / "evaluation-population.json"
+                ).resolve()
+            ),
+            "evaluationPopulationSha256": evaluation_population[
+                "evaluationPopulationSha256"
+            ],
+            "generationIndex": generation_index,
+            "minimumTotalTrades": int(
+                config["frozenSearchPolicy"]["minimumTotalTrades"]
+            ),
+            "minimumTradesPerWindow": int(
+                config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+            ),
+            "capTrades": int(config["frozenSearchPolicy"]["capTrades"]),
+            "provisionalLimit": int(
+                contract["provisionalReduction"]["maxCandidates"]
+            ),
+            "resultPath": "generation-tail-transaction-result.json",
+        },
+        "manifestSha256",
+    )
+    manifest_path = selected_seal_root / "manifest.json"
+    _write_canonical_once(manifest_path, manifest)
+    return manifest, manifest_path
+
+
+def _native_prepared_finalizer_manifest(
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    projection: Mapping[str, Any],
+    cohort: Mapping[str, Any],
+    provisional: Mapping[str, Any],
+    bundles: list[Mapping[str, Any]],
+    complete_bundle_snapshot: bool,
+    auxiliary_plan: Mapping[str, Any] | None,
+    auxiliary_campaign_receipts: list[Mapping[str, Any]],
+    rich_members: list[Mapping[str, Any]],
+    current_member_count: int,
+    campaigns: list[Mapping[str, Any]],
+    total_generation_task_count: int,
+    proposal_tail_index: Mapping[str, Any],
+    generation_record_extra: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    """Freeze the production pre-final transaction without Python outputs."""
+
+    if (
+        not complete_bundle_snapshot
+        or auxiliary_plan is not None
+        or auxiliary_campaign_receipts
+    ):
+        raise TemporalDiscoveryContractError(
+            "native descriptor receipts are disabled until their full authority "
+            "chain can be reopened"
+        )
+
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    proposal_root = generation_root / "proposal"
+    campaign_root = generation_root / "campaign"
+    result_root = campaign_root / "screening-run"
+    evidence_root = generation_root / "evidence"
+    native_root = _native_finalization_root(root, generation_index)
+    contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
+    journal = _canonical_file(
+        proposal_root / "generation-journal.json", name="native production journal"
+    )
+    authority = _canonical_file(campaign_root / "authority.json", name="QD authority")
+    task_manifest = _canonical_file(
+        result_root / "task-manifest.json", name="QD task manifest"
+    )
+    evaluation_checkpoint = _canonical_file(
+        result_root / "checkpoint.json", name="QD evaluation checkpoint"
+    )
+    campaign = _canonical_file(campaign_root / "campaign.json", name="QD campaign")
+    evaluation_identity = _canonical_file(
+        campaign_root / "evaluation-identity.json", name="QD evaluation identity"
+    )
+    empty_archive = {
+        "cells": [],
+        "rotatingEvidenceTransaction": {
+            "schemaVersion": "temporal_qd_prefinal_empty_archive_v1"
+        },
+        "resolvedExecutionDeduplication": {"duplicates": []},
+    }
+    pre_archive_funnel = build_qd_generation_funnel(
+        proposal_entries=projection["funnelEntries"],
+        proposal_accounting=journal,
+        population=projection,
+        authority=authority,
+        task_manifest=task_manifest,
+        checkpoint=evaluation_checkpoint,
+        archive=empty_archive,
+        minimum_total_trades=int(config["frozenSearchPolicy"]["minimumTotalTrades"]),
+        minimum_trades_per_window=int(
+            config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+        ),
+        tail_result_index=proposal_tail_index,
+    )
+    funnel_source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_native_funnel_reduction_source_v1",
+            "preArchiveProjection": True,
+            "completenessPolicy": pre_archive_funnel["completenessPolicy"],
+            "proposalAccounting": pre_archive_funnel["proposalAccounting"],
+            "proposalAttempts": pre_archive_funnel["attemptLedger"]["attempts"],
+            "candidateStageRows": pre_archive_funnel["candidates"],
+        },
+        "funnelSourceSha256",
+    )
+    first = int(config["generationPlan"]["firstGenerationIndex"])
+    previous_archive_path = (
+        Path(str(config["initialArchive"]["path"]))
+        if generation_index == first
+        else root
+        / "generations"
+        / f"generation-{generation_index - 1:04d}"
+        / "archive.json"
+    )
+    previous_cumulative = (
+        None
+        if generation_index == first
+        else _load_previous_cumulative_archive(previous_archive_path)
+    )
+    previous_archive = _canonical_file(
+        previous_archive_path, name="native previous parent archive"
+    )
+    previous_summary = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_previous_parent_archive_summary_v1",
+            "archiveSha256": _sha256(
+                previous_archive.get("archiveSha256"), name="previous parent archive"
+            ),
+            "candidateCountSeen": int(previous_archive.get("candidateCountSeen") or 0),
+            "memberCount": int(previous_archive.get("memberCount") or 0),
+            "cellIds": sorted(
+                str(row.get("cellId"))
+                for row in previous_archive.get("cells") or []
+                if isinstance(row, Mapping)
+            ),
+            **(
+                {
+                    "bidirectionalPairPolicy": _clone(
+                        previous_archive["bidirectionalPairPolicy"],
+                        name="previous bidirectional pair policy",
+                    )
+                }
+                if previous_archive.get("bidirectionalPairPolicy") is not None
+                else {}
+            ),
+        },
+        "summarySha256",
+    )
+    archive_policy = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_archive_policy_binding_v1",
+            "qdVersion": config["qdVersion"],
+            "policyName": config["policyName"],
+            "policySha256": config["policySha256"],
+            "frozenPolicy": _clone(config["frozenPolicy"], name="frozen QD policy"),
+        },
+        "policyBindingSha256",
+    )
+    artifact_base = _native_prefinal_artifact_ledger_base(
+        generation_root=generation_root,
+        generation_index=generation_index,
+        evaluation_population=projection,
+        tail_result_index=proposal_tail_index,
+    )
+    completion_marker_path = native_root / "completion-marker.json"
+    if completion_marker_path.is_file():
+        completion_marker = _canonical_file(
+            completion_marker_path, name="native completion marker"
+        )
+        _identity_payload(
+            completion_marker,
+            "markerSha256",
+            name="native completion marker",
+        )
+        if completion_marker.get("generationIndex") != generation_index:
+            raise TemporalDiscoveryContractError(
+                "native completion marker generation drifted"
+            )
+    else:
+        completion_marker = _native_self_hash(
+            {
+                "schemaVersion": "temporal_qd_native_completion_marker_v1",
+                "generationIndex": generation_index,
+                "completedAt": _utc_now(),
+            },
+            "markerSha256",
+        )
+        _write_canonical_once(completion_marker_path, completion_marker)
+    record_base = {
+        "populationSha256": projection["populationSha256"],
+        "evaluationPopulationSha256": projection["evaluationPopulationSha256"],
+        "journalSha256": journal["journalSha256"],
+        "proposalCount": int(journal["proposalCount"]),
+        "candidateCount": int(projection["candidateCount"]),
+        "originProposalCounts": _clone(
+            journal["originProposalCounts"], name="origin proposal counts"
+        ),
+        "originAcceptedCounts": _clone(
+            journal["originAcceptedCounts"], name="origin accepted counts"
+        ),
+        "campaignSha256": campaign["campaignSha256"],
+        "evaluationIdentitySha256": evaluation_identity[
+            "evaluationIdentitySha256"
+        ],
+        "taskMatrixSha256": task_manifest["taskMatrixSha256"],
+        "taskCount": len(task_manifest["tasks"]),
+        "totalGenerationTaskCount": total_generation_task_count,
+        "proposalSlots": _clone(journal["proposalSlots"], name="proposal slots"),
+        "uniqueIdentityCounts": _clone(
+            journal["uniqueIdentityCounts"], name="unique identity counts"
+        ),
+        "duplicateCounters": _clone(
+            journal["duplicateCounters"], name="duplicate counters"
+        ),
+        "proposalSlotCounters": _clone(
+            journal["proposalSlotCounters"], name="proposal slot counters"
+        ),
+        "nextImmigrantContinuationOrdinal": int(
+            journal["nextImmigrantContinuationOrdinal"]
+        ),
+        "completedAt": completion_marker["completedAt"],
+        **_clone(generation_record_extra, name="native generation record extras"),
+    }
+    publication_paths = {
+        "archive": str((generation_root / "archive.json").resolve()),
+        "generationFunnel": str((generation_root / "generation-funnel.json").resolve()),
+        "rotatingEvidenceLedger": str(
+            (evidence_root / "generation-ledger.json").resolve()
+        ),
+        "rotatingEvidenceCheckpoint": str((evidence_root / "checkpoint.json").resolve()),
+        "cumulativeBreederArchive": str(
+            (evidence_root / "cumulative-archive.json").resolve()
+        ),
+    }
+    source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_source_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "generationIndex": generation_index,
+            "rotatingEvidence": _clone(contract, name="rotating evidence contract"),
+            "cohort": _clone(cohort, name="native cohort"),
+            "provisional": _clone(provisional, name="native provisional"),
+            "baselineCandidatePanelBundles": _clone(
+                bundles, name="native baseline bundle snapshot"
+            ),
+            "completeBundleSnapshot": complete_bundle_snapshot,
+            "auxiliaryPlan": (
+                _clone(auxiliary_plan, name="native auxiliary plan")
+                if auxiliary_plan is not None
+                else None
+            ),
+            "auxiliaryCampaignReceipts": _clone(
+                auxiliary_campaign_receipts,
+                name="native auxiliary campaign receipts",
+            ),
+            "previousCumulativeArchive": previous_cumulative,
+            "previousParentArchiveSummary": previous_summary,
+            "archivePolicy": archive_policy,
+            "richMembers": _clone(rich_members, name="native rich members"),
+            "currentMemberCount": current_member_count,
+            "cellCapacity": int(config["frozenSearchPolicy"]["cellCapacity"]),
+            "campaigns": _clone(campaigns, name="native campaign bindings"),
+            "artifactLedgerBase": artifact_base,
+            "publicationPaths": publication_paths,
+            "funnelReductionSource": funnel_source,
+            "generationRecordBase": record_base,
+            "stateTransitionBase": {
+                "nextGenerationIndex": generation_index + 1,
+                "nextStage": "generation_proposal",
+                "candidateCountIncrement": int(projection["candidateCount"]),
+                "workerTaskCountIncrement": total_generation_task_count,
+                "nextImmigrantContinuationOrdinal": int(
+                    journal["nextImmigrantContinuationOrdinal"]
+                ),
+            },
+        },
+        "sourceSha256",
+    )
+    source_path = native_root / "source.json"
+    _write_canonical_once(source_path, source)
+    manifest = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "finalize_rotating_generation",
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "sourcePath": str(source_path.resolve()),
+            "sourceSha256": source["sourceSha256"],
+            "resultPath": "generation-commit.json",
+        },
+        "manifestSha256",
+    )
+    manifest_path = native_root / "manifest.json"
+    _write_canonical_once(manifest_path, manifest)
+    return manifest, manifest_path
+
+
+def _native_finalizer_manifest(
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    generation_record: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    """Build a historical parity manifest from an already-completed Python boundary.
+
+    This deliberately is not a production finalization gateway: several source
+    fields are projected from Python's completed outputs.  The caller may use
+    it for migration comparison/admission only, never to skip Python work.
+    """
+    generation_index = int(generation_record["generationIndex"])
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    native_root = _native_finalization_root(root, generation_index)
+    evidence_root = generation_root / "evidence"
+    cohort = _canonical_file(evidence_root / "cohort.json", name="native cohort")
+    provisional = _canonical_file(
+        evidence_root / "provisional.json", name="native provisional survivors"
+    )
+    cumulative = _canonical_file(
+        evidence_root / "cumulative-archive.json",
+        name="native cumulative archive oracle",
+    )
+    checkpoint = _canonical_file(
+        evidence_root / "checkpoint.json", name="native rotating checkpoint oracle"
+    )
+    ledger = _canonical_file(
+        evidence_root / "generation-ledger.json",
+        name="native rotating ledger oracle",
+    )
+    archive = _canonical_file(
+        generation_root / "archive.json", name="native parent archive oracle"
+    )
+    funnel = _canonical_file(
+        generation_root / "generation-funnel.json", name="native funnel oracle"
+    )
+    artifacts = _clone(
+        generation_record.get("artifacts"), name="native generation artifact ledger"
+    )
+    if (
+        config.get("rotatingEvidence") is None
+        or not bool((config.get("generationFunnel") or {}).get("enabled"))
+        or not isinstance(artifacts, Mapping)
+    ):
+        raise TemporalDiscoveryContractError(
+            "Rust generation finalization requires rotating evidence and the immutable funnel"
+        )
+    first = int(config["generationPlan"]["firstGenerationIndex"])
+    previous_archive_path = (
+        Path(str(config["initialArchive"]["path"]))
+        if generation_index == first
+        else root
+        / "generations"
+        / f"generation-{generation_index - 1:04d}"
+        / "archive.json"
+    )
+    previous_cumulative = (
+        None
+        if generation_index == first
+        else _canonical_file(
+            root
+            / "generations"
+            / f"generation-{generation_index - 1:04d}"
+            / "evidence"
+            / "cumulative-archive.json",
+            name="previous cumulative archive",
+        )
+    )
+    previous_archive = _canonical_file(
+        previous_archive_path, name="native previous parent archive"
+    )
+    previous_summary = {
+        "schemaVersion": "temporal_qd_previous_parent_archive_summary_v1",
+        "archiveSha256": _sha256(
+            previous_archive.get("archiveSha256"), name="previous parent archive"
+        ),
+        "candidateCountSeen": int(previous_archive.get("candidateCountSeen") or 0),
+        "memberCount": int(previous_archive.get("memberCount") or 0),
+        "cellIds": sorted(
+            str(row.get("cellId"))
+            for row in previous_archive.get("cells") or []
+            if isinstance(row, Mapping)
+        ),
+        **(
+            {
+                "bidirectionalPairPolicy": _clone(
+                    previous_archive["bidirectionalPairPolicy"],
+                    name="previous bidirectional pair policy",
+                )
+            }
+            if previous_archive.get("bidirectionalPairPolicy") is not None
+            else {}
+        ),
+    }
+    previous_summary = _native_self_hash(previous_summary, "summarySha256")
+    archive_policy = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_archive_policy_binding_v1",
+            "qdVersion": config["qdVersion"],
+            "policyName": config["policyName"],
+            "policySha256": config["policySha256"],
+            "frozenPolicy": _clone(config["frozenPolicy"], name="frozen QD policy"),
+        },
+        "policyBindingSha256",
+    )
+    rich_members = [
+        _clone(member, name="native rich parent member")
+        for cell in archive.get("cells") or []
+        if isinstance(cell, Mapping)
+        for member in cell.get("members") or []
+        if isinstance(member, Mapping)
+    ]
+    record_base = {
+        key: _clone(value, name=f"generation record {key}")
+        for key, value in generation_record.items()
+        if key
+        not in {
+            "archiveSha256",
+            "resultSetSha256",
+            "rotatingEvidenceLedgerSha256",
+            "rotatingEvidenceCheckpointSha256",
+            "cumulativeArchiveSha256",
+            "nativeGenerationFinalization",
+        }
+    }
+    funnel_source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_native_funnel_reduction_source_v1",
+            "completenessPolicy": _clone(
+                funnel["completenessPolicy"], name="funnel completeness policy"
+            ),
+            "proposalAccounting": _clone(
+                funnel["proposalAccounting"], name="funnel proposal accounting"
+            ),
+            "proposalAttempts": _clone(
+                funnel["attemptLedger"]["attempts"], name="funnel attempts"
+            ),
+            "candidateStageRows": _clone(
+                funnel["candidates"], name="funnel joined candidate stages"
+            ),
+        },
+        "funnelSourceSha256",
+    )
+    source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_source_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "generationIndex": generation_index,
+            "rotatingEvidence": _clone(
+                config["rotatingEvidence"], name="rotating evidence contract"
+            ),
+            "cohort": cohort,
+            "provisional": provisional,
+            "baselineCandidatePanelBundles": _clone(
+                cumulative["candidatePanelBundles"],
+                name="native candidate panel bundles",
+            ),
+            "completeBundleSnapshot": True,
+            "auxiliaryPlan": None,
+            "auxiliaryCampaignReceipts": [],
+            "previousCumulativeArchive": previous_cumulative,
+            "previousParentArchiveSummary": previous_summary,
+            "archivePolicy": archive_policy,
+            "richMembers": rich_members,
+            "currentMemberCount": int(
+                archive.get("candidateCountReducedThisGeneration") or 0
+            ),
+            "cellCapacity": int(archive["cellCapacity"]),
+            "campaigns": _clone(ledger["campaigns"], name="rotating campaigns"),
+            "stageArtifacts": _clone(
+                checkpoint["stageArtifacts"], name="rotating stage artifacts"
+            ),
+            "artifactLedger": artifacts,
+            "funnelReductionSource": funnel_source,
+            "generationRecordBase": record_base,
+            "stateTransitionBase": {
+                "nextGenerationIndex": generation_index + 1,
+                "nextStage": "generation_proposal",
+                "candidateCountIncrement": int(generation_record["candidateCount"]),
+                "workerTaskCountIncrement": int(
+                    generation_record.get("totalGenerationTaskCount")
+                    or generation_record["taskCount"]
+                ),
+                "nextImmigrantContinuationOrdinal": int(
+                    generation_record["nextImmigrantContinuationOrdinal"]
+                ),
+            },
+        },
+        "sourceSha256",
+    )
+    source_path = native_root / "source.json"
+    _write_canonical_once(source_path, source)
+    manifest = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "finalize_rotating_generation",
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "sourcePath": str(source_path.resolve()),
+            "sourceSha256": source["sourceSha256"],
+            "resultPath": "generation-commit.json",
+        },
+        "manifestSha256",
+    )
+    manifest_path = native_root / "manifest.json"
+    _write_canonical_once(manifest_path, manifest)
+    return manifest, manifest_path
+
+
+def _native_prefinal_artifact_ledger_base(
+    *,
+    generation_root: Path,
+    generation_index: int,
+    evaluation_population: Mapping[str, Any],
+    tail_result_index: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Capture only artifacts which exist before archive/funnel finalization."""
+
+    proposal_root = generation_root / "proposal"
+    campaign_root = generation_root / "campaign"
+    result_root = campaign_root / "screening-run"
+    population_path = proposal_root / "population.json"
+    evaluation_population_file = proposal_root / "evaluation-population.json"
+    journal_path = proposal_root / "generation-journal.json"
+    journal = _canonical_file(journal_path, name="native pre-final journal")
+    preparation_path = campaign_root / "preparation.json"
+    authority_path = campaign_root / "authority.json"
+    identity_path = campaign_root / "evaluation-identity.json"
+    campaign_path = campaign_root / "campaign.json"
+    manifest_path = result_root / "task-manifest.json"
+    result_authority_path = result_root / "authority.json"
+    checkpoint_path = result_root / "checkpoint.json"
+    summary_path = result_root / "summary.json"
+    preparation = _canonical_file(preparation_path, name="native pre-final preparation")
+    authority = _canonical_file(authority_path, name="native pre-final authority")
+    identity = _canonical_file(identity_path, name="native pre-final evaluation identity")
+    campaign = _canonical_file(campaign_path, name="native pre-final campaign")
+    manifest = _canonical_file(manifest_path, name="native pre-final task manifest")
+    result_authority = _canonical_file(
+        result_authority_path, name="native pre-final result authority"
+    )
+    checkpoint = _canonical_file(checkpoint_path, name="native pre-final checkpoint")
+    summary = _canonical_file(summary_path, name="native pre-final summary")
+    if int(journal.get("generationIndex", -1)) != generation_index:
+        raise TemporalDiscoveryContractError("native pre-final journal index drifted")
+    results = _results_descriptor(
+        result_root=result_root,
+        checkpoint=checkpoint,
+        task_manifest=manifest,
+        tail_result_index=tail_result_index,
+    )
+    output: dict[str, Any] = {
+        "schemaVersion": "temporal_qd_supervisor_generation_artifacts_v1",
+        "population": {
+            "path": str(population_path.resolve()),
+            "sha256": evaluation_population["populationFileSha256"],
+            "populationSha256": evaluation_population["populationSha256"],
+        },
+        "preparation": _artifact_descriptor(preparation_path, preparation),
+        "authority": _self_hashed_descriptor(
+            authority_path,
+            authority,
+            field="authorityId",
+            name="native pre-final authority",
+        ),
+        "evaluationIdentity": _self_hashed_descriptor(
+            identity_path,
+            identity,
+            field="evaluationIdentitySha256",
+            name="native pre-final evaluation identity",
+        ),
+        "campaign": _self_hashed_descriptor(
+            campaign_path,
+            campaign,
+            field="campaignSha256",
+            name="native pre-final campaign",
+        ),
+        "taskManifest": _artifact_descriptor(manifest_path, manifest),
+        "resultAuthority": _artifact_descriptor(
+            result_authority_path, result_authority
+        ),
+        "checkpoint": _artifact_descriptor(checkpoint_path, checkpoint),
+        "summary": _artifact_descriptor(summary_path, summary),
+        "results": results,
+        "journal": _self_hashed_descriptor(
+            journal_path,
+            journal,
+            field="journalSha256",
+            name="native pre-final journal",
+        ),
+        "evaluationPopulation": _self_hashed_descriptor(
+            evaluation_population_file,
+            evaluation_population,
+            field="evaluationPopulationSha256",
+            name="native pre-final evaluation population",
+        ),
+    }
+    if evaluation_population.get("g0Bootstrap") is not None:
+        output["g0Bootstrap"] = _clone(
+            evaluation_population["g0Bootstrap"], name="native pre-final G0 binding"
+        )
+    return output
+
+
+def _native_independent_finalizer_manifest(
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    tail_result_indexes: dict[Path, dict[str, Any]],
+    tail_reducer_binary: Path,
+    completed_at: str | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Build a native source without opening any completed finalization output."""
+
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    proposal_root = generation_root / "proposal"
+    campaign_root = generation_root / "campaign"
+    result_root = campaign_root / "screening-run"
+    native_root = _native_finalization_root(root, generation_index)
+    evidence_root = generation_root / "evidence"
+    contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
+    panel = panel_for_generation(contract, generation_index)
+    # The compact projection and journal jointly freeze the 1.2 GB rich
+    # population's byte identity.  Native finalization never consumes those
+    # bytes, so reopening them here is both circular in responsibility and a
+    # severe latency/RSS regression.  Candidate material is independently
+    # reopened below from the append-only proposal journal.
+    projection = load_evaluation_population(
+        population_path=proposal_root / "population.json",
+        journal_path=proposal_root / "generation-journal.json",
+        verify_population_file=False,
+    )
+    journal = _canonical_file(
+        proposal_root / "generation-journal.json", name="native pre-final journal"
+    )
+    cohort = _canonical_file(evidence_root / "cohort.json", name="native cohort")
+    provisional = _canonical_file(
+        evidence_root / "provisional.json", name="native provisional survivors"
+    )
+    proposal_tail_index = validate_tail_result_index(
+        _canonical_file(
+            result_root / "tail-result-index-v3.json",
+            name="native pre-final tail result index",
+        )
+    )
+    if proposal_tail_index.get("funnelProjectionIncluded") is not True:
+        raise TemporalDiscoveryContractError(
+            "native pre-final tail result index lacks funnel projections"
+        )
+    tail_result_indexes[result_root.resolve()] = proposal_tail_index
+    tail_root = native_root / "tail-reduction"
+    tail_manifest = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_native_tail_reduction_manifest_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "reduce_evaluated_members_and_provisional",
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "evaluationPopulationPath": str(
+                (proposal_root / "evaluation-population.json").resolve()
+            ),
+            "evaluationPopulationSha256": projection[
+                "evaluationPopulationSha256"
+            ],
+            "tailResultIndexPath": str(
+                (result_root / "tail-result-index-v3.json").resolve()
+            ),
+            "tailResultIndexSha256": proposal_tail_index[
+                "tailResultIndexSha256"
+            ],
+            "generationIndex": generation_index,
+            "minimumTotalTrades": int(
+                config["frozenSearchPolicy"]["minimumTotalTrades"]
+            ),
+            "minimumTradesPerWindow": int(
+                config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+            ),
+            "capTrades": int(config["frozenSearchPolicy"]["capTrades"]),
+            "provisionalLimit": int(
+                contract["provisionalReduction"]["maxCandidates"]
+            ),
+            "resultPath": "tail-reduction-result.json",
+        },
+        "manifestSha256",
+    )
+    tail_manifest_path = tail_root / "manifest.json"
+    _write_canonical_once(tail_manifest_path, tail_manifest)
+    _invoke_native_tail_reducer(
+        binary=tail_reducer_binary, manifest_path=tail_manifest_path
+    )
+    tail_result = _canonical_file(
+        tail_root / "tail-reduction-result.json", name="native tail reduction result"
+    )
+    _identity_payload(
+        tail_result, "resultSha256", name="native tail reduction result"
+    )
+    if tail_result.get("manifestSha256") != tail_manifest["manifestSha256"]:
+        raise TemporalDiscoveryContractError(
+            "native tail reduction result manifest binding drifted"
+        )
+    native_provisional = tail_result.get("provisional")
+    if (
+        not isinstance(native_provisional, Mapping)
+        or native_provisional.get("candidateCount") != provisional.get("candidateCount")
+        or native_provisional.get("candidates") != provisional.get("candidates")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native provisional reduction differs from frozen Python oracle"
+        )
+    provisional_ids = [str(row["candidateId"]) for row in provisional["candidates"]]
+    provisional_id_set = set(provisional_ids)
+    current_members: dict[str, dict[str, Any]] = {}
+    members_path = tail_root / "evaluated-members.jsonl"
+    try:
+        with members_path.open("r", encoding="utf-8", newline="") as handle:
+            for line in handle:
+                member = json.loads(line)
+                candidate_id = str(member.get("candidateId"))
+                if candidate_id in provisional_id_set:
+                    if candidate_id in current_members:
+                        raise TemporalDiscoveryContractError(
+                            "native tail reduction emitted a duplicate provisional member"
+                        )
+                    current_members[candidate_id] = member
+    except (OSError, ValueError) as exc:
+        raise TemporalDiscoveryContractError(
+            "could not stream native evaluated members"
+        ) from exc
+    new_candidates = {
+        str(row["candidateId"]): row for row in projection["candidates"]
+    }
+    rich_members: list[dict[str, Any]] = []
+    rich_candidates: dict[str, dict[str, Any]] = {}
+    for candidate_id in provisional_ids:
+        member = current_members.get(candidate_id)
+        if member is None:
+            raise TemporalDiscoveryContractError(
+                "native provisional survivor lacks independently reduced member"
+            )
+        candidate = member["candidate"]
+        if candidate_id in new_candidates:
+            candidate = hydrate_evaluation_candidate(
+                candidate, proposal_root=proposal_root / "proposal-journal"
+            )
+        member["candidate"] = candidate
+        rich_candidates[candidate_id] = _clone(
+            candidate, name="native provisional rich candidate"
+        )
+        rich_members.append(member)
+    window_records = _campaign_window_evidence(
+        campaign_root=campaign_root,
+        panel=panel,
+        candidates={
+            candidate_id: new_candidates[candidate_id]
+            for candidate_id in provisional_ids
+            if candidate_id in new_candidates
+        },
+        tail_result_index=proposal_tail_index,
+    )
+    bundles = [
+        build_candidate_panel_bundle(
+            contract=contract,
+            candidate=rich_candidates[candidate_id],
+            panel_id=str(panel["panelId"]),
+            records=window_records[candidate_id],
+        )
+        for candidate_id in sorted(rich_candidates)
+    ]
+    required = required_panel_ids(contract, generation_index)
+    if required != [str(panel["panelId"])]:
+        raise TemporalDiscoveryContractError(
+            "independent historical migration currently requires descriptor-bound auxiliary receipts"
+        )
+    campaign = _canonical_file(campaign_root / "campaign.json", name="proposal campaign")
+    campaigns = [
+        {
+            "role": "proposal_current_panel",
+            "panelId": panel["panelId"],
+            "campaignRoot": str(campaign_root.resolve()),
+            "campaignSha256": campaign["campaignSha256"],
+        }
+    ]
+    authority = _canonical_file(campaign_root / "authority.json", name="QD authority")
+    task_manifest = _canonical_file(
+        result_root / "task-manifest.json", name="QD task manifest"
+    )
+    checkpoint = _canonical_file(
+        result_root / "checkpoint.json", name="QD evaluation checkpoint"
+    )
+    empty_rotating_archive = {
+        "cells": [],
+        "rotatingEvidenceTransaction": {
+            "schemaVersion": "temporal_qd_prefinal_empty_archive_v1"
+        },
+        "resolvedExecutionDeduplication": {"duplicates": []},
+    }
+    pre_archive_funnel = build_qd_generation_funnel(
+        proposal_entries=projection["funnelEntries"],
+        proposal_accounting=journal,
+        population=projection,
+        authority=authority,
+        task_manifest=task_manifest,
+        checkpoint=checkpoint,
+        archive=empty_rotating_archive,
+        minimum_total_trades=int(config["frozenSearchPolicy"]["minimumTotalTrades"]),
+        minimum_trades_per_window=int(
+            config["frozenSearchPolicy"]["minimumTradesPerWindow"]
+        ),
+        tail_result_index=proposal_tail_index,
+    )
+    funnel_source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_native_funnel_reduction_source_v1",
+            "preArchiveProjection": True,
+            "completenessPolicy": pre_archive_funnel["completenessPolicy"],
+            "proposalAccounting": pre_archive_funnel["proposalAccounting"],
+            "proposalAttempts": pre_archive_funnel["attemptLedger"]["attempts"],
+            "candidateStageRows": pre_archive_funnel["candidates"],
+        },
+        "funnelSourceSha256",
+    )
+    first = int(config["generationPlan"]["firstGenerationIndex"])
+    if generation_index == first:
+        previous_archive_path = Path(str(config["initialArchive"]["path"]))
+        previous_cumulative = None
+    else:
+        previous_archive_path = (
+            root
+            / "generations"
+            / f"generation-{generation_index - 1:04d}"
+            / "archive.json"
+        )
+        previous_cumulative = _load_previous_cumulative_archive(previous_archive_path)
+    previous_archive = _canonical_file(
+        previous_archive_path, name="native previous parent archive"
+    )
+    previous_summary = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_previous_parent_archive_summary_v1",
+            "archiveSha256": _sha256(
+                previous_archive.get("archiveSha256"), name="previous parent archive"
+            ),
+            "candidateCountSeen": int(previous_archive.get("candidateCountSeen") or 0),
+            "memberCount": int(previous_archive.get("memberCount") or 0),
+            "cellIds": sorted(
+                str(row.get("cellId"))
+                for row in previous_archive.get("cells") or []
+                if isinstance(row, Mapping)
+            ),
+            **(
+                {
+                    "bidirectionalPairPolicy": _clone(
+                        previous_archive["bidirectionalPairPolicy"],
+                        name="previous bidirectional pair policy",
+                    )
+                }
+                if previous_archive.get("bidirectionalPairPolicy") is not None
+                else {}
+            ),
+        },
+        "summarySha256",
+    )
+    archive_policy = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_archive_policy_binding_v1",
+            "qdVersion": config["qdVersion"],
+            "policyName": config["policyName"],
+            "policySha256": config["policySha256"],
+            "frozenPolicy": _clone(config["frozenPolicy"], name="frozen QD policy"),
+        },
+        "policyBindingSha256",
+    )
+    artifact_base = _native_prefinal_artifact_ledger_base(
+        generation_root=generation_root,
+        generation_index=generation_index,
+        evaluation_population=projection,
+        tail_result_index=proposal_tail_index,
+    )
+    evaluation_identity = _canonical_file(
+        campaign_root / "evaluation-identity.json", name="evaluation identity"
+    )
+    record_base = {
+        "populationSha256": projection["populationSha256"],
+        "evaluationPopulationSha256": projection["evaluationPopulationSha256"],
+        "journalSha256": journal["journalSha256"],
+        "proposalCount": int(journal["proposalCount"]),
+        "candidateCount": int(projection["candidateCount"]),
+        "originProposalCounts": _clone(
+            journal["originProposalCounts"], name="origin proposal counts"
+        ),
+        "originAcceptedCounts": _clone(
+            journal["originAcceptedCounts"], name="origin accepted counts"
+        ),
+        "campaignSha256": campaign["campaignSha256"],
+        "evaluationIdentitySha256": evaluation_identity[
+            "evaluationIdentitySha256"
+        ],
+        "taskMatrixSha256": task_manifest["taskMatrixSha256"],
+        "taskCount": len(task_manifest["tasks"]),
+        "totalGenerationTaskCount": len(task_manifest["tasks"]),
+        "proposalSlots": _clone(journal["proposalSlots"], name="proposal slots"),
+        "uniqueIdentityCounts": _clone(
+            journal["uniqueIdentityCounts"], name="unique identity counts"
+        ),
+        "duplicateCounters": _clone(
+            journal["duplicateCounters"], name="duplicate counters"
+        ),
+        "proposalSlotCounters": _clone(
+            journal["proposalSlotCounters"], name="proposal slot counters"
+        ),
+        "nextImmigrantContinuationOrdinal": int(
+            journal["nextImmigrantContinuationOrdinal"]
+        ),
+        "completedAt": completed_at or _utc_now(),
+        **(
+            {"g0Bootstrap": _clone(journal["g0Bootstrap"], name="G0 bootstrap")}
+            if journal.get("g0Bootstrap") is not None
+            else {}
+        ),
+    }
+    publication_paths = {
+        "archive": str((generation_root / "archive.json").resolve()),
+        "generationFunnel": str(
+            (generation_root / "generation-funnel.json").resolve()
+        ),
+        "rotatingEvidenceLedger": str(
+            (evidence_root / "generation-ledger.json").resolve()
+        ),
+        "rotatingEvidenceCheckpoint": str(
+            (evidence_root / "checkpoint.json").resolve()
+        ),
+        "cumulativeBreederArchive": str(
+            (evidence_root / "cumulative-archive.json").resolve()
+        ),
+    }
+    source = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_source_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "generationIndex": generation_index,
+            "rotatingEvidence": _clone(contract, name="rotating evidence contract"),
+            "cohort": cohort,
+            "provisional": provisional,
+            "baselineCandidatePanelBundles": bundles,
+            "completeBundleSnapshot": True,
+            "auxiliaryPlan": None,
+            "auxiliaryCampaignReceipts": [],
+            "previousCumulativeArchive": previous_cumulative,
+            "previousParentArchiveSummary": previous_summary,
+            "archivePolicy": archive_policy,
+            "richMembers": rich_members,
+            "currentMemberCount": int(tail_result["evaluatedMembers"]["memberCount"]),
+            "cellCapacity": int(config["frozenSearchPolicy"]["cellCapacity"]),
+            "campaigns": campaigns,
+            "artifactLedgerBase": artifact_base,
+            "publicationPaths": publication_paths,
+            "funnelReductionSource": funnel_source,
+            "generationRecordBase": record_base,
+            "stateTransitionBase": {
+                "nextGenerationIndex": generation_index + 1,
+                "nextStage": "generation_proposal",
+                "candidateCountIncrement": int(projection["candidateCount"]),
+                "workerTaskCountIncrement": len(task_manifest["tasks"]),
+                "nextImmigrantContinuationOrdinal": int(
+                    journal["nextImmigrantContinuationOrdinal"]
+                ),
+            },
+        },
+        "sourceSha256",
+    )
+    source_path = native_root / "source.json"
+    _write_canonical_once(source_path, source)
+    manifest = _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
+            "contractVersion": NATIVE_FOUNDATION_CONTRACT_VERSION,
+            "operation": "finalize_rotating_generation",
+            "runtimeAuthoritySha256": _native_finalization_authority_sha256(root),
+            "sourcePath": str(source_path.resolve()),
+            "sourceSha256": source["sourceSha256"],
+            "resultPath": "generation-commit.json",
+        },
+        "manifestSha256",
+    )
+    manifest_path = native_root / "manifest.json"
+    _write_canonical_once(manifest_path, manifest)
+    return manifest, manifest_path
+
+
+def _invoke_native_finalizer(
+    *, binary: Path, manifest_path: Path, timeout_seconds: float = 600.0
+) -> dict[str, Any]:
+    _verify_pinned_native_invocation_binary(
+        binary=binary, manifest_path=manifest_path, role="generationFinalizer"
+    )
+    try:
+        result = subprocess.run(
+            [str(binary.resolve()), str(manifest_path.resolve())],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TemporalDiscoveryContractError(
+            "native generation finalizer invocation failed"
+        ) from exc
+    _verify_pinned_native_invocation_binary(
+        binary=binary, manifest_path=manifest_path, role="generationFinalizer"
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-2_000:]
+        raise TemporalDiscoveryContractError(
+            f"native generation finalizer failed closed: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise TemporalDiscoveryContractError(
+            "native generation finalizer returned invalid JSON"
+        ) from exc
+    if not isinstance(payload, Mapping) or payload.get("status") != "committed":
+        raise TemporalDiscoveryContractError(
+            "native generation finalizer did not return a committed boundary"
+        )
+    return dict(payload)
+
+
+def _publish_native_generation_outputs(
+    *,
+    root: Path,
+    generation_index: int,
+    _after_step: Any | None = None,
+) -> dict[str, Any]:
+    """Publish one committed native boundary to legacy authority paths.
+
+    Native files are immutable and committed first.  Publication is therefore
+    an idempotent convergence step: an existing semantic equal is accepted and
+    any divergent destination fails before supervisor state can advance.
+    """
+
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    native_root = _native_finalization_root(root, generation_index)
+    commit = _canonical_file(
+        native_root / "generation-commit.json",
+        name="committed native generation commit",
+    )
+    commit_sha256 = _identity_payload(
+        commit, "commitSha256", name="committed native generation commit"
+    )
+    destinations = {
+        "cumulative-archive.json": generation_root / "evidence" / "cumulative-archive.json",
+        "archive.json": generation_root / "archive.json",
+        "checkpoint.json": generation_root / "evidence" / "checkpoint.json",
+        "generation-ledger.json": generation_root / "evidence" / "generation-ledger.json",
+        "generation-funnel.json": generation_root / "generation-funnel.json",
+    }
+    journal_path = native_root / "publication-journal.json"
+    if journal_path.is_file():
+        journal = _canonical_file(
+            journal_path, name="native generation publication journal"
+        )
+        _identity_payload(
+            journal,
+            "journalSha256",
+            name="native generation publication journal",
+        )
+        if (
+            journal.get("generationIndex") != generation_index
+            or journal.get("commitSha256") != commit_sha256
+            or not isinstance(journal.get("completedSteps"), list)
+        ):
+            raise TemporalDiscoveryContractError(
+                "native generation publication journal drifted"
+            )
+    else:
+        journal = {
+            "schemaVersion": "temporal_qd_native_publication_journal_v1",
+            "generationIndex": generation_index,
+            "commitSha256": commit_sha256,
+            "completedSteps": [],
+        }
+        journal["journalSha256"] = canonical_sha256(journal)
+        _write_once(journal_path, journal)
+
+    completed_steps = list(journal["completedSteps"])
+    published: dict[str, Any] = {}
+    for source_name, destination in destinations.items():
+        payload = _canonical_file(
+            native_root / source_name, name=f"committed native {source_name}"
+        )
+        if destination.is_file():
+            if _canonical_file(destination, name=f"published {source_name}") != payload:
+                existing = _canonical_file(
+                    destination, name=f"pre-final published {source_name}"
+                )
+                replaceable_checkpoint = (
+                    source_name == "checkpoint.json"
+                    and source_name not in completed_steps
+                    and existing.get("generationIndex") == generation_index
+                    and existing.get("rotatingEvidenceSha256")
+                    == payload.get("rotatingEvidenceSha256")
+                    and existing.get("cohortSha256") == payload.get("cohortSha256")
+                    and existing.get("stage")
+                    in {
+                        "current_panel_evaluation",
+                        "provisional_reduction",
+                        "cumulative_backfill",
+                    }
+                )
+                if not replaceable_checkpoint:
+                    raise TemporalDiscoveryContractError(
+                        f"native publication destination diverged: {destination}"
+                    )
+                _replace(destination, payload)
+        else:
+            _write_once(destination, payload)
+        published[source_name] = payload
+        if source_name not in completed_steps:
+            completed_steps.append(source_name)
+            journal = {
+                "schemaVersion": "temporal_qd_native_publication_journal_v1",
+                "generationIndex": generation_index,
+                "commitSha256": commit_sha256,
+                "completedSteps": completed_steps,
+            }
+            journal["journalSha256"] = canonical_sha256(journal)
+            _replace(journal_path, journal)
+        if _after_step is not None:
+            _after_step(source_name, len(completed_steps))
+    published["generation-funnel-snapshot.json"] = _canonical_file(
+        native_root / "generation-funnel-snapshot.json",
+        name="committed native generation funnel snapshot",
+    )
+    published["generation-record.json"] = _canonical_file(
+        native_root / "generation-record.json", name="committed native generation record"
+    )
+    published["generation-state-patch.json"] = _canonical_file(
+        native_root / "generation-state-patch.json", name="committed native state patch"
+    )
+    published["generation-commit.json"] = commit
+    return published
+
+
+def _validate_native_migration_outputs(
+    *, root: Path, generation_record: Mapping[str, Any], execution: Mapping[str, Any]
+) -> dict[str, Any]:
+    generation_index = int(generation_record["generationIndex"])
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    native_root = _native_finalization_root(root, generation_index)
+    comparisons = (
+        ("cumulative-archive.json", generation_root / "evidence" / "cumulative-archive.json"),
+        ("archive.json", generation_root / "archive.json"),
+        ("checkpoint.json", generation_root / "evidence" / "checkpoint.json"),
+        ("generation-ledger.json", generation_root / "evidence" / "generation-ledger.json"),
+        ("generation-funnel.json", generation_root / "generation-funnel.json"),
+    )
+    for native_name, oracle_path in comparisons:
+        native = _canonical_file(native_root / native_name, name=f"native {native_name}")
+        oracle = _canonical_file(oracle_path, name=f"Python oracle {native_name}")
+        if native != oracle:
+            raise TemporalDiscoveryContractError(
+                f"native historical migration disagrees with Python oracle: {native_name}"
+            )
+    snapshot = _canonical_file(
+        native_root / "generation-funnel-snapshot.json", name="native funnel snapshot"
+    )
+    if snapshot != generation_record["artifacts"]["generationFunnelSnapshot"]:
+        raise TemporalDiscoveryContractError(
+            "native historical migration funnel snapshot disagrees with Python oracle"
+        )
+    commit = _canonical_file(
+        native_root / "generation-commit.json", name="native generation commit"
+    )
+    commit_sha = _sha256(commit.get("commitSha256"), name="native generation commit")
+    if commit_sha != execution.get("commitSha256"):
+        raise TemporalDiscoveryContractError(
+            "native generation commit identity disagrees with execution result"
+        )
+    return commit
+
+
+def _native_generation_binding(
+    *,
+    root: Path,
+    generation_record: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    commit: Mapping[str, Any],
+    adoption_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    generation_index = int(generation_record["generationIndex"])
+    native_root = _native_finalization_root(root, generation_index)
+    record_material = {
+        key: value
+        for key, value in generation_record.items()
+        if key != "nativeGenerationFinalization"
+    }
+    admission = _native_self_hash(
+        {
+            "schemaVersion": NATIVE_FINALIZATION_ADMISSION_SCHEMA,
+            "generationIndex": generation_index,
+            "migrationMode": (
+                "explicit_one_time_python_boundary_adoption"
+                if adoption_authority is not None
+                else "deep_validated_python_boundary_to_native_commit"
+            ),
+            "pythonGenerationRecordSha256": canonical_sha256(record_material),
+            "manifestSha256": manifest["manifestSha256"],
+            "sourceSha256": manifest["sourceSha256"],
+            "commitSha256": commit["commitSha256"],
+            "archiveSha256": generation_record["archiveSha256"],
+            "resultSetSha256": generation_record["resultSetSha256"],
+            "rotatingEvidenceLedgerSha256": generation_record[
+                "rotatingEvidenceLedgerSha256"
+            ],
+            "rotatingEvidenceCheckpointSha256": generation_record[
+                "rotatingEvidenceCheckpointSha256"
+            ],
+            "cumulativeArchiveSha256": generation_record["cumulativeArchiveSha256"],
+            "generationFunnelArtifactSha256": generation_record[
+                "generationFunnelArtifactSha256"
+            ],
+            "generationFunnelSnapshotSha256": generation_record[
+                "generationFunnelSnapshotSha256"
+            ],
+            **(
+                {
+                    "adoptionAuthoritySha256": adoption_authority[
+                        "authoritySha256"
+                    ],
+                    "runtimeAuthoritySha256": adoption_authority[
+                        "runtimeAuthoritySha256"
+                    ],
+                }
+                if adoption_authority is not None
+                else {}
+            ),
+        },
+        "admissionSha256",
+    )
+    admission_path = native_root / "historical-admission.json"
+    _write_once(admission_path, admission)
+    return _native_self_hash(
+        {
+            "schemaVersion": NATIVE_FINALIZATION_BINDING_SCHEMA,
+            "generationIndex": generation_index,
+            "authorityMode": (
+                "native_explicit_python_boundary_adoption"
+                if adoption_authority is not None
+                else "native_compact_commit"
+            ),
+            "commitPath": str((native_root / "generation-commit.json").resolve()),
+            "commitSha256": commit["commitSha256"],
+            "generationRecordSha256": commit["generationRecord"][
+                "generationRecordSha256"
+            ],
+            "manifestPath": str((native_root / "manifest.json").resolve()),
+            "manifestSha256": manifest["manifestSha256"],
+            "admissionPath": str(admission_path.resolve()),
+            "admissionSha256": admission["admissionSha256"],
+            **(
+                {
+                    "adoptionAuthorityPath": str(
+                        (root / NATIVE_FINALIZATION_ADOPTION_AUTHORITY_FILE).resolve()
+                    ),
+                    "adoptionAuthoritySha256": adoption_authority[
+                        "authoritySha256"
+                    ],
+                    "runtimeAuthoritySha256": adoption_authority[
+                        "runtimeAuthoritySha256"
+                    ],
+                }
+                if adoption_authority is not None
+                else {}
+            ),
+            "deepAuditAvailable": True,
+        },
+        "bindingSha256",
+    )
+
+
+def _native_production_generation_binding(
+    *,
+    root: Path,
+    generation_index: int,
+    manifest: Mapping[str, Any],
+    commit: Mapping[str, Any],
+) -> dict[str, Any]:
+    native_root = _native_finalization_root(root, generation_index)
+    runtime_authority_sha256 = _sha256(
+        manifest.get("runtimeAuthoritySha256"),
+        name="native production runtime authority",
+    )
+    if runtime_authority_sha256 != _native_finalization_authority_sha256(root):
+        raise TemporalDiscoveryContractError(
+            "native production manifest runtime authority drifted"
+        )
+    return _native_self_hash(
+        {
+            "schemaVersion": NATIVE_FINALIZATION_BINDING_SCHEMA,
+            "generationIndex": generation_index,
+            "authorityMode": "native_production_compact_commit",
+            "commitPath": str((native_root / "generation-commit.json").resolve()),
+            "commitSha256": commit["commitSha256"],
+            "generationRecordSha256": commit["generationRecord"][
+                "generationRecordSha256"
+            ],
+            "manifestPath": str((native_root / "manifest.json").resolve()),
+            "manifestSha256": manifest["manifestSha256"],
+            "runtimeAuthoritySha256": runtime_authority_sha256,
+            "deepAuditAvailable": True,
+        },
+        "bindingSha256",
+    )
+
+
+def _validate_native_generation_binding(
+    *,
+    generation_record: Mapping[str, Any],
+    binary: Path,
+) -> None:
+    binding = _clone(
+        generation_record.get("nativeGenerationFinalization"),
+        name="native generation binding",
+    )
+    if not isinstance(binding, Mapping) or binding.get("schemaVersion") != (
+        NATIVE_FINALIZATION_BINDING_SCHEMA
+    ):
+        raise TemporalDiscoveryContractError(
+            "completed generation lacks its native finalization binding"
+        )
+    supplied_binding = _sha256(
+        binding.get("bindingSha256"), name="native generation binding"
+    )
+    material = dict(binding)
+    material.pop("bindingSha256", None)
+    if canonical_sha256(material) != supplied_binding:
+        raise TemporalDiscoveryContractError(
+            "native generation binding identity mismatch"
+        )
+    if binding.get("authorityMode") == "native_production_compact_commit":
+        current_runtime_authority = _native_finalization_runtime_authority(binary)
+        if binding.get("runtimeAuthoritySha256") != current_runtime_authority.get(
+            "authoritySha256"
+        ):
+            raise TemporalDiscoveryContractError(
+                "native production binary identity drifted"
+            )
+        manifest = _canonical_file(
+            Path(str(binding["manifestPath"])),
+            name="native production finalization manifest",
+        )
+        if (
+            _identity_payload(
+                manifest,
+                "manifestSha256",
+                name="native production finalization manifest",
+            )
+            != binding.get("manifestSha256")
+            or manifest.get("runtimeAuthoritySha256")
+            != binding.get("runtimeAuthoritySha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "native production manifest runtime authority drifted"
+            )
+        record_material = {
+            key: value
+            for key, value in generation_record.items()
+            if key not in {"nativeGenerationFinalization", "generationRecordSha256"}
+        }
+        if canonical_sha256(record_material) != generation_record.get(
+            "generationRecordSha256"
+        ):
+            raise TemporalDiscoveryContractError(
+                "native production generation record identity mismatch"
+            )
+        execution = _invoke_native_finalizer(
+            binary=binary, manifest_path=Path(str(binding["manifestPath"]))
+        )
+        if (
+            execution.get("restart") is not True
+            or execution.get("restartValidation")
+            != "compact_commit_and_output_hashes"
+            or execution.get("commitSha256") != binding.get("commitSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "native production compact restart authority disagrees with binding"
+            )
+        execution_commit = execution.get("commit")
+        if not isinstance(execution_commit, Mapping):
+            raise TemporalDiscoveryContractError(
+                "native production compact restart omitted its commit"
+            )
+        committed_record_sha256 = binding.get("generationRecordSha256")
+        if (
+            committed_record_sha256 != generation_record.get("generationRecordSha256")
+            or (execution_commit.get("generationRecord") or {}).get(
+                "generationRecordSha256"
+            )
+            != committed_record_sha256
+        ):
+            raise TemporalDiscoveryContractError(
+                "native production generation record binding drifted"
+            )
+        commit_root = Path(str(binding["commitPath"])).parent
+        committed_record = _canonical_file(
+            commit_root / "generation-record.json",
+            name="native committed generation record",
+        )
+        state_patch = _canonical_file(
+            commit_root / "generation-state-patch.json",
+            name="native committed generation state patch",
+        )
+        if (
+            _identity_payload(
+                committed_record,
+                "generationRecordSha256",
+                name="native committed generation record",
+            )
+            != committed_record_sha256
+            or _identity_payload(
+                state_patch,
+                "statePatchSha256",
+                name="native committed generation state patch",
+            )
+            != (execution_commit.get("statePatch") or {}).get(
+                "statePatchSha256"
+            )
+            or state_patch.get("generationRecordSha256")
+            != committed_record_sha256
+            or state_patch.get("generationRecord") != committed_record
+            or {
+                key: value
+                for key, value in generation_record.items()
+                if key != "nativeGenerationFinalization"
+            }
+            != committed_record
+        ):
+            raise TemporalDiscoveryContractError(
+                "native production generation record/state patch chain drifted"
+            )
+        return
+    authority_mode = binding.get("authorityMode")
+    if authority_mode not in {
+        "native_compact_commit",
+        "native_explicit_python_boundary_adoption",
+    }:
+        raise TemporalDiscoveryContractError(
+            "native generation binding has an unknown authority mode"
+        )
+    admission = _canonical_file(
+        Path(str(binding["admissionPath"])), name="native historical admission"
+    )
+    supplied_admission = _sha256(
+        admission.get("admissionSha256"), name="native historical admission"
+    )
+    admission_material = dict(admission)
+    admission_material.pop("admissionSha256", None)
+    if (
+        canonical_sha256(admission_material) != supplied_admission
+        or supplied_admission != binding.get("admissionSha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native historical admission identity mismatch"
+        )
+    if authority_mode == "native_explicit_python_boundary_adoption":
+        adoption_authority = _canonical_file(
+            Path(str(binding["adoptionAuthorityPath"])),
+            name="Python boundary adoption authority",
+        )
+        authority_material = dict(adoption_authority)
+        authority_material.pop("authoritySha256", None)
+        if (
+            adoption_authority.get("schemaVersion")
+            != NATIVE_FINALIZATION_ADOPTION_AUTHORITY_SCHEMA
+            or canonical_sha256(authority_material)
+            != adoption_authority.get("authoritySha256")
+            or adoption_authority.get("authoritySha256")
+            != binding.get("adoptionAuthoritySha256")
+            or adoption_authority.get("runtimeAuthoritySha256")
+            != binding.get("runtimeAuthoritySha256")
+            or admission.get("adoptionAuthoritySha256")
+            != binding.get("adoptionAuthoritySha256")
+            or admission.get("runtimeAuthoritySha256")
+            != binding.get("runtimeAuthoritySha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "explicit Python boundary adoption authority drifted"
+            )
+        current_runtime_authority = _native_finalization_runtime_authority(binary)
+        if binding.get("runtimeAuthoritySha256") != current_runtime_authority.get(
+            "authoritySha256"
+        ):
+            raise TemporalDiscoveryContractError(
+                "explicit Python boundary adoption binary identity drifted"
+            )
+        boundary = next(
+            (
+                row
+                for row in adoption_authority.get("boundaries") or []
+                if isinstance(row, Mapping)
+                and row.get("generationIndex") == generation_record.get("generationIndex")
+            ),
+            None,
+        )
+        if boundary != _python_boundary_adoption_descriptor(generation_record):
+            raise TemporalDiscoveryContractError(
+                "explicit Python boundary adoption record identity drifted"
+            )
+        manifest = _canonical_file(
+            Path(str(binding["manifestPath"])),
+            name="native adopted-boundary finalization manifest",
+        )
+        if (
+            manifest.get("runtimeAuthoritySha256")
+            != binding.get("runtimeAuthoritySha256")
+            or manifest.get("manifestSha256") != binding.get("manifestSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "explicit Python boundary adoption manifest authority drifted"
+            )
+    current_record_material = {
+        key: value
+        for key, value in generation_record.items()
+        if key != "nativeGenerationFinalization"
+    }
+    if canonical_sha256(current_record_material) != admission.get(
+        "pythonGenerationRecordSha256"
+    ):
+        raise TemporalDiscoveryContractError(
+            "native admission no longer binds the completed generation record"
+        )
+    for field in (
+        "archiveSha256",
+        "resultSetSha256",
+        "rotatingEvidenceLedgerSha256",
+        "rotatingEvidenceCheckpointSha256",
+        "cumulativeArchiveSha256",
+        "generationFunnelArtifactSha256",
+        "generationFunnelSnapshotSha256",
+    ):
+        if generation_record.get(field) != admission.get(field):
+            raise TemporalDiscoveryContractError(
+                f"native admission {field} disagrees with completed generation"
+            )
+    execution = _invoke_native_finalizer(
+        binary=binary, manifest_path=Path(str(binding["manifestPath"]))
+    )
+    if (
+        execution.get("restart") is not True
+        or execution.get("restartValidation") != "compact_commit_and_output_hashes"
+        or execution.get("commitSha256") != binding.get("commitSha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native compact restart authority disagrees with supervisor binding"
+        )
+
+
+def _admit_completed_generations_native(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    config: Mapping[str, Any],
+    binary: Path,
+    deep_audit: bool,
+    tail_result_mode: str,
+    tail_result_indexes: dict[Path, dict[str, Any]],
+    adoption_authority: Mapping[str, Any] | None = None,
+) -> dict[int, dict[str, Any]]:
+    records = _validate_completed_generation_ledger(state=state, config=config)
+    changed = False
+    for generation_index in sorted(records):
+        record = records[generation_index]
+        if record.get("nativeGenerationFinalization") is None:
+            authorized_generations = set(
+                (adoption_authority or {}).get("generationIndices") or []
+            )
+            if generation_index not in authorized_generations:
+                raise TemporalDiscoveryContractError(
+                    "Rust resume cannot silently adopt a Python-completed boundary"
+                )
+            # Adoption always reopens and validates the complete Python boundary.
+            # The ordinary compact-restart deep-audit preference cannot weaken
+            # this one-time trust transition.
+            _validate_generation_artifacts(
+                root=root,
+                generation_record=record,
+                config=config,
+                tail_result_mode=tail_result_mode,
+                tail_result_indexes=tail_result_indexes,
+            )
+            manifest, manifest_path = _native_independent_finalizer_manifest(
+                root=root,
+                config=config,
+                generation_index=generation_index,
+                tail_result_indexes=tail_result_indexes,
+                tail_reducer_binary=binary.with_name(
+                    "temporal-qd-tail-reducer.exe"
+                    if os.name == "nt"
+                    else "temporal-qd-tail-reducer"
+                ),
+                completed_at=str(record["completedAt"]),
+            )
+            execution = _invoke_native_finalizer(
+                binary=binary, manifest_path=manifest_path
+            )
+            commit = _validate_native_migration_outputs(
+                root=root, generation_record=record, execution=execution
+            )
+            binding = _native_generation_binding(
+                root=root,
+                generation_record=record,
+                manifest=manifest,
+                commit=commit,
+                adoption_authority=adoption_authority,
+            )
+            for state_record in state["completedGenerations"]:
+                if int(state_record["generationIndex"]) == generation_index:
+                    state_record["nativeGenerationFinalization"] = binding
+                    break
+            changed = True
+            _event(
+                "native_generation_explicitly_adopted",
+                generationIndex=generation_index,
+                commitSha256=commit["commitSha256"],
+                adoptionAuthoritySha256=adoption_authority["authoritySha256"],
+            )
+        else:
+            _validate_native_generation_binding(
+                generation_record=record, binary=binary
+            )
+            if deep_audit:
+                _validate_generation_artifacts(
+                    root=root,
+                    generation_record=record,
+                    config=config,
+                    tail_result_mode=tail_result_mode,
+                    tail_result_indexes=tail_result_indexes,
+                )
+    if changed:
+        _save_state(state_path, state)
+    return _validate_completed_generation_ledger(state=state, config=config)
+
+
+def _validate_completed_generations_native_engine(
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    config: Mapping[str, Any],
+    binary: Path,
+) -> dict[int, dict[str, Any]]:
+    """Recover production generations from compact native commits only."""
+
+    records = _validate_completed_generation_ledger(state=state, config=config)
+    for generation_index in sorted(records):
+        record = records[generation_index]
+        _validate_native_generation_binding(generation_record=record, binary=binary)
+        _publish_native_generation_outputs(
+            root=root, generation_index=generation_index
+        )
+    return records
+
+
 def _validate_published_generation_boundary(
     *,
     root: Path,
@@ -2416,7 +5038,89 @@ def _load_previous_cumulative_archive(parent_archive_path: Path) -> dict[str, An
     return payload
 
 
-def _complete_rotating_generation_transaction(
+def _invoke_native_tail_reducer(
+    *, binary: Path, manifest_path: Path, timeout_seconds: float = 600.0
+) -> dict[str, Any]:
+    """Run the bounded native tail reducer and require its canonical result."""
+
+    _verify_pinned_native_invocation_binary(
+        binary=binary, manifest_path=manifest_path, role="tailReducer"
+    )
+    try:
+        result = subprocess.run(
+            [str(binary.resolve()), "--manifest", str(manifest_path.resolve())],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TemporalDiscoveryContractError(
+            f"native tail reducer could not execute: {exc}"
+        ) from exc
+    _verify_pinned_native_invocation_binary(
+        binary=binary, manifest_path=manifest_path, role="tailReducer"
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise TemporalDiscoveryContractError(
+            f"native tail reducer failed ({result.returncode}): {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError as exc:
+        raise TemporalDiscoveryContractError(
+            "native tail reducer returned invalid JSON"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native tail reducer response is not an object"
+        )
+    return dict(payload)
+
+
+def _invoke_native_campaign_seal(
+    *, binary: Path, manifest_path: Path, timeout_seconds: float = 1_200.0
+) -> dict[str, Any]:
+    _verify_pinned_native_invocation_binary(
+        binary=binary, manifest_path=manifest_path, role="campaignSeal"
+    )
+    try:
+        result = subprocess.run(
+            [str(binary.resolve()), "--manifest", str(manifest_path.resolve())],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TemporalDiscoveryContractError(
+            f"native campaign seal could not execute: {exc}"
+        ) from exc
+    _verify_pinned_native_invocation_binary(
+        binary=binary, manifest_path=manifest_path, role="campaignSeal"
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-2_000:]
+        raise TemporalDiscoveryContractError(
+            f"native campaign seal failed closed: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError as exc:
+        raise TemporalDiscoveryContractError(
+            "native campaign seal returned invalid JSON"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native campaign seal response is not an object"
+        )
+    return dict(payload)
+
+
+def _run_rotating_generation_transaction(
     *,
     root: Path,
     generation_root: Path,
@@ -2429,11 +5133,26 @@ def _complete_rotating_generation_transaction(
     client: LabGatewayClient,
     tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
     tail_result_indexes: dict[Path, dict[str, Any]] | None = None,
+    finalization_engine: str = GENERATION_FINALIZATION_ENGINE_PYTHON,
+    native_finalizer_binary: Path | None = None,
+    generation_record_extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Complete one atomic proposal/reevaluation/backfill/archive transaction."""
 
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
+    finalization_engine = _normalize_generation_finalization_engine(
+        finalization_engine
+    )
     indexes = tail_result_indexes if tail_result_indexes is not None else {}
+    native_campaign_seal_binary = (
+        native_finalizer_binary.with_name(
+            "temporal-qd-campaign-seal.exe"
+            if os.name == "nt"
+            else "temporal-qd-campaign-seal"
+        )
+        if native_finalizer_binary is not None
+        else None
+    )
     _validate_frozen_sources(config)
     contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
     panel = panel_for_generation(contract, generation_index)
@@ -2452,6 +5171,36 @@ def _complete_rotating_generation_transaction(
         ledger_path,
         archive_path,
     )
+    native_commit_path = (
+        _native_finalization_root(root, generation_index)
+        / "generation-commit.json"
+    )
+    if (
+        finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST
+        and native_commit_path.is_file()
+    ):
+        if native_finalizer_binary is None:
+            raise TemporalDiscoveryContractError(
+                "Rust finalization recovery binary is unavailable"
+            )
+        recovery_manifest_path = (
+            _native_finalization_root(root, generation_index) / "manifest.json"
+        )
+        recovery_execution = _invoke_native_finalizer(
+            binary=native_finalizer_binary,
+            manifest_path=recovery_manifest_path,
+        )
+        if (
+            recovery_execution.get("restart") is not True
+            or recovery_execution.get("restartValidation")
+            != "compact_commit_and_output_hashes"
+        ):
+            raise TemporalDiscoveryContractError(
+                "native generation recovery did not reopen compact commit authority"
+            )
+        _publish_native_generation_outputs(
+            root=root, generation_index=generation_index
+        )
     if all(path.is_file() for path in completed_paths):
         cohort = _canonical_file(cohort_path, name="rotating evaluation cohort")
         cohort_sha = _identity_payload(
@@ -2571,6 +5320,38 @@ def _complete_rotating_generation_transaction(
             for member in cell.get("members") or []
             if isinstance(member, Mapping)
         )
+        native_restart: dict[str, Any] = {}
+        if finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+            if native_finalizer_binary is None:
+                raise TemporalDiscoveryContractError(
+                    "Rust finalization restart binary is unavailable"
+                )
+            manifest_path = _native_finalization_root(
+                root, generation_index
+            ) / "manifest.json"
+            execution = _invoke_native_finalizer(
+                binary=native_finalizer_binary, manifest_path=manifest_path
+            )
+            if (
+                execution.get("restart") is not True
+                or execution.get("restartValidation")
+                != "compact_commit_and_output_hashes"
+            ):
+                raise TemporalDiscoveryContractError(
+                    "native generation restart did not use compact commit authority"
+                )
+            published = _publish_native_generation_outputs(
+                root=root, generation_index=generation_index
+            )
+            manifest = _canonical_file(
+                manifest_path, name="native generation finalization manifest"
+            )
+            native_restart = {
+                "nativeManifest": manifest,
+                "nativeCommit": published["generation-commit.json"],
+                "nativeGenerationRecord": published["generation-record.json"],
+                "nativeStatePatch": published["generation-state-patch.json"],
+            }
         return {
             "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
             "archiveSha256": archive_sha,
@@ -2594,6 +5375,7 @@ def _complete_rotating_generation_transaction(
             "rotatingEvidenceLedgerSha256": ledger_sha,
             "rotatingEvidenceCheckpointSha256": checkpoint_sha,
             "additionalWorkerTaskCount": additional_worker_task_count,
+            **native_restart,
         }
 
     projection = load_evaluation_population(
@@ -2650,20 +5432,73 @@ def _complete_rotating_generation_transaction(
     )
     _replace(checkpoint_path, checkpoint)
 
-    proposal_tail_index = (
-        _verified_tail_result_index(
-            campaign_root=proposal_campaign_root,
-            indexes=indexes,
-            include_funnel_projection=bool(
-                (config.get("generationFunnel") or {}).get("enabled")
-            ),
+    sealed_member_batch: dict[str, Any] | None = None
+    if finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+        if native_finalizer_binary is None:
+            raise TemporalDiscoveryContractError(
+                "Rust generation finalization binary is unavailable"
+            )
+        seal_manifest, seal_manifest_path = _native_campaign_seal_manifest(
+            root=root,
+            config=config,
+            generation_index=generation_index,
+            evaluation_population=projection,
         )
-        if tail_result_mode == TAIL_RESULT_MODE_INDEXED
-        else None
-    )
+        assert native_campaign_seal_binary is not None
+        seal_execution = _invoke_native_campaign_seal(
+            binary=native_campaign_seal_binary, manifest_path=seal_manifest_path
+        )
+        seal_root = seal_manifest_path.parent
+        proposal_tail_index = validate_tail_result_index(
+            _canonical_file(
+                seal_root / "tail-result-index-v3.json",
+                name="native sealed proposal tail index",
+            )
+        )
+        if (
+            seal_execution.get("transaction", {}).get("tailResultIndexSha256")
+            != proposal_tail_index.get("tailResultIndexSha256")
+            or seal_manifest.get("sourceSha256")
+            != seal_execution.get("transaction", {}).get("sourceSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "native campaign seal transaction binding drifted"
+            )
+        sealed_members: list[dict[str, Any]] = []
+        try:
+            with (seal_root / "evaluated-members.jsonl").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                for line in handle:
+                    member = json.loads(line)
+                    if not isinstance(member, dict):
+                        raise ValueError("member row is not an object")
+                    sealed_members.append(member)
+        except (OSError, ValueError) as exc:
+            raise TemporalDiscoveryContractError(
+                "native sealed evaluated members are unavailable"
+            ) from exc
+        sealed_member_batch = {"members": sealed_members}
+        indexes[(proposal_campaign_root / "screening-run").resolve()] = (
+            proposal_tail_index
+        )
+    else:
+        proposal_tail_index = (
+            _verified_tail_result_index(
+                campaign_root=proposal_campaign_root,
+                indexes=indexes,
+                include_funnel_projection=bool(
+                    (config.get("generationFunnel") or {}).get("enabled")
+                ),
+            )
+            if tail_result_mode == TAIL_RESULT_MODE_INDEXED
+            else None
+        )
 
     member_batches = [
-        load_qd_evaluated_members(
+        sealed_member_batch
+        if sealed_member_batch is not None
+        else load_qd_evaluated_members(
             population_path=proposal_root / "population.json",
             result_root=proposal_campaign_root / "screening-run",
             generation_index=generation_index,
@@ -2886,8 +5721,7 @@ def _complete_rotating_generation_transaction(
             candidates={candidate_id: rich_candidates[candidate_id] for candidate_id in missing},
             tail_result_index=(
                 _verified_tail_result_index(
-                    campaign_root=backfill_campaign_root,
-                    indexes=indexes,
+                    campaign_root=backfill_campaign_root, indexes=indexes
                 )
                 if tail_result_mode == TAIL_RESULT_MODE_INDEXED
                 else None
@@ -2937,6 +5771,109 @@ def _complete_rotating_generation_transaction(
                 else None
             ),
         )
+
+    if finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+        if native_finalizer_binary is None:
+            raise TemporalDiscoveryContractError(
+                "Rust generation finalization binary is unavailable"
+            )
+        if proposal_tail_index is None:
+            proposal_tail_index = _verified_tail_result_index(
+                campaign_root=proposal_campaign_root,
+                indexes=indexes,
+                include_funnel_projection=True,
+            )
+        required_set = set(required)
+        if any(set(panel_bundles) != required_set for panel_bundles in bundles.values()):
+            raise TemporalDiscoveryContractError(
+                "native finalization requires exact complete panel coverage"
+            )
+        complete_bundles = [
+            panel_bundle
+            for _candidate_id, panel_bundles in sorted(bundles.items())
+            for _panel_id, panel_bundle in sorted(panel_bundles.items())
+        ]
+        total_task_count = sum(
+            int(
+                _canonical_file(
+                    Path(binding["campaignRoot"]) / "campaign.json",
+                    name="native rotating campaign",
+                )["taskCount"]
+            )
+            for binding in campaign_bindings
+        )
+        manifest, manifest_path = _native_prepared_finalizer_manifest(
+            root=root,
+            config=config,
+            generation_index=generation_index,
+            projection=projection,
+            cohort=cohort,
+            provisional=provisional_artifact,
+            bundles=complete_bundles,
+            complete_bundle_snapshot=True,
+            auxiliary_plan=None,
+            auxiliary_campaign_receipts=[],
+            rich_members=[current_members[candidate_id] for candidate_id in rich_candidates],
+            current_member_count=len(current_members),
+            campaigns=campaign_bindings,
+            total_generation_task_count=total_task_count,
+            proposal_tail_index=proposal_tail_index,
+            generation_record_extra=generation_record_extra or {},
+        )
+        execution = _invoke_native_finalizer(
+            binary=native_finalizer_binary, manifest_path=manifest_path
+        )
+        published = _publish_native_generation_outputs(
+            root=root, generation_index=generation_index
+        )
+        commit = published["generation-commit.json"]
+        if execution.get("commitSha256") != commit.get("commitSha256"):
+            raise TemporalDiscoveryContractError(
+                "native execution and committed publication identity disagree"
+            )
+        archive = published["archive.json"]
+        checkpoint = published["checkpoint.json"]
+        ledger = published["generation-ledger.json"]
+        frontier_count = sum(
+            member.get("archiveLane") == "rotating_frontier"
+            for cell in archive.get("cells") or []
+            if isinstance(cell, Mapping)
+            for member in cell.get("members") or []
+            if isinstance(member, Mapping)
+        )
+        return {
+            "schemaVersion": "temporal_qd_rotating_parent_archive_result_v1",
+            "archiveSha256": archive["archiveSha256"],
+            "parentSchedule": _clone(
+                archive["rotatingEvidenceTransaction"]["parentSchedule"],
+                name="native parent schedule",
+            ),
+            "cumulativeArchiveSha256": published["cumulative-archive.json"][
+                "archiveSha256"
+            ],
+            "occupiedCellCount": int(archive["occupiedCellCount"]),
+            "memberCount": int(archive["memberCount"]),
+            "qualityMemberCount": int(archive["qualityMemberCount"]),
+            "frontierMemberCount": int(frontier_count),
+            "newCellCount": int(archive["newCellCount"]),
+            "paretoAdmissionCount": int(archive["paretoAdmissionCount"]),
+            "paretoEvictionCount": int(archive["paretoEvictionCount"]),
+            "observationalMemberCount": int(archive["observationalMemberCount"]),
+            "negativeNoveltyMemberCount": int(archive["negativeNoveltyMemberCount"]),
+            "rotatingEvidenceLedgerSha256": ledger["ledgerSha256"],
+            "rotatingEvidenceCheckpointSha256": checkpoint["checkpointSha256"],
+            "additionalWorkerTaskCount": total_task_count
+            - len(
+                _canonical_file(
+                    proposal_campaign_root / "screening-run" / "task-manifest.json",
+                    name="proposal task manifest",
+                )["tasks"]
+            ),
+            "nativeManifest": manifest,
+            "nativeCommit": commit,
+            "nativeGenerationRecord": published["generation-record.json"],
+            "nativeStatePatch": published["generation-state-patch.json"],
+        }
 
     cumulative = build_cumulative_breeder_archive(
         contract=contract,
@@ -3012,6 +5949,24 @@ def _complete_rotating_generation_transaction(
             if binding["role"] != "proposal_current_panel"
         ),
     }
+
+
+def _complete_rotating_generation_transaction(**kwargs: Any) -> dict[str, Any]:
+    """Python-oracle materialization entry point retained as the default."""
+
+    return _run_rotating_generation_transaction(
+        **kwargs, finalization_engine=GENERATION_FINALIZATION_ENGINE_PYTHON
+    )
+
+
+def _complete_rotating_generation_transaction_native(
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Opt-in Rust materialization entry point selected before Python completion."""
+
+    return _run_rotating_generation_transaction(
+        **kwargs, finalization_engine=GENERATION_FINALIZATION_ENGINE_RUST
+    )
 
 
 def _g0_generation_record_fields(
@@ -3096,10 +6051,52 @@ def run_qd_supervisor(
     initial_construction_pool_size: int | None = None,
     evaluation_population_size: int | None = None,
     tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
+    native_finalization_validation: str = NATIVE_FINALIZATION_VALIDATION_NONE,
+    generation_finalization_engine: str = GENERATION_FINALIZATION_ENGINE_PYTHON,
+    generation_finalizer_binary: Path | str | None = None,
+    native_generation_deep_audit: bool = False,
+    adopt_python_completed_generations: tuple[int, ...] = (),
+    stop_before_evaluation_generation: int | None = None,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
+    native_finalization_validation = _normalize_native_finalization_validation(
+        native_finalization_validation
+    )
+    generation_finalization_engine = _normalize_generation_finalization_engine(
+        generation_finalization_engine
+    )
+    native_finalizer_binary = (
+        Path(generation_finalizer_binary)
+        if generation_finalizer_binary is not None
+        else None
+    )
+    if (
+        native_finalization_validation == NATIVE_FINALIZATION_VALIDATION_HISTORICAL
+        or generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST
+    ) and native_finalizer_binary is None:
+        raise TemporalDiscoveryContractError(
+            "native generation finalization requires an explicit binary path"
+        )
+    if (
+        generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST
+        and native_finalization_validation == NATIVE_FINALIZATION_VALIDATION_HISTORICAL
+    ):
+        raise TemporalDiscoveryContractError(
+            "Rust finalization engine and historical admission are separate modes"
+        )
+    if (
+        adopt_python_completed_generations
+        and generation_finalization_engine != GENERATION_FINALIZATION_ENGINE_RUST
+    ):
+        raise TemporalDiscoveryContractError(
+            "Python boundary adoption is valid only with the Rust finalization engine"
+        )
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
+    _require_irreversible_native_cutover_engine(
+        root=root,
+        generation_finalization_engine=generation_finalization_engine,
+    )
     initial_archive_file = Path(initial_archive_path)
     # Pair mode never constructs a v2 continuation.  These placeholders are
     # deliberately not persisted or opened in that mode.
@@ -3144,6 +6141,13 @@ def run_qd_supervisor(
         raise TemporalDiscoveryContractError(
             "indexed tail result mode is currently supported only by rotating evidence"
         )
+    if (
+        generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST
+        and tail_result_mode != TAIL_RESULT_MODE_INDEXED
+    ):
+        raise TemporalDiscoveryContractError(
+            "Rust generation finalization requires indexed tail authority"
+        )
     config_path = root / "config.json"
     state_path = root / "state.json"
     _write_once(config_path, config)
@@ -3177,17 +6181,82 @@ def run_qd_supervisor(
             "tripwire": None,
         }
         _save_state(state_path, state)
+    _require_irreversible_native_cutover_engine(
+        root=root,
+        generation_finalization_engine=generation_finalization_engine,
+        state=state,
+    )
+    adoption_authority: Mapping[str, Any] | None = None
+    if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+        assert native_finalizer_binary is not None
+        adoption_authority = _prepare_native_finalization_adoption_authority(
+            root=root,
+            state=state,
+            config=config,
+            finalizer_binary=native_finalizer_binary,
+            requested_generations=adopt_python_completed_generations,
+        )
+        _freeze_native_finalization_runtime_authority(
+            root=root,
+            finalizer_binary=native_finalizer_binary,
+            state=state,
+            authorized_adoption_generations=frozenset(
+                (adoption_authority or {}).get("generationIndices") or []
+            ),
+        )
     # This is deliberately before both the completed fast path and gateway
     # construction.  A restart must never treat a stale source, or a merely
     # self-claimed completed state, as permission to skip immutable work.
     validator_command = _validate_frozen_sources(config)
-    completed_by_index = _validate_completed_generations(
-        root=root,
-        state=state,
-        config=config,
-        tail_result_mode=tail_result_mode,
-        tail_result_indexes=tail_result_indexes,
+    if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+        assert native_finalizer_binary is not None
+        completed_by_index = _admit_completed_generations_native(
+            root=root,
+            state=state,
+            state_path=state_path,
+            config=config,
+            binary=native_finalizer_binary,
+            deep_audit=native_generation_deep_audit,
+            tail_result_mode=tail_result_mode,
+            tail_result_indexes=tail_result_indexes,
+            adoption_authority=adoption_authority,
+        )
+    elif native_finalization_validation == NATIVE_FINALIZATION_VALIDATION_HISTORICAL:
+        assert native_finalizer_binary is not None
+        completed_by_index = _admit_completed_generations_native(
+            root=root,
+            state=state,
+            state_path=state_path,
+            config=config,
+            binary=native_finalizer_binary,
+            deep_audit=native_generation_deep_audit,
+            tail_result_mode=tail_result_mode,
+            tail_result_indexes=tail_result_indexes,
+        )
+    else:
+        completed_by_index = _validate_completed_generations(
+            root=root,
+            state=state,
+            config=config,
+            tail_result_mode=tail_result_mode,
+            tail_result_indexes=tail_result_indexes,
+        )
+    native_pair_ledger_transaction = (
+        (config.get("pairGenerationRuntime") or {}).get("engine")
+        == PAIR_GENERATION_RUNTIME_RUST
     )
+    committed_identity_ledger: dict[str, Any] | None = None
+    committed_identity_ledger_sha256: str | None = None
+    if native_pair_ledger_transaction:
+        (
+            committed_identity_ledger,
+            committed_identity_ledger_sha256,
+        ) = _reconcile_native_pair_identity_ledger(
+            root=root,
+            state=state,
+            state_path=state_path,
+            completed_by_index=completed_by_index,
+        )
     # Completed generation validation does not share a live reduction
     # transaction with the next generation.  Release its retained projections
     # before opening the gateway or creating new work.
@@ -3277,6 +6346,17 @@ def run_qd_supervisor(
                 parentArchive=str(parent_archive_path.resolve()),
                 immigrantContinuationOrdinal=immigrant_cursor,
             )
+            if native_pair_ledger_transaction:
+                assert committed_identity_ledger is not None
+                assert committed_identity_ledger_sha256 is not None
+                _prepare_native_pair_identity_ledger_transaction(
+                    root=root,
+                    state=state,
+                    state_path=state_path,
+                    generation_index=generation_index,
+                    input_ledger=committed_identity_ledger,
+                    input_ledger_sha256=committed_identity_ledger_sha256,
+                )
             # Do not let a file-backed source change while an earlier
             # generation is running and then silently feed a later phase.
             validator_command = _validate_frozen_sources(config)
@@ -3362,6 +6442,23 @@ def run_qd_supervisor(
                 raise TemporalDiscoveryContractError(
                     "QD generation proposal manifest did not complete"
                 )
+            generation_output_identity_ledger: dict[str, Any] | None = None
+            generation_output_identity_ledger_sha256: str | None = None
+            if native_pair_ledger_transaction:
+                assert committed_identity_ledger is not None
+                assert committed_identity_ledger_sha256 is not None
+                (
+                    generation_output_identity_ledger,
+                    generation_output_identity_ledger_sha256,
+                ) = _seal_native_pair_identity_ledger_output(
+                    root=root,
+                    state=state,
+                    state_path=state_path,
+                    generation_index=generation_index,
+                    input_ledger=committed_identity_ledger,
+                    input_ledger_sha256=committed_identity_ledger_sha256,
+                    generation_result=generation_result,
+                )
 
             state["stage"] = "freezing_evaluation"
             _save_state(state_path, state)
@@ -3398,6 +6495,37 @@ def run_qd_supervisor(
                 raise TemporalDiscoveryContractError(
                     "frozen QD evaluation identity drifted from supervisor config"
                 )
+
+            if stop_before_evaluation_generation == generation_index:
+                state["stage"] = "evaluation_frozen_canary"
+                state["evaluationProgress"] = {
+                    "campaignSha256": campaign_result["campaignSha256"],
+                    "evaluationIdentitySha256": campaign_result[
+                        "evaluationIdentitySha256"
+                    ],
+                    "completedTaskCount": _completed_task_count(
+                        result_root / "checkpoint.json"
+                    ),
+                    "taskCount": campaign_result["taskCount"],
+                    "resultRoot": str(result_root.resolve()),
+                }
+                _save_state(state_path, state)
+                _event(
+                    "generation_evaluation_frozen_canary",
+                    generationIndex=generation_index,
+                    taskCount=campaign_result["taskCount"],
+                    campaignSha256=campaign_result["campaignSha256"],
+                )
+                return {
+                    "schemaVersion": "temporal_qd_supervisor_result_v3",
+                    "status": "paused_before_evaluation",
+                    "generationIndex": generation_index,
+                    "campaignSha256": campaign_result["campaignSha256"],
+                    "taskCount": campaign_result["taskCount"],
+                    "configSha256": config["configSha256"],
+                    "stateSha256": state["stateSha256"],
+                    "runRoot": str(root.resolve()),
+                }
 
             state["stage"] = "evaluating"
             state["evaluationProgress"] = {
@@ -3467,7 +6595,13 @@ def run_qd_supervisor(
             )
             _save_state(state_path, state)
             if config.get("rotatingEvidence") is not None:
-                archive_result = _complete_rotating_generation_transaction(
+                rotating_transaction = (
+                    _complete_rotating_generation_transaction_native
+                    if generation_finalization_engine
+                    == GENERATION_FINALIZATION_ENGINE_RUST
+                    else _complete_rotating_generation_transaction
+                )
+                archive_result = rotating_transaction(
                     root=root,
                     generation_root=generation_root,
                     generation_index=generation_index,
@@ -3479,6 +6613,12 @@ def run_qd_supervisor(
                     client=client,
                     tail_result_mode=tail_result_mode,
                     tail_result_indexes=tail_result_indexes,
+                    native_finalizer_binary=native_finalizer_binary,
+                    generation_record_extra=_g0_generation_record_fields(
+                        generation_result=generation_result,
+                        config=config,
+                        generation_index=generation_index,
+                    ),
                 )
             else:
                 archive_result = build_qd_archive(
@@ -3498,7 +6638,11 @@ def run_qd_supervisor(
                     cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
                 )
             funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
-            if funnel_enabled:
+            if (
+                funnel_enabled
+                and generation_finalization_engine
+                == GENERATION_FINALIZATION_ENGINE_PYTHON
+            ):
                 evaluation_population = load_evaluation_population(
                     population_path=proposal_root / "population.json",
                     journal_path=proposal_root / "generation-journal.json",
@@ -3652,38 +6796,177 @@ def run_qd_supervisor(
                 "artifacts": artifacts,
                 "completedAt": _utc_now(),
             }
+            native_state_patch: Mapping[str, Any] | None = None
+            if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+                assert native_finalizer_binary is not None
+                native_record = _clone(
+                    archive_result.get("nativeGenerationRecord"),
+                    name="native production generation record",
+                )
+                native_state_patch = _clone(
+                    archive_result.get("nativeStatePatch"),
+                    name="native production state patch",
+                )
+                if (
+                    not isinstance(native_record, Mapping)
+                    or not isinstance(native_state_patch, Mapping)
+                    or native_record.get("artifacts") != artifacts
+                    or native_state_patch.get("generationRecord") != native_record
+                    or native_state_patch.get("generationRecordSha256")
+                    != native_record.get("generationRecordSha256")
+                ):
+                    raise TemporalDiscoveryContractError(
+                        "native generation record/state patch disagrees with published artifacts"
+                    )
+                generation_record = dict(native_record)
+                generation_record["nativeGenerationFinalization"] = (
+                    _native_production_generation_binding(
+                        root=root,
+                        generation_index=generation_index,
+                        manifest=archive_result["nativeManifest"],
+                        commit=archive_result["nativeCommit"],
+                    )
+                )
+            elif native_finalization_validation == NATIVE_FINALIZATION_VALIDATION_HISTORICAL:
+                assert native_finalizer_binary is not None
+                native_manifest, native_manifest_path = _native_independent_finalizer_manifest(
+                    root=root,
+                    config=config,
+                    generation_index=generation_index,
+                    tail_result_indexes=tail_result_indexes,
+                    tail_reducer_binary=native_finalizer_binary.with_name(
+                        "temporal-qd-tail-reducer.exe"
+                        if os.name == "nt"
+                        else "temporal-qd-tail-reducer"
+                    ),
+                    completed_at=str(generation_record["completedAt"]),
+                )
+                native_execution = _invoke_native_finalizer(
+                    binary=native_finalizer_binary,
+                    manifest_path=native_manifest_path,
+                )
+                native_commit = _validate_native_migration_outputs(
+                    root=root,
+                    generation_record=generation_record,
+                    execution=native_execution,
+                )
+                generation_record["nativeGenerationFinalization"] = (
+                    _native_generation_binding(
+                        root=root,
+                        generation_record=generation_record,
+                        manifest=native_manifest,
+                        commit=native_commit,
+                    )
+                )
             completed_generations = list(state.get("completedGenerations") or [])
             completed_generations.append(generation_record)
+            candidate_increment = int(generation_result["candidateCount"])
+            worker_increment = int(campaign_result["taskCount"]) + int(
+                archive_result.get("additionalWorkerTaskCount") or 0
+            )
+            next_immigrant_ordinal = int(
+                generation_result["nextImmigrantContinuationOrdinal"]
+            )
+            if native_state_patch is not None:
+                expected_patch = {
+                    "nextGenerationIndex": generation_index + 1,
+                    "nextStage": "generation_proposal",
+                    "candidateCountIncrement": candidate_increment,
+                    "workerTaskCountIncrement": worker_increment,
+                    "nextImmigrantContinuationOrdinal": next_immigrant_ordinal,
+                }
+                if any(
+                    native_state_patch.get(key) != value
+                    for key, value in expected_patch.items()
+                ):
+                    raise TemporalDiscoveryContractError(
+                        "native state transition differs from supervisor counters"
+                    )
+                candidate_increment = int(
+                    native_state_patch["candidateCountIncrement"]
+                )
+                worker_increment = int(
+                    native_state_patch["workerTaskCountIncrement"]
+                )
+                next_immigrant_ordinal = int(
+                    native_state_patch["nextImmigrantContinuationOrdinal"]
+                )
             state.update(
                 {
                     "stage": "generation_boundary",
                     "completedGenerations": completed_generations,
-                    "currentGenerationIndex": generation_index + 1,
-                    "nextImmigrantContinuationOrdinal": generation_result[
-                        "nextImmigrantContinuationOrdinal"
-                    ],
+                    "currentGenerationIndex": (
+                        int(native_state_patch["nextGenerationIndex"])
+                        if native_state_patch is not None
+                        else generation_index + 1
+                    ),
+                    "nextImmigrantContinuationOrdinal": next_immigrant_ordinal,
                     "uniqueCandidatesEvaluated": int(
                         state.get("uniqueCandidatesEvaluated") or 0
                     )
-                    + int(generation_result["candidateCount"]),
+                    + candidate_increment,
                     "workerTasksCompleted": int(state.get("workerTasksCompleted") or 0)
-                    + int(campaign_result["taskCount"])
-                    + int(archive_result.get("additionalWorkerTaskCount") or 0),
+                    + worker_increment,
                     "uniqueIdentityCounts": generation_result["uniqueIdentityCounts"],
                     "duplicateCounters": generation_result["duplicateCounters"],
                     "proposalSlotCounters": generation_result["proposalSlotCounters"],
                     "evaluationProgress": None,
                 }
             )
+            if native_pair_ledger_transaction:
+                _promote_native_pair_identity_ledger(
+                    root=root,
+                    state=state,
+                    state_path=state_path,
+                    generation_index=generation_index,
+                    generation_record=generation_record,
+                )
             _save_state(state_path, state)
-            _validate_published_generation_boundary(
-                root=root,
-                state=state,
-                config=config,
-                generation_index=generation_index,
-                tail_result_mode=tail_result_mode,
-                tail_result_indexes=tail_result_indexes,
-            )
+            if native_pair_ledger_transaction:
+                assert generation_output_identity_ledger is not None
+                assert generation_output_identity_ledger_sha256 is not None
+                committed_identity_ledger = generation_output_identity_ledger
+                committed_identity_ledger_sha256 = (
+                    generation_output_identity_ledger_sha256
+                )
+            if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
+                assert native_finalizer_binary is not None
+                _validate_native_generation_binding(
+                    generation_record=generation_record,
+                    binary=native_finalizer_binary,
+                )
+                _validate_published_generation_boundary(
+                    root=root,
+                    state=state,
+                    config=config,
+                    generation_index=generation_index,
+                    tail_result_mode=tail_result_mode,
+                    tail_result_indexes=tail_result_indexes,
+                )
+            elif native_finalization_validation == NATIVE_FINALIZATION_VALIDATION_HISTORICAL:
+                assert native_finalizer_binary is not None
+                _validate_native_generation_binding(
+                    generation_record=generation_record,
+                    binary=native_finalizer_binary,
+                )
+                if native_generation_deep_audit:
+                    _validate_published_generation_boundary(
+                        root=root,
+                        state=state,
+                        config=config,
+                        generation_index=generation_index,
+                        tail_result_mode=tail_result_mode,
+                        tail_result_indexes=tail_result_indexes,
+                    )
+            else:
+                _validate_published_generation_boundary(
+                    root=root,
+                    state=state,
+                    config=config,
+                    generation_index=generation_index,
+                    tail_result_mode=tail_result_mode,
+                    tail_result_indexes=tail_result_indexes,
+                )
             _event(
                 "generation_completed",
                 generationIndex=generation_index,
@@ -3983,6 +7266,51 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--native-finalization-validation",
+        choices=sorted(_NATIVE_FINALIZATION_VALIDATION_MODES),
+        default=NATIVE_FINALIZATION_VALIDATION_NONE,
+        help=(
+            "legacy compatibility flag; fresh historical admission is disabled and "
+            "only 'none' is accepted"
+        ),
+    )
+    parser.add_argument(
+        "--generation-finalization-engine",
+        choices=sorted(_GENERATION_FINALIZATION_ENGINES),
+        default=GENERATION_FINALIZATION_ENGINE_PYTHON,
+        help=(
+            "generation boundary materializer; Python remains the default oracle, "
+            "Rust is an explicit fail-closed opt-in and becomes mandatory for "
+            "every restart after native cutover"
+        ),
+    )
+    parser.add_argument(
+        "--generation-finalizer-binary",
+        type=Path,
+        help="prebuilt temporal-qd-generation-finalizer binary; required for Rust finalization",
+    )
+    parser.add_argument(
+        "--native-generation-deep-audit",
+        action="store_true",
+        help="reopen rich generation artifacts even after compact native admission",
+    )
+    parser.add_argument(
+        "--adopt-python-completed-generation",
+        dest="adopt_python_completed_generations",
+        action="append",
+        type=int,
+        default=[],
+        help=(
+            "explicit one-time Rust cutover authority for an already-completed "
+            "Python generation; repeat for every unbound completed generation"
+        ),
+    )
+    parser.add_argument(
+        "--stop-before-evaluation-generation",
+        type=int,
+        help="freeze the named generation campaign and stop before enqueueing worker tasks",
+    )
+    parser.add_argument(
         "--evidence-ladder-config",
         type=Path,
         help="closed temporal_qd_evidence_ladder_input_v1 JSON; enables frozen 3m/12m/36m evidence gates",
@@ -4059,6 +7387,14 @@ def main() -> None:
             initial_construction_pool_size=args.initial_construction_pool_size,
             evaluation_population_size=args.evaluation_population_size,
             tail_result_mode=args.tail_result_mode,
+            native_finalization_validation=args.native_finalization_validation,
+            generation_finalization_engine=args.generation_finalization_engine,
+            generation_finalizer_binary=args.generation_finalizer_binary,
+            native_generation_deep_audit=args.native_generation_deep_audit,
+            adopt_python_completed_generations=tuple(
+                args.adopt_python_completed_generations
+            ),
+            stop_before_evaluation_generation=args.stop_before_evaluation_generation,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return
@@ -4113,6 +7449,14 @@ def main() -> None:
         initial_construction_pool_size=args.initial_construction_pool_size,
         evaluation_population_size=args.evaluation_population_size,
         tail_result_mode=args.tail_result_mode,
+        native_finalization_validation=args.native_finalization_validation,
+        generation_finalization_engine=args.generation_finalization_engine,
+        generation_finalizer_binary=args.generation_finalizer_binary,
+        native_generation_deep_audit=args.native_generation_deep_audit,
+        adopt_python_completed_generations=tuple(
+            args.adopt_python_completed_generations
+        ),
+        stop_before_evaluation_generation=args.stop_before_evaluation_generation,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

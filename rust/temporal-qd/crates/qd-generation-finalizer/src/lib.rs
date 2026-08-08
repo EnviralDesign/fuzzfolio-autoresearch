@@ -1,0 +1,2544 @@
+//! Restartable native transaction from sealed rotating-evidence inputs to a
+//! committed generation boundary.
+//!
+//! Python remains the semantic oracle and campaign launcher. This crate is a
+//! historical parity prototype for the deterministic final half: it rebuilds
+//! cumulative evidence, projects the rich parent archive, and emits a compact
+//! commit whose restart hashes every bound output. It is not a production
+//! cutover authority yet: the supervisor gateway still sources funnel/record
+//! material from Python's completed boundary, and externally supplied
+//! auxiliary receipts are rejected until they carry reopenable descriptors.
+
+#![recursion_limit = "512"]
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, anyhow, ensure};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use temporal_qd_contract::{
+    CONTRACT_VERSION, canonical_json_line, canonical_sha256, canonical_sha256_without_object_field,
+};
+
+pub const SOURCE_SCHEMA: &str = "temporal_qd_generation_finalization_source_v1";
+pub const MANIFEST_SCHEMA: &str = "temporal_qd_generation_finalization_manifest_v1";
+pub const PLAN_SCHEMA: &str = "temporal_qd_auxiliary_evidence_plan_v1";
+pub const RECEIPT_SCHEMA: &str = "temporal_qd_auxiliary_campaign_receipt_v1";
+pub const COMMIT_SCHEMA: &str = "temporal_qd_generation_commit_v1";
+pub const EXECUTION_SCHEMA: &str = "temporal_qd_generation_finalization_execution_v1";
+pub const OPERATION: &str = "finalize_rotating_generation";
+pub const PLAN_PATH: &str = "auxiliary-evidence-plan.json";
+pub const CUMULATIVE_PATH: &str = "cumulative-archive.json";
+pub const ARCHIVE_PATH: &str = "archive.json";
+pub const CHECKPOINT_PATH: &str = "checkpoint.json";
+pub const LEDGER_PATH: &str = "generation-ledger.json";
+pub const RECORD_PATH: &str = "generation-record.json";
+pub const STATE_PATCH_PATH: &str = "generation-state-patch.json";
+pub const FUNNEL_PATH: &str = "generation-funnel.json";
+pub const FUNNEL_SNAPSHOT_PATH: &str = "generation-funnel-snapshot.json";
+pub const COMMIT_PATH: &str = "generation-commit.json";
+
+const ROTATING_SCHEMA: &str = "temporal_qd_rotating_evidence_v1";
+const COHORT_SCHEMA: &str = "temporal_qd_current_panel_evaluation_cohort_v1";
+const PROVISIONAL_SCHEMA: &str = "temporal_qd_provisional_survivors_v1";
+const BUNDLE_SCHEMA: &str = "temporal_qd_candidate_panel_evidence_bundle_v1";
+const WINDOW_SCHEMA: &str = "temporal_qd_candidate_window_evidence_v1";
+const CUMULATIVE_SCHEMA: &str = "temporal_qd_cumulative_breeder_archive_v1";
+const CHECKPOINT_SCHEMA: &str = "temporal_qd_rotating_evidence_checkpoint_v1";
+const ARCHIVE_SCHEMA: &str = "temporal_qd_archive_v3";
+const FUNNEL_SOURCE_SCHEMA: &str = "temporal_qd_native_funnel_reduction_source_v1";
+const FUNNEL_SCHEMA: &str = "temporal_generation_funnel_v1";
+const FUNNEL_SNAPSHOT_SCHEMA: &str = "temporal_generation_funnel_supervisor_snapshot_v1";
+const CAMPAIGN_SEAL_SCHEMA: &str = "temporal_qd_campaign_seal_v1";
+const TAIL_TRANSACTION_SCHEMA: &str = "temporal_qd_generation_tail_transaction_v1";
+const TAIL_REDUCTION_SCHEMA: &str = "temporal_qd_native_tail_reduction_result_v1";
+const AUXILIARY_BUNDLE_ARTIFACT_SCHEMA: &str = "temporal_qd_auxiliary_panel_bundles_v1";
+
+#[derive(Clone, Debug)]
+struct Manifest {
+    runtime_authority_sha256: Option<String>,
+    source_path: PathBuf,
+    source_sha256: String,
+    manifest_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct Source {
+    value: Value,
+    generation_index: u64,
+    rotating_sha: String,
+    current_panel_id: String,
+    required_panel_ids: Vec<String>,
+    breeder_width: usize,
+    cohort: Value,
+    provisional: Value,
+    baseline_bundles: Vec<Value>,
+    complete_bundle_snapshot: bool,
+    receipts: Vec<Value>,
+    prior_cumulative: Option<Value>,
+    previous_parent: Value,
+    archive_policy: Value,
+    rich_members: Vec<Value>,
+    current_member_count: u64,
+    cell_capacity: usize,
+    campaigns: Vec<Value>,
+    artifact_ledger_base: Value,
+    publication_paths: Value,
+    funnel_source: Value,
+    generation_record_base: Value,
+    state_transition_base: Value,
+    expected_plan: Option<Value>,
+    source_sha256: String,
+}
+
+struct FinalizedOutputs<'a> {
+    cumulative: &'a Value,
+    archive: &'a Value,
+    funnel: &'a Value,
+    funnel_snapshot: &'a Value,
+    checkpoint: &'a Value,
+    ledger: &'a Value,
+}
+
+pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
+    let started = Instant::now();
+    let manifest_path = existing_file(manifest_path, "generation finalization manifest")?;
+    let output_dir = manifest_path.parent().context("manifest has no parent")?;
+    let commit_path = output_dir.join(COMMIT_PATH);
+    let manifest = parse_manifest(&fs::read(&manifest_path)?, commit_path.exists())?;
+    if commit_path.exists() {
+        let commit = read_self_hashed(&commit_path, "commitSha256", COMMIT_SCHEMA)?;
+        ensure!(
+            sha(&commit, "manifestSha256")? == manifest.manifest_sha256,
+            "committed manifest binding drifted"
+        );
+        ensure!(
+            sha(&commit, "sourceSha256")? == manifest.source_sha256,
+            "committed source binding drifted"
+        );
+        if let Some(runtime_authority_sha256) = &manifest.runtime_authority_sha256 {
+            ensure!(
+                sha(&commit, "runtimeAuthoritySha256")? == runtime_authority_sha256.clone(),
+                "committed runtime authority binding drifted"
+            );
+        }
+        validate_commit_outputs(output_dir, &commit)?;
+        return Ok(restart_execution(&manifest, commit, started));
+    }
+    let source = load_source(&manifest)?;
+    let plan = build_auxiliary_plan(&source)?;
+
+    if let Some(expected) = &source.expected_plan {
+        ensure!(
+            expected == &plan,
+            "bound auxiliary plan differs from recomputed obligations"
+        );
+    } else {
+        ensure!(
+            source.receipts.is_empty(),
+            "auxiliary receipts require an exact bound plan"
+        );
+    }
+    publish_value_once(output_dir, PLAN_PATH, &plan)?;
+
+    if !array(&plan, "obligations")?.is_empty() && source.receipts.is_empty() {
+        return Ok(json!({
+            "schemaVersion": EXECUTION_SCHEMA,
+            "status": "awaiting_auxiliary_results",
+            "sourceSha256": source.source_sha256,
+            "manifestSha256": manifest.manifest_sha256,
+            "auxiliaryPlanSha256": text(&plan, "planSha256")?,
+            "obligationCount": array(&plan, "obligations")?.len(),
+            "elapsedMilliseconds": started.elapsed().as_millis() as u64,
+        }));
+    }
+
+    let bundles = admit_receipts(&source, &plan)?;
+    let cumulative = build_cumulative_archive(&source, &bundles)?;
+    let archive = build_parent_archive(&source, &cumulative)?;
+    let (funnel, funnel_snapshot) = build_funnel(&source, &archive)?;
+    let checkpoint = build_checkpoint(&source, &cumulative, &archive)?;
+    let ledger = build_ledger(&source, &plan, &cumulative, &archive, &checkpoint)?;
+    let record = build_generation_record(
+        &source,
+        &plan,
+        &FinalizedOutputs {
+            cumulative: &cumulative,
+            archive: &archive,
+            funnel: &funnel,
+            funnel_snapshot: &funnel_snapshot,
+            checkpoint: &checkpoint,
+            ledger: &ledger,
+        },
+    )?;
+    let state_patch = build_state_patch(&source, &record)?;
+
+    publish_value_once(output_dir, CUMULATIVE_PATH, &cumulative)?;
+    publish_value_once(output_dir, ARCHIVE_PATH, &archive)?;
+    publish_value_once(output_dir, FUNNEL_PATH, &funnel)?;
+    publish_value_once(output_dir, FUNNEL_SNAPSHOT_PATH, &funnel_snapshot)?;
+    publish_value_once(output_dir, CHECKPOINT_PATH, &checkpoint)?;
+    publish_value_once(output_dir, LEDGER_PATH, &ledger)?;
+    publish_value_once(output_dir, RECORD_PATH, &record)?;
+    publish_value_once(output_dir, STATE_PATCH_PATH, &state_patch)?;
+
+    let mut commit = json!({
+        "schemaVersion": COMMIT_SCHEMA,
+        "contractVersion": CONTRACT_VERSION,
+        "sourceSha256": source.source_sha256,
+        "manifestSha256": manifest.manifest_sha256,
+        "generationIndex": source.generation_index,
+        "auxiliaryPlanSha256": text(&plan, "planSha256")?,
+        "cumulativeArchive": descriptor(CUMULATIVE_PATH, &cumulative, "archiveSha256")?,
+        "parentArchive": descriptor(ARCHIVE_PATH, &archive, "archiveSha256")?,
+        "generationFunnel": descriptor(FUNNEL_PATH, &funnel, "artifactSha256")?,
+        "generationFunnelSnapshot": descriptor(FUNNEL_SNAPSHOT_PATH, &funnel_snapshot, "snapshotSha256")?,
+        "checkpoint": descriptor(CHECKPOINT_PATH, &checkpoint, "checkpointSha256")?,
+        "ledger": descriptor(LEDGER_PATH, &ledger, "ledgerSha256")?,
+        "generationRecord": descriptor(RECORD_PATH, &record, "generationRecordSha256")?,
+        "statePatch": descriptor(STATE_PATCH_PATH, &state_patch, "statePatchSha256")?,
+        "restartValidation": "compact_commit_and_output_hashes",
+        "rawResultReads": 0,
+    });
+    if let Some(runtime_authority_sha256) = &manifest.runtime_authority_sha256 {
+        object_mut(&mut commit, "generation commit")?.insert(
+            "runtimeAuthoritySha256".into(),
+            json!(runtime_authority_sha256),
+        );
+    }
+    add_self_hash(&mut commit, "commitSha256")?;
+    publish_value_once(output_dir, COMMIT_PATH, &commit)?;
+    Ok(execution(&source, &manifest, &plan, commit, false, started))
+}
+
+fn parse_manifest(raw: &[u8], allow_legacy_committed_manifest: bool) -> Result<Manifest> {
+    let value: Value = serde_json::from_slice(raw).context("parse finalization manifest")?;
+    ensure!(
+        canonical_json_line(&value)? == raw,
+        "manifest must be canonical JSON plus LF"
+    );
+    let map = object(&value, "manifest")?;
+    let mut manifest_keys = vec![
+        "schemaVersion",
+        "contractVersion",
+        "operation",
+        "runtimeAuthoritySha256",
+        "sourcePath",
+        "sourceSha256",
+        "resultPath",
+        "manifestSha256",
+    ];
+    let runtime_authority_sha256 = match map.get("runtimeAuthoritySha256") {
+        Some(_) => Some(sha(&value, "runtimeAuthoritySha256")?),
+        None if allow_legacy_committed_manifest => {
+            manifest_keys.retain(|key| *key != "runtimeAuthoritySha256");
+            None
+        }
+        None => return Err(anyhow!("manifest lacks runtime authority")),
+    };
+    exact_keys(map, &manifest_keys, "manifest")?;
+    ensure!(
+        text(&value, "schemaVersion")? == MANIFEST_SCHEMA,
+        "unsupported manifest schema"
+    );
+    ensure!(
+        text(&value, "contractVersion")? == CONTRACT_VERSION,
+        "native contract version mismatch"
+    );
+    ensure!(
+        text(&value, "operation")? == OPERATION,
+        "unsupported operation"
+    );
+    ensure!(
+        text(&value, "resultPath")? == COMMIT_PATH,
+        "result path must be fixed"
+    );
+    let hash = sha(&value, "manifestSha256")?;
+    ensure!(
+        canonical_sha256_without_object_field(&value, "manifestSha256")? == hash,
+        "manifest identity mismatch"
+    );
+    Ok(Manifest {
+        runtime_authority_sha256,
+        source_path: PathBuf::from(text(&value, "sourcePath")?),
+        source_sha256: sha(&value, "sourceSha256")?,
+        manifest_sha256: hash,
+    })
+}
+
+fn load_source(manifest: &Manifest) -> Result<Source> {
+    let path = existing_file(&manifest.source_path, "finalization source")?;
+    let raw = fs::read(path)?;
+    let value: Value = serde_json::from_slice(&raw).context("parse finalization source")?;
+    ensure!(
+        canonical_json_line(&value)? == raw,
+        "source must be canonical JSON plus LF"
+    );
+    ensure!(
+        text(&value, "schemaVersion")? == SOURCE_SCHEMA,
+        "unsupported source schema"
+    );
+    ensure!(
+        text(&value, "contractVersion")? == CONTRACT_VERSION,
+        "source contract version mismatch"
+    );
+    let source_sha = sha(&value, "sourceSha256")?;
+    ensure!(
+        source_sha == manifest.source_sha256,
+        "manifest/source identity mismatch"
+    );
+    ensure!(
+        canonical_sha256_without_object_field(&value, "sourceSha256")? == source_sha,
+        "source identity mismatch"
+    );
+    let generation_index = unsigned(&value, "generationIndex")?;
+    ensure!(generation_index > 0, "generation index must be positive");
+    let rotating = member(&value, "rotatingEvidence")?.clone();
+    ensure!(
+        text(&rotating, "schemaVersion")? == ROTATING_SCHEMA,
+        "unsupported rotating contract"
+    );
+    verify_self_hash(&rotating, "rotatingEvidenceSha256", "rotating contract")?;
+    let rotating_sha = sha(&rotating, "rotatingEvidenceSha256")?;
+    let panels = array(&rotating, "panels")?;
+    let cycle = unsigned(
+        member(&rotating, "absoluteGenerationMapping")?,
+        "cycleLength",
+    )? as usize;
+    ensure!(
+        cycle > 0 && cycle == panels.len(),
+        "rotating panel cycle is invalid"
+    );
+    let current_panel_id =
+        text(&panels[(generation_index as usize - 1) % cycle], "panelId")?.to_owned();
+    let mut required_panel_ids = Vec::new();
+    for index in 0..generation_index as usize {
+        let id = text(&panels[index % cycle], "panelId")?.to_owned();
+        if !required_panel_ids.contains(&id) {
+            required_panel_ids.push(id);
+        }
+    }
+    let breeder_width = unsigned(member(&rotating, "robustSelection")?, "breederWidth")? as usize;
+    ensure!(breeder_width > 0, "breeder width must be positive");
+    let cohort = member(&value, "cohort")?.clone();
+    verify_self_hash(&cohort, "cohortSha256", "cohort")?;
+    ensure!(
+        text(&cohort, "schemaVersion")? == COHORT_SCHEMA
+            && unsigned(&cohort, "generationIndex")? == generation_index
+            && sha(&cohort, "rotatingEvidenceSha256")? == rotating_sha
+            && text(&cohort, "panelId")? == current_panel_id,
+        "cohort binding mismatch"
+    );
+    let provisional = member(&value, "provisional")?.clone();
+    verify_self_hash(&provisional, "provisionalSha256", "provisional")?;
+    ensure!(
+        text(&provisional, "schemaVersion")? == PROVISIONAL_SCHEMA
+            && unsigned(&provisional, "generationIndex")? == generation_index
+            && sha(&provisional, "cohortSha256")? == sha(&cohort, "cohortSha256")?,
+        "provisional binding mismatch"
+    );
+    let baseline_bundles = array(&value, "baselineCandidatePanelBundles")?.to_vec();
+    let complete_bundle_snapshot = member(&value, "completeBundleSnapshot")?
+        .as_bool()
+        .ok_or_else(|| anyhow!("completeBundleSnapshot must be boolean"))?;
+    let receipts = array(&value, "auxiliaryCampaignReceipts")?.to_vec();
+    let prior_cumulative = nullable_member(&value, "previousCumulativeArchive")?.cloned();
+    if let Some(previous) = &prior_cumulative {
+        verify_self_hash(previous, "archiveSha256", "previous cumulative archive")?;
+    }
+    let previous_parent = member(&value, "previousParentArchiveSummary")?.clone();
+    verify_self_hash(&previous_parent, "summarySha256", "previous parent summary")?;
+    let archive_policy = member(&value, "archivePolicy")?.clone();
+    verify_self_hash(
+        &archive_policy,
+        "policyBindingSha256",
+        "archive policy binding",
+    )?;
+    let rich_members = array(&value, "richMembers")?.to_vec();
+    let current_member_count = unsigned(&value, "currentMemberCount")?;
+    ensure!(
+        current_member_count >= rich_members.len() as u64,
+        "rich member count exceeds current member count"
+    );
+    let cell_capacity = unsigned(&value, "cellCapacity")? as usize;
+    ensure!(cell_capacity > 0, "cell capacity must be positive");
+    let expected_plan = nullable_member(&value, "auxiliaryPlan")?.cloned();
+    if let Some(plan) = &expected_plan {
+        verify_self_hash(plan, "planSha256", "auxiliary plan")?;
+    }
+    let funnel_source = member(&value, "funnelReductionSource")?.clone();
+    ensure!(
+        text(&funnel_source, "schemaVersion")? == FUNNEL_SOURCE_SCHEMA,
+        "unsupported funnel reduction source"
+    );
+    verify_self_hash(
+        &funnel_source,
+        "funnelSourceSha256",
+        "funnel reduction source",
+    )?;
+    Ok(Source {
+        value: value.clone(),
+        generation_index,
+        rotating_sha,
+        current_panel_id,
+        required_panel_ids,
+        breeder_width,
+        cohort,
+        provisional,
+        baseline_bundles,
+        complete_bundle_snapshot,
+        receipts,
+        prior_cumulative,
+        previous_parent,
+        archive_policy,
+        rich_members,
+        current_member_count,
+        cell_capacity,
+        campaigns: array(&value, "campaigns")?.to_vec(),
+        artifact_ledger_base: member(&value, "artifactLedgerBase")?.clone(),
+        publication_paths: member(&value, "publicationPaths")?.clone(),
+        funnel_source,
+        generation_record_base: member(&value, "generationRecordBase")?.clone(),
+        state_transition_base: member(&value, "stateTransitionBase")?.clone(),
+        expected_plan,
+        source_sha256: source_sha,
+    })
+}
+
+fn build_auxiliary_plan(source: &Source) -> Result<Value> {
+    let provisional = provisional_map(source)?;
+    let mut available: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if !source.complete_bundle_snapshot
+        && let Some(previous) = &source.prior_cumulative
+    {
+        for bundle in array(previous, "candidatePanelBundles")? {
+            validate_bundle(source, bundle)?;
+            available
+                .entry(text(bundle, "candidateId")?.to_owned())
+                .or_default()
+                .insert(text(bundle, "panelId")?.to_owned());
+        }
+    }
+    for bundle in &source.baseline_bundles {
+        validate_bundle(source, bundle)?;
+        let candidate = text(bundle, "candidateId")?.to_owned();
+        ensure!(
+            provisional.contains_key(&candidate),
+            "baseline bundle candidate is not provisional"
+        );
+        available
+            .entry(candidate)
+            .or_default()
+            .insert(text(bundle, "panelId")?.to_owned());
+    }
+    let mut obligations = Vec::new();
+    for candidate_id in provisional.keys() {
+        for panel_id in &source.required_panel_ids {
+            if !available
+                .get(candidate_id)
+                .is_some_and(|v| v.contains(panel_id))
+            {
+                obligations.push(json!({"candidateId": candidate_id, "panelId": panel_id}));
+            }
+        }
+    }
+    let mut by_panel: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &obligations {
+        by_panel
+            .entry(text(row, "panelId")?.to_owned())
+            .or_default()
+            .push(text(row, "candidateId")?.to_owned());
+    }
+    let campaigns = by_panel
+        .into_iter()
+        .map(|(panel, candidates)| {
+            json!({
+                "role": "cumulative_backfill",
+                "panelId": panel,
+                "candidateIds": candidates,
+                "candidateCount": candidates.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut output = json!({
+        "schemaVersion": PLAN_SCHEMA,
+        "sourceGenerationIndex": source.generation_index,
+        "rotatingEvidenceSha256": source.rotating_sha,
+        "cohortSha256": sha(&source.cohort, "cohortSha256")?,
+        "provisionalSha256": sha(&source.provisional, "provisionalSha256")?,
+        "requiredPanelIds": source.required_panel_ids,
+        "obligations": obligations,
+        "obligationCount": obligations.len(),
+        "campaigns": campaigns,
+        "campaignCount": campaigns.len(),
+    });
+    add_self_hash(&mut output, "planSha256")?;
+    Ok(output)
+}
+
+fn admit_receipts(source: &Source, plan: &Value) -> Result<BTreeMap<String, Vec<Value>>> {
+    let provisional = provisional_map(source)?;
+    let mut result: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    if !source.complete_bundle_snapshot
+        && let Some(previous) = &source.prior_cumulative
+    {
+        for bundle in array(previous, "candidatePanelBundles")? {
+            if provisional.contains_key(text(bundle, "candidateId")?) {
+                insert_bundle(source, &mut result, bundle.clone())?;
+            }
+        }
+    }
+    for bundle in &source.baseline_bundles {
+        insert_bundle(source, &mut result, bundle.clone())?;
+    }
+    let obligations = array(plan, "obligations")?
+        .iter()
+        .map(|row| {
+            Ok((
+                text(row, "candidateId")?.to_owned(),
+                text(row, "panelId")?.to_owned(),
+            ))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut received = BTreeSet::new();
+    for receipt in &source.receipts {
+        ensure!(
+            text(receipt, "schemaVersion")? == RECEIPT_SCHEMA,
+            "unsupported auxiliary receipt schema"
+        );
+        verify_self_hash(receipt, "receiptSha256", "auxiliary receipt")?;
+        ensure!(
+            text(receipt, "role")? == "cumulative_backfill",
+            "unsupported auxiliary campaign role"
+        );
+        let panel_id = text(receipt, "panelId")?.to_owned();
+        let candidate_ids = array(receipt, "candidateIds")?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("receipt candidate id is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bundle_artifact = reopen_auxiliary_receipt(receipt)?;
+        ensure!(
+            text(&bundle_artifact, "panelId")? == panel_id,
+            "receipt bundle artifact panel mismatch"
+        );
+        ensure!(
+            member(&bundle_artifact, "campaignBinding")? == member(receipt, "campaignBinding")?,
+            "receipt campaign binding differs from reopened artifact"
+        );
+        let bundles = array(&bundle_artifact, "candidatePanelBundles")?;
+        ensure!(
+            bundles.len() == candidate_ids.len(),
+            "receipt candidate/bundle count mismatch"
+        );
+        let mut actual = Vec::new();
+        for bundle in bundles {
+            ensure!(
+                text(bundle, "panelId")? == panel_id,
+                "receipt bundle panel mismatch"
+            );
+            let candidate_id = text(bundle, "candidateId")?.to_owned();
+            ensure!(
+                obligations.contains(&(candidate_id.clone(), panel_id.clone())),
+                "receipt fulfills no frozen obligation"
+            );
+            ensure!(
+                received.insert((candidate_id.clone(), panel_id.clone())),
+                "duplicate auxiliary obligation receipt"
+            );
+            actual.push(candidate_id);
+            insert_bundle(source, &mut result, bundle.clone())?;
+        }
+        actual.sort();
+        let mut expected = candidate_ids;
+        expected.sort();
+        ensure!(
+            actual == expected,
+            "receipt candidate list differs from bundles"
+        );
+    }
+    ensure!(
+        received == obligations,
+        "auxiliary receipts do not fulfill the exact plan"
+    );
+    for candidate in provisional.keys() {
+        let panels = result
+            .get(candidate)
+            .context("provisional candidate lacks evidence")?
+            .iter()
+            .map(|b| text(b, "panelId").map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            panels == source.required_panel_ids,
+            "candidate does not have exact ordered panel coverage"
+        );
+    }
+    Ok(result)
+}
+
+fn reopen_auxiliary_receipt(receipt: &Value) -> Result<Value> {
+    let seal_descriptor = member(receipt, "campaignSeal")?;
+    let transaction_descriptor = member(receipt, "tailTransaction")?;
+    let bundle_descriptor = member(receipt, "bundleArtifact")?;
+    let seal = read_descriptor_bound_value(
+        seal_descriptor,
+        "campaignSealSha256",
+        CAMPAIGN_SEAL_SCHEMA,
+        "auxiliary campaign seal",
+    )?;
+    let transaction = read_descriptor_bound_value(
+        transaction_descriptor,
+        "transactionSha256",
+        TAIL_TRANSACTION_SCHEMA,
+        "auxiliary tail transaction",
+    )?;
+    ensure!(
+        sha(&transaction, "campaignSealSha256")? == sha(&seal, "campaignSealSha256")?,
+        "auxiliary transaction does not bind reopened campaign seal"
+    );
+    let transaction_path = existing_file(
+        &PathBuf::from(text(transaction_descriptor, "path")?),
+        "auxiliary tail transaction",
+    )?;
+    let reduction_path = transaction_path
+        .parent()
+        .context("auxiliary transaction has no parent")?
+        .join("tail-reduction-result.json");
+    let reduction = read_self_hashed(&reduction_path, "resultSha256", TAIL_REDUCTION_SCHEMA)?;
+    ensure!(
+        sha(&reduction, "resultSha256")? == sha(&transaction, "tailReductionResultSha256")?,
+        "auxiliary transaction reduction identity drifted"
+    );
+    ensure!(
+        member(&reduction, "evaluatedMembers")? == member(&transaction, "evaluatedMembers")?
+            && member(&reduction, "provisional")? == member(&transaction, "provisional")?,
+        "auxiliary transaction reduction projection drifted"
+    );
+    validate_evaluated_members_descriptor(
+        transaction_path
+            .parent()
+            .context("auxiliary transaction has no parent")?,
+        member(&transaction, "evaluatedMembers")?,
+    )?;
+    let bundle_artifact = read_descriptor_bound_value(
+        bundle_descriptor,
+        "bundleArtifactSha256",
+        AUXILIARY_BUNDLE_ARTIFACT_SCHEMA,
+        "auxiliary panel bundle artifact",
+    )?;
+    ensure!(
+        sha(&bundle_artifact, "campaignSealSha256")? == sha(&seal, "campaignSealSha256")?
+            && sha(&bundle_artifact, "tailTransactionSha256")?
+                == sha(&transaction, "transactionSha256")?
+            && sha(&bundle_artifact, "tailReductionResultSha256")?
+                == sha(&reduction, "resultSha256")?
+            && sha(&bundle_artifact, "evaluatedMembersSha256")?
+                == canonical_sha256(member(&transaction, "evaluatedMembers")?)?,
+        "auxiliary panel bundles do not bind reopened campaign transaction"
+    );
+    ensure!(
+        text(&bundle_artifact, "panelId")? == text(receipt, "panelId")?
+            && member(&bundle_artifact, "candidateIds")? == member(receipt, "candidateIds")?,
+        "auxiliary receipt candidate/panel binding drifted"
+    );
+    Ok(bundle_artifact)
+}
+
+fn read_descriptor_bound_value(
+    descriptor: &Value,
+    identity_field: &str,
+    schema: &str,
+    name: &str,
+) -> Result<Value> {
+    let path = existing_file(&PathBuf::from(text(descriptor, "path")?), name)?;
+    let value = read_self_hashed(&path, identity_field, schema)?;
+    ensure!(
+        sha(&value, identity_field)? == sha(descriptor, "sha256")?,
+        "{name} descriptor identity drifted"
+    );
+    Ok(value)
+}
+
+fn validate_evaluated_members_descriptor(root: &Path, evaluated: &Value) -> Result<()> {
+    let members = member(evaluated, "membersFile")?;
+    let relative = PathBuf::from(text(members, "path")?);
+    ensure!(
+        relative.components().count() == 1,
+        "evaluated members path must be a fixed sibling"
+    );
+    let path = existing_file(&root.join(relative), "evaluated members JSONL")?;
+    let metadata = fs::metadata(&path)?;
+    ensure!(
+        metadata.len() == unsigned(members, "sizeBytes")?,
+        "evaluated members size drifted"
+    );
+    ensure!(
+        sha256_file(&path)? == sha(members, "rawSha256")?,
+        "evaluated members content drifted"
+    );
+    let raw = fs::read(&path)?;
+    ensure!(
+        raw.last() == Some(&b'\n')
+            && raw.iter().filter(|byte| **byte == b'\n').count()
+                == unsigned(members, "recordCount")? as usize,
+        "evaluated members record count drifted"
+    );
+    Ok(())
+}
+
+fn insert_bundle(
+    source: &Source,
+    output: &mut BTreeMap<String, Vec<Value>>,
+    bundle: Value,
+) -> Result<()> {
+    validate_bundle(source, &bundle)?;
+    let candidate = text(&bundle, "candidateId")?.to_owned();
+    let panel = text(&bundle, "panelId")?.to_owned();
+    let rows = output.entry(candidate).or_default();
+    ensure!(
+        !rows
+            .iter()
+            .any(|v| text(v, "panelId").ok() == Some(panel.as_str())),
+        "duplicate candidate/panel bundle"
+    );
+    rows.push(bundle);
+    rows.sort_by(|a, b| {
+        panel_order(source, text(a, "panelId").unwrap_or(""))
+            .cmp(&panel_order(source, text(b, "panelId").unwrap_or("")))
+    });
+    Ok(())
+}
+
+fn validate_bundle(source: &Source, bundle: &Value) -> Result<()> {
+    ensure!(
+        text(bundle, "schemaVersion")? == BUNDLE_SCHEMA,
+        "unsupported bundle schema"
+    );
+    verify_self_hash(bundle, "bundleSha256", "candidate panel bundle")?;
+    ensure!(
+        sha(bundle, "rotatingEvidenceSha256")? == source.rotating_sha,
+        "bundle curriculum mismatch"
+    );
+    let candidate_id = text(bundle, "candidateId")?;
+    let provisional = provisional_map(source)?;
+    let candidate = provisional
+        .get(candidate_id)
+        .context("bundle candidate is not a provisional survivor")?;
+    ensure!(
+        sha(bundle, "candidateIdentitySha256")? == sha(candidate, "candidateIdentitySha256")?,
+        "bundle candidate identity differs from provisional survivor"
+    );
+    ensure!(
+        sha(bundle, "programSha256")? == sha(candidate, "programSha256")?,
+        "bundle program identity differs from provisional survivor"
+    );
+    let panel_id = text(bundle, "panelId")?;
+    ensure!(
+        source.required_panel_ids.iter().any(|v| v == panel_id),
+        "bundle panel is not required"
+    );
+    let panel = array(member(&source.value, "rotatingEvidence")?, "panels")?
+        .iter()
+        .find(|p| text(p, "panelId").ok() == Some(panel_id))
+        .context("bundle panel missing from contract")?;
+    let expected = array(panel, "windowIds")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_owned())
+        .collect::<Vec<_>>();
+    let records = array(bundle, "windowEvidence")?;
+    ensure!(
+        records.len() == expected.len(),
+        "bundle window count mismatch"
+    );
+    let mut actual = Vec::new();
+    for record in records {
+        ensure!(
+            text(record, "schemaVersion")? == WINDOW_SCHEMA,
+            "unsupported window evidence schema"
+        );
+        verify_self_hash(record, "recordSha256", "window evidence")?;
+        ensure!(
+            text(record, "candidateId")? == candidate_id && text(record, "panelId")? == panel_id,
+            "window evidence bundle binding mismatch"
+        );
+        ensure!(
+            sha(record, "candidateIdentitySha256")? == sha(bundle, "candidateIdentitySha256")?
+                && sha(record, "programSha256")? == sha(bundle, "programSha256")?,
+            "window evidence candidate/program binding mismatch"
+        );
+        actual.push(text(record, "windowId")?.to_owned());
+        for field in [
+            "sourceProfileSnapshotSha256",
+            "resolvedProfileSnapshotSha256",
+            "resolvedProgramSha256",
+        ] {
+            sha(member(record, "metrics")?, field)?;
+        }
+    }
+    let mut expected_sorted = expected;
+    expected_sorted.sort();
+    actual.sort();
+    ensure!(
+        actual == expected_sorted,
+        "bundle lacks exact panel windows"
+    );
+    Ok(())
+}
+
+fn build_cumulative_archive(
+    source: &Source,
+    bundles: &BTreeMap<String, Vec<Value>>,
+) -> Result<Value> {
+    let provisional = provisional_map(source)?;
+    let mut members = Vec::new();
+    for (candidate_id, candidate) in &provisional {
+        let candidate_bundles = bundles
+            .get(candidate_id)
+            .context("missing candidate bundles")?;
+        let mut windows = Vec::new();
+        let mut source_profiles = BTreeSet::new();
+        let mut resolved_profiles = BTreeSet::new();
+        let mut resolved_programs = BTreeSet::new();
+        for panel_id in &source.required_panel_ids {
+            let bundle = candidate_bundles
+                .iter()
+                .find(|b| text(b, "panelId").ok() == Some(panel_id))
+                .context("required panel bundle missing")?;
+            for record in array(bundle, "windowEvidence")? {
+                let metrics = member(record, "metrics")?;
+                let conservative = number_f64(metrics, "conservativeNetR")
+                    .or_else(|_| number_f64(metrics, "netR"))?;
+                let source_profile = sha(metrics, "sourceProfileSnapshotSha256")?;
+                let resolved_profile = sha(metrics, "resolvedProfileSnapshotSha256")?;
+                let resolved_program = sha(metrics, "resolvedProgramSha256")?;
+                source_profiles.insert(source_profile.clone());
+                resolved_profiles.insert(resolved_profile.clone());
+                resolved_programs.insert(resolved_program.clone());
+                windows.push(json!({
+                    "panelId": panel_id,
+                    "windowId": text(record,"windowId")?,
+                    "conservativeNetR": conservative,
+                    "noCostNetR": optional_f64(metrics,"noCostNetR")?.unwrap_or(conservative),
+                    "maxDrawdownR": optional_f64(metrics,"maxDrawdownR")?.unwrap_or(0.0),
+                    "closedTrades": optional_i64(metrics,"closedTrades")?.or(optional_i64(metrics,"trades")?).unwrap_or(0),
+                    "sourceProfileSnapshotSha256": source_profile,
+                    "resolvedProfileSnapshotSha256": resolved_profile,
+                    "resolvedProgramSha256": resolved_program,
+                }));
+            }
+        }
+        ensure!(
+            source_profiles == BTreeSet::from([sha(candidate, "profileSnapshotSha256")?])
+                && resolved_profiles.len() == 1
+                && resolved_programs.len() == 1,
+            "candidate execution identity changed across panels"
+        );
+        let months = required_months(source)?;
+        let panel_hashes = source
+            .required_panel_ids
+            .iter()
+            .map(|panel| {
+                candidate_bundles
+                    .iter()
+                    .find(|b| text(b, "panelId").ok() == Some(panel))
+                    .and_then(|b| sha(b, "bundleSha256").ok())
+                    .map(Value::String)
+                    .ok_or_else(|| anyhow!("missing bundle hash"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        members.push(json!({
+            "candidateId": candidate_id,
+            "candidateIdentitySha256": sha(candidate,"candidateIdentitySha256")?,
+            "programSha256": sha(candidate,"programSha256")?,
+            "cellId": text(candidate,"cellId")?,
+            "currentPanelRank": number_f64(candidate,"currentPanelRank")?,
+            "coveredMonths": months,
+            "windowMetrics": windows,
+            "panelBundleSha256s": panel_hashes,
+            "sourceProfileSnapshotSha256": source_profiles.iter().next().unwrap(),
+            "resolvedProfileSnapshotSha256": resolved_profiles.iter().next().unwrap(),
+            "resolvedProgramSha256": resolved_programs.iter().next().unwrap(),
+            "novelty": optional_f64(candidate,"novelty")?.unwrap_or(0.0),
+            "currentPanelId": source.current_panel_id,
+            "requiredPanelIds": source.required_panel_ids,
+            "panelBundles": panel_hashes,
+        }));
+    }
+    let policy = member(
+        member(&source.value, "rotatingEvidence")?,
+        "robustSelection",
+    )?
+    .get("policy")
+    .context("robust policy missing")?
+    .clone();
+    verify_self_hash(&policy, "policySha256", "robust policy")?;
+    let classified = classify(members, &policy, source.breeder_width)?;
+    let mut output = json!({
+        "schemaVersion": CUMULATIVE_SCHEMA,
+        "mode": "replace",
+        "rotatingEvidenceSha256": source.rotating_sha,
+        "generationIndex": source.generation_index,
+        "currentPanelId": source.current_panel_id,
+        "requiredPanelIds": source.required_panel_ids,
+        "previousArchiveSha256": source.prior_cumulative.as_ref().map(|v| sha(v,"archiveSha256")).transpose()?,
+        "members": classified.members,
+        "candidatePanelBundles": bundles.values().flatten().cloned().collect::<Vec<_>>(),
+        "robustBreederPolicy": policy,
+        "breederWidth": source.breeder_width,
+        "qualityCandidateIds": classified.quality_ids,
+        "frontierCandidateIds": classified.frontier_ids,
+        "qualityMemberCount": classified.quality_ids.len(),
+        "frontierMemberCount": classified.frontier_ids.len(),
+        "staleAggregateCarryPermitted": false,
+    });
+    add_self_hash(&mut output, "archiveSha256")?;
+    Ok(output)
+}
+
+struct Classified {
+    members: Vec<Value>,
+    quality_ids: Vec<String>,
+    frontier_ids: Vec<String>,
+}
+
+fn classify(mut rows: Vec<Value>, policy: &Value, width: usize) -> Result<Classified> {
+    let min_active = number_f64(policy, "minimumActiveWindowFraction")?;
+    let min_trades = number_f64(policy, "minimumAverageClosedTradesPerCandidateMonth")?;
+    let mut quality = Vec::new();
+    let mut frontier = Vec::new();
+    let mut base_rows = Vec::new();
+    for mut row in rows.drain(..) {
+        base_rows.push(row.clone());
+        let windows = array(&row, "windowMetrics")?;
+        ensure!(!windows.is_empty(), "candidate has no windows");
+        let window_count = windows.len();
+        let mut net = Vec::new();
+        let mut drawdowns = Vec::new();
+        let mut cost_drag = Vec::new();
+        let mut active = 0usize;
+        let mut trades = 0.0;
+        for w in windows {
+            let n = number_f64(w, "conservativeNetR")?;
+            let d = number_f64(w, "maxDrawdownR")?.max(0.0);
+            let t = number_f64(w, "closedTrades")?;
+            net.push(n);
+            drawdowns.push(d);
+            cost_drag.push(number_f64(w, "noCostNetR")? - n);
+            if t > 0.0 {
+                active += 1
+            };
+            trades += t;
+        }
+        let sum_net = net.iter().sum::<f64>();
+        let median = median(&net);
+        let worst = net.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_dd = drawdowns.iter().copied().fold(0.0, f64::max);
+        let drag = cost_drag.iter().sum::<f64>();
+        let novelty = number_f64(&row, "novelty")?;
+        let months = number_f64(&row, "coveredMonths")?;
+        object_mut(&mut row,"candidate")?.insert("robustSupport".into(),json!({"activeWindowFraction": active as f64/window_count as f64,"averageClosedTradesPerMonth":trades/months,"coveredWindowCount":window_count,"coveredMonths":months}));
+        object_mut(&mut row,"candidate")?.insert("robustEconomics".into(),json!({"cumulativeConservativeNetR":sum_net,"medianWindowConservativeNetR":median,"worstWindowConservativeNetR":worst,"maximumWindowDrawdownR":max_dd,"cumulativeCostDragR":drag}));
+        object_mut(&mut row,"candidate")?.insert("robustObjectives".into(),json!({"worstWindowConservativeNetR":worst,"drawdown":max_dd,"costDrag":drag,"novelty":novelty}));
+        let supported =
+            active as f64 / window_count as f64 >= min_active && trades / months >= min_trades;
+        if supported && sum_net > 0.0 && median > 0.0 {
+            quality.push(row)
+        } else if supported {
+            frontier.push(row)
+        }
+    }
+    quality = pareto(quality, width)?;
+    let frontier_cap = ((width as f64) * number_f64(policy, "frontierMaximumFraction")?) as usize;
+    frontier = pareto(frontier, frontier_cap.min(width - quality.len()))?;
+    let quality_ids = quality
+        .iter()
+        .map(|v| text(v, "candidateId").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    let frontier_ids = frontier
+        .iter()
+        .map(|v| text(v, "candidateId").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    let mut classified = BTreeMap::new();
+    for (lane, values) in [("quality", &quality), ("frontier", &frontier)] {
+        for row in values {
+            let mut v = row.clone();
+            let map = v.as_object_mut().unwrap();
+            map.insert("robustBreederLane".into(), json!(lane));
+            map.insert("robustBreederEligible".into(), json!(true));
+            classified.insert(text(row, "candidateId")?.to_owned(), v);
+        }
+    }
+    let members = base_rows
+        .into_iter()
+        .map(|row| {
+            let id = text(&row, "candidateId").unwrap_or("");
+            if let Some(selected) = classified.get(id) {
+                selected.clone()
+            } else {
+                let mut unsupported = row;
+                let map = unsupported.as_object_mut().expect("candidate is object");
+                map.insert("robustBreederLane".into(), json!("unsupported"));
+                map.insert("robustBreederEligible".into(), json!(false));
+                unsupported
+            }
+        })
+        .collect();
+    Ok(Classified {
+        members,
+        quality_ids,
+        frontier_ids,
+    })
+}
+
+fn pareto(mut rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
+    if capacity == 0 || rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    rows.sort_by(|a, b| {
+        text(a, "candidateId")
+            .unwrap_or("")
+            .cmp(text(b, "candidateId").unwrap_or(""))
+    });
+    let vectors = rows.iter().map(objectives).collect::<Result<Vec<_>>>()?;
+    let n = rows.len();
+    let mut dominates = vec![Vec::new(); n];
+    let mut dominated = vec![0usize; n];
+    for l in 0..n {
+        for r in l + 1..n {
+            let ld = dominates_vec(vectors[l], vectors[r]);
+            let rd = dominates_vec(vectors[r], vectors[l]);
+            if ld {
+                dominates[l].push(r);
+                dominated[r] += 1
+            } else if rd {
+                dominates[r].push(l);
+                dominated[l] += 1
+            }
+        }
+    }
+    let mut fronts = Vec::new();
+    let mut current = (0..n).filter(|i| dominated[*i] == 0).collect::<Vec<_>>();
+    while !current.is_empty() {
+        current.sort_by_key(|i| text(&rows[*i], "candidateId").unwrap_or("").to_owned());
+        fronts.push(current.clone());
+        let mut next = Vec::new();
+        for i in current {
+            for target in &dominates[i] {
+                dominated[*target] -= 1;
+                if dominated[*target] == 0 {
+                    next.push(*target)
+                }
+            }
+        }
+        current = next;
+    }
+    let mut selected = Vec::new();
+    for (front_index, front) in fronts.iter().enumerate() {
+        let mut distances = BTreeMap::new();
+        for i in front {
+            distances.insert(*i, 0.0f64);
+        }
+        if front.len() <= 2 {
+            for i in front {
+                distances.insert(*i, f64::INFINITY);
+            }
+        } else {
+            for (d, _) in vectors[0].iter().enumerate() {
+                let mut ordered = front.clone();
+                ordered.sort_by(|a, b| {
+                    vectors[*a][d].total_cmp(&vectors[*b][d]).then_with(|| {
+                        text(&rows[*a], "candidateId")
+                            .unwrap_or("")
+                            .cmp(text(&rows[*b], "candidateId").unwrap_or(""))
+                    })
+                });
+                *distances.get_mut(&ordered[0]).unwrap() = f64::INFINITY;
+                *distances.get_mut(ordered.last().unwrap()).unwrap() = f64::INFINITY;
+                let low = vectors[ordered[0]][d];
+                let high = vectors[*ordered.last().unwrap()][d];
+                if high > low {
+                    for pos in 1..ordered.len() - 1 {
+                        let i = ordered[pos];
+                        if !distances[&i].is_infinite() {
+                            *distances.get_mut(&i).unwrap() += (vectors[ordered[pos + 1]][d]
+                                - vectors[ordered[pos - 1]][d])
+                                / (high - low)
+                        }
+                    }
+                }
+            }
+        }
+        let mut ordered = front.clone();
+        ordered.sort_by(|a, b| {
+            cmp_desc(distances[a], distances[b])
+                .then_with(|| {
+                    cmp_desc(
+                        number_f64(
+                            member(&rows[*a], "robustEconomics").unwrap(),
+                            "cumulativeConservativeNetR",
+                        )
+                        .unwrap(),
+                        number_f64(
+                            member(&rows[*b], "robustEconomics").unwrap(),
+                            "cumulativeConservativeNetR",
+                        )
+                        .unwrap(),
+                    )
+                })
+                .then_with(|| {
+                    cmp_desc(
+                        number_f64(
+                            member(&rows[*a], "robustEconomics").unwrap(),
+                            "medianWindowConservativeNetR",
+                        )
+                        .unwrap(),
+                        number_f64(
+                            member(&rows[*b], "robustEconomics").unwrap(),
+                            "medianWindowConservativeNetR",
+                        )
+                        .unwrap(),
+                    )
+                })
+                .then_with(|| {
+                    text(&rows[*a], "candidateId")
+                        .unwrap_or("")
+                        .cmp(text(&rows[*b], "candidateId").unwrap_or(""))
+                })
+        });
+        for i in ordered.into_iter().take(capacity - selected.len()) {
+            let mut row = rows[i].clone();
+            let m = row.as_object_mut().unwrap();
+            m.insert("robustParetoFront".into(), json!(front_index));
+            m.insert(
+                "robustCrowdingDistance".into(),
+                if distances[&i].is_infinite() {
+                    Value::Null
+                } else {
+                    json!(distances[&i])
+                },
+            );
+            selected.push(row);
+        }
+        if selected.len() >= capacity {
+            break;
+        }
+    }
+    Ok(selected)
+}
+
+fn build_parent_archive(source: &Source, cumulative: &Value) -> Result<Value> {
+    let quality = array(cumulative, "qualityCandidateIds")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_owned())
+        .collect::<BTreeSet<_>>();
+    let frontier = array(cumulative, "frontierCandidateIds")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_owned())
+        .collect::<BTreeSet<_>>();
+    ensure!(quality.is_disjoint(&frontier), "breeder lanes overlap");
+    let allowed = quality.union(&frontier).cloned().collect::<BTreeSet<_>>();
+    let rich = source
+        .rich_members
+        .iter()
+        .map(|r| Ok((text(r, "candidateId")?.to_owned(), r.clone())))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let cumulative_members = array(cumulative, "members")?
+        .iter()
+        .map(|r| Ok((text(r, "candidateId")?.to_owned(), r.clone())))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for candidate_id in &allowed {
+        let mut row = rich
+            .get(candidate_id)
+            .context("selected breeder lacks rich member")?
+            .clone();
+        let c = cumulative_members
+            .get(candidate_id)
+            .context("selected breeder lacks cumulative member")?;
+        ensure!(
+            sha(member(&row, "candidate")?, "candidateIdentitySha256")?
+                == sha(c, "candidateIdentitySha256")?
+                && sha(member(&row, "candidate")?, "programSha256")? == sha(c, "programSha256")?,
+            "rich breeder genome mismatch"
+        );
+        let lane = if quality.contains(candidate_id) {
+            "quality"
+        } else {
+            "rotating_frontier"
+        };
+        let robust = member(c, "robustObjectives")?.clone();
+        let structural =
+            optional_f64(member(&row, "objectives")?, "structuralComplexity")?.unwrap_or(0.0);
+        let map = row.as_object_mut().unwrap();
+        map.insert("objectives".into(),json!({"worstWindowConservativeNetR":number_f64(&robust,"worstWindowConservativeNetR")?,"maximumDrawdownR":number_f64(&robust,"drawdown")?,"structuralComplexity":structural}));
+        map.insert("archiveLane".into(), json!(lane));
+        map.insert(
+            "retentionReason".into(),
+            json!(if lane == "quality" {
+                "cumulative_robust_quality"
+            } else {
+                "bounded_cumulative_frontier_fallback"
+            }),
+        );
+        map.insert("robustBreederEligible".into(), json!(true));
+        map.insert("cumulativeEvidence".into(), c.clone());
+        map.insert(
+            "cumulativeEvidenceArchiveSha256".into(),
+            json!(sha(cumulative, "archiveSha256")?),
+        );
+        map.insert("robustObjectives".into(), robust);
+        map.insert("paretoFront".into(), Value::Null);
+        map.insert("crowdingDistance".into(), Value::Null);
+        let cell = text(member(&row, "descriptor")?, "cellId")?.to_owned();
+        groups.entry(cell).or_default().push(row);
+    }
+    let mut cells = Vec::new();
+    for (cell_id, mut rows) in groups {
+        let before = rows.len();
+        let quality_before = rows
+            .iter()
+            .filter(|r| text(r, "archiveLane").ok() == Some("quality"))
+            .count();
+        rows.sort_by(parent_member_cmp);
+        rows.truncate(source.cell_capacity);
+        let descriptor = member(&rows[0], "descriptor")?.clone();
+        rows.sort_by(|a, b| {
+            text(a, "candidateId")
+                .unwrap_or("")
+                .cmp(text(b, "candidateId").unwrap_or(""))
+        });
+        cells.push(json!({"cellId":cell_id,"descriptor":descriptor,"candidateCountBeforeCapacity":before,"qualityEligibleCountBeforeCapacity":quality_before,"negativeNoveltyEligibleCountBeforeCapacity":0,"observationalCountBeforeCapacity":0,"breedingEligibleMemberCount":rows.len(),"negativeNoveltyMemberCount":0,"selectionVisitCount":0,"offspringAttemptCount":0,"members":rows}));
+    }
+    let parent_count = cells
+        .iter()
+        .map(|c| array(c, "members").map(|v| v.len()))
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .sum::<usize>();
+    ensure!(
+        parent_count <= source.breeder_width,
+        "parent archive exceeds breeder width"
+    );
+    let (num, den) = if parent_count * 5 < source.breeder_width * 4 {
+        (parent_count, source.breeder_width)
+    } else {
+        (4, 5)
+    };
+    let mut schedule = json!({"schemaVersion":"temporal_qd_rotating_parent_schedule_v1","breederWidth":source.breeder_width,"breederParentCount":parent_count,"maximumOffspringNumerator":4,"maximumOffspringDenominator":5,"offspringNumerator":num,"offspringDenominator":den,"immigrantsFillUnsupportedShare":true,"schedulingMethod":"deterministic_rational_prefix_balance"});
+    add_self_hash(&mut schedule, "scheduleSha256")?;
+    let old_cells = array(&source.previous_parent, "cellIds")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let new_cells = cells
+        .iter()
+        .map(|c| text(c, "cellId").unwrap_or(""))
+        .collect::<BTreeSet<_>>();
+    let policy = object(&source.archive_policy, "archive policy")?;
+    let mut archive = json!({"schemaVersion":ARCHIVE_SCHEMA,"qdVersion":policy.get("qdVersion").context("qdVersion missing")?,"policyName":policy.get("policyName").context("policyName missing")?,"policySha256":policy.get("policySha256").context("policySha missing")?,"frozenPolicy":policy.get("frozenPolicy").context("frozen policy missing")?,"generationIndex":source.generation_index,"populationSha256":canonical_sha256(&json!({"cumulativeArchiveSha256":sha(cumulative,"archiveSha256")?,"candidateIds":allowed}))?,"resultSetSha256":sha(cumulative,"archiveSha256")?,"previousArchiveSha256":sha(&source.previous_parent,"archiveSha256")?,"cellCapacity":source.cell_capacity,"candidateCountSeen":unsigned(&source.previous_parent,"candidateCountSeen")?+source.current_member_count,"candidateCountReducedThisGeneration":source.current_member_count,"occupiedCellCount":cells.len(),"newCellCount":new_cells.difference(&old_cells).count(),"memberCount":parent_count,"qualityMemberCount":cells.iter().flat_map(|c|array(c,"members").unwrap()).filter(|r|text(r,"archiveLane").ok()==Some("quality")).count(),"observationalMemberCount":0,"negativeNoveltyMemberCount":0,"paretoAdmissionCount":allowed.len(),"paretoEvictionCount":unsigned(&source.previous_parent,"memberCount")?.saturating_sub(allowed.len() as u64),"rotatingEvidenceTransaction":{"schemaVersion":"temporal_qd_rotating_parent_projection_v1","cumulativeArchiveSha256":sha(cumulative,"archiveSha256")?,"rotatingEvidenceSha256":source.rotating_sha,"requiredPanelIds":source.required_panel_ids,"mode":"replace","frontierFallbackPermitted":true,"parentSchedule":schedule},"cells":cells});
+    if let Some(pair) = source.previous_parent.get("bidirectionalPairPolicy") {
+        archive
+            .as_object_mut()
+            .unwrap()
+            .insert("bidirectionalPairPolicy".into(), pair.clone());
+    }
+    add_self_hash(&mut archive, "archiveSha256")?;
+    Ok(archive)
+}
+
+fn build_funnel(source: &Source, archive: &Value) -> Result<(Value, Value)> {
+    let reduction = &source.funnel_source;
+    let policy = member(reduction, "completenessPolicy")?.clone();
+    ensure!(
+        text(&policy, "schemaVersion")? == "temporal_generation_funnel_completeness_v1",
+        "unsupported funnel completeness policy"
+    );
+    let proposal_accounting = member(reduction, "proposalAccounting")?.clone();
+    let attempts = array(reduction, "proposalAttempts")?;
+    ensure!(
+        !attempts.is_empty(),
+        "funnel attempt ledger must not be empty"
+    );
+
+    let mut normalized_attempts = Vec::with_capacity(attempts.len());
+    let mut ordinals = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    let mut attempt_candidates = BTreeMap::new();
+    let mut disposition_counts = BTreeMap::<String, u64>::new();
+    let mut origin_counts = BTreeMap::<String, u64>::new();
+    for raw in attempts {
+        let ordinal = unsigned(raw, "proposalOrdinal")?;
+        let identity = sha(raw, "attemptIdentitySha256")?;
+        let origin = text(raw, "originKind")?.to_owned();
+        let disposition = text(raw, "disposition")?.to_owned();
+        ensure!(ordinals.insert(ordinal), "duplicate funnel attempt ordinal");
+        ensure!(
+            identities.insert(identity.clone()),
+            "duplicate funnel attempt identity"
+        );
+        let candidate = object(raw, "funnel attempt")?.get("candidateId");
+        let normalized = if let Some(candidate_id) = candidate.and_then(Value::as_str) {
+            ensure!(!candidate_id.is_empty(), "empty attempt candidate id");
+            let raw_sha = sha(raw, "rawSourceProfileSha256")?;
+            ensure!(
+                attempt_candidates
+                    .insert(candidate_id.to_owned(), raw_sha.clone())
+                    .is_none(),
+                "candidate appears in multiple attempts"
+            );
+            json!({
+                "proposalOrdinal": ordinal,
+                "attemptIdentitySha256": identity,
+                "originKind": origin,
+                "disposition": disposition,
+                "candidateId": candidate_id,
+                "rawSourceProfileSha256": raw_sha,
+            })
+        } else {
+            ensure!(
+                object(raw, "funnel attempt")?
+                    .get("rawSourceProfileSha256")
+                    .is_none(),
+                "candidate-free attempt has a source identity"
+            );
+            json!({
+                "proposalOrdinal": ordinal,
+                "attemptIdentitySha256": identity,
+                "originKind": origin,
+                "disposition": disposition,
+            })
+        };
+        *disposition_counts.entry(disposition).or_default() += 1;
+        *origin_counts.entry(origin).or_default() += 1;
+        normalized_attempts.push(normalized);
+    }
+    ensure!(
+        ordinals == (0..attempts.len() as u64).collect(),
+        "funnel attempt ordinals are not contiguous"
+    );
+    normalized_attempts.sort_by_key(|row| unsigned(row, "proposalOrdinal").unwrap_or(u64::MAX));
+    ensure!(
+        count_map(member(&proposal_accounting, "dispositionCounts")?)? == disposition_counts,
+        "funnel proposal disposition accounting mismatch"
+    );
+    ensure!(
+        count_map(member(&proposal_accounting, "originProposalCounts")?)? == origin_counts,
+        "funnel proposal origin accounting mismatch"
+    );
+    let mut attempt_ledger = json!({
+        "attemptCount": normalized_attempts.len(),
+        "materializedCandidateCount": attempt_candidates.len(),
+        "nonMaterializedAttemptCount": normalized_attempts.len() - attempt_candidates.len(),
+        "attemptDispositionCounts": disposition_counts,
+        "attemptOriginCounts": origin_counts,
+        "attempts": normalized_attempts,
+    });
+    add_self_hash(&mut attempt_ledger, "attemptLedgerSha256")?;
+
+    let mut candidates = array(reduction, "candidateStageRows")?.clone();
+    let pre_archive_projection = object(reduction, "funnel reduction source")?
+        .get("preArchiveProjection")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if pre_archive_projection {
+        finalize_pre_archive_funnel_candidates(&mut candidates, archive)?;
+    }
+    ensure!(
+        candidates.len() == attempt_candidates.len(),
+        "funnel candidate/attempt materialization mismatch"
+    );
+    let mut candidate_ids = BTreeSet::new();
+    let mut previous_id: Option<String> = None;
+    let mut stage_counts = BTreeMap::<String, u64>::new();
+    let mut terminal_counts = BTreeMap::<String, u64>::new();
+    let mut operator_counts = BTreeMap::<String, u64>::new();
+    let mut motif_counts = BTreeMap::<String, u64>::new();
+    let mut direction_counts = BTreeMap::<String, u64>::new();
+    for candidate in &candidates {
+        let candidate_id = text(candidate, "candidateId")?.to_owned();
+        ensure!(
+            previous_id.as_ref().is_none_or(|old| old < &candidate_id),
+            "funnel candidates must be uniquely sorted"
+        );
+        previous_id = Some(candidate_id.clone());
+        ensure!(
+            candidate_ids.insert(candidate_id.clone()),
+            "duplicate funnel candidate"
+        );
+        let identity = member(candidate, "identity")?;
+        ensure!(
+            text(identity, "candidateId")? == candidate_id,
+            "funnel candidate identity mismatch"
+        );
+        let raw_sha = sha(identity, "rawSourceProfileSha256")?;
+        ensure!(
+            attempt_candidates.get(&candidate_id) == Some(&raw_sha),
+            "funnel candidate does not match its attempt"
+        );
+        validate_optional_identity_shas(identity)?;
+        let stages = member(candidate, "stages")?;
+        validate_stage_chain(stages, candidate)?;
+        for (stage, record) in object(stages, "funnel stages")? {
+            let outcome = text(record, "outcome")?;
+            *stage_counts
+                .entry(format!("{stage}:{outcome}"))
+                .or_default() += 1;
+        }
+        let terminal = text(candidate, "terminalDisposition")?.to_owned();
+        *terminal_counts.entry(terminal).or_default() += 1;
+        for operator in string_array(candidate, "operatorIds")? {
+            *operator_counts.entry(operator).or_default() += 1;
+        }
+        for motif in string_array(candidate, "motifIds")? {
+            *motif_counts.entry(motif).or_default() += 1;
+        }
+        *direction_counts
+            .entry(text(candidate, "direction")?.to_owned())
+            .or_default() += 1;
+    }
+    ensure!(
+        candidate_ids == attempt_candidates.keys().cloned().collect(),
+        "funnel materialized candidate set mismatch"
+    );
+
+    let mut artifact = json!({
+        "schemaVersion": FUNNEL_SCHEMA,
+        "completenessPolicy": policy,
+        "proposalAccounting": proposal_accounting,
+        "attemptLedger": attempt_ledger,
+        "attemptToMaterializedAttrition": {
+            "attempted": attempts.len(),
+            "materializedCandidates": attempt_candidates.len(),
+            "notMaterialized": attempts.len() - attempt_candidates.len(),
+            "attemptDispositionCounts": disposition_counts,
+        },
+        "candidateCount": candidates.len(),
+        "candidates": candidates,
+        "stageCounts": stage_counts,
+        "terminalDispositionCounts": terminal_counts,
+        "operatorBreakdown": operator_counts,
+        "motifBreakdown": motif_counts,
+        "directionBreakdown": direction_counts,
+    });
+    add_self_hash(&mut artifact, "artifactSha256")?;
+    let mut snapshot = json!({
+        "schemaVersion": FUNNEL_SNAPSHOT_SCHEMA,
+        "funnelArtifactSha256": sha(&artifact, "artifactSha256")?,
+        "candidateCount": candidates.len(),
+        "terminalDispositionCounts": terminal_counts,
+        "candidateTerminals": candidates.iter().map(|row| json!({
+            "candidateId": text(row, "candidateId").unwrap(),
+            "terminalDisposition": text(row, "terminalDisposition").unwrap(),
+        })).collect::<Vec<_>>(),
+    });
+    add_self_hash(&mut snapshot, "snapshotSha256")?;
+    Ok((artifact, snapshot))
+}
+
+fn finalize_pre_archive_funnel_candidates(candidates: &mut [Value], archive: &Value) -> Result<()> {
+    let mut retained = BTreeMap::<String, String>::new();
+    for cell in array(archive, "cells")? {
+        for member in array(cell, "members")? {
+            let candidate_id = text(member, "candidateId")?.to_owned();
+            ensure!(
+                retained
+                    .insert(candidate_id, canonical_sha256(member)?)
+                    .is_none(),
+                "archive contains duplicate funnel candidate"
+            );
+        }
+    }
+    for candidate in candidates {
+        let candidate_id = text(candidate, "candidateId")?.to_owned();
+        let candidate_map = object_mut(candidate, "pre-archive funnel candidate")?;
+        let member_sha = retained.get(&candidate_id);
+        {
+            let identity = object_mut(
+                candidate_map
+                    .get_mut("identity")
+                    .context("pre-archive funnel identity missing")?,
+                "pre-archive funnel identity",
+            )?;
+            identity.insert(
+                "archiveMemberIdentitySha256".into(),
+                member_sha.map_or(Value::Null, |value| json!(value)),
+            );
+        }
+        let terminal = {
+            let stages = object_mut(
+                candidate_map
+                    .get_mut("stages")
+                    .context("pre-archive funnel stages missing")?,
+                "pre-archive funnel stages",
+            )?;
+            stages.remove("archiveRetention");
+            stages.remove("exploratoryRetention");
+            if member_sha.is_some() {
+                ensure!(
+                    stages.contains_key("activationQuality"),
+                    "retained funnel candidate lacks activation evidence"
+                );
+                stages.insert(
+                    "activationQuality".into(),
+                    json!({"outcome":"recorded","qualityDisposition":"eligible","reasons":[]}),
+                );
+                stages.insert(
+                    "archiveRetention".into(),
+                    json!({"outcome":"retained","reasons":[]}),
+                );
+                Some("retained")
+            } else if stages
+                .get("activationQuality")
+                .and_then(|row| row.get("outcome"))
+                .and_then(Value::as_str)
+                == Some("recorded")
+            {
+                stages.insert(
+                    "archiveRetention".into(),
+                    json!({"outcome":"not_retained","reasons":["not_selected_by_archive"]}),
+                );
+                Some("not_retained")
+            } else {
+                None
+            }
+        };
+        if let Some(terminal) = terminal {
+            candidate_map.insert("terminalDisposition".into(), json!(terminal));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_identity_shas(identity: &Value) -> Result<()> {
+    for field in [
+        "resolvedProfileSha256",
+        "programSha256",
+        "validationReportSha256",
+        "validationIdentitySha256",
+        "canonicalEvidenceIdentitySha256",
+        "archiveMemberIdentitySha256",
+    ] {
+        if let Some(value) = object(identity, "funnel identity")?.get(field) {
+            if !value.is_null() {
+                sha(identity, field)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_stage_chain(stages: &Value, candidate: &Value) -> Result<()> {
+    let stages = object(stages, "funnel stages")?;
+    ensure!(
+        stages
+            .get("proposed")
+            .and_then(|row| row.get("outcome"))
+            .and_then(Value::as_str)
+            == Some("proposed"),
+        "funnel candidate lacks proposed stage"
+    );
+    let terminal = text(candidate, "terminalDisposition")?;
+    let static_outcome = stages
+        .get("staticallyReachable")
+        .context("missing static reachability stage")?
+        .get("outcome")
+        .and_then(Value::as_str)
+        .context("invalid static outcome")?;
+    if static_outcome == "rejected" {
+        ensure!(
+            terminal == "static_reachability_rejected",
+            "invalid static terminal"
+        );
+        ensure!(stages.len() == 2, "post-terminal static stages present");
+        return Ok(());
+    }
+    let native = stage_outcome(stages, "nativeValid")?;
+    if native == "rejected" {
+        ensure!(
+            terminal == "native_validation_rejected",
+            "invalid native terminal"
+        );
+        return Ok(());
+    }
+    let admission = stage_outcome(stages, "uniqueAdmitted")?;
+    if admission == "rejected_duplicate" {
+        ensure!(
+            terminal == "duplicate_rejected",
+            "invalid duplicate terminal"
+        );
+        return Ok(());
+    }
+    stage_outcome(stages, "syntheticEvidence")?;
+    let evaluated = stage_outcome(stages, "evaluated")?;
+    if evaluated != "evaluated" {
+        ensure!(
+            terminal == format!("evaluation_{evaluated}"),
+            "invalid evaluation terminal"
+        );
+        return Ok(());
+    }
+    let activation = stage_outcome(stages, "activationQuality")?;
+    if activation == "recorded" {
+        let retention = stage_outcome(stages, "archiveRetention")?;
+        ensure!(terminal == retention, "invalid retention terminal");
+    } else {
+        ensure!(
+            terminal == format!("activation_{activation}"),
+            "invalid activation terminal"
+        );
+        if stages.contains_key("exploratoryRetention") {
+            ensure!(
+                activation == "quality_rejected",
+                "invalid exploratory retention"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn stage_outcome<'a>(stages: &'a Map<String, Value>, stage: &str) -> Result<&'a str> {
+    stages
+        .get(stage)
+        .with_context(|| format!("missing funnel stage {stage}"))?
+        .get("outcome")
+        .and_then(Value::as_str)
+        .with_context(|| format!("invalid funnel stage {stage}"))
+}
+
+fn string_array(value: &Value, key: &str) -> Result<Vec<String>> {
+    let values = array(value, key)?;
+    ensure!(!values.is_empty(), "{key} must not be empty");
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("{key} must contain nonempty strings"))
+        })
+        .collect()
+}
+
+fn count_map(value: &Value) -> Result<BTreeMap<String, u64>> {
+    object(value, "count map")?
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                key.clone(),
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("count map value must be unsigned"))?,
+            ))
+        })
+        .collect()
+}
+
+fn campaign_bindings(source: &Source) -> Result<Vec<Value>> {
+    let mut campaigns = source.campaigns.clone();
+    for receipt in &source.receipts {
+        campaigns.push(member(receipt, "campaignBinding")?.clone());
+    }
+    Ok(campaigns)
+}
+
+fn build_checkpoint(source: &Source, cumulative: &Value, archive: &Value) -> Result<Value> {
+    let mut ids = array(&source.provisional, "candidates")?
+        .iter()
+        .map(|r| text(r, "candidateId").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    ids.sort();
+    ids.dedup();
+    let campaigns = campaign_bindings(source)?;
+    let campaigns_value = Value::Array(campaigns);
+    let mut v = json!({"schemaVersion":CHECKPOINT_SCHEMA,"rotatingEvidenceSha256":source.rotating_sha,"generationIndex":source.generation_index,"panelId":source.current_panel_id,"requiredPanelIds":source.required_panel_ids,"stage":"cumulative_archive","cohortSha256":sha(&source.cohort,"cohortSha256")?,"provisionalCandidateIds":ids,"cumulativeArchiveSha256":sha(cumulative,"archiveSha256")?,"stageArtifacts":{"parentArchiveSha256":sha(archive,"archiveSha256")?,"campaignsSha256":canonical_sha256(&campaigns_value)?}});
+    add_self_hash(&mut v, "checkpointSha256")?;
+    Ok(v)
+}
+fn build_ledger(
+    source: &Source,
+    _plan: &Value,
+    cumulative: &Value,
+    archive: &Value,
+    checkpoint: &Value,
+) -> Result<Value> {
+    let campaigns = campaign_bindings(source)?;
+    let mut v = json!({"schemaVersion":"temporal_qd_rotating_generation_ledger_v1","rotatingEvidenceSha256":source.rotating_sha,"generationIndex":source.generation_index,"panelId":source.current_panel_id,"cohortSha256":sha(&source.cohort,"cohortSha256")?,"proposalCandidateIds":member(&source.cohort,"newProposalCandidateIds")?,"retainedParentEvaluationCandidateIds":member(&source.cohort,"retainedParentEvaluationCandidateIds")?,"proposalOnlyFunnelReporting":true,"campaigns":campaigns,"provisionalSha256":sha(&source.provisional,"provisionalSha256")?,"cumulativeArchiveSha256":sha(cumulative,"archiveSha256")?,"checkpointSha256":sha(checkpoint,"checkpointSha256")?,"parentArchiveSha256":sha(archive,"archiveSha256")?});
+    add_self_hash(&mut v, "ledgerSha256")?;
+    Ok(v)
+}
+fn build_generation_record(
+    source: &Source,
+    plan: &Value,
+    outputs: &FinalizedOutputs<'_>,
+) -> Result<Value> {
+    let mut v = source.generation_record_base.clone();
+    let m = object_mut(&mut v, "generation record")?;
+    m.insert("generationIndex".into(), json!(source.generation_index));
+    m.insert(
+        "archiveSha256".into(),
+        json!(sha(outputs.archive, "archiveSha256")?),
+    );
+    m.insert(
+        "resultSetSha256".into(),
+        json!(sha(outputs.cumulative, "archiveSha256")?),
+    );
+    m.insert(
+        "rotatingEvidenceLedgerSha256".into(),
+        json!(sha(outputs.ledger, "ledgerSha256")?),
+    );
+    m.insert(
+        "rotatingEvidenceCheckpointSha256".into(),
+        json!(sha(outputs.checkpoint, "checkpointSha256")?),
+    );
+    m.insert(
+        "cumulativeArchiveSha256".into(),
+        json!(sha(outputs.cumulative, "archiveSha256")?),
+    );
+    m.insert(
+        "auxiliaryPlanSha256".into(),
+        json!(sha(plan, "planSha256")?),
+    );
+    m.insert(
+        "generationFunnelArtifactSha256".into(),
+        json!(sha(outputs.funnel, "artifactSha256")?),
+    );
+    m.insert(
+        "generationFunnelSnapshotSha256".into(),
+        json!(sha(outputs.funnel_snapshot, "snapshotSha256")?),
+    );
+    m.insert(
+        "archivePath".into(),
+        member(&source.publication_paths, "archive")?.clone(),
+    );
+    for (field, key) in [
+        ("occupiedCellCount", "occupiedCellCount"),
+        ("newCellCount", "newCellCount"),
+        ("qualityMemberCount", "qualityMemberCount"),
+        ("observationalMemberCount", "observationalMemberCount"),
+        ("negativeNoveltyMemberCount", "negativeNoveltyMemberCount"),
+        ("paretoAdmissionCount", "paretoAdmissionCount"),
+        ("paretoEvictionCount", "paretoEvictionCount"),
+    ] {
+        m.insert(field.into(), member(outputs.archive, key)?.clone());
+    }
+    let mut frontier_count = 0;
+    for cell in array(outputs.archive, "cells")? {
+        frontier_count += array(cell, "members")?
+            .iter()
+            .filter(|member| text(member, "archiveLane").ok() == Some("rotating_frontier"))
+            .count();
+    }
+    m.insert("frontierMemberCount".into(), json!(frontier_count));
+    m.insert(
+        "parentSchedule".into(),
+        member(
+            member(outputs.archive, "rotatingEvidenceTransaction")?,
+            "parentSchedule",
+        )?
+        .clone(),
+    );
+    m.insert("artifacts".into(), build_artifact_ledger(source, outputs)?);
+    add_self_hash(&mut v, "generationRecordSha256")?;
+    Ok(v)
+}
+
+fn build_artifact_ledger(source: &Source, outputs: &FinalizedOutputs<'_>) -> Result<Value> {
+    let mut artifacts = source.artifact_ledger_base.clone();
+    let map = object_mut(&mut artifacts, "artifact ledger base")?;
+    map.insert(
+        "archive".into(),
+        semantic_artifact_descriptor(
+            text(&source.publication_paths, "archive")?,
+            outputs.archive,
+            "archiveSha256",
+        )?,
+    );
+    map.insert(
+        "generationFunnel".into(),
+        semantic_artifact_descriptor(
+            text(&source.publication_paths, "generationFunnel")?,
+            outputs.funnel,
+            "artifactSha256",
+        )?,
+    );
+    map.insert(
+        "generationFunnelSnapshot".into(),
+        outputs.funnel_snapshot.clone(),
+    );
+    map.insert(
+        "rotatingEvidenceLedger".into(),
+        semantic_artifact_descriptor(
+            text(&source.publication_paths, "rotatingEvidenceLedger")?,
+            outputs.ledger,
+            "ledgerSha256",
+        )?,
+    );
+    map.insert(
+        "rotatingEvidenceCheckpoint".into(),
+        semantic_artifact_descriptor(
+            text(&source.publication_paths, "rotatingEvidenceCheckpoint")?,
+            outputs.checkpoint,
+            "checkpointSha256",
+        )?,
+    );
+    map.insert(
+        "cumulativeBreederArchive".into(),
+        semantic_artifact_descriptor(
+            text(&source.publication_paths, "cumulativeBreederArchive")?,
+            outputs.cumulative,
+            "archiveSha256",
+        )?,
+    );
+    Ok(artifacts)
+}
+
+fn semantic_artifact_descriptor(path: &str, value: &Value, field: &str) -> Result<Value> {
+    let mut descriptor = json!({"path":path,"sha256":canonical_sha256(value)?});
+    object_mut(&mut descriptor, "artifact descriptor")?
+        .insert(field.into(), json!(sha(value, field)?));
+    Ok(descriptor)
+}
+fn build_state_patch(source: &Source, record: &Value) -> Result<Value> {
+    let mut v = source.state_transition_base.clone();
+    let m = object_mut(&mut v, "state transition")?;
+    m.insert(
+        "schemaVersion".into(),
+        json!("temporal_qd_generation_state_patch_v1"),
+    );
+    m.insert("generationIndex".into(), json!(source.generation_index));
+    m.insert(
+        "generationRecordSha256".into(),
+        json!(sha(record, "generationRecordSha256")?),
+    );
+    m.insert("generationRecord".into(), record.clone());
+    add_self_hash(&mut v, "statePatchSha256")?;
+    Ok(v)
+}
+
+fn execution(
+    source: &Source,
+    manifest: &Manifest,
+    plan: &Value,
+    commit: Value,
+    restart: bool,
+    started: Instant,
+) -> Value {
+    json!({"schemaVersion":EXECUTION_SCHEMA,"status":"committed","sourceSha256":source.source_sha256,"manifestSha256":manifest.manifest_sha256,"generationIndex":source.generation_index,"auxiliaryPlanSha256":sha(plan,"planSha256").unwrap(),"commitSha256":sha(&commit,"commitSha256").unwrap(),"restart":restart,"rawResultReads":0,"elapsedMilliseconds":started.elapsed().as_millis() as u64,"commit":commit})
+}
+fn restart_execution(manifest: &Manifest, commit: Value, started: Instant) -> Value {
+    json!({"schemaVersion":EXECUTION_SCHEMA,"status":"committed","sourceSha256":manifest.source_sha256,"manifestSha256":manifest.manifest_sha256,"generationIndex":unsigned(&commit,"generationIndex").unwrap(),"auxiliaryPlanSha256":sha(&commit,"auxiliaryPlanSha256").unwrap(),"commitSha256":sha(&commit,"commitSha256").unwrap(),"restart":true,"restartValidation":"compact_commit_and_output_hashes","rawResultReads":0,"elapsedMilliseconds":started.elapsed().as_millis() as u64,"commit":commit})
+}
+
+fn provisional_map(source: &Source) -> Result<BTreeMap<String, Value>> {
+    let rows = array(&source.provisional, "candidates")?;
+    ensure!(
+        unsigned(&source.provisional, "candidateCount")? == rows.len() as u64,
+        "provisional count mismatch"
+    );
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let id = text(row, "candidateId")?.to_owned();
+        ensure!(
+            out.insert(id, row.clone()).is_none(),
+            "duplicate provisional candidate"
+        );
+        for f in [
+            "candidateIdentitySha256",
+            "programSha256",
+            "profileSnapshotSha256",
+        ] {
+            sha(row, f)?;
+        }
+        number_f64(row, "currentPanelRank")?;
+        text(row, "cellId")?;
+    }
+    Ok(out)
+}
+fn required_months(source: &Source) -> Result<u64> {
+    let panels = array(member(&source.value, "rotatingEvidence")?, "panels")?;
+    source
+        .required_panel_ids
+        .iter()
+        .map(|id| {
+            panels
+                .iter()
+                .find(|p| text(p, "panelId").ok() == Some(id))
+                .context("required panel missing")
+                .and_then(|p| unsigned(p, "totalMonths"))
+        })
+        .sum()
+}
+fn panel_order(source: &Source, panel: &str) -> usize {
+    source
+        .required_panel_ids
+        .iter()
+        .position(|v| v == panel)
+        .unwrap_or(usize::MAX)
+}
+fn objectives(v: &Value) -> Result<[f64; 4]> {
+    let o = member(v, "robustObjectives")?;
+    Ok([
+        number_f64(o, "worstWindowConservativeNetR")?,
+        -number_f64(o, "drawdown")?,
+        -number_f64(o, "costDrag")?,
+        number_f64(o, "novelty")?,
+    ])
+}
+fn dominates_vec(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| *x >= y) && a.iter().zip(b).any(|(x, y)| *x > y)
+}
+fn median(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    if v.len() % 2 == 1 {
+        v[v.len() / 2]
+    } else {
+        (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0
+    }
+}
+fn cmp_desc(a: f64, b: f64) -> Ordering {
+    b.total_cmp(&a)
+}
+fn parent_member_cmp(a: &Value, b: &Value) -> Ordering {
+    let quality_a = text(a, "archiveLane").ok() == Some("quality");
+    let quality_b = text(b, "archiveLane").ok() == Some("quality");
+    quality_b
+        .cmp(&quality_a)
+        .then_with(|| {
+            unsigned(
+                member(a, "cumulativeEvidence").unwrap(),
+                "robustParetoFront",
+            )
+            .unwrap_or(0)
+            .cmp(
+                &unsigned(
+                    member(b, "cumulativeEvidence").unwrap(),
+                    "robustParetoFront",
+                )
+                .unwrap_or(0),
+            )
+        })
+        .then_with(|| {
+            let x = optional_f64(
+                member(a, "cumulativeEvidence").unwrap(),
+                "robustCrowdingDistance",
+            )
+            .unwrap_or(None)
+            .unwrap_or(f64::INFINITY);
+            let y = optional_f64(
+                member(b, "cumulativeEvidence").unwrap(),
+                "robustCrowdingDistance",
+            )
+            .unwrap_or(None)
+            .unwrap_or(f64::INFINITY);
+            cmp_desc(x, y)
+        })
+        .then_with(|| {
+            cmp_desc(
+                number_f64(
+                    member(a, "robustObjectives").unwrap(),
+                    "worstWindowConservativeNetR",
+                )
+                .unwrap_or(0.0),
+                number_f64(
+                    member(b, "robustObjectives").unwrap(),
+                    "worstWindowConservativeNetR",
+                )
+                .unwrap_or(0.0),
+            )
+        })
+        .then_with(|| {
+            number_f64(member(a, "robustObjectives").unwrap(), "drawdown")
+                .unwrap_or(0.0)
+                .total_cmp(
+                    &number_f64(member(b, "robustObjectives").unwrap(), "drawdown").unwrap_or(0.0),
+                )
+        })
+        .then_with(|| {
+            number_f64(member(a, "robustObjectives").unwrap(), "costDrag")
+                .unwrap_or(0.0)
+                .total_cmp(
+                    &number_f64(member(b, "robustObjectives").unwrap(), "costDrag").unwrap_or(0.0),
+                )
+        })
+        .then_with(|| {
+            cmp_desc(
+                number_f64(member(a, "robustObjectives").unwrap(), "novelty").unwrap_or(0.0),
+                number_f64(member(b, "robustObjectives").unwrap(), "novelty").unwrap_or(0.0),
+            )
+        })
+        .then_with(|| {
+            cmp_desc(
+                number_f64(member(a, "cumulativeEvidence").unwrap(), "currentPanelRank")
+                    .unwrap_or(0.0),
+                number_f64(member(b, "cumulativeEvidence").unwrap(), "currentPanelRank")
+                    .unwrap_or(0.0),
+            )
+        })
+        .then_with(|| {
+            text(a, "candidateId")
+                .unwrap_or("")
+                .cmp(text(b, "candidateId").unwrap_or(""))
+        })
+}
+
+fn descriptor(path: &str, value: &Value, field: &str) -> Result<Value> {
+    let bytes = canonical_json_line(value)?;
+    Ok(
+        json!({"path":path,field:sha(value,field)?,"bytes":bytes.len(),"fileSha256":sha256_bytes(&bytes)}),
+    )
+}
+
+fn validate_commit_outputs(root: &Path, commit: &Value) -> Result<()> {
+    for (descriptor_name, expected_path) in [
+        ("cumulativeArchive", CUMULATIVE_PATH),
+        ("parentArchive", ARCHIVE_PATH),
+        ("generationFunnel", FUNNEL_PATH),
+        ("generationFunnelSnapshot", FUNNEL_SNAPSHOT_PATH),
+        ("checkpoint", CHECKPOINT_PATH),
+        ("ledger", LEDGER_PATH),
+        ("generationRecord", RECORD_PATH),
+        ("statePatch", STATE_PATCH_PATH),
+    ] {
+        let descriptor = member(commit, descriptor_name)?;
+        ensure!(
+            text(descriptor, "path")? == expected_path,
+            "committed descriptor path drifted"
+        );
+        let path = root.join(expected_path);
+        ensure!(
+            path.is_file(),
+            "committed output is missing: {expected_path}"
+        );
+        let metadata = fs::metadata(&path)?;
+        ensure!(
+            metadata.len() == unsigned(descriptor, "bytes")?,
+            "committed output size drifted: {expected_path}"
+        );
+        ensure!(
+            sha256_file(&path)? == sha(descriptor, "fileSha256")?,
+            "committed output content drifted: {expected_path}"
+        );
+    }
+    Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    // Keep this heap-backed: the Windows release binary's main thread has a
+    // much smaller stack than Rust's test threads, and a 1 MiB local buffer
+    // can overflow before restart validation gets a chance to report errors.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+fn add_self_hash(value: &mut Value, field: &str) -> Result<()> {
+    let hash = canonical_sha256(value)?;
+    object_mut(value, "self-hashed object")?.insert(field.into(), Value::String(hash));
+    Ok(())
+}
+fn verify_self_hash(value: &Value, field: &str, name: &str) -> Result<()> {
+    let supplied = sha(value, field)?;
+    ensure!(
+        canonical_sha256_without_object_field(value, field)? == supplied,
+        "{name} identity mismatch"
+    );
+    Ok(())
+}
+fn read_self_hashed(path: &Path, field: &str, schema: &str) -> Result<Value> {
+    let bytes = fs::read(path)?;
+    let v: Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        canonical_json_line(&v)? == bytes,
+        "committed file is noncanonical"
+    );
+    ensure!(
+        text(&v, "schemaVersion")? == schema,
+        "committed schema mismatch"
+    );
+    verify_self_hash(&v, field, "committed object")?;
+    Ok(v)
+}
+fn publish_value_once(root: &Path, name: &str, value: &Value) -> Result<()> {
+    let bytes = canonical_json_line(value)?;
+    let path = root.join(name);
+    if path.exists() {
+        ensure!(fs::read(&path)? == bytes, "immutable output {name} differs");
+        return Ok(());
+    }
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let tmp = root.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+    let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    drop(f);
+    match fs::hard_link(&tmp, &path) {
+        Ok(()) => {
+            fs::remove_file(&tmp)?;
+            sync_directory(root)?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(fs::read(&path)? == bytes, "immutable output {name} differs");
+            fs::remove_file(&tmp)?;
+            sync_directory(root)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
+}
+#[cfg(not(windows))]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(GENERIC_READ | GENERIC_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let directory = match options.open(path) {
+        Ok(directory) => directory,
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 5 | 50 | 87)) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    match directory.sync_all() {
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 5 | 50 | 87)) => Ok(()),
+        outcome => outcome.map_err(Into::into),
+    }
+}
+fn existing_file(path: &Path, name: &str) -> Result<PathBuf> {
+    ensure!(path.is_file(), "{name} is missing");
+    Ok(path.canonicalize()?)
+}
+fn object<'a>(v: &'a Value, name: &str) -> Result<&'a Map<String, Value>> {
+    v.as_object()
+        .ok_or_else(|| anyhow!("{name} must be an object"))
+}
+fn object_mut<'a>(v: &'a mut Value, name: &str) -> Result<&'a mut Map<String, Value>> {
+    v.as_object_mut()
+        .ok_or_else(|| anyhow!("{name} must be an object"))
+}
+fn member<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
+    object(v, "object")?
+        .get(key)
+        .ok_or_else(|| anyhow!("missing {key}"))
+}
+fn nullable_member<'a>(v: &'a Value, key: &str) -> Result<Option<&'a Value>> {
+    let x = member(v, key)?;
+    Ok((!x.is_null()).then_some(x))
+}
+fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
+    member(v, key)?
+        .as_str()
+        .ok_or_else(|| anyhow!("{key} must be text"))
+}
+fn array<'a>(v: &'a Value, key: &str) -> Result<&'a Vec<Value>> {
+    member(v, key)?
+        .as_array()
+        .ok_or_else(|| anyhow!("{key} must be an array"))
+}
+fn unsigned(v: &Value, key: &str) -> Result<u64> {
+    member(v, key)?
+        .as_u64()
+        .ok_or_else(|| anyhow!("{key} must be unsigned"))
+}
+fn sha(v: &Value, key: &str) -> Result<String> {
+    let s = text(v, key)?;
+    ensure!(
+        s.len() == 71
+            && s.starts_with("sha256:")
+            && s[7..]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit()
+                    && (!b.is_ascii_alphabetic() || b.is_ascii_lowercase())),
+        "{key} is not a canonical sha256"
+    );
+    Ok(s.to_owned())
+}
+fn number_f64(v: &Value, key: &str) -> Result<f64> {
+    let n = member(v, key)?
+        .as_f64()
+        .ok_or_else(|| anyhow!("{key} must be numeric"))?;
+    ensure!(n.is_finite(), "{key} must be finite");
+    Ok(n)
+}
+fn optional_f64(v: &Value, key: &str) -> Result<Option<f64>> {
+    match object(v, "object")?.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => {
+            let n = x.as_f64().ok_or_else(|| anyhow!("{key} must be numeric"))?;
+            ensure!(n.is_finite(), "{key} must be finite");
+            Ok(Some(n))
+        }
+    }
+}
+fn optional_i64(v: &Value, key: &str) -> Result<Option<i64>> {
+    match object(v, "object")?.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => Ok(Some(
+            x.as_i64().ok_or_else(|| anyhow!("{key} must be integer"))?,
+        )),
+    }
+}
+fn exact_keys(map: &Map<String, Value>, keys: &[&str], name: &str) -> Result<()> {
+    let actual = map.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = keys.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(actual == expected, "{name} fields differ");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const HASH_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HASH_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn synthetic_bundle(candidate: &Value, panel_id: &str, window_id: &str) -> Value {
+        let mut record = json!({
+            "schemaVersion": WINDOW_SCHEMA,
+            "candidateId": text(candidate,"candidateId").unwrap(),
+            "candidateIdentitySha256": sha(candidate,"candidateIdentitySha256").unwrap(),
+            "programSha256": sha(candidate,"programSha256").unwrap(),
+            "panelId": panel_id,
+            "windowId": window_id,
+            "analysisWindowStart": "2020-01-01T00:00:00Z",
+            "analysisWindowEnd": "2020-04-01T00:00:00Z",
+            "evidencePlanSemanticSha256": HASH_A,
+            "metrics": {
+                "conservativeNetR": 1.0,
+                "noCostNetR": 1.1,
+                "maxDrawdownR": 0.2,
+                "closedTrades": 20,
+                "sourceProfileSnapshotSha256": HASH_C,
+                "resolvedProfileSnapshotSha256": HASH_C,
+                "resolvedProgramSha256": HASH_B,
+            },
+            "evidenceDigestSha256": HASH_A,
+            "rawTaskProvenance": {"authorityId":HASH_A,"taskMatrixSha256":HASH_A,"taskId":format!("{panel_id}-{window_id}"),"resultSha256":HASH_A},
+        });
+        add_self_hash(&mut record, "recordSha256").unwrap();
+        let mut bundle = json!({
+            "schemaVersion": BUNDLE_SCHEMA,
+            "rotatingEvidenceSha256": HASH_A,
+            "candidateId": text(candidate,"candidateId").unwrap(),
+            "candidateIdentitySha256": HASH_A,
+            "programSha256": HASH_B,
+            "panelId": panel_id,
+            "windowEvidenceDigests": [{"windowId":window_id,"evidenceDigestSha256":HASH_A,"recordSha256":sha(&record,"recordSha256").unwrap()}],
+            "windowEvidence": [record.clone()],
+            "rawTaskProvenance": [{"windowId":window_id,"authorityId":HASH_A,"taskMatrixSha256":HASH_A,"taskId":format!("{panel_id}-{window_id}"),"resultSha256":HASH_A}],
+        });
+        add_self_hash(&mut bundle, "bundleSha256").unwrap();
+        bundle
+    }
+
+    fn synthetic_source(baseline: Vec<Value>, receipts: Vec<Value>) -> Source {
+        let policy = {
+            let mut value = json!({
+                "schemaVersion":"temporal_qd_robust_breeder_policy_v1",
+                "minimumAverageClosedTradesPerCandidateMonth":4.0,
+                "minimumActiveWindowFraction":0.75,
+                "qualityRequiresPositiveCumulativeConservativeNetR":true,
+                "qualityRequiresPositiveMedianWindowConservativeNetR":true,
+                "frontierMaximumFraction":0.2,
+                "worstWindowConservativeNetRIsHardGate":false,
+                "drawdownIsHardGate":false,
+                "objectiveDimensions":["worstWindowConservativeNetR","drawdown","costDrag","novelty"],
+            });
+            add_self_hash(&mut value, "policySha256").unwrap();
+            value
+        };
+        let mut rotating = json!({
+            "schemaVersion":ROTATING_SCHEMA,
+            "panels":[
+                {"panelId":"panel-1","windowIds":["w1"],"windows":[{"windowId":"w1"}],"totalMonths":3},
+                {"panelId":"panel-2","windowIds":["w2"],"windows":[{"windowId":"w2"}],"totalMonths":3}
+            ],
+            "absoluteGenerationMapping":{"cycleLength":2},
+            "robustSelection":{"breederWidth":1,"policy":policy},
+        });
+        add_self_hash(&mut rotating, "rotatingEvidenceSha256").unwrap();
+        // Test helpers deliberately bind the synthetic curriculum to the
+        // fixed hash used by their evidence bundles.
+        rotating["rotatingEvidenceSha256"] = json!(HASH_A);
+        let candidate = json!({
+            "candidateId":"candidate-1","candidateIdentitySha256":HASH_A,
+            "programSha256":HASH_B,"profileSnapshotSha256":HASH_C,
+            "cellId":"cell-1","currentPanelRank":1.0,"novelty":0.0,
+        });
+        let mut cohort = json!({
+            "schemaVersion":COHORT_SCHEMA,"rotatingEvidenceSha256":HASH_A,
+            "generationIndex":2,"panelId":"panel-2","candidates":[{"candidateId":"candidate-1","candidateIdentitySha256":HASH_A,"cohortRole":"new_proposal"}],
+            "newProposalCandidateIds":["candidate-1"],"retainedParentEvaluationCandidateIds":[],"parentReevaluationIsProposal":false,
+        });
+        add_self_hash(&mut cohort, "cohortSha256").unwrap();
+        let mut provisional = json!({
+            "schemaVersion":PROVISIONAL_SCHEMA,"generationIndex":2,"panelId":"panel-2",
+            "cohortSha256":sha(&cohort,"cohortSha256").unwrap(),"candidateCount":1,"candidates":[candidate],
+        });
+        add_self_hash(&mut provisional, "provisionalSha256").unwrap();
+        Source {
+            value: json!({"rotatingEvidence":rotating}),
+            generation_index: 2,
+            rotating_sha: HASH_A.into(),
+            current_panel_id: "panel-2".into(),
+            required_panel_ids: vec!["panel-1".into(), "panel-2".into()],
+            breeder_width: 1,
+            cohort,
+            provisional,
+            baseline_bundles: baseline,
+            complete_bundle_snapshot: false,
+            receipts,
+            prior_cumulative: None,
+            previous_parent: Value::Null,
+            archive_policy: Value::Null,
+            rich_members: Vec::new(),
+            current_member_count: 1,
+            cell_capacity: 1,
+            campaigns: Vec::new(),
+            artifact_ledger_base: json!({"schemaVersion":"temporal_qd_supervisor_generation_artifacts_v1"}),
+            publication_paths: json!({
+                "archive":"archive.json",
+                "generationFunnel":"generation-funnel.json",
+                "rotatingEvidenceLedger":"generation-ledger.json",
+                "rotatingEvidenceCheckpoint":"checkpoint.json",
+                "cumulativeBreederArchive":"cumulative-archive.json",
+            }),
+            funnel_source: Value::Null,
+            generation_record_base: json!({}),
+            state_transition_base: json!({}),
+            expected_plan: None,
+            source_sha256: HASH_A.into(),
+        }
+    }
+    #[test]
+    fn dominance_is_strict_and_multidimensional() {
+        assert!(dominates_vec([2.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]));
+        assert!(!dominates_vec([2.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]));
+        assert!(!dominates_vec([1.0; 4], [1.0; 4]));
+    }
+    #[test]
+    fn median_matches_even_and_odd_oracle() {
+        assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+    }
+
+    #[test]
+    fn compact_restart_needs_no_source_and_tamper_fails_closed() {
+        let root = tempdir().unwrap();
+        let source_sha = HASH_A;
+        let mut manifest = json!({
+            "schemaVersion":MANIFEST_SCHEMA,"contractVersion":CONTRACT_VERSION,
+            "operation":OPERATION,"sourcePath":root.path().join("absent-source.json").to_string_lossy(),
+            "sourceSha256":source_sha,"resultPath":COMMIT_PATH,
+        });
+        add_self_hash(&mut manifest, "manifestSha256").unwrap();
+        let manifest_path = root.path().join("manifest.json");
+        fs::write(&manifest_path, canonical_json_line(&manifest).unwrap()).unwrap();
+        let mut commit = json!({
+            "schemaVersion":COMMIT_SCHEMA,"contractVersion":CONTRACT_VERSION,
+            "sourceSha256":source_sha,"manifestSha256":sha(&manifest,"manifestSha256").unwrap(),
+            "generationIndex":1,"auxiliaryPlanSha256":HASH_B,
+        });
+        for (descriptor_name, output_path) in [
+            ("cumulativeArchive", CUMULATIVE_PATH),
+            ("parentArchive", ARCHIVE_PATH),
+            ("generationFunnel", FUNNEL_PATH),
+            ("generationFunnelSnapshot", FUNNEL_SNAPSHOT_PATH),
+            ("checkpoint", CHECKPOINT_PATH),
+            ("ledger", LEDGER_PATH),
+            ("generationRecord", RECORD_PATH),
+            ("statePatch", STATE_PATCH_PATH),
+        ] {
+            let bytes = b"{}\n";
+            fs::write(root.path().join(output_path), bytes).unwrap();
+            commit[descriptor_name] = json!({
+                "path":output_path,"bytes":bytes.len(),"fileSha256":sha256_bytes(bytes)
+            });
+        }
+        add_self_hash(&mut commit, "commitSha256").unwrap();
+        let commit_path = root.path().join(COMMIT_PATH);
+        fs::write(&commit_path, canonical_json_line(&commit).unwrap()).unwrap();
+        let result = execute_manifest(&manifest_path).unwrap();
+        assert_eq!(
+            result["restartValidation"],
+            "compact_commit_and_output_hashes"
+        );
+        assert_eq!(result["restart"], true);
+        fs::remove_file(root.path().join(ARCHIVE_PATH)).unwrap();
+        assert!(execute_manifest(&manifest_path).is_err());
+        fs::write(root.path().join(ARCHIVE_PATH), b"{}\n").unwrap();
+        commit["generationIndex"] = json!(2);
+        fs::write(&commit_path, canonical_json_line(&commit).unwrap()).unwrap();
+        assert!(execute_manifest(&manifest_path).is_err());
+    }
+
+    #[test]
+    fn synthetic_multi_panel_receipt_is_exact_and_tamper_evident() {
+        let root = tempdir().unwrap();
+        let candidate = json!({
+            "candidateId":"candidate-1","candidateIdentitySha256":HASH_A,
+            "programSha256":HASH_B,"profileSnapshotSha256":HASH_C,
+        });
+        let panel_1 = synthetic_bundle(&candidate, "panel-1", "w1");
+        let panel_2 = synthetic_bundle(&candidate, "panel-2", "w2");
+        let source = synthetic_source(vec![panel_2.clone()], Vec::new());
+        let plan = build_auxiliary_plan(&source).unwrap();
+        assert_eq!(unsigned(&plan, "obligationCount").unwrap(), 1);
+        assert_eq!(plan["obligations"][0]["panelId"], "panel-1");
+        assert!(admit_receipts(&source, &plan).is_err());
+
+        let members_bytes = b"{}\n";
+        let members_path = root.path().join("evaluated-members.jsonl");
+        fs::write(&members_path, members_bytes).unwrap();
+        let evaluated = json!({
+            "membersFile":{
+                "path":"evaluated-members.jsonl",
+                "rawSha256":sha256_bytes(members_bytes),
+                "sizeBytes":members_bytes.len(),
+                "recordCount":1
+            }
+        });
+        let provisional = json!({"candidateCount":1,"candidates":[{"candidateId":"candidate-1"}]});
+        let mut seal = json!({"schemaVersion":CAMPAIGN_SEAL_SCHEMA});
+        add_self_hash(&mut seal, "campaignSealSha256").unwrap();
+        let seal_path = root.path().join("campaign-seal-result.json");
+        let seal_bytes = canonical_json_line(&seal).unwrap();
+        fs::write(&seal_path, &seal_bytes).unwrap();
+        let mut reduction = json!({
+            "schemaVersion":TAIL_REDUCTION_SCHEMA,
+            "evaluatedMembers":evaluated,
+            "provisional":provisional,
+        });
+        add_self_hash(&mut reduction, "resultSha256").unwrap();
+        let reduction_path = root.path().join("tail-reduction-result.json");
+        fs::write(&reduction_path, canonical_json_line(&reduction).unwrap()).unwrap();
+        let mut transaction = json!({
+            "schemaVersion":TAIL_TRANSACTION_SCHEMA,
+            "campaignSealSha256":sha(&seal,"campaignSealSha256").unwrap(),
+            "tailReductionResultSha256":sha(&reduction,"resultSha256").unwrap(),
+            "evaluatedMembers":evaluated,
+            "provisional":provisional,
+        });
+        add_self_hash(&mut transaction, "transactionSha256").unwrap();
+        let transaction_path = root.path().join("generation-tail-transaction-result.json");
+        let transaction_bytes = canonical_json_line(&transaction).unwrap();
+        fs::write(&transaction_path, &transaction_bytes).unwrap();
+        let campaign_binding = json!({"role":"cumulative_backfill"});
+        let mut bundle_artifact = json!({
+            "schemaVersion":AUXILIARY_BUNDLE_ARTIFACT_SCHEMA,
+            "panelId":"panel-1","candidateIds":["candidate-1"],
+            "campaignBinding":campaign_binding,
+            "campaignSealSha256":sha(&seal,"campaignSealSha256").unwrap(),
+            "tailTransactionSha256":sha(&transaction,"transactionSha256").unwrap(),
+            "tailReductionResultSha256":sha(&reduction,"resultSha256").unwrap(),
+            "evaluatedMembersSha256":canonical_sha256(&evaluated).unwrap(),
+            "candidatePanelBundles":[panel_1.clone()],
+        });
+        add_self_hash(&mut bundle_artifact, "bundleArtifactSha256").unwrap();
+        let bundle_path = root.path().join("auxiliary-panel-bundles.json");
+        let bundle_bytes = canonical_json_line(&bundle_artifact).unwrap();
+        fs::write(&bundle_path, &bundle_bytes).unwrap();
+        let mut receipt = json!({
+            "schemaVersion":RECEIPT_SCHEMA,"role":"cumulative_backfill",
+            "panelId":"panel-1","candidateIds":["candidate-1"],
+            "campaignBinding":campaign_binding,
+            "campaignSeal":{"path":seal_path.to_string_lossy(),"sha256":sha(&seal,"campaignSealSha256").unwrap()},
+            "tailTransaction":{"path":transaction_path.to_string_lossy(),"sha256":sha(&transaction,"transactionSha256").unwrap()},
+            "bundleArtifact":{"path":bundle_path.to_string_lossy(),"sha256":sha(&bundle_artifact,"bundleArtifactSha256").unwrap()},
+        });
+        add_self_hash(&mut receipt, "receiptSha256").unwrap();
+        let complete = synthetic_source(vec![panel_2.clone()], vec![receipt.clone()]);
+        let admitted = admit_receipts(&complete, &plan).unwrap();
+        assert_eq!(admitted["candidate-1"].len(), 2);
+        assert_eq!(admitted["candidate-1"][0]["panelId"], "panel-1");
+        assert_eq!(admitted["candidate-1"][1]["panelId"], "panel-2");
+
+        fs::write(&bundle_path, b"{}\n").unwrap();
+        assert!(admit_receipts(&complete, &plan).is_err());
+        fs::write(&bundle_path, &bundle_bytes).unwrap();
+        fs::write(&members_path, b"tampered\n").unwrap();
+        assert!(admit_receipts(&complete, &plan).is_err());
+        fs::write(&members_path, members_bytes).unwrap();
+        fs::write(&seal_path, b"{}\n").unwrap();
+        assert!(admit_receipts(&complete, &plan).is_err());
+    }
+
+    #[test]
+    fn bundle_identity_and_program_must_match_provisional_survivor() {
+        let candidate = json!({
+            "candidateId":"candidate-1","candidateIdentitySha256":HASH_A,
+            "programSha256":HASH_B,"profileSnapshotSha256":HASH_C,
+        });
+        let source = synthetic_source(Vec::new(), Vec::new());
+
+        let mut identity_tamper = synthetic_bundle(&candidate, "panel-1", "w1");
+        identity_tamper["candidateIdentitySha256"] = json!(HASH_C);
+        identity_tamper
+            .as_object_mut()
+            .unwrap()
+            .remove("bundleSha256");
+        add_self_hash(&mut identity_tamper, "bundleSha256").unwrap();
+        assert!(validate_bundle(&source, &identity_tamper).is_err());
+
+        let mut program_tamper = synthetic_bundle(&candidate, "panel-1", "w1");
+        program_tamper["programSha256"] = json!(HASH_C);
+        program_tamper
+            .as_object_mut()
+            .unwrap()
+            .remove("bundleSha256");
+        add_self_hash(&mut program_tamper, "bundleSha256").unwrap();
+        assert!(validate_bundle(&source, &program_tamper).is_err());
+    }
+
+    #[test]
+    fn funnel_stage_chain_rejects_post_terminal_padding() {
+        let candidate = json!({
+            "terminalDisposition":"static_reachability_rejected",
+            "stages":{
+                "proposed":{"outcome":"proposed","reasons":[]},
+                "staticallyReachable":{"outcome":"rejected","reasons":["no_path"]},
+                "nativeValid":{"outcome":"valid","reasons":[]}
+            }
+        });
+        assert!(validate_stage_chain(&candidate["stages"], &candidate).is_err());
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "temporal-qd-campaign-seal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+flate2.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-tail-reducer = { path = "../qd-tail-reducer" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

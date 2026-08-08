@@ -5,6 +5,9 @@ members = [
     "crates/qd-dashboard-jsonl",
     "crates/qd-runtime",
     "crates/qd-batch",
+    "crates/qd-tail-reducer",
+    "crates/qd-campaign-seal",
+    "crates/qd-generation-finalizer",
 ]
 resolver = "3"
 
@@ -17,6 +20,11 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
+# The Python oracle uses zlib's deflate implementation. The system-zlib
+# backend preserves byte-exact deterministic gzip projections; miniz_oxide is
+# semantically equivalent but chooses different deflate blocks.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 ryu = "1"
