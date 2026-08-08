@@ -133,19 +133,31 @@ def _parse_positive_float(value: Any) -> float | None:
     return parsed
 
 
-def _is_lake_service_unavailable(error: str) -> bool:
+def _is_lake_window_request(error: str) -> bool:
     normalized = str(error or "").strip().lower()
-    service_unavailable = (
-        "503 server error" in normalized
-        or "503 service unavailable" in normalized
-        or "service unavailable" in normalized
-    )
-    lake_request = (
+    return (
         "window-attestations" in normalized
         or "fuzzfoliodatalake" in normalized
         or "market data lake" in normalized
     )
-    return service_unavailable and lake_request
+
+
+def _is_lake_service_unavailable(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    return _is_lake_window_request(normalized) and (
+        "503 server error" in normalized
+        or "503 service unavailable" in normalized
+        or "service unavailable" in normalized
+    )
+
+
+def _is_lake_mutation_conflict(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    return _is_lake_window_request(normalized) and (
+        "409 client error" in normalized
+        or "409 conflict" in normalized
+        or "409 server error" in normalized
+    )
 
 
 def _is_expected_websocket_disconnect_exception(exc: Exception) -> bool:
@@ -174,7 +186,10 @@ def _retry_delay_for_failure(
         return explicit
 
     normalized = str(error or "").strip().lower()
-    if "remote market data lake is mutating" in normalized:
+    if (
+        "remote market data lake is mutating" in normalized
+        or _is_lake_mutation_conflict(normalized)
+    ):
         return max(float(config.lake_mutation_retry_after_seconds), 0.0)
     if _is_lake_service_unavailable(normalized):
         # Older frozen workers can lose the lake's Retry-After header when
@@ -191,6 +206,7 @@ def _failure_preserves_attempt_budget(error: str) -> bool:
     return (
         "remote market data lake is mutating" in normalized
         or "retry after the mutation completes" in normalized
+        or _is_lake_mutation_conflict(normalized)
         or _is_lake_service_unavailable(normalized)
         or ("read timed out" in normalized and ("192.168.1.2" in normalized or "market data lake" in normalized))
     )

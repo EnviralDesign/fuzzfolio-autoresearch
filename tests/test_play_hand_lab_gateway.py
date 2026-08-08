@@ -433,6 +433,42 @@ def test_lab_gateway_lake_503_without_retry_header_preserves_attempt_budget() ->
     assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
 
 
+def test_lab_gateway_lake_409_without_retry_header_uses_mutation_cadence() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(lake_mutation_retry_after_seconds=900.0)
+    )
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=1,
+        )
+    )
+    gateway.register_worker("worker-1")
+
+    claim = gateway.claim("worker-1")
+    failed = gateway.fail(
+        "worker-1",
+        claim["lease_id"],
+        error=(
+            "HTTPError: 409 Client Error: Conflict for url: "
+            "https://fuzzfoliodatalake.example/api/lake/window-attestations/verify"
+        ),
+        retryable=True,
+        retry_after_seconds=None,
+    )
+
+    snapshot = gateway.snapshot()
+    assert failed["status"] == "requeued"
+    assert failed["retry_after_seconds"] == 900.0
+    assert failed["attempt_budget_preserved"] is True
+    assert snapshot["failed_tasks"] == 0
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["metrics"]["failures_final"] == 0
+    assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
+
+
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
     gateway = PlayHandLabGateway()
     server = build_lab_gateway_http_server(
