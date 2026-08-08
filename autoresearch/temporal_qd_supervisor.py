@@ -6582,6 +6582,10 @@ def run_qd_supervisor(
                 resume=True,
                 enqueue_batch_size=int(config["evaluation"]["enqueueBatchSize"]),
                 progress_callback=progress,
+                include_selection_summary=(
+                    generation_finalization_engine
+                    != GENERATION_FINALIZATION_ENGINE_RUST
+                ),
             )
             if evaluation_result["completedTaskCount"] != campaign_result["taskCount"]:
                 raise TemporalDiscoveryContractError(

@@ -1796,6 +1796,7 @@ def run_temporal_search_tasks(
     resume: bool = False,
     enqueue_batch_size: int = 128,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    include_selection_summary: bool = True,
 ) -> dict[str, Any]:
     """Execute an already finite plan; intentionally no search expansion occurs."""
     manifest = materialize_plan(authority, output_root)
@@ -1967,11 +1968,18 @@ def run_temporal_search_tasks(
                 for item in pending
                 if item["task_id"] != str(completion.get("task_id") or "")
             ]
-    # Basic selection is intentionally transparent and optional: rank finite numeric score only.
     rows = []
+    # Basic selection is intentionally transparent and optional: rank finite
+    # numeric score only.  Temporal QD delegates result reduction and full
+    # result validation to its native campaign seal, so it explicitly skips
+    # this otherwise redundant serial reopen of every compressed result.
     for task_id, item in completed.items():
         if not isinstance(item, Mapping):
-            raise TemporalSearchContractError("checkpoint completion must be an object")
+            raise TemporalSearchContractError(
+                "checkpoint completion must be an object"
+            )
+        if not include_selection_summary:
+            continue
         result = _read_checkpoint_result(item)
         score = result.get("selection_score")
         if isinstance(score, (int, float)) and not isinstance(score, bool):
@@ -1982,9 +1990,10 @@ def run_temporal_search_tasks(
                     "selectionScore": float(score),
                 }
             )
-    rows.sort(
-        key=lambda row: (-row["selectionScore"], row["candidateId"], row["taskId"])
-    )
+    if include_selection_summary:
+        rows.sort(
+            key=lambda row: (-row["selectionScore"], row["candidateId"], row["taskId"])
+        )
     summary = {
         "schemaVersion": "temporal_graph_candidate_window_run_result_v1",
         "authorityId": manifest["authorityId"],

@@ -741,6 +741,34 @@ def test_controller_materializes_both_cost_results_from_one_stream(
     assert len(gateway.enqueued) == 1
 
 
+def test_controller_can_defer_selection_reduction_without_reopening_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+    gateway = _Gateway(task)
+
+    def reject_result_reopen(_record):
+        raise AssertionError("selection-disabled completion reopened a result")
+
+    monkeypatch.setattr(
+        "autoresearch.temporal_search._read_checkpoint_result",
+        reject_result_reopen,
+    )
+    result = run_temporal_search_tasks(
+        gateway,
+        authority,
+        output_root=tmp_path,
+        timeout_seconds=1,
+        include_selection_summary=False,
+    )
+
+    assert result["completedTaskCount"] == 1
+    assert result["selection"] == []
+    assert gateway.acks == ["lease-1"]
+
+
 def test_resume_rejects_checkpoint_without_result_path(tmp_path: Path) -> None:
     authority = build_authority(_preparation())
     task = build_task_matrix(authority)[0]
