@@ -154,20 +154,23 @@ def test_play_hand_lab_default_retention_writes_canonical_artifacts_only(
     assert (artifact_dir / "task-result-receipt.json").is_file()
     assert len(lab.load_attempts(lane_ctx.attempts_path)) == 1
 
-    with pytest.raises(lab.DurableExecutionError, match="identity conflicts"):
-        lab._record_lab_result(
-            config=_config(runs_root),
-            cli=SimpleNamespace(),
-            lane_ctx=lane_ctx,
-            lane=lane,
-            runtime=runtime,
-            lab_result={
-                "task_id": "task-1",
-                "status": "success",
-                "result": {"status": "success", "different": True},
-            },
-            reward_matrix=None,
-        )
+    # A redelivery cannot replace a fully sealed first result.  The recovery
+    # layer reads the ledger-backed receipt as the immutable authority rather
+    # than treating the later transport payload as a new result.
+    conflicting = lab._record_lab_result(
+        config=_config(runs_root),
+        cli=SimpleNamespace(),
+        lane_ctx=lane_ctx,
+        lane=lane,
+        runtime=runtime,
+        lab_result={
+            "task_id": "task-1",
+            "status": "success",
+            "result": {"status": "success", "different": True},
+        },
+        reward_matrix=None,
+    )
+    assert conflicting == result
     with pytest.raises(lab.DurableExecutionError, match="ledger failure identity conflicts"):
         lab._record_lab_failure(
             config=_config(runs_root),

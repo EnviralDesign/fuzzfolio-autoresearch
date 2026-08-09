@@ -56,6 +56,56 @@ def _identity(payload: Mapping[str, Any], field: str, *, name: str) -> str:
     return supplied
 
 
+def _sha(value: Any, *, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise TemporalDiscoveryContractError(f"{name} must be a canonical sha256 digest")
+    return value
+
+
+def _canonical_evidence_identity(
+    candidate: Mapping[str, Any], evidence_context: Mapping[str, Any]
+) -> str:
+    """Local verifier for the v3 sidecar identity, avoiding an evolution import cycle.
+
+    The source-profile digest is the raw/authored profile identity; the profile
+    snapshot digest is the normalized validator/evaluator snapshot.  The two
+    are deliberately independent inputs to the evidence identity.
+    """
+    context = _clone(evidence_context, name="QD predeclared evidence context")
+    supplied = _sha(
+        context.pop("predeclaredEvidenceContextSha256", None),
+        name="QD predeclared evidence context identity",
+    )
+    if canonical_sha256(context) != supplied:
+        raise TemporalDiscoveryContractError("QD predeclared evidence context diverged")
+    profile = candidate.get("sourceProfile")
+    if not isinstance(profile, Mapping):
+        raise TemporalDiscoveryContractError("QD evidence source profile must be an object")
+    source_sha = _sha(
+        candidate.get("sourceProfileSha256"), name="QD evidence raw/authored source profile"
+    )
+    if canonical_sha256(profile) != source_sha:
+        raise TemporalDiscoveryContractError("QD evidence raw/authored source profile mismatch")
+    return canonical_sha256({
+        "schemaVersion": "temporal_qd_canonical_evidence_identity_v3",
+        "programSha256": _sha(candidate.get("programSha256"), name="QD evidence program"),
+        "sourceProfileSha256": source_sha,
+        "profileSnapshotSha256": _sha(
+            candidate.get("profileSnapshotSha256") or source_sha,
+            name="QD evidence normalized profile snapshot",
+        ),
+        "orderedWindowPlanSemantic": context.get("orderedWindowPlanSemantic"),
+        "costViews": context.get("costViews"),
+        "workerContractSha256": context.get("workerContractSha256"),
+        "executionConfigSha256": canonical_sha256(profile.get("executionConfig") or {}),
+    })
+
+
 def load_evaluation_population(
     *,
     population_path: Path | str,
@@ -96,6 +146,35 @@ def load_evaluation_population(
     pair_policy = payload.get("bidirectionalPairPolicy")
     if not isinstance(pair_policy, Mapping) or payload.get("pairPolicySha256") != canonical_sha256(pair_policy):
         raise TemporalDiscoveryContractError("QD evaluation population pair policy identity mismatch")
+    archive_policy_authority = payload.get("archivePolicyAuthority")
+    if archive_policy_authority is not None:
+        if not isinstance(archive_policy_authority, Mapping) or set(archive_policy_authority) != {
+            "qdVersion", "policyName", "policySha256", "frozenPolicy"
+        }:
+            raise TemporalDiscoveryContractError(
+                "QD evaluation population archive policy authority is invalid"
+            )
+        if (
+            archive_policy_authority.get("policyName") != payload.get("policyName")
+            or archive_policy_authority.get("policySha256") != payload.get("policySha256")
+            or canonical_sha256(archive_policy_authority["frozenPolicy"])
+            != archive_policy_authority.get("policySha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD evaluation population archive policy authority binding mismatch"
+            )
+    declared_context = payload.get("predeclaredEvidenceContext")
+    declared_context_sha = payload.get("predeclaredEvidenceContextSha256")
+    if declared_context is not None:
+        if not isinstance(declared_context, Mapping):
+            raise TemporalDiscoveryContractError("QD evaluation population predeclared evidence context is invalid")
+        if _sha(declared_context_sha, name="QD evaluation population predeclared evidence context") != declared_context.get("predeclaredEvidenceContextSha256"):
+            raise TemporalDiscoveryContractError("QD evaluation population predeclared evidence context binding mismatch")
+        # This payload field is additive for v1 sidecars.  Old sidecars carry
+        # only the frozen hash and remain readable for audit; any sidecar that
+        # carries the context must prove each candidate against it.
+    elif declared_context_sha is not None:
+        _sha(declared_context_sha, name="QD evaluation population predeclared evidence context")
     seen: set[str] = set()
     for candidate in candidates:
         if not isinstance(candidate, Mapping):
@@ -119,11 +198,12 @@ def load_evaluation_population(
         seen.add(candidate_id)
         if canonical_sha256(profile) != candidate.get("sourceProfileSha256"):
             raise TemporalDiscoveryContractError("QD evaluation population profile identity mismatch")
-        evidence_required = payload.get("predeclaredEvidenceContextSha256") is not None
+        evidence_required = declared_context_sha is not None
         for field in (
             "candidateIdentitySha256",
             "programSha256",
             "sourceProfileSha256",
+            "profileSnapshotSha256",
             "proposalEntrySha256",
         ):
             value = candidate.get(field)
@@ -137,6 +217,10 @@ def load_evaluation_population(
         ):
             raise TemporalDiscoveryContractError(
                 "QD evaluation population candidate canonical evidence identity is invalid"
+            )
+        if declared_context is not None and evidence != _canonical_evidence_identity(candidate, declared_context):
+            raise TemporalDiscoveryContractError(
+                "QD evaluation population candidate canonical evidence identity mismatch"
             )
     funnel_entries = payload.get("funnelEntries")
     if (
@@ -221,6 +305,12 @@ def load_evaluation_population(
         ):
             raise TemporalDiscoveryContractError(
                 "QD evaluation population journal identity binding mismatch"
+            )
+        if payload.get("archivePolicyAuthority") != journal.get(
+            "archivePolicyAuthority"
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD evaluation population journal archive policy authority mismatch"
             )
         entries = journal.get("entrySha256s")
         if not isinstance(entries, list):

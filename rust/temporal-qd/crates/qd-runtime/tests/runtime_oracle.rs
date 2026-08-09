@@ -12,13 +12,13 @@ use temporal_qd_runtime::{DashboardPort, RuntimeManifest, RuntimePairAuthority};
 
 const FIXTURE_ROOT: &str = "../../../../tests/fixtures/temporal_qd_runtime_oracle";
 const ORACLE_FIXTURE_FILE_SHA256: &str =
-    "b0586f3276afc1c4b487a08dd261428bb697bc4cade5ae83719aeb71e883e1c1";
+    "30089a3c445fbcf731ec78b46e763304276b1ab94b9131358755bec3a2bcf1fb";
 const ORACLE_MANIFEST_FILE_SHA256: &str =
-    "9de7a10e9bd223559bbbd21f93258566db218652cec3c2d5161f034158d6ccb9";
+    "3d8ac2b15886c2cb99db1cf9672f5949ff9f23d2058169e0e1e889169072e0fd";
 const ORACLE_TRANSCRIPT_FILE_SHA256: &str =
-    "481bf02f0989e0dad7ccfc334b7dc95d9f36f77936f240454fb6e332e95c89f3";
+    "0aa60feceb6154fa6eb0e31082f91ea4a3f3538425f55c9efcf447e82a521ac8";
 const ORACLE_GENERATOR_SOURCE_SHA256: &str =
-    "sha256:b4347b0ce3fbea1c03b806943f43c095ee99d4791ddd285b4e038b824fcbf29c";
+    "sha256:acba6296a83136c88889a65e24b3bd60d1dc49cd57bd68b63b48d7e911360082";
 
 fn fixture_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT)
@@ -469,7 +469,7 @@ fn runtime_replays_real_python_oracle_transcript_in_exact_order() {
     let crossover = authority
         .execute(
             &ProposalIntent::SameSideCrossover {
-                proposal_seed: "runtime-oracle-crossover-materialized-v1".into(),
+                proposal_seed: "runtime-oracle-crossover-materialized:1".into(),
                 side: Side::Long,
                 parent: parent(&depth2, "depth2"),
                 mate: parent(&depth3, "depth3"),

@@ -99,6 +99,32 @@ struct CandidateReduction {
     member_encode_nanos: u128,
 }
 
+/// Accumulator for the immutable, Python-authored realized-behavior window
+/// projection.  The reducer never reinterprets a replay: it validates and
+/// combines the attested per-window projection exactly as the Python oracle
+/// does, so direction-aware downstream consumers receive one coherent
+/// aggregate from the native finalizer.
+#[derive(Default)]
+struct RealizedBehaviorSide {
+    closed_trades: i64,
+    wins: i64,
+    losses: i64,
+    flat_trades: i64,
+    gross_r: f64,
+    net_r: f64,
+    cost_r: f64,
+    holding_bars: i64,
+    holding_hours: f64,
+    active_window_count: i64,
+    close_reason_counts: BTreeMap<String, i64>,
+    action_counts: BTreeMap<String, i64>,
+    transition_counts: BTreeMap<String, i64>,
+    terminal_status_counts: BTreeMap<String, i64>,
+    terminal_direction_count: i64,
+    conflict_abstentions: i64,
+    trade_sequence: Vec<Value>,
+}
+
 struct StageProfile {
     enabled: bool,
     started: Instant,
@@ -1278,6 +1304,18 @@ fn aggregate_candidate(candidate: &Value, windows: &[Value]) -> Result<Value> {
         "transitionDistribution": distribution(&transition_counts), "complexity": complexity,
         "terminalEvidence": terminal_evidence, "windowRecords": windows,
     });
+    let realized_behavior = aggregate_realized_behavior(windows)?;
+    aggregate
+        .as_object_mut()
+        .expect("aggregate is an object")
+        .insert(
+            "behaviorIdentitySha256".to_owned(),
+            realized_behavior["identitySha256"].clone(),
+        );
+    aggregate
+        .as_object_mut()
+        .expect("aggregate is an object")
+        .insert("realizedBehavior".to_owned(), realized_behavior);
     let fingerprint_keys = [
         "entryFrequencyPerThousand",
         "averageExposureRatio",
@@ -1305,6 +1343,313 @@ fn aggregate_candidate(candidate: &Value, windows: &[Value]) -> Result<Value> {
         Value::String(canonical_sha256(&Value::Object(fingerprint))?),
     );
     Ok(aggregate)
+}
+
+fn aggregate_realized_behavior(windows: &[Value]) -> Result<Value> {
+    ensure!(
+        !windows.is_empty(),
+        "realized behavior requires at least one window"
+    );
+    let mut sides = BTreeMap::from([
+        ("long", RealizedBehaviorSide::default()),
+        ("short", RealizedBehaviorSide::default()),
+    ]);
+    let mut total_observations = 0i64;
+    let mut terminal_status_counts = BTreeMap::new();
+    let mut terminal_direction_counts = BTreeMap::new();
+    let mut conflict_abstentions = 0i64;
+    let mut unattributed_conflict_abstentions = 0i64;
+    let mut unattributed_closed_trades = 0i64;
+    let mut window_signatures = Vec::with_capacity(windows.len());
+
+    for (index, window) in windows.iter().enumerate() {
+        let behavior = window
+            .get("realizedBehavior")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("window {index} has no valid realized behavior"))?;
+        ensure!(
+            behavior.get("schemaVersion").and_then(Value::as_str)
+                == Some("temporal_realized_behavior_v1"),
+            "window {index} has no valid realized behavior"
+        );
+        total_observations = total_observations
+            .checked_add(behavior_nonnegative_i64(
+                behavior,
+                "observations",
+                "behavior observations",
+            )?)
+            .ok_or_else(|| anyhow!("behavior observations overflow"))?;
+        // The Python oracle accepts an omitted/null terminal projection as
+        // the empty terminal summary ("unknown", no attributed direction).
+        // Preserve that legacy-readable behavior while still rejecting a
+        // supplied non-object terminal record.
+        let empty_terminal = Map::new();
+        let terminal = match behavior.get("terminal") {
+            None | Some(Value::Null) => &empty_terminal,
+            Some(value) => value
+                .as_object()
+                .ok_or_else(|| anyhow!("window {index} terminal behavior is invalid"))?,
+        };
+        increment_count(
+            &mut terminal_status_counts,
+            python_label(terminal.get("positionStatus")),
+            1,
+        )?;
+        if let Some(direction) = terminal.get("direction").filter(|value| !value.is_null()) {
+            let direction = direction
+                .as_str()
+                .filter(|value| matches!(*value, "long" | "short"))
+                .ok_or_else(|| anyhow!("window {index} terminal direction is invalid"))?;
+            increment_count(&mut terminal_direction_counts, direction.to_owned(), 1)?;
+        }
+        conflict_abstentions = conflict_abstentions
+            .checked_add(behavior_nonnegative_i64(
+                behavior,
+                "conflictAbstentions",
+                "behavior conflict abstentions",
+            )?)
+            .ok_or_else(|| anyhow!("behavior conflict abstentions overflow"))?;
+        unattributed_conflict_abstentions = unattributed_conflict_abstentions
+            .checked_add(behavior_nonnegative_i64(
+                behavior,
+                "unattributedConflictAbstentions",
+                "behavior unattributed conflict abstentions",
+            )?)
+            .ok_or_else(|| anyhow!("behavior unattributed conflict abstentions overflow"))?;
+        unattributed_closed_trades = unattributed_closed_trades
+            .checked_add(behavior_nonnegative_i64(
+                behavior,
+                "unattributedClosedTrades",
+                "behavior unattributed closed trades",
+            )?)
+            .ok_or_else(|| anyhow!("behavior unattributed closed trades overflow"))?;
+
+        let source_sides = behavior
+            .get("sides")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("window {index} realized behavior sides are invalid"))?;
+        let mut signature_sides = Map::new();
+        for side_name in ["long", "short"] {
+            let source = source_sides
+                .get(side_name)
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    anyhow!("window {index} realized behavior {side_name} side is invalid")
+                })?;
+            let target = sides.get_mut(side_name).expect("fixed sides");
+            for (field_name, target_value) in [
+                ("closedTrades", &mut target.closed_trades),
+                ("wins", &mut target.wins),
+                ("losses", &mut target.losses),
+                ("flatTrades", &mut target.flat_trades),
+                ("holdingBars", &mut target.holding_bars),
+                (
+                    "terminalDirectionCount",
+                    &mut target.terminal_direction_count,
+                ),
+                ("conflictAbstentions", &mut target.conflict_abstentions),
+            ] {
+                *target_value = target_value
+                    .checked_add(behavior_nonnegative_i64(
+                        source,
+                        field_name,
+                        &format!("behavior {side_name} {field_name}"),
+                    )?)
+                    .ok_or_else(|| anyhow!("behavior {side_name} {field_name} overflow"))?;
+            }
+            for (field_name, target_value) in [
+                ("grossR", &mut target.gross_r),
+                ("netR", &mut target.net_r),
+                ("costR", &mut target.cost_r),
+                ("holdingHours", &mut target.holding_hours),
+            ] {
+                *target_value += behavior_finite(
+                    source,
+                    field_name,
+                    &format!("behavior {side_name} {field_name}"),
+                )?;
+            }
+            if source.get("active") == Some(&Value::Bool(true)) {
+                target.active_window_count += 1;
+            }
+            for (field_name, target_counts) in [
+                ("closeReasonCounts", &mut target.close_reason_counts),
+                ("actionCounts", &mut target.action_counts),
+                ("transitionCounts", &mut target.transition_counts),
+                ("terminalStatusCounts", &mut target.terminal_status_counts),
+            ] {
+                merge_behavior_counts(source, field_name, target_counts, side_name)?;
+            }
+            let sequence = match source.get("tradeSequence") {
+                None | Some(Value::Null) => &[][..],
+                Some(value) => value.as_array().map(Vec::as_slice).ok_or_else(|| {
+                    anyhow!("behavior {side_name} tradeSequence must be an array")
+                })?,
+            };
+            for item in sequence {
+                let mut item = item.as_object().cloned().ok_or_else(|| {
+                    anyhow!("behavior {side_name} tradeSequence rows must be objects")
+                })?;
+                item.insert("windowOrdinal".to_owned(), json!(index));
+                target.trade_sequence.push(Value::Object(item));
+            }
+            signature_sides.insert(
+                side_name.to_owned(),
+                json!({
+                    "active": source.get("active") == Some(&Value::Bool(true)),
+                    "tradeSequence": source.get("tradeSequence").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!([])),
+                    "actionDistribution": source.get("actionDistribution").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!({})),
+                    "transitionDistribution": source.get("transitionDistribution").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!({})),
+                    "closeReasonDistribution": source.get("closeReasonDistribution").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!({})),
+                    "terminalStatusCounts": source.get("terminalStatusCounts").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!({})),
+                    "conflictAbstentions": source.get("conflictAbstentions").cloned().unwrap_or_else(|| json!(0)),
+                }),
+            );
+        }
+        window_signatures.push(json!({"windowOrdinal": index, "sides": signature_sides}));
+    }
+
+    let mut aggregate_sides = Map::new();
+    let mut identity_sides = Map::new();
+    for side_name in ["long", "short"] {
+        let side = sides.get(side_name).expect("fixed sides");
+        ensure!(
+            (side.gross_r - side.net_r - side.cost_r).abs() <= 1e-9,
+            "realized behavior {side_name} cost R does not reconcile"
+        );
+        let active = side.closed_trades != 0 || side.terminal_direction_count != 0;
+        let exposure = if total_observations == 0 {
+            0.0
+        } else {
+            side.holding_bars as f64 / total_observations as f64
+        };
+        let average_hold = if side.closed_trades == 0 {
+            0.0
+        } else {
+            side.holding_bars as f64 / side.closed_trades as f64
+        };
+        let row = json!({
+            "closedTrades": side.closed_trades, "wins": side.wins, "losses": side.losses,
+            "flatTrades": side.flat_trades, "grossR": side.gross_r, "netR": side.net_r,
+            "costR": side.cost_r, "holdingBars": side.holding_bars, "holdingHours": side.holding_hours,
+            "activeWindowCount": side.active_window_count, "closeReasonCounts": side.close_reason_counts,
+            "actionCounts": side.action_counts, "transitionCounts": side.transition_counts,
+            "terminalStatusCounts": side.terminal_status_counts,
+            "terminalDirectionCount": side.terminal_direction_count, "conflictAbstentions": side.conflict_abstentions,
+            "tradeSequence": side.trade_sequence, "active": active,
+            "activeWindowFraction": side.active_window_count as f64 / windows.len() as f64,
+            "exposureProxy": exposure, "averageHoldingBars": average_hold,
+            "closeReasonDistribution": distribution(&side.close_reason_counts),
+            "actionDistribution": distribution(&side.action_counts),
+            "transitionDistribution": distribution(&side.transition_counts),
+        });
+        aggregate_sides.insert(side_name.to_owned(), row.clone());
+        let fields = row.as_object().expect("row is object");
+        let identity_keys = [
+            "closedTrades",
+            "wins",
+            "losses",
+            "flatTrades",
+            "grossR",
+            "netR",
+            "costR",
+            "holdingBars",
+            "holdingHours",
+            "active",
+            "activeWindowCount",
+            "exposureProxy",
+            "terminalDirectionCount",
+            "conflictAbstentions",
+            "closeReasonDistribution",
+            "actionDistribution",
+            "transitionDistribution",
+            "terminalStatusCounts",
+        ];
+        identity_sides.insert(
+            side_name.to_owned(),
+            Value::Object(
+                identity_keys
+                    .into_iter()
+                    .map(|key| (key.to_owned(), fields[key].clone()))
+                    .collect(),
+            ),
+        );
+    }
+    let identity_material = json!({
+        "schemaVersion": "temporal_realized_behavior_identity_v1",
+        "totalObservations": total_observations,
+        "windowSignatures": window_signatures,
+        "terminalStatusCounts": terminal_status_counts,
+        "terminalDirectionCounts": terminal_direction_counts,
+        "conflictAbstentions": conflict_abstentions,
+        "unattributedConflictAbstentions": unattributed_conflict_abstentions,
+        "unattributedClosedTrades": unattributed_closed_trades,
+        "sides": identity_sides,
+    });
+    Ok(json!({
+        "schemaVersion": "temporal_realized_behavior_v1", "windowCount": windows.len(),
+        "totalObservations": total_observations, "terminalStatusCounts": terminal_status_counts,
+        "terminalDirectionCounts": terminal_direction_counts, "conflictAbstentions": conflict_abstentions,
+        "unattributedConflictAbstentions": unattributed_conflict_abstentions,
+        "unattributedClosedTrades": unattributed_closed_trades, "sides": aggregate_sides,
+        "identityMaterial": identity_material,
+        "identitySha256": canonical_sha256(&identity_material)?,
+    }))
+}
+
+fn behavior_nonnegative_i64(source: &Map<String, Value>, key: &str, label: &str) -> Result<i64> {
+    source
+        .get(key)
+        .unwrap_or(&Value::from(0))
+        .as_i64()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| anyhow!("{label} must be a nonnegative integer"))
+}
+
+fn behavior_finite(source: &Map<String, Value>, key: &str, label: &str) -> Result<f64> {
+    source
+        .get(key)
+        .unwrap_or(&Value::from(0.0))
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow!("{label} must be finite"))
+}
+
+fn python_label(value: Option<&Value>) -> String {
+    value
+        .filter(|value| python_truthy(value))
+        .map(value_to_python_str)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn increment_count(counts: &mut BTreeMap<String, i64>, key: String, increment: i64) -> Result<()> {
+    let entry = counts.entry(key).or_insert(0);
+    *entry = entry
+        .checked_add(increment)
+        .ok_or_else(|| anyhow!("behavior count overflow"))?;
+    Ok(())
+}
+
+fn merge_behavior_counts(
+    source: &Map<String, Value>,
+    key: &str,
+    target: &mut BTreeMap<String, i64>,
+    side_name: &str,
+) -> Result<()> {
+    let Some(value) = source.get(key).filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let values = value
+        .as_object()
+        .ok_or_else(|| anyhow!("behavior {side_name} {key} must be an object"))?;
+    for (name, count) in values {
+        let count = count
+            .as_i64()
+            .filter(|count| *count >= 0)
+            .ok_or_else(|| anyhow!("behavior {side_name} count must be a nonnegative integer"))?;
+        increment_count(target, name.clone(), count)?;
+    }
+    Ok(())
 }
 
 fn execution_binding(candidate: &Value, windows: &[Value]) -> Result<Value> {
@@ -1374,7 +1719,7 @@ fn behavior_descriptor(candidate: &Value, aggregate: &Value) -> Result<Value> {
     );
     let nodes = bucket(
         f64_at(&structure, "graphNodeCount")?,
-        &[9.0, 13.0, 19.0, f64::INFINITY],
+        &[40.0, 55.0, 70.0, f64::INFINITY],
         &["small", "medium", "large", "very_large"],
     );
     let frequency = if trades == 0 {
@@ -1422,16 +1767,7 @@ fn graph_structure(candidate: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let mut operators = BTreeSet::new();
-    for row in history {
-        if let Some(operator) = row
-            .get("operatorId")
-            .filter(|value| python_truthy(value))
-            .map(value_to_python_str)
-        {
-            operators.insert(operator);
-        }
-    }
+    let operators = history_operator_ids(history);
     let mut entry_events = BTreeSet::new();
     let mut management_count = 0usize;
     let mut guard_count = 0usize;
@@ -1450,9 +1786,12 @@ fn graph_structure(candidate: &Value) -> Result<Value> {
                 matches!(
                     action.get("kind").and_then(Value::as_str),
                     Some(
-                        "exit_next_open"
-                            | "move_stop_to_break_even_next_open"
-                            | "move_stop_next_open"
+                        "move_stop_to_break_even_next_open"
+                            | "tighten_stop_next_open"
+                            | "set_target_next_open"
+                            | "cancel_target_next_open"
+                            | "activate_trailing_stop_next_open"
+                            | "deactivate_trailing_stop_next_open"
                     )
                 )
             })
@@ -1486,7 +1825,7 @@ fn graph_structure(candidate: &Value) -> Result<Value> {
         .map_or(0, Vec::len);
     Ok(json!({
         "operatorFamilyIds": operators.into_iter().collect::<Vec<_>>(), "operatorFamilyCount": history_operator_count(history),
-        "mutationDepth": history.len(), "entryEventCount": entry_events.len(), "managementActionCount": management_count,
+        "mutationDepth": history.iter().filter(|row| !is_root_construction(row)).count(), "entryEventCount": entry_events.len(), "managementActionCount": management_count,
         "stateCount": state_count, "transitionCount": transition_count, "graphNodeCount": state_count + transition_count,
         "guardCount": guard_count, "indicatorCount": indicator_count,
         "structuralComplexity": state_count as f64 + transition_count as f64 + 0.25 * guard_count as f64 + 0.5 * indicator_count as f64,
@@ -1494,13 +1833,30 @@ fn graph_structure(candidate: &Value) -> Result<Value> {
 }
 
 fn history_operator_count(history: &[Value]) -> usize {
+    history_operator_ids(history).len()
+}
+
+fn is_root_construction(row: &Value) -> bool {
+    matches!(
+        row.get("operation").and_then(Value::as_str),
+        Some("typed_seed" | "rich_immigrant_construction")
+    )
+}
+
+fn history_operator_ids(history: &[Value]) -> BTreeSet<String> {
     history
         .iter()
-        .filter_map(|row| row.get("operatorId"))
-        .filter(|value| python_truthy(value))
-        .map(value_to_python_str)
-        .collect::<BTreeSet<_>>()
-        .len()
+        .filter(|row| !is_root_construction(row))
+        .filter_map(|row| {
+            ["operatorId", "operation", "kind"]
+                .into_iter()
+                .find_map(|field| {
+                    row.get(field)
+                        .filter(|value| python_truthy(value))
+                        .map(value_to_python_str)
+                })
+        })
+        .collect()
 }
 
 fn walk_guards<F: FnMut(&Map<String, Value>)>(value: Option<&Value>, visit: &mut F) {

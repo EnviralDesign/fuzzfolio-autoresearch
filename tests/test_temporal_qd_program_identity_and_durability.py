@@ -42,6 +42,20 @@ def _write_population_envelope(path: Path) -> None:
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _archive_descriptor() -> dict[str, str]:
+    descriptor = {
+        "operatorFamilies": "none",
+        "mutationDepth": "root",
+        "entryEvents": "none",
+        "managementActions": "none",
+        "graphNodes": "small",
+        "tradeFrequency": "dormant",
+        "medianHolding": "none",
+    }
+    descriptor["cellId"] = "|".join(descriptor[key] for key in qd.QD_DESCRIPTOR_AXES)
+    return descriptor
+
+
 def _window(
     candidate: dict[str, object],
     *,
@@ -212,13 +226,20 @@ def test_qd_archive_accepts_authored_vs_resolved_execution_identity(
             "programSha256": resolved_program,
         },
     )
-    monkeypatch.setattr(qd, "qd_behavior_descriptor", lambda *_args: {})
+    descriptor = _archive_descriptor()
+    monkeypatch.setattr(qd, "qd_behavior_descriptor", lambda *_args: dict(descriptor))
     monkeypatch.setattr(qd, "_objective_row", lambda *_args: {})
     monkeypatch.setattr(qd, "_finite_data_validity", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         qd,
         "select_qd_archive",
-        lambda members, **_kwargs: [{"cellId": "fixture", "members": members}],
+        lambda members, **_kwargs: [
+            {
+                "cellId": descriptor["cellId"],
+                "descriptor": dict(descriptor),
+                "members": [{**member, "archiveLane": "quality"} for member in members],
+            }
+        ],
     )
     _write_population_envelope(tmp_path / "population.json")
 
@@ -284,7 +305,8 @@ def test_qd_archive_deduplicates_distinct_authored_candidates_with_one_resolved_
             "programSha256": resolved_program,
         },
     )
-    monkeypatch.setattr(qd, "qd_behavior_descriptor", lambda *_args: {"cellId": "fixture"})
+    descriptor = _archive_descriptor()
+    monkeypatch.setattr(qd, "qd_behavior_descriptor", lambda *_args: dict(descriptor))
     monkeypatch.setattr(
         qd,
         "_objective_row",
@@ -303,7 +325,11 @@ def test_qd_archive_deduplicates_distinct_authored_candidates_with_one_resolved_
         qd,
         "select_qd_archive",
         lambda members, **_kwargs: [
-            {"cellId": "fixture", "members": list(members)}
+            {
+                "cellId": descriptor["cellId"],
+                "descriptor": dict(descriptor),
+                "members": [{**member, "archiveLane": "quality"} for member in members],
+            }
         ],
     )
     _write_population_envelope(tmp_path / "population.json")

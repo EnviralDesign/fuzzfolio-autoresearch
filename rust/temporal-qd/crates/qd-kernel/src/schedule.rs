@@ -11,8 +11,9 @@ use crate::{
     selector::unbiased_digest_index,
 };
 
-pub const ROTATING_PARENT_SCHEDULE_SCHEMA: &str = "temporal_qd_rotating_parent_schedule_v1";
-pub const RATIONAL_PREFIX_BALANCE_METHOD: &str = "deterministic_rational_prefix_balance";
+pub const ROTATING_PARENT_SCHEDULE_SCHEMA: &str = "temporal_qd_rotating_parent_schedule_v2";
+pub const ROTATING_PARENT_SCHEDULE_SCHEMA_LEGACY: &str = "temporal_qd_rotating_parent_schedule_v1";
+pub const RATIONAL_PREFIX_BALANCE_METHOD: &str = "accepted_quota_prefix_balance_v1";
 /// The largest ordinal representable by the Rust rational-prefix API.
 ///
 /// The schedule compares the prefixes at `ordinal` and `ordinal + 1`, so its
@@ -41,7 +42,9 @@ pub enum ScheduleError {
     UnsupportedRandomBitWidth,
 }
 
-/// The validated rational schedule committed by a rotating parent projection.
+/// The validated minimum-immigrant schedule committed by a rotating parent
+/// projection.  Valid sparse parents are a replacement-sampled reservoir;
+/// they do not reduce the evaluated offspring quota.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RotatingParentSchedule {
     pub breeder_width: u64,
@@ -51,7 +54,7 @@ pub struct RotatingParentSchedule {
 }
 
 impl RotatingParentSchedule {
-    /// Construct the exact 4/5-capped schedule used by Python.
+    /// Construct the exact 4/5 offspring / 1/5 immigrant floor used by Python.
     pub fn from_counts(
         breeder_width: u64,
         breeder_parent_count: u64,
@@ -62,8 +65,7 @@ impl RotatingParentSchedule {
         if breeder_parent_count > breeder_width {
             return Err(ScheduleError::ParentCountExceedsWidth);
         }
-        let (offspring_numerator, offspring_denominator) =
-            expected_ratio(breeder_width, breeder_parent_count);
+        let (offspring_numerator, offspring_denominator) = (4, 5);
         Ok(Self {
             breeder_width,
             breeder_parent_count,
@@ -89,7 +91,33 @@ impl RotatingParentSchedule {
         Ok(expected)
     }
 
-    /// Python's `scheduleSha256`, excluding the final hash field itself.
+    /// Validate the historical v1 sparse-parent projection exactly as it was
+    /// sealed.  v1 either used its available-parent share or the 4/5 cap;
+    /// accepting another self-hashed ratio would reinterpret archived work.
+    pub fn validated_legacy_fields(
+        breeder_width: u64,
+        breeder_parent_count: u64,
+        offspring_numerator: u64,
+        offspring_denominator: u64,
+    ) -> Result<Self, ScheduleError> {
+        if offspring_denominator == 0 || offspring_numerator > offspring_denominator {
+            return Err(ScheduleError::InvalidRotatingSchedule);
+        }
+        let expected = if u128::from(breeder_parent_count) * 5 < u128::from(breeder_width) * 4 {
+            (breeder_parent_count, breeder_width)
+        } else {
+            (4, 5)
+        };
+        if (offspring_numerator, offspring_denominator) != expected {
+            return Err(ScheduleError::InvalidRotatingSchedule);
+        }
+        // The v2 runtime deliberately replacement-samples valid parents and
+        // retains its fixed accepted-population quota.  Return that execution
+        // schedule only after proving the historical record is authentic.
+        Self::from_counts(breeder_width, breeder_parent_count)
+    }
+
+    /// Python's v2 `scheduleSha256`, excluding the final hash field itself.
     pub fn schedule_sha256(self) -> String {
         canonical_sha256_object(&[
             (
@@ -101,15 +129,50 @@ impl RotatingParentSchedule {
                 "breederParentCount",
                 CanonicalValue::Unsigned(self.breeder_parent_count),
             ),
+            ("minimumImmigrantNumerator", CanonicalValue::Unsigned(1)),
+            ("minimumImmigrantDenominator", CanonicalValue::Unsigned(5)),
+            (
+                "parentSampling",
+                CanonicalValue::String("with_replacement_supported_parents_v1"),
+            ),
+            (
+                "unsupportedParentPolicy",
+                CanonicalValue::String("immigrant_only_authority_bound_v1"),
+            ),
+            (
+                "schedulingMethod",
+                CanonicalValue::String(RATIONAL_PREFIX_BALANCE_METHOD),
+            ),
+        ])
+    }
+
+    /// Compatibility identity for archived v1 schedules.  v1's sparse
+    /// numerator is accepted for recovery but never reused as an allocation.
+    pub fn legacy_schedule_sha256(
+        breeder_width: u64,
+        breeder_parent_count: u64,
+        offspring_numerator: u64,
+        offspring_denominator: u64,
+    ) -> String {
+        canonical_sha256_object(&[
+            (
+                "schemaVersion",
+                CanonicalValue::String(ROTATING_PARENT_SCHEDULE_SCHEMA_LEGACY),
+            ),
+            ("breederWidth", CanonicalValue::Unsigned(breeder_width)),
+            (
+                "breederParentCount",
+                CanonicalValue::Unsigned(breeder_parent_count),
+            ),
             ("maximumOffspringNumerator", CanonicalValue::Unsigned(4)),
             ("maximumOffspringDenominator", CanonicalValue::Unsigned(5)),
             (
                 "offspringNumerator",
-                CanonicalValue::Unsigned(self.offspring_numerator),
+                CanonicalValue::Unsigned(offspring_numerator),
             ),
             (
                 "offspringDenominator",
-                CanonicalValue::Unsigned(self.offspring_denominator),
+                CanonicalValue::Unsigned(offspring_denominator),
             ),
             (
                 "immigrantsFillUnsupportedShare",
@@ -117,7 +180,7 @@ impl RotatingParentSchedule {
             ),
             (
                 "schedulingMethod",
-                CanonicalValue::String(RATIONAL_PREFIX_BALANCE_METHOD),
+                CanonicalValue::String("deterministic_rational_prefix_balance"),
             ),
         ])
     }
@@ -137,6 +200,24 @@ impl RotatingParentSchedule {
     }
 }
 
+/// Frozen accepted-population immigrant floor used by Python v2 allocation.
+/// This uses division/remainder rather than `target + 4` so all `u64` targets
+/// remain deterministic without overflow.
+pub const fn accepted_quota_immigrant_count(
+    target_unique_candidates: u64,
+    has_supported_parents: bool,
+) -> u64 {
+    if !has_supported_parents {
+        return target_unique_candidates;
+    }
+    target_unique_candidates / 5
+        + if target_unique_candidates % 5 == 0 {
+            0
+        } else {
+            1
+        }
+}
+
 /// Mirrors `_scheduled_immigrant`.  An archive-free run always starts from
 /// immigrants; without an opt-in rotating schedule, one in five slots is an
 /// immigrant (`ordinal % 5 == 4`).
@@ -152,6 +233,39 @@ pub fn scheduled_immigrant(
         Some(schedule) => schedule.is_immigrant(proposal_ordinal),
         None => Ok(proposal_ordinal % 5 == 4),
     }
+}
+
+/// Select the next attempted origin from accepted evaluated quota state.  A
+/// rejection leaves the same deficit active, so retries cannot silently move
+/// the final evaluated population away from the frozen scientific allocation.
+pub fn scheduled_immigrant_for_accepted_quota(
+    desired_offspring: u64,
+    desired_immigrants: u64,
+    accepted_offspring: u64,
+    accepted_immigrants: u64,
+) -> Result<bool, ScheduleError> {
+    if desired_offspring == 0 {
+        return Ok(true);
+    }
+    if accepted_offspring >= desired_offspring {
+        return Ok(true);
+    }
+    if accepted_immigrants >= desired_immigrants {
+        return Ok(false);
+    }
+    let target = desired_offspring
+        .checked_add(desired_immigrants)
+        .ok_or(ScheduleError::ProposalOrdinalExhausted)?;
+    let accepted = accepted_offspring
+        .checked_add(accepted_immigrants)
+        .ok_or(ScheduleError::ProposalOrdinalExhausted)?;
+    let next = accepted
+        .checked_add(1)
+        .ok_or(ScheduleError::ProposalOrdinalExhausted)?;
+    Ok(
+        (u128::from(next) * u128::from(desired_immigrants)) / u128::from(target)
+            > (u128::from(accepted) * u128::from(desired_immigrants)) / u128::from(target),
+    )
 }
 
 /// The same-side crossover slot rule.  It is only meaningful on an offspring
@@ -388,14 +502,6 @@ impl PythonRandom {
         value ^= (value << 15) & 0xefc6_0000;
         value ^= value >> 18;
         value
-    }
-}
-
-fn expected_ratio(width: u64, parent_count: u64) -> (u64, u64) {
-    if u128::from(parent_count) * 5 < u128::from(width) * 4 {
-        (parent_count, width)
-    } else {
-        (4, 5)
     }
 }
 

@@ -20,6 +20,7 @@ from autoresearch.temporal_qd_evolution import (
     qd_behavior_descriptor,
 )
 from autoresearch.temporal_qd_rotating_evidence import reduce_provisional_diverse_survivors
+from autoresearch.temporal_realized_behavior import build_window_realized_behavior
 
 
 def digest(label: str) -> str:
@@ -82,7 +83,7 @@ def window(row: dict, index: int, net: float, trades: int) -> dict:
         "terminalExitCostPercent": 0.01,
         "terminalAdjustedMaxDrawdownR": abs(net) / 2.0,
     }
-    return {
+    record = {
         "candidateId": row["candidateId"],
         "windowId": f"{start}/{end}",
         "analysisWindowStart": start,
@@ -122,6 +123,55 @@ def window(row: dict, index: int, net: float, trades: int) -> dict:
         "noCostTerminal": {**terminal, "terminalNetR": 0.25},
         "evidenceContractEndpoints": {"start": start, "end": end},
     }
+    # The native tail reducer consumes the compact window projection emitted
+    # by the current Python stage.  That projection now includes a validated
+    # realized-behavior record; a fixture that omits it is a malformed current
+    # window, not a valid legacy archive row.  Build it through the production
+    # projector so this test exercises the same semantic contract.
+    trade_net = float(net) / trades
+    replay_trades = [
+        {
+            "direction": "long",
+            "tradeId": f"{row['candidateId']}-trade-{index}-{ordinal}",
+            "positionId": f"{row['candidateId']}-position-{index}-{ordinal}",
+            "entryClockIndex": ordinal * 3,
+            "exitClockIndex": ordinal * 3 + 2,
+            "entryTime": start,
+            "exitTime": end,
+            "holdingBars": 2,
+            "holdingHours": 1.0,
+            "closeReason": "target" if trade_net > 0.0 else "stop",
+            "grossR": trade_net + 0.01,
+            "netR": trade_net,
+        }
+        for ordinal in range(trades)
+    ]
+    record["realizedBehavior"] = build_window_realized_behavior(
+        window_id=record["windowId"],
+        replay={
+            "trades": replay_trades,
+            "executionTraces": [
+                {
+                    "tradeId": trade["tradeId"],
+                    "actionKind": "enter_next_open",
+                    "status": "filled",
+                }
+                for trade in replay_trades
+            ],
+            "graphTraces": [
+                {"direction": "long", "transitionId": "entry"}
+                for _ in replay_trades
+            ],
+        },
+        metrics={
+            "tradesClosed": trades,
+            "observationsProcessed": record["observations"],
+            "totalGrossR": sum(trade["grossR"] for trade in replay_trades),
+            "totalNetR": sum(trade["netR"] for trade in replay_trades),
+            "terminalValuation": {"positionStatus": "no_open_position"},
+        },
+    )
+    return record
 
 
 def rejection_window(row: dict, index: int) -> dict:
@@ -227,7 +277,7 @@ def main() -> None:
         "populationSha256": digest("population"),
         "populationFileSha256": digest("population-file"),
         "pairGenerationConfigSha256": digest("config"),
-        "policyName": "stage5e7_v3_robust_quality_archive",
+        "policyName": "stage5e7_v4_corrected_descriptor_archive",
         "policySha256": digest("policy"),
         "pairPolicySha256": semantic_sha256({}),
         "bidirectionalPairPolicy": {},

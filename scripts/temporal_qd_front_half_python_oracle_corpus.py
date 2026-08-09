@@ -531,11 +531,16 @@ def materialize_python_oracle_corpus(output_root: Path | str) -> dict[str, Any]:
 
     rejected_common = _arguments(
         generation_index=2,
-        target_unique_candidates=7,
+        # Eight accepted slots make ordinal six a structural crossover under
+        # the current accepted-quota schedule.  Seven slots now schedule its
+        # second immigrant at that ordinal, so it cannot witness crossover
+        # rejection at all.
+        target_unique_candidates=8,
         pair_factory=UniqueFixtureFactory(),
         parents=parents,
         reject_crossover=True,
-        max_proposal_attempts=8,
+        # One rejected crossover needs a deterministic backfill attempt.
+        max_proposal_attempts=9,
     )
     rejected_root = root / "shape-8-rejected-crossover"
     rejected = generate_pair_population(output_root=rejected_root, **rejected_common)

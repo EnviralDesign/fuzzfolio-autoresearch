@@ -14,9 +14,12 @@ from autoresearch.temporal_search import (
     TemporalSearchTimeout,
     _classified_deterministic_rejection,
     _cost_view_path_sha256,
+    _validate_candidate_behavior_attribution_artifact,
+    _result_material,
     build_authority,
     build_task_matrix,
     canonical_sha256,
+    enable_candidate_behavior_attribution,
     materialize_plan,
     run_temporal_search_tasks,
     validate_authority,
@@ -166,6 +169,156 @@ def test_authority_freezes_one_candidate_window_to_one_two_cost_task() -> None:
         in task["required_worker_capabilities"]
     )
     assert "management.action.dynamic" in task["required_worker_capabilities"]
+
+
+def test_task_preserves_distinct_optional_normalized_snapshot_and_program_bindings() -> None:
+    preparation = _preparation()
+    candidate = preparation["candidates"][0]
+    candidate["profileSnapshotSha256"] = "sha256:" + "d" * 64
+    candidate["programSha256"] = "sha256:" + "e" * 64
+    candidate["resolvedProfileSnapshotSha256"] = "sha256:" + "f" * 64
+    candidate["resolvedProgramSha256"] = "sha256:" + "0" * 64
+    task = build_task_matrix(build_authority(preparation))[0]["payload"]
+    assert task["raw_source_profile_sha256"] == candidate["sourceProfileSha256"]
+    assert task["normalized_profile_snapshot_sha256"] == candidate["profileSnapshotSha256"]
+    assert task["authored_program_sha256"] == candidate["programSha256"]
+    assert task["expected_resolved_profile_snapshot_sha256"] == candidate["resolvedProfileSnapshotSha256"]
+    assert task["expected_resolved_program_sha256"] == candidate["resolvedProgramSha256"]
+    assert task["window_id"] == "development-a"
+
+
+def test_behavior_attribution_is_an_explicit_new_evidence_task_extension() -> None:
+    task = build_task_matrix(build_authority(_preparation()))[0]
+    legacy_payload = json.dumps(
+        task["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    enabled = enable_candidate_behavior_attribution(task)
+
+    assert json.dumps(
+        task["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ) == legacy_payload
+    request = enabled["payload"]["candidate_behavior_attribution_request"]
+    assert request == {
+        "schema_version": "temporal_candidate_behavior_attribution_request_v1",
+        "enabled": True,
+        "attribution_schema": "temporal_candidate_behavior_attribution_v1",
+        "replay_cost_view": "research_conservative",
+    }
+    assert (
+        "temporal_candidate_behavior_attribution_v1"
+        in enabled["required_worker_capabilities"]
+    )
+
+    gateway = _Gateway(enabled)
+    gateway.enqueue_tasks([enabled])
+    completion = gateway.read_results(limit=1)[0]
+    material = _result_material(enabled, completion)
+    sidecar = material["candidate_behavior_attribution"]
+    assert sidecar["candidate_id"] == enabled["payload"]["candidate_id"]
+    assert sidecar["window_id"] == "development-a"
+    assert sidecar["attribution"]["collectionStatus"] == "complete"
+
+    # A remote worker cannot relabel an otherwise valid sidecar as another
+    # candidate/window: recomputing its own hash does not bypass task binding.
+    stale = copy.deepcopy(completion)
+    stale_sidecar = stale["result"]["result"]["candidate_behavior_attribution"]
+    stale_sidecar["candidate_id"] = "another_candidate"
+    sidecar_identity = dict(stale_sidecar)
+    sidecar_identity.pop("artifact_sha256")
+    stale_sidecar["artifact_sha256"] = canonical_sha256(sidecar_identity)
+    with pytest.raises(TemporalSearchContractError, match="attribution mismatch for candidate_id"):
+        _result_material(enabled, stale)
+
+
+def _v5_behavior_attribution_requirement() -> dict:
+    policy = {
+        "schemaVersion": "temporal_qd_behavior_attribution_requirement_v1",
+        "observerSchema": "temporal_candidate_behavior_attribution_v1",
+        "required": True,
+        "fuzzyMemberAttribution": "required_fail_closed_v1",
+        "checkpointRestore": "required_exact_v1",
+        "taskIdentityBinding": "required_v5_candidate_window_v1",
+    }
+    return {**policy, "requirementSha256": canonical_sha256(policy)}
+
+
+def test_v5_attribution_requirement_is_task_manifest_and_restart_bound(
+    tmp_path: Path,
+) -> None:
+    authority = build_authority(_preparation())
+    requirement = _v5_behavior_attribution_requirement()
+    manifest = materialize_plan(
+        authority,
+        tmp_path,
+        behavior_attribution_requirement=requirement,
+    )
+    task = manifest["tasks"][0]
+    assert (
+        task["payload"]["candidate_behavior_attribution_request"]
+        ["behavior_attribution_requirement"]
+        == requirement
+    )
+    assert "temporal_candidate_behavior_attribution_v1" in task[
+        "required_worker_capabilities"
+    ]
+    assert (
+        materialize_plan(
+            authority,
+            tmp_path,
+            behavior_attribution_requirement=requirement,
+        )["taskMatrixSha256"]
+        == manifest["taskMatrixSha256"]
+    )
+
+    changed = dict(requirement)
+    changed["required"] = False
+    changed["requirementSha256"] = canonical_sha256(
+        {key: value for key, value in changed.items() if key != "requirementSha256"}
+    )
+    with pytest.raises(
+        TemporalSearchContractError,
+        match="sealed v5 diagnostic policy",
+    ):
+        materialize_plan(
+            authority,
+            tmp_path / "invalid",
+            behavior_attribution_requirement=changed,
+        )
+
+    # This is the actual AutoResearch task -> worker-result -> controller
+    # boundary, not a hand-authored sidecar fixture.
+    gateway = _Gateway(task)
+    gateway.enqueue_tasks([task])
+    completion = gateway.read_results(limit=1)[0]
+    material = _result_material(task, completion)
+    sidecar = material["candidate_behavior_attribution"]
+    assert sidecar["behavior_attribution_requirement_sha256"] == requirement[
+        "requirementSha256"
+    ]
+    assert sidecar["attribution"]["fuzzyMemberAttribution"]["status"] == "available"
+    unavailable = copy.deepcopy(sidecar)
+    unavailable["attribution"]["fuzzyMemberAttribution"]["status"] = "not_available"
+    observer = dict(unavailable["attribution"])
+    observer.pop("attributionSha256")
+    unavailable["attribution"]["attributionSha256"] = canonical_sha256(observer)
+    wrapper = dict(unavailable)
+    wrapper.pop("artifact_sha256")
+    unavailable["artifact_sha256"] = canonical_sha256(wrapper)
+    with pytest.raises(TemporalSearchContractError, match="requires available fuzzy"):
+        _validate_candidate_behavior_attribution_artifact(
+            unavailable, job=task["payload"], material=material
+        )
+
+    # A caller cannot silently drop the extra worker capability after it has
+    # frozen a v5 attribution task; controller admission rejects the result.
+    missing = copy.deepcopy(task)
+    missing["payload"]["required_capabilities"].remove(
+        "temporal_candidate_behavior_attribution_v1"
+    )
+    gateway = _Gateway(missing)
+    gateway.enqueue_tasks([missing])
+    with pytest.raises(TemporalSearchContractError, match="request is invalid"):
+        _result_material(missing, gateway.read_results(limit=1)[0])
 
 
 def test_v3_candidate_window_task_uses_the_worker_required_bidirectional_evaluator() -> None:
@@ -531,8 +684,9 @@ def test_plan_checkpoint_is_mutable_but_immutable_manifest_is_not(
 
 
 class _Gateway:
-    def __init__(self, task: dict):
+    def __init__(self, task: dict, *, result_mutator=None):
         self.task = task
+        self.result_mutator = result_mutator
         self.enqueued: list[dict] = []
         self.delivered = False
         self.acks: list[str] = []
@@ -547,9 +701,16 @@ class _Gateway:
         self.delivered = True
         job = self.task["payload"]
         stream = "sha256:" + "e" * 64
-        source_profile_snapshot = canonical_sha256(job["inline_profile_snapshot"])
-        resolved_profile_snapshot = "sha256:" + "d" * 64
-        resolved_program = "sha256:" + "f" * 64
+        source_profile_snapshot = job.get(
+            "normalized_profile_snapshot_sha256",
+            canonical_sha256(job["inline_profile_snapshot"]),
+        )
+        resolved_profile_snapshot = job.get(
+            "expected_resolved_profile_snapshot_sha256", "sha256:" + "d" * 64
+        )
+        resolved_program = job.get(
+            "expected_resolved_program_sha256", "sha256:" + "f" * 64
+        )
         last_bar_start = "2024-02-29T23:55:00Z"
         path_sha = canonical_sha256(
             {
@@ -676,6 +837,64 @@ class _Gateway:
             },
             "selection_score": 1.0,
         }
+        if job.get("candidate_behavior_attribution_request") is not None:
+            requirement = job["candidate_behavior_attribution_request"].get(
+                "behavior_attribution_requirement"
+            )
+            attribution = {
+                "schemaVersion": "temporal_candidate_behavior_attribution_v1",
+                "profileSnapshotSha256": resolved_profile_snapshot,
+                "streamSha256": stream,
+                "transitionBehaviors": [],
+                "guardBehaviors": [],
+                "actionBehaviors": [],
+                "unattributedEffectCounts": {},
+                "fuzzyMemberAttribution": {
+                    "status": "available" if requirement is not None else "not_available",
+                    "extensionContract": (
+                        "TemporalFuzzyMemberAttributionAdapter.contributions_for_event"
+                    ),
+                },
+                "collectionStatus": "complete",
+                "incompleteReasons": [],
+            }
+            attribution["attributionSha256"] = canonical_sha256(attribution)
+            sidecar = {
+                "schema_version": (
+                    "temporal_candidate_window_behavior_attribution_artifact_v1"
+                ),
+                "request_schema_version": (
+                    "temporal_candidate_behavior_attribution_request_v1"
+                ),
+                "attribution_schema": "temporal_candidate_behavior_attribution_v1",
+                "replay_cost_view": "research_conservative",
+                "authority_id": job["authority_id"],
+                "window_id": job["window_id"],
+                "candidate_id": job["candidate_id"],
+                "job_id": job["job_id"],
+                "lake_window_semantic_sha256": job["lake_window_semantic_sha256"],
+                "shared_observation_stream_id": job["shared_observation_stream_id"],
+                "analysis_window_start": job["analysis_window_start"],
+                "analysis_window_end": job["analysis_window_end"],
+                "resolved_profile_snapshot_sha256": resolved_profile_snapshot,
+                "program_sha256": resolved_program,
+                "observation_stream_sha256": stream,
+                **(
+                    {
+                        "behavior_attribution_requirement_sha256": requirement[
+                            "requirementSha256"
+                        ]
+                    }
+                    if requirement is not None
+                    else {}
+                ),
+                "attribution": attribution,
+            }
+            sidecar["artifact_sha256"] = canonical_sha256(sidecar)
+            result["window_id"] = job["window_id"]
+            result["candidate_behavior_attribution"] = sidecar
+        if self.result_mutator is not None:
+            self.result_mutator(result)
         result["artifact_sha256"] = canonical_sha256(result)
         artifact_size = 1
         for _ in range(16):
@@ -725,6 +944,7 @@ def test_controller_materializes_both_cost_results_from_one_stream(
     assert result["completedTaskCount"] == 1
     assert gateway.acks == ["lease-1"]
     assert len(gateway.enqueued) == 1
+
     checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
     record = checkpoint["completed"][task["task_id"]]
     assert record["resultPath"].endswith(".json.gz")
@@ -744,6 +964,38 @@ def test_controller_materializes_both_cost_results_from_one_stream(
     )
     assert resumed == result
     assert len(gateway.enqueued) == 1
+
+
+def test_distinct_raw_normalized_authored_and_resolved_identities_are_not_collapsed(
+    tmp_path: Path,
+) -> None:
+    """Regression: worker source/program identities are not candidate raw/authored IDs."""
+    preparation = _preparation()
+    candidate = preparation["candidates"][0]
+    candidate["profileSnapshotSha256"] = "sha256:" + "7" * 64
+    candidate["programSha256"] = "sha256:" + "5" * 64
+    candidate["resolvedProfileSnapshotSha256"] = "sha256:" + "9" * 64
+    candidate["resolvedProgramSha256"] = "sha256:" + "d" * 64
+    authority = build_authority(preparation)
+    task = build_task_matrix(authority)[0]
+
+    assert run_temporal_search_tasks(
+        _Gateway(task), authority, output_root=tmp_path / "valid", timeout_seconds=1
+    )["completedTaskCount"] == 1
+
+    swaps = (
+        ("source_profile_snapshot_sha256", candidate["sourceProfileSha256"], "normalized profile snapshot"),
+        ("resolved_profile_snapshot_sha256", candidate["profileSnapshotSha256"], "resolved profile"),
+        ("program_sha256", candidate["programSha256"], "resolved program"),
+    )
+    for field, swapped, error in swaps:
+        with pytest.raises(TemporalSearchContractError, match=error):
+            run_temporal_search_tasks(
+                _Gateway(task, result_mutator=lambda result, key=field, value=swapped: result.__setitem__(key, value)),
+                authority,
+                output_root=tmp_path / field,
+                timeout_seconds=1,
+            )
 
 
 def test_controller_can_use_a_distinct_local_summary_filename(

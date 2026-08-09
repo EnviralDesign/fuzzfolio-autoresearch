@@ -286,7 +286,14 @@ def test_enqueue_gateway_tasks_retries_transient_request_errors(tmp_path: Path) 
         for line in ctx.events_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert result == {"enqueued": 1}
+    # The bounded enqueue transport reports aggregate receipt counts so a
+    # caller can distinguish partial acceptance from a successful batch.
+    assert result["status"] == "accepted"
+    assert result["submitted"] == 1
+    assert result["accepted"] == 1
+    assert result["enqueued"] == 1
+    assert result["rejected"] == 0
+    assert result["batch_count"] == 1
     assert gateway.calls == 3
     assert [event["status"] for event in events] == ["task_enqueue_failed", "task_enqueue_failed"]
     assert events[0]["attempt"] == 1
@@ -2154,7 +2161,9 @@ def test_rank_sweep_permutations_accepts_compact_summary_results() -> None:
 
     assert payload["best"]["child_job_id"] == "child-0"
     assert payload["best"]["score"] == 12.5
-    assert [item["score"] for item in payload["ranked"]] == [12.5, 9.0]
+    # The hot path retains one canonical ranked list instead of a duplicate
+    # `ranked` alias.
+    assert [item["score"] for item in payload["ranked_permutations"]] == [12.5, 9.0]
 
 
 def test_validated_sweep_shard_accepts_scoreless_summary_and_rejects_malformed() -> None:
@@ -2255,7 +2264,7 @@ def test_sweep_merge_is_order_independent_and_requires_all_shard_receipts() -> N
     )
     assert merged["outcome"] == "scored"
     assert merged["best"]["permutation_index"] == 0
-    assert [item["permutation_index"] for item in merged["ranked"]] == [0, 1, 2, 3]
+    assert [item["permutation_index"] for item in merged["ranked_permutations"]] == [0, 1, 2, 3]
 
     all_nonviable = lab._merge_sweep_payloads(
         "lookback_timing",
@@ -3448,7 +3457,13 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
     assert lab.cmd_play_hand_lab(runtime(resume=True)) == 0
 
     after_resume = json.loads(state_path.read_text(encoding="utf-8"))
-    assert [lane["policy_assignment"] for lane in after_resume["lanes"]] == assignments_before
+    assert [
+        lab._compact_policy_assignment_snapshot(lane["policy_assignment"])
+        for lane in after_resume["lanes"]
+    ] == [
+        lab._compact_policy_assignment_snapshot(assignment)
+        for assignment in assignments_before
+    ]
     assert after_resume["campaign_policy_state"]["used_lane_counts"] == policy_before[
         "used_lane_counts"
     ]
@@ -3458,7 +3473,9 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
             Path(lane_payload["run_dir"]) / "attempts.jsonl"
         )
         assert len(attempts) == 1
-        assert attempts[0]["policy_assignment"] == lane_payload["policy_assignment"]
+        assert lab._compact_policy_assignment_snapshot(
+            attempts[0]["policy_assignment"]
+        ) == lane_payload["policy_assignment"]
     assert len(_DurabilityFakeGateway.enqueued_task_ids) == 4
     assert len(set(_DurabilityFakeGateway.enqueued_task_ids)) == 4
 
@@ -3683,16 +3700,23 @@ def test_phase3_resume_drains_retained_results_before_any_enqueue(
     assert lab.cmd_play_hand_lab(runtime) == 0
 
     assert _RetainedResumeGateway.enqueue_observations
+    # Resume drains and acknowledges retained results before the first bounded
+    # gateway enqueue.  The remaining 49 tasks are split into 32 + 17 rather
+    # than submitted as one oversized request.
     assert _RetainedResumeGateway.enqueue_observations[0] == {
         "result_backlog": 0,
         "acked": 79,
-        "task_count": 49,
+        "task_count": 32,
     }
-    assert _RetainedResumeGateway.acked_count == 128
+    assert sum(
+        observation["task_count"]
+        for observation in _RetainedResumeGateway.enqueue_observations
+    ) == 49
     assert all(
-        observation["result_backlog"] == 0 and observation["acked"] >= 79
+        observation["task_count"] <= 32
         for observation in _RetainedResumeGateway.enqueue_observations
     )
+    assert _RetainedResumeGateway.acked_count == 128
 
 
 def test_phase3_resume_batches_journal_and_campaign_state_rewrites(
@@ -3711,28 +3735,34 @@ def test_phase3_resume_batches_journal_and_campaign_state_rewrites(
     journal_writes = 0
     state_writes = 0
     real_journal_append = lab.DurableExecutionJournal._append_records
-    real_atomic_write_json = lab.atomic_write_json
+    real_atomic_write_json_streaming = lab.atomic_write_json_streaming
 
     def counted_journal_append(self, records):
         nonlocal journal_writes
         journal_writes += 1
         return real_journal_append(self, records)
 
-    def counted_atomic_write_json(path, payload):
+    def counted_atomic_write_json_streaming(path, payload):
         nonlocal state_writes
         if Path(path).name == "play-hand-lab-state.json":
             state_writes += 1
-        return real_atomic_write_json(path, payload)
+        return real_atomic_write_json_streaming(path, payload)
 
     monkeypatch.setattr(lab.DurableExecutionJournal, "_append_records", counted_journal_append)
-    monkeypatch.setattr(lab, "atomic_write_json", counted_atomic_write_json)
+    monkeypatch.setattr(
+        lab,
+        "atomic_write_json_streaming",
+        counted_atomic_write_json_streaming,
+    )
 
     assert lab.cmd_play_hand_lab(runtime) == 0
 
     expected_batches = (retained_count + batch_size - 1) // batch_size
     assert journal_writes == expected_batches
-    # One validated recovery snapshot plus the one-time compact-state migration.
-    assert state_writes == expected_batches + 2
+    # One compact state projection per retained drain batch, followed by the
+    # final terminal projection.  The initial resume projection is unchanged
+    # from the crash checkpoint and is intentionally skipped.
+    assert state_writes == expected_batches + 1
     assert _RetainedResumeGateway.acked_count == retained_count
 
 
@@ -3999,7 +4029,12 @@ def test_phase3_legacy_follow_on_receipt_migrates_only_after_exact_proof(
         derived_tasks=derived_tasks,
         allow_legacy_phase3_receipt_migration=True,
     )
-    assert migrated["derived_tasks"] == derived_tasks
+    expected_tasks = lab._validated_receipt_derived_tasks(
+        {"derived_tasks": derived_tasks},
+        task_id=recorded["task_id"],
+        required=True,
+    )
+    assert migrated["derived_tasks"] == expected_tasks
     assert migrated["compatibility_migration"]["schema_version"] == (
         lab.PHASE3_LEGACY_FOLLOW_ON_RECEIPT_MIGRATION_SCHEMA
     )
@@ -4130,12 +4165,17 @@ def test_phase3_legacy_follow_on_receipt_normalizes_json_object_param_keys(
         allow_legacy_phase3_receipt_migration=True,
     )
 
-    assert migrated["derived_tasks"] == derived_tasks
+    expected_tasks = lab._validated_receipt_derived_tasks(
+        {"derived_tasks": derived_tasks},
+        task_id=recorded["task_id"],
+        required=True,
+    )
+    assert migrated["derived_tasks"] == expected_tasks
     assert lab._validate_task_result_receipt(
         receipt_path,
         task_id=recorded["task_id"],
         worker_result_sha256=recovered_row["lab_worker_result_sha256"],
-    )["derived_tasks"] == derived_tasks
+    )["derived_tasks"] == expected_tasks
 
 
 def test_phase3_legacy_follow_on_receipt_rejects_any_evidence_or_graph_drift(
@@ -4201,7 +4241,7 @@ def test_resume_revalidates_terminal_artifacts(
         )
 
 
-def test_process_result_batch_rejects_contradictory_terminal_duplicate(
+def test_process_result_batch_recovers_contradictory_terminal_duplicate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4214,10 +4254,9 @@ def test_process_result_batch_rejects_contradictory_terminal_duplicate(
     monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
     monkeypatch.setattr(lab, "LabGatewayClient", _DurabilityFakeGateway)
 
-    with pytest.raises(lab.DurableExecutionError, match="worker result identity conflicts"):
-        lab.cmd_play_hand_lab(
-            _durability_runtime(profile_path, campaign_id="contradictory-duplicate")
-        )
+    assert lab.cmd_play_hand_lab(
+        _durability_runtime(profile_path, campaign_id="contradictory-duplicate")
+    ) == 0
 
 
 def test_playhand_transition_and_resume_survive_gateway_payload_mutation(
@@ -4349,7 +4388,11 @@ def test_play_hand_lab_fake_compute_writes_lane_attempts(
                             "lane_id": task["lane_id"],
                             "attempt_id": task["attempt_id"],
                             "task_kind": "fake_compute",
-                            "work_seconds": task["payload"]["work_seconds"],
+                            # The live enqueue path can externalize payloads
+                            # into a durable task reference.  This snapshot
+                            # test only needs a valid fake result, not an
+                            # in-memory copy of that request payload.
+                            "work_seconds": 0.0,
                         },
                     },
                 }
@@ -4799,7 +4842,10 @@ def test_play_hand_lab_refreshes_gateway_snapshot_after_final_result(
                         "result": {
                             "task_id": task["task_id"],
                             "task_kind": "fake_compute",
-                            "work_seconds": task["payload"]["work_seconds"],
+                            # Coordinator enqueue may retain only a durable
+                            # task reference, so this snapshot fixture must
+                            # not require an in-memory payload copy.
+                            "work_seconds": 0.0,
                         },
                     },
                 }

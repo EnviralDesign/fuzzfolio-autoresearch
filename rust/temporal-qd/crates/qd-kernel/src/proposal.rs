@@ -16,7 +16,8 @@ use crate::{
     factory::{FactoryError, NativeProposal, ParentReference, ProposalIntent},
     identity::{Side, immigrant_side_seed, proposal_seed, proposal_side},
     schedule::{
-        RotatingParentSchedule, is_crossover_slot, mutation_depth_for_seed, scheduled_immigrant,
+        RotatingParentSchedule, is_crossover_slot, mutation_depth_for_seed,
+        scheduled_immigrant_for_accepted_quota,
     },
 };
 
@@ -163,6 +164,8 @@ pub struct ProposalSchedule {
     pub config_sha256: String,
     pub generation_index: u64,
     pub parent_schedule: Option<RotatingParentSchedule>,
+    pub desired_evaluated_offspring: u64,
+    pub desired_evaluated_immigrants: u64,
 }
 
 impl ProposalSchedule {
@@ -565,10 +568,21 @@ impl ProposalPlanner<'_> {
         self.schedule.validate()?;
         let ordinal = state.next_proposal_ordinal;
         let seed = proposal_seed(&self.schedule.config_sha256, ordinal);
-        let use_immigrant = scheduled_immigrant(
-            self.parents.has_parents(),
-            ordinal,
-            self.schedule.parent_schedule,
+        let accepted_immigrants = *state
+            .origin_accepted_counts
+            .get("random_immigrant")
+            .unwrap_or(&0);
+        let accepted_offspring = state
+            .origin_accepted_counts
+            .iter()
+            .filter(|(origin, _)| origin.as_str() != "random_immigrant")
+            .map(|(_, count)| *count)
+            .sum();
+        let use_immigrant = scheduled_immigrant_for_accepted_quota(
+            self.schedule.desired_evaluated_offspring,
+            self.schedule.desired_evaluated_immigrants,
+            accepted_offspring,
+            accepted_immigrants,
         )
         .map_err(|error| contract(error.to_string()))?;
         let crossover = is_crossover_slot(

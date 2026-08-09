@@ -43,10 +43,13 @@ def _contract():
 
 
 def _candidate(candidate_id: str) -> dict:
+    profile = {"version": "v3", "candidate": candidate_id}
     return {
         "candidateId": candidate_id,
         "candidateIdentitySha256": "sha256:" + candidate_id * 64,
         "programSha256": "sha256:" + ("a" if candidate_id == "a" else "b") * 64,
+        "sourceProfile": profile,
+        "sourceProfileSha256": canonical_sha256(profile),
         "profileSnapshotSha256": "sha256:" + ("1" if candidate_id == "a" else "2") * 64,
     }
 
@@ -56,7 +59,7 @@ def _execution_metrics(candidate: dict, **values) -> dict:
         **values,
         "sourceProfileSnapshotSha256": candidate["profileSnapshotSha256"],
         "resolvedProfileSnapshotSha256": "sha256:" + "3" * 64,
-        "resolvedProgramSha256": "sha256:" + "4" * 64,
+        "resolvedProgramSha256": candidate["programSha256"],
     }
 
 
@@ -70,6 +73,34 @@ def _bundle(contract: dict, candidate: dict, panel_id: str) -> dict:
             provenance={"authorityId": "sha256:" + "d" * 64, "taskMatrixSha256": "sha256:" + "e" * 64, "taskId": f"{candidate['candidateId']}-{window['windowId']}", "resultSha256": "sha256:" + "f" * 64},
         ))
     return build_candidate_panel_bundle(contract=contract, candidate=candidate, panel_id=panel_id, records=records)
+
+
+def _rehash_record(record: dict) -> None:
+    digest_fields = (
+        "schemaVersion", "candidateId", "candidateIdentitySha256", "programSha256",
+        "rawSourceProfileSha256", "normalizedProfileSnapshotSha256", "panelId", "windowId",
+        "analysisWindowStart", "analysisWindowEnd", "evidencePlanSemanticSha256", "metrics",
+    )
+    record["evidenceDigestSha256"] = canonical_sha256(
+        {field: record[field] for field in digest_fields}
+    )
+    record["recordSha256"] = canonical_sha256(
+        {field: value for field, value in record.items() if field != "recordSha256"}
+    )
+
+
+def _rehash_bundle(bundle: dict) -> None:
+    records = sorted(bundle["windowEvidence"], key=lambda row: row["windowId"])
+    bundle["windowEvidenceDigests"] = [
+        {"windowId": row["windowId"], "evidenceDigestSha256": row["evidenceDigestSha256"], "recordSha256": row["recordSha256"]}
+        for row in records
+    ]
+    bundle["rawTaskProvenance"] = [
+        {"windowId": row["windowId"], **row["rawTaskProvenance"]} for row in records
+    ]
+    bundle["bundleSha256"] = canonical_sha256(
+        {field: value for field, value in bundle.items() if field != "bundleSha256"}
+    )
 
 
 def test_latin_square_schedule_identity_and_equal_coverage():
@@ -183,6 +214,59 @@ def test_contract_rejects_drift_and_bundle_corruption():
         build_cumulative_breeder_archive(contract=contract, generation_index=1, provisional=[{**candidate, "cellId": "c", "currentPanelRank": 1.0}], bundles={"a": [bundle]})
 
 
+def test_panel_bundle_rebinds_forged_digest_and_exact_half_open_window():
+    contract = _contract()
+    candidate = _candidate("a")
+    candidate["resolvedProgramSha256"] = candidate["programSha256"]
+    panel = contract["panels"][0]
+    records = [
+        build_candidate_window_evidence(
+            candidate=candidate, panel=panel, window=window,
+            metrics=_execution_metrics(candidate, netR=1.0),
+            evidence_plan_semantic_sha256="sha256:" + "c" * 64,
+            provenance={"authorityId": "sha256:" + "d" * 64, "taskMatrixSha256": "sha256:" + "e" * 64, "taskId": window["windowId"], "resultSha256": "sha256:" + "f" * 64},
+        )
+        for window in panel["windows"]
+    ]
+    forged = copy.deepcopy(records)
+    forged[0]["evidenceDigestSha256"] = "sha256:" + "0" * 64
+    forged[0]["recordSha256"] = canonical_sha256(
+        {key: value for key, value in forged[0].items() if key != "recordSha256"}
+    )
+    with pytest.raises(TemporalDiscoveryContractError, match="evidence digest mismatch"):
+        build_candidate_panel_bundle(
+            contract=contract, candidate=candidate, panel_id="panel-1", records=forged
+        )
+    wrong_date = copy.deepcopy(records)
+    wrong_date[0]["analysisWindowStart"] = "2021-02-01T00:00:00Z"
+    _rehash_record(wrong_date[0])
+    with pytest.raises(TemporalDiscoveryContractError, match="canonically bound"):
+        build_candidate_panel_bundle(
+            contract=contract, candidate=candidate, panel_id="panel-1", records=wrong_date
+        )
+    wrong_window = copy.deepcopy(records)
+    wrong_window[0]["windowId"] = "year-1-q4"
+    _rehash_record(wrong_window[0])
+    with pytest.raises(TemporalDiscoveryContractError, match="cover each panel window"):
+        build_candidate_panel_bundle(
+            contract=contract, candidate=candidate, panel_id="panel-1", records=wrong_window
+        )
+
+
+def test_cumulative_boundary_rebinds_even_a_rehashed_bundle():
+    contract = _contract()
+    candidate = _candidate("a")
+    bundle = _bundle(contract, candidate, "panel-1")
+    bundle["windowEvidence"][0]["analysisWindowEnd"] = "2021-04-02T00:00:00Z"
+    _rehash_record(bundle["windowEvidence"][0])
+    _rehash_bundle(bundle)
+    with pytest.raises(TemporalDiscoveryContractError, match="canonically bound"):
+        cumulative_candidate_row(
+            contract=contract, generation_index=1, candidate=candidate,
+            bundles=[bundle], cell_id="cell", current_panel_rank=1.0,
+        )
+
+
 def test_split_restart_parity_for_absolute_phase():
     contract = _contract()
     uninterrupted = [panel_for_generation(contract, index)["panelId"] for index in range(1, 9)]
@@ -293,16 +377,16 @@ def test_robust_selection_uses_declared_pareto_objectives_not_return_lexicograph
     ]
 
 
-def test_cumulative_candidate_rejects_cross_panel_execution_resolution_drift():
+def test_panel_bundle_rejects_wrong_resolved_program_before_cumulative_reduction():
     contract = _contract()
     candidate = _candidate("a")
-    first = _bundle(contract, candidate, "panel-1")
+    candidate["resolvedProgramSha256"] = candidate["programSha256"]
     second_panel = contract["panels"][1]
-    records = [
+    with pytest.raises(TemporalDiscoveryContractError, match="resolved program identity drifted"):
         build_candidate_window_evidence(
             candidate=candidate,
             panel=second_panel,
-            window=window,
+            window=second_panel["windows"][0],
             metrics={
                 **_execution_metrics(candidate, netR=1.0),
                 "resolvedProgramSha256": "sha256:" + "9" * 64,
@@ -311,26 +395,9 @@ def test_cumulative_candidate_rejects_cross_panel_execution_resolution_drift():
             provenance={
                 "authorityId": "sha256:" + "d" * 64,
                 "taskMatrixSha256": "sha256:" + "e" * 64,
-                "taskId": f"drift-{window['windowId']}",
+                "taskId": "drift",
                 "resultSha256": "sha256:" + "f" * 64,
             },
-        )
-        for window in second_panel["windows"]
-    ]
-    second = build_candidate_panel_bundle(
-        contract=contract,
-        candidate=candidate,
-        panel_id="panel-2",
-        records=records,
-    )
-    with pytest.raises(TemporalDiscoveryContractError, match="changed across panels"):
-        cumulative_candidate_row(
-            contract=contract,
-            generation_index=2,
-            candidate=candidate,
-            bundles=[first, second],
-            cell_id="cell",
-            current_panel_rank=1.0,
         )
 
 

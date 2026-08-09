@@ -293,16 +293,12 @@ def _member(
         "generationIndex": 0,
         "candidate": candidate,
         "aggregate": {"totalTrades": total_trades},
-        "descriptor": {
-            "operatorFamilies": "none",
-            "mutationDepth": "root",
-            "entryEvents": "none",
-            "managementActions": "one",
-            "graphNodes": "medium",
-            "tradeFrequency": "moderate",
-            "medianHolding": "medium",
-            "cellId": "one-cell",
-        },
+        "descriptor": _descriptor(
+            management_actions="one",
+            graph_nodes="medium",
+            trade_frequency="moderate",
+            median_holding="medium",
+        ),
         "objectives": {
             "worstWindowConservativeNetR": robust_return,
             "maximumDrawdownR": drawdown,
@@ -317,6 +313,57 @@ def _member(
             "validForQuality": valid_for_quality,
         },
     }
+
+
+def _descriptor(
+    *,
+    operator_families: str = "none",
+    mutation_depth: str = "root",
+    entry_events: str = "none",
+    management_actions: str = "none",
+    graph_nodes: str = "small",
+    trade_frequency: str = "dormant",
+    median_holding: str = "none",
+) -> dict[str, str]:
+    result = {
+        "operatorFamilies": operator_families,
+        "mutationDepth": mutation_depth,
+        "entryEvents": entry_events,
+        "managementActions": management_actions,
+        "graphNodes": graph_nodes,
+        "tradeFrequency": trade_frequency,
+        "medianHolding": median_holding,
+    }
+    result["cellId"] = "|".join(result[key] for key in qd_module.QD_DESCRIPTOR_AXES)
+    return result
+
+
+def _geometry_archive(*, cells: list[dict]) -> dict:
+    archive = qd_module.canonical_empty_bidirectional_archive_template()
+    archive.pop("archiveSha256")
+    archive.update(
+        {
+            "cells": cells,
+            "occupiedCellCount": len(cells),
+            "memberCount": sum(len(cell["members"]) for cell in cells),
+        }
+    )
+    archive["archiveSha256"] = canonical_sha256(archive)
+    return archive
+
+
+def _legacy_geometry_archive(*, cells: list[dict]) -> dict:
+    archive = _geometry_archive(cells=cells)
+    archive.pop("archiveSha256")
+    archive.update(
+        {
+            "policyName": qd_module.LEGACY_QD_POLICY_NAME,
+            "policySha256": qd_module.LEGACY_QD_POLICY_SHA256,
+            "frozenPolicy": qd_module.LEGACY_QD_POLICY,
+        }
+    )
+    archive["archiveSha256"] = canonical_sha256(archive)
+    return archive
 
 
 def test_qd_archive_retains_multiobjective_cell_extremes() -> None:
@@ -405,6 +452,183 @@ def test_qd_identity_and_descriptors_exclude_scheduling_and_profitability() -> N
     )
     assert left == right
     assert not {"profit", "score", "origin", "generation"} & set(left)
+
+
+def test_qd_descriptor_reads_persisted_pair_lineage_and_excludes_root_construction() -> None:
+    candidate = {
+        "sourceProfile": {"graph": {"states": [], "transitions": []}, "indicators": []},
+        "structuralOperatorHistory": [
+            {"operation": "rich_immigrant_construction", "side": "long"},
+            {"operation": "rich_immigrant_construction", "side": "short"},
+            {"operation": "typed_grammar", "side": "long"},
+            {"operatorId": "parametric_graph_structure_v1"},
+            {"kind": "generator_v2_mutation", "payload": {}},
+        ],
+    }
+
+    structure = qd_module._graph_structure(candidate)
+
+    assert structure["operatorFamilyIds"] == [
+        "generator_v2_mutation",
+        "parametric_graph_structure_v1",
+        "typed_grammar",
+    ]
+    assert structure["operatorFamilyCount"] == 3
+    assert structure["mutationDepth"] == 3
+
+
+def test_qd_descriptor_counts_only_management_actions_and_partitions_composite_graphs() -> None:
+    def candidate(*, states: int, transitions: int) -> dict:
+        actions = [
+            {"kind": "enter_next_open"},
+            {"kind": "exit_next_open"},
+            {"kind": "move_stop_next_open"},
+            {"kind": "move_stop_to_break_even_next_open"},
+            {"kind": "tighten_stop_next_open"},
+            {"kind": "set_target_next_open"},
+            {"kind": "cancel_target_next_open"},
+            {"kind": "activate_trailing_stop_next_open"},
+            {"kind": "deactivate_trailing_stop_next_open"},
+        ]
+        return {
+            "sourceProfile": {
+                "graph": {
+                    "states": [{} for _ in range(states)],
+                    "transitions": [{"actions": actions}]
+                    + [{"actions": []} for _ in range(transitions - 1)],
+                },
+                "indicators": [],
+            }
+        }
+
+    aggregate = {
+        "totalTrades": 1,
+        "entryFrequencyPerThousand": 1.0,
+        "medianHoldingBars": 1.0,
+    }
+    assert qd_module._graph_structure(candidate(states=9, transitions=23))["managementActionCount"] == 6
+    assert [
+        qd_module.qd_behavior_descriptor(candidate(states=states, transitions=transitions), aggregate)["graphNodes"]
+        for states, transitions in ((9, 23), (12, 33), (16, 43), (21, 57))
+    ] == ["small", "medium", "large", "very_large"]
+
+
+def test_qd_archive_geometry_rejects_malformed_cells_and_preserves_valid_authority(
+    tmp_path: Path,
+) -> None:
+    descriptor = _descriptor()
+    member = {
+        "candidateId": "candidate-a",
+        "archiveLane": "quality",
+        "descriptor": dict(descriptor),
+    }
+    cell = {"cellId": descriptor["cellId"], "descriptor": dict(descriptor), "members": [member]}
+    valid = _geometry_archive(cells=[cell])
+    valid_path = tmp_path / "valid.json"
+    valid_path.write_text(json.dumps(valid), encoding="utf-8")
+    loaded, _ = qd_module._load_archive(valid_path)
+    assert loaded["cells"] == [cell]
+
+    malformed = deepcopy(valid)
+    malformed["cells"][0]["members"][0]["descriptor"]["cellId"] = "wrong-cell"
+    malformed["archiveSha256"] = canonical_sha256(
+        {key: value for key, value in malformed.items() if key != "archiveSha256"}
+    )
+    malformed_path = tmp_path / "malformed.json"
+    malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
+    with pytest.raises(TemporalDiscoveryContractError, match="member descriptor does not match"):
+        qd_module._load_archive(malformed_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("duplicate_cell", "cell IDs must be unique"),
+        ("duplicate_candidate", "candidate IDs must be unique"),
+        ("unknown_lane", "unknown archiveLane"),
+        ("missing_axis", "graphNodes must be a nonempty string"),
+    ],
+)
+def test_qd_archive_geometry_rejects_global_identity_lane_and_axis_errors(
+    mutation: str, error: str
+) -> None:
+    descriptor = _descriptor()
+    member = {
+        "candidateId": "candidate-a",
+        "archiveLane": "quality",
+        "descriptor": dict(descriptor),
+    }
+    archive = _geometry_archive(
+        cells=[
+            {
+                "cellId": descriptor["cellId"],
+                "descriptor": dict(descriptor),
+                "members": [member],
+            }
+        ]
+    )
+    if mutation == "duplicate_cell":
+        archive["cells"].append(deepcopy(archive["cells"][0]))
+    elif mutation == "duplicate_candidate":
+        archive["cells"][0]["members"].append(deepcopy(member))
+    elif mutation == "unknown_lane":
+        archive["cells"][0]["members"][0]["archiveLane"] = "legacy"
+    else:
+        del archive["cells"][0]["descriptor"]["graphNodes"]
+
+    with pytest.raises(TemporalDiscoveryContractError, match=error):
+        qd_module.validate_qd_archive_geometry(archive)
+
+
+def test_qd_archive_geometry_rebuild_is_deterministic_under_input_reordering() -> None:
+    descriptor = _descriptor()
+    left = _member("candidate-left", 1.0, 1.0)
+    right = _member("candidate-right", 2.0, 1.0)
+    for member in (left, right):
+        member["descriptor"] = dict(descriptor)
+    first = _geometry_archive(cells=select_qd_archive([left, right]))
+    second = _geometry_archive(cells=select_qd_archive([right, left]))
+
+    qd_module.validate_qd_archive_geometry(first)
+    qd_module.validate_qd_archive_geometry(second)
+    assert canonical_sha256(first) == canonical_sha256(second)
+
+
+def test_qd_descriptor_policy_reads_legacy_but_rejects_cross_policy_evolution(
+    tmp_path: Path,
+) -> None:
+    descriptor = _descriptor()
+    legacy = _legacy_geometry_archive(
+        cells=[
+            {
+                "cellId": descriptor["cellId"],
+                "descriptor": dict(descriptor),
+                "members": [
+                    {
+                        "candidateId": "legacy-candidate",
+                        "archiveLane": "quality",
+                        "descriptor": dict(descriptor),
+                    }
+                ],
+            }
+        ]
+    )
+    legacy_path = tmp_path / "legacy-archive.json"
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded, _ = qd_module._load_archive(legacy_path)
+    assert loaded["policyName"] == qd_module.LEGACY_QD_POLICY_NAME
+    new_archive = qd_module.canonical_empty_bidirectional_archive_template()
+    assert new_archive["policyName"] == qd_module.QD_POLICY_NAME
+    assert new_archive["policySha256"] == qd_module.QD_POLICY_SHA256
+    with pytest.raises(TemporalDiscoveryContractError, match="legacy and corrected"):
+        qd_module.build_rotating_qd_parent_archive(
+            current_members=[],
+            cumulative_archive={},
+            output_path=tmp_path / "corrected-archive.json",
+            generation_index=1,
+            previous_archive_path=legacy_path,
+        )
 
 
 def test_qd_robust_objective_uses_worst_window_not_total_return() -> None:
@@ -903,7 +1127,7 @@ def test_qd_generation_is_exact_across_full_and_sliced_restart(
         "negativeNoveltyMemberCount": 0,
         "cells": [
             {
-                "cellId": "one-cell",
+                "cellId": member["descriptor"]["cellId"],
                 "descriptor": member["descriptor"],
                 "candidateCountBeforeCapacity": 1,
                 "qualityEligibleCountBeforeCapacity": 1,
@@ -1083,7 +1307,7 @@ def test_empty_quality_bootstrap_is_immigrant_only_and_restart_exact(
         "negativeNoveltyMemberCount": 1,
         "cells": [
             {
-                "cellId": "one-cell",
+                "cellId": observational["descriptor"]["cellId"],
                 "descriptor": observational["descriptor"],
                 "candidateCountBeforeCapacity": 2,
                 "qualityEligibleCountBeforeCapacity": 0,
@@ -1242,9 +1466,10 @@ def test_rotating_frontier_archive_is_a_bounded_explicit_parent_fallback(
         "candidateIdentitySha256": "sha256:" + "a" * 64,
         "programSha256": "sha256:" + "b" * 64,
     }
+    descriptor = _descriptor()
     cumulative_member = {
         **candidate,
-        "cellId": "cell",
+        "cellId": descriptor["cellId"],
         "currentPanelRank": -0.1,
         "coveredMonths": 12,
         "windowMetrics": [],
@@ -1271,7 +1496,7 @@ def test_rotating_frontier_archive_is_a_bounded_explicit_parent_fallback(
         "candidateId": candidate["candidateId"],
         "candidate": candidate,
         "aggregate": {},
-        "descriptor": {"cellId": "cell", "structuralMeasurements": {}},
+        "descriptor": descriptor,
         "objectives": {
             "worstWindowConservativeNetR": -0.1,
             "maximumDrawdownR": 1.0,
@@ -1316,11 +1541,12 @@ def test_rotating_parent_cell_capacity_preserves_robust_pareto_winner(
 
     winner = candidate("pareto-winner", "a")
     dominated = candidate("current-panel-winner", "b")
+    descriptor = _descriptor()
 
     def cumulative_row(raw: dict, *, rank: float, front: int, worst: float) -> dict:
         return {
             **raw,
-            "cellId": "shared-cell",
+            "cellId": descriptor["cellId"],
             "currentPanelRank": rank,
             "robustParetoFront": front,
             "robustCrowdingDistance": None,
@@ -1353,7 +1579,7 @@ def test_rotating_parent_cell_capacity_preserves_robust_pareto_winner(
             "candidateId": raw["candidateId"],
             "candidate": raw,
             "aggregate": {},
-            "descriptor": {"cellId": "shared-cell", "structuralMeasurements": {}},
+            "descriptor": descriptor,
             "objectives": {
                 "worstWindowConservativeNetR": 0.0,
                 "maximumDrawdownR": 0.0,

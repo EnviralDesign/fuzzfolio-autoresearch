@@ -1,0 +1,75 @@
+{
+  "admission": "native_v2_then_compiled_v3_no_market_v1",
+  "authoritySha256": "sha256:7fbf45787ea91ef707f58c71a04c00fc275d8df0791ed190b1182d553130f164",
+  "capacityContract": {
+    "admission": "no_market_native_v2_and_compiled_v3_v1",
+    "minimumUniquePairs": 4096,
+    "minimumUniqueResourceFingerprintsPerSide": 64,
+    "minimumUniqueTopologiesPerSide": 8,
+    "previewStreamSize": 8192,
+    "requiredDirections": [
+      "long",
+      "short"
+    ],
+    "schemaVersion": "temporal_qd_evolvable_module_capacity_contract_v1"
+  },
+  "catalogSha256": "sha256:e870e59811079ac4be601380a6f507b7be0c34bccf9ce3699eded4e65e6bae3b",
+  "codec": "evolvable_module_genome_json_v1",
+  "compiledAdmittedCandidateCount": 8192,
+  "compilerPolicySha256": "sha256:677d0d764b2877040b8f7d14b0d53acb22594dcb41ccf042b9eb244067cd56f4",
+  "factoryPolicySha256": "sha256:8a4091aa23a3c7224f17681806fb58def4033d696a901f83ba71f1e0119a579c",
+  "nativeOrCompilerRejectionCounts": {},
+  "noMarket": true,
+  "operatorRegistrySha256": "sha256:4eb3c2e7f76e2e679fc40d68308f1b3553dafdb0c109222121b1c4b4c35465a5",
+  "pairRunConfigSha256": "sha256:2fe936bec06e5b8541eff8869703350ae7203c22e555e9eac038aa4dad752e8c",
+  "passed": true,
+  "perSide": {
+    "long": {
+      "exitPresenceCounts": {
+        "False": 4149,
+        "True": 4043
+      },
+      "managementEffectCounts": {
+        "None": 2020,
+        "activate_trailing_stop_next_open": 2048,
+        "move_stop_to_break_even_next_open": 2076,
+        "tighten_stop_next_open": 2048
+      },
+      "uniqueResourceFingerprintCount": 288,
+      "uniqueSemanticTopologyCount": 32
+    },
+    "short": {
+      "exitPresenceCounts": {
+        "False": 4094,
+        "True": 4098
+      },
+      "managementEffectCounts": {
+        "None": 2098,
+        "activate_trailing_stop_next_open": 2009,
+        "move_stop_to_break_even_next_open": 2036,
+        "tighten_stop_next_open": 2049
+      },
+      "uniqueResourceFingerprintCount": 288,
+      "uniqueSemanticTopologyCount": 32
+    }
+  },
+  "previewStreamSize": 8192,
+  "programKind": "evolvable_module_genome_v1",
+  "rawPreview": {
+    "perSide": {
+      "long": {
+        "uniqueResourceFingerprintCount": 288,
+        "uniqueSemanticTopologyCount": 32
+      },
+      "short": {
+        "uniqueResourceFingerprintCount": 288,
+        "uniqueSemanticTopologyCount": 32
+      }
+    },
+    "uniqueSemanticPairCount": 8192
+  },
+  "schemaVersion": "temporal_qd_evolvable_module_capacity_receipt_v1",
+  "semanticReceiptSha256": "sha256:3c403c9c68f2796ec6fe79bc601ab2891ef0fdfa0bfe7cf1affdc143169ed594",
+  "uniqueCompiledV3ProfileCount": 8192,
+  "uniqueSemanticPairCount": 8192
+}

@@ -47,6 +47,7 @@ from .temporal_qd_evolution import (
     _parent_member_order,
     _quality_member,
     _normalize_parameters,
+    _resolve_archive_policy_authority,
     _read,
     build_qd_archive,
     build_rotating_qd_parent_archive,
@@ -103,6 +104,7 @@ from .temporal_generation_funnel import (
     write_generation_funnel_artifact,
 )
 from .temporal_search import run_temporal_search_tasks
+from .temporal_proposal_lineage_artifact import write_proposal_lineage_unavailable
 from .result_codec import ResultCodecError, read_json_object
 
 SUPERVISOR_VERSION = "temporal_qd_supervisor_v3"
@@ -480,6 +482,37 @@ def _require_frozen_immigrant_capacity_requirement(
     return required
 
 
+def _require_evolvable_capacity_receipt_supply(
+    receipt: Mapping[str, Any], *, required_unique_candidates: int
+) -> None:
+    """Require an actual-factory receipt to prove the frozen campaign supply.
+
+    A v5 receipt is not merely a factory-health signal: broad admission's
+    G0-plus-later-generation construction requirement is frozen in the run
+    contract. Its two admitted identity counts must both cover that exact
+    requirement, otherwise a finite preview can make a false campaign-wide
+    non-collision claim.
+    """
+
+    if isinstance(required_unique_candidates, bool) or required_unique_candidates < 1:
+        raise TemporalDiscoveryContractError(
+            "evolvable v5 capacity receipt requirement is invalid"
+        )
+    admitted = receipt.get("compiledAdmittedCandidateCount")
+    unique_pairs = receipt.get("uniqueSemanticPairCount")
+    if (
+        not isinstance(admitted, int)
+        or isinstance(admitted, bool)
+        or not isinstance(unique_pairs, int)
+        or isinstance(unique_pairs, bool)
+        or admitted < required_unique_candidates
+        or unique_pairs < required_unique_candidates
+    ):
+        raise TemporalDiscoveryContractError(
+            "evolvable v5 capacity receipt does not prove the frozen campaign candidate supply"
+        )
+
+
 def _archive_member_count(archive: Mapping[str, Any]) -> int:
     cells = archive.get("cells")
     if not isinstance(cells, list):
@@ -805,6 +838,74 @@ def _artifact_descriptor(path: Path, payload: Mapping[str, Any]) -> dict[str, st
         "path": str(path.resolve()),
         "sha256": canonical_sha256(payload),
     }
+
+
+_V5_LINEAGE_UNAVAILABLE_REASONS = (
+    "operator_application_not_sealed",
+    "observed_execution_attribution_not_sealed",
+    "canonical_evidence_components_not_sealed",
+    "realized_behavior_evidence_binding_not_sealed",
+    "retention_evidence_not_sealed",
+    "full_ancestry_or_external_parent_evidence_not_sealed",
+)
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _write_v5_lineage_unavailable_marker(
+    *, root: Path, generation_index: int, config: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Seal an explicit v5 causal-lineage abstention after finalization.
+
+    This is intentionally absent for historical policies.  The bounded source
+    set consists only of completed immutable artifacts already reopened by the
+    supervisor; no aggregate is reverse-engineered into missing causality.
+    """
+    if not isinstance(config.get("evolvableModuleAuthority"), Mapping):
+        return None
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    relative_paths = [
+        "proposal/generation-journal.json",
+        "campaign/campaign.json",
+        "archive.json",
+    ]
+    evidence_ledger = generation_root / "evidence" / "generation-ledger.json"
+    if evidence_ledger.is_file():
+        relative_paths.append("evidence/generation-ledger.json")
+    artifacts: list[dict[str, str]] = []
+    for relative in relative_paths:
+        path = generation_root / relative
+        if not path.is_file():
+            raise TemporalDiscoveryContractError(
+                "v5 lineage-unavailable marker source artifact is absent"
+            )
+        artifacts.append({"relativePath": relative, "sha256": _file_digest(path)})
+    return write_proposal_lineage_unavailable(
+        generation_root=generation_root,
+        campaign_id=f"v5:{config['configSha256']}",
+        completed_generation_index=generation_index,
+        reasons=_V5_LINEAGE_UNAVAILABLE_REASONS,
+        source_artifacts=artifacts,
+    )
+
+
+def _pair_policy_authority(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Use the base pair authority for policy projection under enriched v5."""
+    if isinstance(config.get("evolvableModuleAuthority"), Mapping):
+        source = config.get("bidirectionalPairSourceAuthority")
+        if not isinstance(source, Mapping):
+            raise TemporalDiscoveryContractError(
+                "evolvable v5 pair source authority is unavailable"
+            )
+        return source
+    value = config.get("bidirectionalPairGeneration")
+    return value if isinstance(value, Mapping) else None
 
 
 def _self_hashed_descriptor(
@@ -1613,6 +1714,9 @@ def _validate_completed_generations(
             config=config,
             tail_result_mode=tail_result_mode,
             tail_result_indexes=tail_result_indexes,
+        )
+        _write_v5_lineage_unavailable_marker(
+            root=root, generation_index=index, config=config
         )
         # A restart/audit pass never needs one generation's verified
         # projections while validating the next.  Release each boundary so
@@ -5015,9 +5119,39 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     else:
         # Rebuilds the concrete typed/native authorities and validates every
         # frozen registry/catalog/transport identity before a resume can run.
+        evolvable_config = config.get("evolvableModuleAuthority")
+        source_pair_config = (
+            config.get("bidirectionalPairSourceAuthority")
+            if isinstance(evolvable_config, Mapping)
+            else pair_config
+        )
+        if not isinstance(source_pair_config, Mapping):
+            raise TemporalDiscoveryContractError(
+                "evolvable v5 pair source authority is unavailable"
+            )
         if not native_pair_generation:
-            with PairAuthorityBundle(_clone(pair_config, name="frozen pair authority")):
-                pass
+            with PairAuthorityBundle(
+                _clone(source_pair_config, name="frozen pair source authority")
+            ) as bundle:
+                if isinstance(evolvable_config, Mapping):
+                    evolvable = bundle.open_evolvable_module_authority(
+                        evolvable_config
+                    )
+                    bindings = evolvable.generation_bindings(pair_config)
+                    if (
+                        bindings["runConfig"] != pair_config
+                        or bindings["archivePolicyAuthority"]
+                        != evolvable_config.get("archivePolicyAuthority")
+                        or bindings["behaviorAttributionRequirement"]
+                        != evolvable_config.get("behaviorAttributionRequirement")
+                        or bindings["operatorImplementation"]
+                        != pair_config.get("operatorImplementation")
+                        or bindings["capacityReceipt"]
+                        != pair_config.get("capacityReceipt")
+                    ):
+                        raise TemporalDiscoveryContractError(
+                            "evolvable v5 generation bindings drifted"
+                        )
         if config.get("broadAdmission") is True:
             contract = config.get("broadAdmissionContract")
             if not isinstance(contract, Mapping):
@@ -5027,19 +5161,34 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
             required_unique_candidates = _require_frozen_immigrant_capacity_requirement(
                 config, contract
             )
-            current_capacity = immigrant_capacity_audit(
-                pair_config,
-                required_unique_candidates=required_unique_candidates,
-            )
-            if _clone(
-                current_capacity, name="reopened pair immigrant capacity audit"
-            ) != _clone(
-                contract.get("immigrantConstructionCapacity"),
-                name="frozen pair immigrant capacity audit",
-            ):
-                raise TemporalDiscoveryContractError(
-                    "QD broad immigrant construction capacity audit drifted"
+            if isinstance(evolvable_config, Mapping):
+                receipt = contract.get("evolvableFactoryCapacityReceipt")
+                if not isinstance(receipt, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "evolvable v5 broad admission lacks its sealed actual-factory capacity receipt"
+                    )
+                if receipt != pair_config.get("capacityReceipt"):
+                    raise TemporalDiscoveryContractError(
+                        "evolvable v5 broad admission capacity receipt drifted"
+                    )
+                _require_evolvable_capacity_receipt_supply(
+                    receipt,
+                    required_unique_candidates=required_unique_candidates,
                 )
+            else:
+                current_capacity = immigrant_capacity_audit(
+                    pair_config,
+                    required_unique_candidates=required_unique_candidates,
+                )
+                if _clone(
+                    current_capacity, name="reopened pair immigrant capacity audit"
+                ) != _clone(
+                    contract.get("immigrantConstructionCapacity"),
+                    name="frozen pair immigrant capacity audit",
+                ):
+                    raise TemporalDiscoveryContractError(
+                        "QD broad immigrant construction capacity audit drifted"
+                    )
 
     validator_binding = config.get("validator")
     if pair_config is None:
@@ -5054,6 +5203,14 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     evaluation = config.get("evaluation")
     if not isinstance(evaluation, Mapping):
         raise TemporalDiscoveryContractError("QD supervisor evaluation binding is invalid")
+    evolvable_config = config.get("evolvableModuleAuthority")
+    if isinstance(evolvable_config, Mapping) and (
+        evaluation.get("behaviorAttributionRequirement")
+        != evolvable_config.get("behaviorAttributionRequirement")
+    ):
+        raise TemporalDiscoveryContractError(
+            "evolvable v5 evaluation behavior attribution requirement drifted"
+        )
     template_path = Path(str(evaluation.get("templatePreparationPath") or ""))
     template = _canonical_file(template_path, name="QD template preparation")
     if canonical_sha256(template) != evaluation.get("templatePreparationSha256"):
@@ -5153,6 +5310,7 @@ def _frozen_config(
     continuation_from: Mapping[str, Any] | None = None,
     initial_construction_pool_size: int | None = None,
     evaluation_population_size: int | None = None,
+    evolvable_module_authority_config: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -5263,6 +5421,54 @@ def _frozen_config(
             ),
         )
     pair_authority = load_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
+    pair_source_authority = (
+        _clone(pair_authority, name="base pair source authority")
+        if pair_authority is not None
+        else None
+    )
+    evolvable_authority = (
+        _clone(
+            evolvable_module_authority_config,
+            name="evolvable module authority config",
+        )
+        if evolvable_module_authority_config is not None
+        else None
+    )
+    evolvable_capacity_receipt: Mapping[str, Any] | None = None
+    if evolvable_authority is not None:
+        if pair_authority is None:
+            raise TemporalDiscoveryContractError(
+                "evolvable module authority requires bidirectional pair mode"
+            )
+        policy_authority = evolvable_authority.get("archivePolicyAuthority")
+        if not isinstance(policy_authority, Mapping):
+            raise TemporalDiscoveryContractError(
+                "evolvable module authority lacks archive policy authority"
+            )
+        _, _, _, direction_aware = _resolve_archive_policy_authority(policy_authority)
+        if not direction_aware:
+            raise TemporalDiscoveryContractError(
+                "evolvable module authority requires the exact v5 archive policy"
+            )
+        if not isinstance(evolvable_authority.get("behaviorAttributionRequirement"), Mapping):
+            raise TemporalDiscoveryContractError(
+                "evolvable module authority lacks behavior attribution requirement"
+            )
+        # Freeze the authority-authored operator identity before hashing the
+        # supervisor config.  The generation runtime reopens and verifies this
+        # same material; it must never inherit the legacy pair operator label.
+        with PairAuthorityBundle(pair_authority) as _pair_bundle:
+            _evolvable = _pair_bundle.open_evolvable_module_authority(
+                evolvable_authority
+            )
+            _binding_input = _clone(pair_authority, name="base pair generation config")
+            # The base pair config's v4 operator identity names the legacy
+            # factory.  It remains the source authority, but cannot be passed
+            # through as the v5 generation operator identity.
+            _binding_input.pop("operatorImplementation", None)
+            _bindings = _evolvable.generation_bindings(_binding_input)
+        pair_authority = _bindings["runConfig"]
+        evolvable_capacity_receipt = _bindings["capacityReceipt"]
     if pair_authority is None and pair_generation_engine is not None:
         raise TemporalDiscoveryContractError(
             "pair generation engine requires bidirectional pair mode"
@@ -5278,6 +5484,26 @@ def _frozen_config(
         )
     except TemporalQDNativeError as exc:
         raise TemporalDiscoveryContractError(str(exc)) from exc
+    if evolvable_authority is not None and pair_generation_runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON:
+        raise TemporalDiscoveryContractError(
+            "evolvable module authority currently requires the explicit Python pair-generation oracle"
+        )
+    archive_policy_authority = (
+        evolvable_authority["archivePolicyAuthority"]
+        if evolvable_authority is not None
+        else None
+    )
+    policy_name, policy_sha256, frozen_policy, direction_aware = (
+        _resolve_archive_policy_authority(archive_policy_authority)
+    )
+    if (
+        initial_archive.get("policyName") != policy_name
+        or initial_archive.get("policySha256") != policy_sha256
+        or initial_archive.get("frozenPolicy") != frozen_policy
+    ):
+        raise TemporalDiscoveryContractError(
+            "initial archive policy does not match the frozen supervisor authority"
+        )
     g0_enabled = bool(pair_authority is not None and not is_continuation and first_generation_index == 1)
     if g0_enabled and initial_construction_pool_size is None and evaluation_population_size is None:
         evaluation_population_size = int(normalized_parameters["targetUniqueCandidates"])
@@ -5340,10 +5566,28 @@ def _frozen_config(
     )
     pair_capacity_audit = None
     if broad_admission and pair_authority is not None:
-        pair_capacity_audit = immigrant_capacity_audit(
-            pair_authority,
-            required_unique_candidates=pair_capacity_requirement,
-        )
+        if evolvable_authority is not None:
+            if not isinstance(evolvable_capacity_receipt, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "evolvable v5 broad admission requires a sealed actual-factory capacity receipt"
+                )
+            _require_evolvable_capacity_receipt_supply(
+                evolvable_capacity_receipt,
+                required_unique_candidates=pair_capacity_requirement,
+            )
+            # The authority has already verified this receipt against its
+            # actual factory, compiler and capacity contract.  Keep the
+            # receipt as the v5 admission witness instead of applying the
+            # legacy pair-factory audit to an enriched v5 run config.
+            pair_capacity_audit = _clone(
+                evolvable_capacity_receipt,
+                name="evolvable v5 actual-factory capacity receipt",
+            )
+        else:
+            pair_capacity_audit = immigrant_capacity_audit(
+                pair_authority,
+                required_unique_candidates=pair_capacity_requirement,
+            )
     source = None if pair_authority is not None else ExactGeneratorV2Continuation(
         source_preparation_path=source_preparation_path,
         base_generator_root=base_generator_root,
@@ -5357,9 +5601,9 @@ def _frozen_config(
         "schemaVersion": SUPERVISOR_CONFIG_SCHEMA,
         "supervisorVersion": SUPERVISOR_VERSION,
         "qdVersion": QD_VERSION,
-        "policyName": QD_POLICY_NAME,
-        "policySha256": QD_POLICY_SHA256,
-        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
+        "frozenPolicy": _clone(frozen_policy, name="frozen QD policy"),
         "broadAdmission": bool(broad_admission),
         **(
             {
@@ -5383,7 +5627,11 @@ def _frozen_config(
                     **(
                         {
                             "immigrantConstructionCandidateRequirement": pair_capacity_requirement,
-                            "immigrantConstructionCapacity": pair_capacity_audit,
+                            **(
+                                {"evolvableFactoryCapacityReceipt": pair_capacity_audit}
+                                if evolvable_authority is not None
+                                else {"immigrantConstructionCapacity": pair_capacity_audit}
+                            ),
                         }
                         if pair_capacity_audit is not None
                         else {}
@@ -5413,8 +5661,8 @@ def _frozen_config(
         "workerContractSha256": _sha256(worker_contract_sha256, name="worker contract"),
         "identityLedger": {
             "schemaVersion": QD_IDENTITY_LEDGER_SCHEMA,
-            "policySha256": QD_POLICY_SHA256,
-            "canonicalEvidenceIdentity": QD_POLICY["identity"]["canonicalEvidence"],
+            "policySha256": policy_sha256,
+            "canonicalEvidenceIdentity": frozen_policy["identity"]["canonicalEvidence"],
         },
         **(
             {"constructionOperatorPolicy": construction_policy}
@@ -5446,7 +5694,17 @@ def _frozen_config(
             }
         } if source is not None else {
             "bidirectionalPairGeneration": pair_authority,
+            **(
+                {"bidirectionalPairSourceAuthority": pair_source_authority}
+                if evolvable_authority is not None
+                else {}
+            ),
             "pairGenerationRuntime": pair_generation_runtime,
+            **(
+                {"evolvableModuleAuthority": evolvable_authority}
+                if evolvable_authority is not None
+                else {}
+            ),
         }),
         **({"validator": {"commandFile": str(validator_command_file.resolve()), "command": validator_command, "commandSha256": canonical_sha256(validator_command), "timeoutSeconds": 60.0}} if pair_authority is None else {}),
         "evaluation": {
@@ -5460,6 +5718,16 @@ def _frozen_config(
             "timeoutSecondsPerGeneration": float(evaluation_timeout_seconds),
             "enqueueBatchSize": int(enqueue_batch_size),
             "costViews": _clone(QD_COST_VIEWS, name="frozen QD cost views"),
+            **(
+                {
+                    "behaviorAttributionRequirement": _clone(
+                        evolvable_authority["behaviorAttributionRequirement"],
+                        name="v5 behavior attribution requirement",
+                    )
+                }
+                if evolvable_authority is not None
+                else {}
+            ),
         },
         **({"evidenceLadder": evidence_ladder} if evidence_ladder is not None else {}),
         **({"rotatingEvidence": rotating_evidence} if rotating_evidence is not None else {}),
@@ -5503,6 +5771,7 @@ def _campaign_window_evidence(
     panel: Mapping[str, Any],
     candidates: Mapping[str, Mapping[str, Any]],
     tail_result_index: Mapping[str, Any] | None = None,
+    direction_aware: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     result_root = campaign_root / "screening-run"
     return load_provenance_bound_window_evidence(
@@ -5516,6 +5785,7 @@ def _campaign_window_evidence(
         panel=panel,
         candidates=candidates,
         tail_result_index=tail_result_index,
+        direction_aware=direction_aware,
     )
 
 
@@ -5560,6 +5830,16 @@ def _run_rotating_cohort_campaign(
         rotating_evidence=config["rotatingEvidence"],
         campaign_role=campaign_role,
         panel_id=panel_id,
+        archive_policy_authority=(
+            config["evolvableModuleAuthority"]["archivePolicyAuthority"]
+            if config.get("evolvableModuleAuthority") is not None
+            else None
+        ),
+        behavior_attribution_requirement=(
+            config["evaluation"].get("behaviorAttributionRequirement")
+            if config.get("evolvableModuleAuthority") is not None
+            else None
+        ),
     )
     authority = _canonical_file(campaign_root / "authority.json", name="rotating authority")
     evaluation = run_temporal_search_tasks(
@@ -5569,6 +5849,15 @@ def _run_rotating_cohort_campaign(
         timeout_seconds=float(config["evaluation"]["timeoutSecondsPerGeneration"]),
         resume=True,
         enqueue_batch_size=int(config["evaluation"]["enqueueBatchSize"]),
+        **(
+            {
+                "behavior_attribution_requirement": config["evaluation"][
+                    "behaviorAttributionRequirement"
+                ]
+            }
+            if config.get("evolvableModuleAuthority") is not None
+            else {}
+        ),
     )
     if evaluation.get("completedTaskCount") != result["taskCount"]:
         raise TemporalDiscoveryContractError(
@@ -6079,6 +6368,7 @@ def _run_rotating_generation_transaction(
             ),
             cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
             tail_result_index=proposal_tail_index,
+            direction_aware=(config.get("evolvableModuleAuthority") is not None),
         )
     ]
     campaign_bindings: list[dict[str, Any]] = [
@@ -6116,6 +6406,7 @@ def _run_rotating_generation_transaction(
                     config["frozenSearchPolicy"]["minimumTradesPerWindow"]
                 ),
                 cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+                direction_aware=(config.get("evolvableModuleAuthority") is not None),
                 tail_result_index=(
                     _verified_tail_result_index(
                         campaign_root=parent_campaign_root,
@@ -6223,6 +6514,7 @@ def _run_rotating_generation_transaction(
         panel=panel,
         candidates=evaluated_new_candidates,
         tail_result_index=proposal_tail_index,
+        direction_aware=config.get("evolvableModuleAuthority") is not None,
     )
     current_records.update(new_records)
     if parent_campaign_root is not None:
@@ -6239,6 +6531,7 @@ def _run_rotating_generation_transaction(
                     if tail_result_mode == TAIL_RESULT_MODE_INDEXED
                     else None
                 ),
+                direction_aware=config.get("evolvableModuleAuthority") is not None,
             )
         )
     bundles: dict[str, dict[str, dict[str, Any]]] = {
@@ -6296,6 +6589,7 @@ def _run_rotating_generation_transaction(
                 if tail_result_mode == TAIL_RESULT_MODE_INDEXED
                 else None
             ),
+            direction_aware=config.get("evolvableModuleAuthority") is not None,
         )
         for candidate_id in missing:
             bundles[candidate_id][backfill_panel_id] = build_candidate_panel_bundle(
@@ -6420,6 +6714,7 @@ def _run_rotating_generation_transaction(
             for candidate_id, panel_bundles in bundles.items()
         },
         previous_archive=previous_cumulative,
+        direction_aware=config.get("evolvableModuleAuthority") is not None,
     )
     _write_once(cumulative_path, cumulative)
     archive_result = build_rotating_qd_parent_archive(
@@ -6429,8 +6724,8 @@ def _run_rotating_generation_transaction(
         generation_index=generation_index,
         previous_archive_path=parent_archive_path,
         bidirectional_pair_policy=(
-            pair_policy_from_config(config["bidirectionalPairGeneration"])
-            if config.get("bidirectionalPairGeneration") is not None
+            pair_policy_from_config(_pair_policy_authority(config))
+            if _pair_policy_authority(config) is not None
             else None
         ),
         cell_capacity=int(config["frozenSearchPolicy"]["cellCapacity"]),
@@ -6592,8 +6887,16 @@ def run_qd_supervisor(
     adopt_python_completed_generations: tuple[int, ...] = (),
     authorize_native_finalization_authority_rotation: bool = False,
     stop_before_evaluation_generation: int | None = None,
+    evolvable_module_authority_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
+    if (
+        evolvable_module_authority_config is not None
+        and tail_result_mode == TAIL_RESULT_MODE_INDEXED
+    ):
+        raise TemporalDiscoveryContractError(
+            "evolvable v5 authority requires raw rotating result provenance until direction-aware tail indexing is versioned"
+        )
     native_finalization_validation = _normalize_native_finalization_validation(
         native_finalization_validation
     )
@@ -6668,6 +6971,7 @@ def run_qd_supervisor(
         continuation_from=continuation_from,
         initial_construction_pool_size=initial_construction_pool_size,
         evaluation_population_size=evaluation_population_size,
+        evolvable_module_authority_config=evolvable_module_authority_config,
     )
     if (
         tail_result_mode == TAIL_RESULT_MODE_INDEXED
@@ -6921,6 +7225,11 @@ def run_qd_supervisor(
                     "policySha256": config["policySha256"],
                     "frozenPolicy": config["frozenPolicy"],
                 },
+                archive_policy_authority=(
+                    config["evolvableModuleAuthority"]["archivePolicyAuthority"]
+                    if config.get("evolvableModuleAuthority") is not None
+                    else None
+                ),
             )
             if config.get("bidirectionalPairGeneration") is None:
                 # Legacy generation owns the file-backed source and command
@@ -6944,18 +7253,55 @@ def run_qd_supervisor(
                 except TemporalQDNativeError as exc:
                     raise TemporalDiscoveryContractError(str(exc)) from exc
                 if pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_PYTHON:
-                    with PairAuthorityBundle(config["bidirectionalPairGeneration"]) as pair_authority:
+                    with PairAuthorityBundle(
+                        config.get(
+                            "bidirectionalPairSourceAuthority",
+                            config["bidirectionalPairGeneration"],
+                        )
+                    ) as pair_authority:
+                        evolvable = (
+                            pair_authority.open_evolvable_module_authority(
+                                config["evolvableModuleAuthority"]
+                            )
+                            if config.get("evolvableModuleAuthority") is not None
+                            else None
+                        )
+                        bindings = (
+                            evolvable.generation_bindings(
+                                config["bidirectionalPairGeneration"]
+                            )
+                            if evolvable is not None
+                            else None
+                        )
+                        if bindings is not None:
+                            generation_kwargs["archive_policy_authority"] = bindings[
+                                "archivePolicyAuthority"
+                            ]
                         g0 = config.get("g0Bootstrap")
                         generation_result = generate_qd_generation(
                             **generation_kwargs,
                             pair_generation_runtime=pair_runtime,
-                            bidirectional_pair_run_config=config["bidirectionalPairGeneration"],
-                            bidirectional_pair_policy=pair_policy_from_config(config["bidirectionalPairGeneration"]),
-                            bidirectional_pair_factory=pair_authority.factory,
-                            bidirectional_module_authority=pair_authority.operator,
+                            bidirectional_pair_run_config=(
+                                bindings["runConfig"]
+                                if bindings is not None
+                                else config["bidirectionalPairGeneration"]
+                            ),
+                            bidirectional_pair_policy=pair_policy_from_config(
+                                _pair_policy_authority(config)
+                            ),
+                            bidirectional_pair_factory=(
+                                evolvable.factory if evolvable is not None else pair_authority.factory
+                            ),
+                            bidirectional_module_authority=(
+                                evolvable.operator if evolvable is not None else pair_authority.operator
+                            ),
                             bidirectional_native_validator=pair_authority.validator,
                             bidirectional_pair_compiler=pair_authority.compiler,
-                            bidirectional_operator_implementation_identity=config["bidirectionalPairGeneration"]["operatorImplementation"],
+                            bidirectional_operator_implementation_identity=(
+                                bindings["operatorImplementation"]
+                                if bindings is not None
+                                else config["bidirectionalPairGeneration"]["operatorImplementation"]
+                            ),
                             initial_construction_pool_size=(int(g0["initialConstructionPoolSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
                             evaluation_population_size=(int(g0["evaluationPopulationSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
                         )
@@ -6965,7 +7311,9 @@ def run_qd_supervisor(
                         **generation_kwargs,
                         pair_generation_runtime=pair_runtime,
                         bidirectional_pair_run_config=config["bidirectionalPairGeneration"],
-                        bidirectional_pair_policy=pair_policy_from_config(config["bidirectionalPairGeneration"]),
+                        bidirectional_pair_policy=pair_policy_from_config(
+                            _pair_policy_authority(config)
+                        ),
                         bidirectional_operator_implementation_identity=config["bidirectionalPairGeneration"]["operatorImplementation"],
                         initial_construction_pool_size=(int(g0["initialConstructionPoolSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
                         evaluation_population_size=(int(g0["evaluationPopulationSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
@@ -7012,6 +7360,16 @@ def run_qd_supervisor(
                 ),
                 evidence_ladder=config.get("evidenceLadder"),
                 rotating_evidence=config.get("rotatingEvidence"),
+                archive_policy_authority=(
+                    config["evolvableModuleAuthority"]["archivePolicyAuthority"]
+                    if config.get("evolvableModuleAuthority") is not None
+                    else None
+                ),
+                behavior_attribution_requirement=(
+                    config["evaluation"].get("behaviorAttributionRequirement")
+                    if config.get("evolvableModuleAuthority") is not None
+                    else None
+                ),
             )
             evaluation_identity = _read(
                 campaign_root / "evaluation-identity.json",
@@ -7024,7 +7382,7 @@ def run_qd_supervisor(
                     "workerContractSha256"
                 )
                 != config["workerContractSha256"]
-                or evaluation_identity.get("policySha256") != QD_POLICY_SHA256
+                or evaluation_identity.get("policySha256") != config["policySha256"]
                 or (config.get("rotatingEvidence") is None and evaluation_identity.get("predeclaredEvidenceContextSha256")
                 != config["evaluation"]["predeclaredEvidenceContextSha256"])
             ):
@@ -7122,6 +7480,15 @@ def run_qd_supervisor(
                     generation_finalization_engine
                     != GENERATION_FINALIZATION_ENGINE_RUST
                 ),
+                **(
+                    {
+                        "behavior_attribution_requirement": config["evaluation"][
+                            "behaviorAttributionRequirement"
+                        ]
+                    }
+                    if config.get("evolvableModuleAuthority") is not None
+                    else {}
+                ),
             )
             if evaluation_result["completedTaskCount"] != campaign_result["taskCount"]:
                 raise TemporalDiscoveryContractError(
@@ -7176,6 +7543,13 @@ def run_qd_supervisor(
                         config["frozenSearchPolicy"]["minimumTradesPerWindow"]
                     ),
                     cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
+                    archive_policy_authority=(
+                        config["evolvableModuleAuthority"][
+                            "archivePolicyAuthority"
+                        ]
+                        if config.get("evolvableModuleAuthority") is not None
+                        else None
+                    ),
                 )
             funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
             if (
@@ -7280,6 +7654,20 @@ def run_qd_supervisor(
                 ),
                 "originProposalCounts": generation_result["originProposalCounts"],
                 "originAcceptedCounts": generation_result["originAcceptedCounts"],
+                **(
+                    {
+                        "reproductionAllocation": generation_result[
+                            "reproductionAllocation"
+                        ],
+                        "reproductionAllocationAccounting": generation_result[
+                            "reproductionAllocationAccounting"
+                        ],
+                    }
+                    if generation_result.get("reproductionAllocation") is not None
+                    and generation_result.get("reproductionAllocationAccounting")
+                    is not None
+                    else {}
+                ),
                 "campaignSha256": campaign_result["campaignSha256"],
                 "evaluationIdentitySha256": campaign_result["evaluationIdentitySha256"],
                 "taskMatrixSha256": campaign_result["taskMatrixSha256"],
@@ -7412,6 +7800,9 @@ def run_qd_supervisor(
                 )
             completed_generations = list(state.get("completedGenerations") or [])
             completed_generations.append(generation_record)
+            _write_v5_lineage_unavailable_marker(
+                root=root, generation_index=generation_index, config=config
+            )
             candidate_increment = int(generation_result["candidateCount"])
             worker_increment = int(campaign_result["taskCount"]) + int(
                 archive_result.get("additionalWorkerTaskCount") or 0
@@ -7883,6 +8274,11 @@ def main() -> None:
     parser.add_argument("--stop-after-generation", type=int)
     parser.add_argument("--bidirectional-pair-config", type=Path, help="closed temporal_qd_bidirectional_pair_run_config_v1 JSON; opt-in only")
     parser.add_argument(
+        "--evolvable-module-authority-config",
+        type=Path,
+        help="fresh closed temporal_qd_evolvable_module_authority_v1 JSON; requires v5 archive and Python pair oracle",
+    )
+    parser.add_argument(
         "--pair-generation-engine",
         choices=(PAIR_GENERATION_RUNTIME_PYTHON, PAIR_GENERATION_RUNTIME_RUST),
         default=PAIR_GENERATION_RUNTIME_DEFAULT,
@@ -7958,6 +8354,14 @@ def main() -> None:
                 args.authorize_native_finalization_authority_rotation
             ),
             stop_before_evaluation_generation=args.stop_before_evaluation_generation,
+            evolvable_module_authority_config=(
+                _read(
+                    args.evolvable_module_authority_config,
+                    name="evolvable module authority config",
+                )
+                if args.evolvable_module_authority_config is not None
+                else None
+            ),
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return
@@ -8023,6 +8427,14 @@ def main() -> None:
             args.authorize_native_finalization_authority_rotation
         ),
         stop_before_evaluation_generation=args.stop_before_evaluation_generation,
+        evolvable_module_authority_config=(
+            _read(
+                args.evolvable_module_authority_config,
+                name="evolvable module authority config",
+            )
+            if args.evolvable_module_authority_config is not None
+            else None
+        ),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

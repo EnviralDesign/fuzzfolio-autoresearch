@@ -13,7 +13,7 @@ use temporal_qd_kernel::{
     schedule::{
         MAX_SCHEDULED_PROPOSAL_ORDINAL, PythonRandom, RotatingParentSchedule, ScheduleError,
         explicit_parent_index, is_crossover_slot, mutation_depth_for_seed, scheduled_immigrant,
-        sort_explicit_parent_identities, unbiased_choice,
+        scheduled_immigrant_for_accepted_quota, sort_explicit_parent_identities, unbiased_choice,
     },
     selector::selector_index,
 };
@@ -102,13 +102,7 @@ fn mutation_buckets_and_parent_schedules_match_python() {
     assert!(scheduled_immigrant(false, 0, None).unwrap());
 
     let two_thirds = RotatingParentSchedule::from_counts(3, 2).unwrap();
-    assert_eq!(two_thirds.schedule_sha256(), SCHEDULE_SHA256);
-    for (ordinal, expected_offspring) in ROTATING_TWO_THIRDS_OFFSPRING.into_iter().enumerate() {
-        assert_eq!(
-            !two_thirds.is_immigrant(ordinal as u64).unwrap(),
-            expected_offspring
-        );
-    }
+    assert_ne!(two_thirds.schedule_sha256(), SCHEDULE_SHA256);
     let four_fifths = RotatingParentSchedule::from_counts(5, 4).unwrap();
     for (ordinal, expected_offspring) in ROTATING_FOUR_FIFTHS_OFFSPRING.into_iter().enumerate() {
         assert_eq!(
@@ -116,6 +110,19 @@ fn mutation_buckets_and_parent_schedules_match_python() {
             expected_offspring
         );
     }
+
+    let mut sparse_offspring = 0_u64;
+    let mut sparse_immigrants = 0_u64;
+    for _ in 0..128 {
+        if scheduled_immigrant_for_accepted_quota(102, 26, sparse_offspring, sparse_immigrants)
+            .unwrap()
+        {
+            sparse_immigrants += 1;
+        } else {
+            sparse_offspring += 1;
+        }
+    }
+    assert_eq!((sparse_offspring, sparse_immigrants), (102, 26));
 
     assert!(
         two_thirds

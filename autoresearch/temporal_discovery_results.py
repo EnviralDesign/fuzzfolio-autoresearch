@@ -28,6 +28,11 @@ from .temporal_search import (
 )
 
 from .temporal_discovery_base import *
+from .temporal_realized_behavior import (
+    aggregate_realized_behavior,
+    behavior_family_clusters,
+    build_window_realized_behavior,
+)
 
 def _result_files(result_root: Path | str) -> list[Path]:
     root = Path(result_root)
@@ -311,6 +316,17 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(holding, int) and not isinstance(holding, bool) and holding >= 0:
             holding_bars.append(holding)
 
+    realized_behavior = build_window_realized_behavior(
+        replay=conservative_replay,
+        metrics=conservative_metrics,
+        window_id=(
+            str(result.get("analysis_window_start"))
+            + "/"
+            + str(result.get("analysis_window_end"))
+        ),
+        allow_legacy_sparse=not v3_admissible,
+    )
+
     return {
         "economicsBasis": (
             "stage5e7_v3_terminal_adjusted"
@@ -448,6 +464,10 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
             sum(mae_values) / len(mae_values) if mae_values else 0.0
         ),
         "equityCurveR": economic_equity_curve,
+        # The realized projection is derived only from immutable conservative
+        # replay evidence.  It intentionally carries no authored/program
+        # identity, so execution-equivalent genotypes can be reported together.
+        "realizedBehavior": realized_behavior,
     }
 
 
@@ -455,6 +475,7 @@ def load_stage_results(
     result_root: Path | str,
     *,
     tail_result_index: Mapping[str, Any] | None = None,
+    direction_aware: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Load canonical candidate/window records from raw blobs or a verified index.
 
@@ -466,6 +487,12 @@ def load_stage_results(
     """
 
     if tail_result_index is not None:
+        if direction_aware:
+            # Indexed v1 intentionally predates exact per-direction behavior.
+            # A v5 archive must not infer side safety from scalar metrics.
+            raise TemporalDiscoveryContractError(
+                "direction-aware rotating evidence requires raw result provenance"
+            )
         # Import lazily: the index module uses ``_window_record`` from this
         # module to build its exact legacy-compatible projection.
         from .temporal_qd_tail_result_index import load_indexed_stage_results
@@ -506,6 +533,7 @@ def load_provenance_bound_window_evidence(
     panel: Mapping[str, Any],
     candidates: Mapping[str, Mapping[str, Any]],
     tail_result_index: Mapping[str, Any] | None = None,
+    direction_aware: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Derive authority-independent window digests from verified result data.
 
@@ -515,6 +543,13 @@ def load_provenance_bound_window_evidence(
     """
 
     if tail_result_index is not None:
+        if direction_aware:
+            # The indexed v1 projection intentionally predates exact
+            # per-direction realized behavior.  Do not infer v5 side safety
+            # from scalar metrics; use the raw authority-bound result path.
+            raise TemporalDiscoveryContractError(
+                "direction-aware rotating evidence requires raw result provenance"
+            )
         # Keep this import lazy for the same cycle-avoidance reason as the
         # stage loader above.
         from .temporal_qd_tail_result_index import (
@@ -633,6 +668,11 @@ def load_provenance_bound_window_evidence(
             "sourceProfileSnapshotSha256": window_record[
                 "sourceProfileSnapshotSha256"
             ],
+            **(
+                {"realizedBehavior": window_record["realizedBehavior"]}
+                if direction_aware
+                else {}
+            ),
         }
         grouped.setdefault(candidate_id, []).append(
             build_candidate_window_evidence(
@@ -1100,6 +1140,8 @@ def _aggregate_candidate(
         "terminalEvidence": terminal_evidence,
         "windowRecords": list(windows),
     }
+    record["realizedBehavior"] = aggregate_realized_behavior(windows)
+    record["behaviorIdentitySha256"] = record["realizedBehavior"]["identitySha256"]
     record["fingerprintSha256"] = canonical_sha256(
         {
             key: record[key]

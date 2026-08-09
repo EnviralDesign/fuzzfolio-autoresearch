@@ -13,7 +13,10 @@ from autoresearch.temporal_discovery_base import (
 )
 from autoresearch.lake_window import LakeWindowBinding
 from autoresearch.temporal_qd_campaign import freeze_qd_screening_campaign
-from autoresearch.temporal_qd_evaluation_population import raw_file_sha256
+from autoresearch.temporal_qd_evaluation_population import (
+    load_evaluation_population,
+    raw_file_sha256,
+)
 from autoresearch.temporal_qd_evolution import QD_POLICY_NAME, QD_POLICY_SHA256, qd_canonical_evidence_identity, qd_predeclared_evidence_context
 from autoresearch.temporal_bidirectional_genome import IdentitySnapshot
 from autoresearch.temporal_search import TemporalSearchContractError, build_authority, materialize_plan
@@ -230,6 +233,23 @@ def _write_pair_evaluation_projection(population_path: Path, template: dict) -> 
     _write(population_path.with_name("evaluation-population.json"), projection)
     _write(population_path.with_name("generation-journal.json"), journal)
     return projection
+
+
+def test_sidecar_recomputes_canonical_evidence_when_context_is_embedded(
+    tmp_path: Path,
+) -> None:
+    template = _template()
+    population_path = tmp_path / "population.json"
+    projection = _write_pair_evaluation_projection(population_path, template)
+    context = qd_predeclared_evidence_context(template)
+    projection["predeclaredEvidenceContext"] = context
+    projection["candidates"][0]["canonicalEvidenceIdentitySha256"] = "sha256:" + "0" * 64
+    projection["evaluationPopulationSha256"] = canonical_sha256(
+        {key: value for key, value in projection.items() if key != "evaluationPopulationSha256"}
+    )
+    _write(population_path.with_name("evaluation-population.json"), projection)
+    with pytest.raises(TemporalDiscoveryContractError, match="canonical evidence identity mismatch"):
+        load_evaluation_population(population_path=population_path)
 
 
 def test_pair_campaign_uses_compact_evaluation_population_without_loading_rich_source(

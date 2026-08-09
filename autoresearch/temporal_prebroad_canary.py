@@ -70,11 +70,23 @@ def module(module, side, candidate):
     fragments=tuple(Fragment(uid='artifact_%d' % index, production_id=item['productionId'], resources=item['resources'], choices=item['choices']) for index,item in enumerate(canonical['fragments']))
     program=ModuleProgram(canonical['direction'], fragments)
     grammar=TypedFragmentGrammar(context, native_authority=Authority())
-    if canonical_sha256(grammar.canonical_program(program)) != module['programSha256'] or canonical_sha256(grammar.context) != module['contextSha256']:
+    # v2 typed-fragment bytes are a sealed historical reader format.  The
+    # active compiler writes v3, but the canary must be able to validate a
+    # pre-broad v2 artifact against its original immutable program identity
+    # before compiling its semantics with the current Dashboard authority.
+    program_payload=grammar.canonical_program(program)
+    if canonical.get('grammarVersion') == '2': program_payload={**program_payload, 'grammarVersion':'2'}
+    if canonical.get('grammarVersion') not in ('2','3') or canonical_sha256(program_payload) != module['programSha256'] or canonical_sha256(grammar.context) != module['contextSha256']:
         raise ValueError('typed module canonical program/context identity drifted')
     compiled=grammar.compile_module(program, candidate_id=candidate+'_'+side)
     artifact=module['nativeArtifact']; profile=dict(compiled.profile)
     exact={'profileSha256':canonical_sha256(profile), **compiled.identities}
+    # The legacy module program hash is over the sealed v2 envelope above;
+    # the current compiler reports the equivalent v3 writer envelope.  The
+    # profile/report identities must still match exactly, while this one
+    # historical representation field is checked against its already-verified
+    # v2 bytes rather than being silently upgraded.
+    if canonical.get('grammarVersion') == '2': exact['programSha256']=module['programSha256']
     identity_drift=[k for k,v in exact.items() if artifact['identities'].get(k) != v]
     if canonical_sha256(profile) != artifact['profileSha256'] or profile != artifact['profile'] or identity_drift or artifact['validation'] != compiled.native_report:
         raise ValueError('content-bound native module artifact identity drifted: profile=%s identities=%s report=%s' % (profile != artifact['profile'], identity_drift, artifact['validation'] != compiled.native_report))

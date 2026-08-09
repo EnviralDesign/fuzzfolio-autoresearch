@@ -26,6 +26,31 @@ use crate::{
 pub const GENERATION_REQUEST_SCHEMA: &str = "temporal_qd_front_generation_request_v1";
 pub const GENERATION_PROGRESS_SCHEMA: &str = "temporal_qd_front_generation_progress_v1";
 
+// `temporal_qd_pair_generation_v2` predates the accepted-quota allocation
+// record.  Only the two already-sealed evolution campaigns below are allowed
+// to use that historical shape.  New v2/v5 material must carry the explicit
+// allocation; otherwise a caller could accidentally recreate an old,
+// ordinal-scheduled campaign under the new selection semantics.
+const PAIR_GENERATION_SCHEMA_LEGACY: &str = "temporal_qd_pair_generation_v1";
+const PAIR_GENERATION_SCHEMA: &str = "temporal_qd_pair_generation_v2";
+const FROZEN_LEGACY_QD_VERSIONS: &[&str] =
+    &["temporal_qd_evolution_v3", "temporal_qd_evolution_v4"];
+const REPRODUCTION_ALLOCATION_SCHEMA: &str = "temporal_qd_reproduction_allocation_v1";
+const REPRODUCTION_ALLOCATION_SCHEMA_ACCEPTED: &str = "temporal_qd_reproduction_allocation_v2";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReproductionPolicy {
+    /// A campaign sealed before accepted-quota allocation was introduced.
+    /// Its parent schedule is still checked against the frozen pair config;
+    /// the original kernel quota projection remains its recovery behavior.
+    LegacyProjection,
+    /// A fresh campaign has committed its exact accepted-population quota.
+    FrozenAcceptedQuota {
+        desired_offspring: u64,
+        desired_immigrants: u64,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GenerationError {
     #[error("generation filesystem failure: {0}")]
@@ -76,6 +101,96 @@ fn sha(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn u64_field(fields: &Map<String, Value>, name: &str, label: &str) -> Result<u64> {
+    fields
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| contract(format!("{label} {name} is invalid")))
+}
+
+/// Decode the *already frozen* schedule object in a pair config.  This is
+/// deliberately kept in the kernel rather than trusting the caller's compact
+/// schedule: the pair-config self-hash is the restart authority.
+fn frozen_parent_schedule(value: &Value) -> Result<crate::schedule::RotatingParentSchedule> {
+    let fields = value
+        .as_object()
+        .ok_or_else(|| contract("pair config parentSchedule must be an object"))?;
+    let breeder_width = u64_field(fields, "breederWidth", "pair config parentSchedule")?;
+    let breeder_parent_count =
+        u64_field(fields, "breederParentCount", "pair config parentSchedule")?;
+    match fields.get("schemaVersion").and_then(Value::as_str) {
+        Some("temporal_qd_rotating_parent_schedule_v1") => {
+            let numerator = u64_field(fields, "offspringNumerator", "legacy parentSchedule")?;
+            let denominator = u64_field(fields, "offspringDenominator", "legacy parentSchedule")?;
+            let expected = crate::schedule::RotatingParentSchedule::legacy_schedule_sha256(
+                breeder_width,
+                breeder_parent_count,
+                numerator,
+                denominator,
+            );
+            if fields.get("scheduleSha256").and_then(Value::as_str) != Some(expected.as_str()) {
+                return Err(contract(
+                    "legacy pair config parentSchedule identity mismatch",
+                ));
+            }
+            crate::schedule::RotatingParentSchedule::validated_legacy_fields(
+                breeder_width,
+                breeder_parent_count,
+                numerator,
+                denominator,
+            )
+            .map_err(|error| {
+                contract(format!(
+                    "legacy pair config parentSchedule is invalid: {error}"
+                ))
+            })
+        }
+        Some("temporal_qd_rotating_parent_schedule_v2") => {
+            if fields
+                .get("minimumImmigrantNumerator")
+                .and_then(Value::as_u64)
+                != Some(1)
+                || fields
+                    .get("minimumImmigrantDenominator")
+                    .and_then(Value::as_u64)
+                    != Some(5)
+                || fields.get("parentSampling").and_then(Value::as_str)
+                    != Some("with_replacement_supported_parents_v1")
+                || fields
+                    .get("unsupportedParentPolicy")
+                    .and_then(Value::as_str)
+                    != Some("immigrant_only_authority_bound_v1")
+                || fields.get("schedulingMethod").and_then(Value::as_str)
+                    != Some(crate::schedule::RATIONAL_PREFIX_BALANCE_METHOD)
+            {
+                return Err(contract("pair config parentSchedule v2 policy is invalid"));
+            }
+            let schedule = crate::schedule::RotatingParentSchedule::from_counts(
+                breeder_width,
+                breeder_parent_count,
+            )
+            .map_err(|error| contract(format!("pair config parentSchedule is invalid: {error}")))?;
+            if fields.get("scheduleSha256").and_then(Value::as_str)
+                != Some(schedule.schedule_sha256().as_str())
+            {
+                return Err(contract("pair config parentSchedule identity mismatch"));
+            }
+            Ok(schedule)
+        }
+        _ => Err(contract("pair config parentSchedule schema is invalid")),
+    }
+}
+
+fn frozen_qd_version(fields: &Map<String, Value>) -> Option<&str> {
+    fields
+        .get("runConfig")
+        .and_then(Value::as_object)
+        .and_then(|run| run.get("parameters"))
+        .and_then(Value::as_object)
+        .and_then(|parameters| parameters.get("version"))
+        .and_then(Value::as_str)
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerateGenerationRequest {
     pub output_root: PathBuf,
@@ -100,6 +215,156 @@ pub struct GenerateGenerationRequest {
 }
 
 impl GenerateGenerationRequest {
+    fn reproduction_policy(
+        &self,
+        config_fields: &Map<String, Value>,
+    ) -> Result<ReproductionPolicy> {
+        // The compact request schedule is a convenience for the planner, not
+        // an authority.  If a schedule was sealed in the config, it must
+        // decode and project to exactly the same compact value before a
+        // restart can touch a journal.
+        match config_fields.get("parentSchedule") {
+            Some(Value::Null) | None => {
+                if self.parent_schedule.is_some() {
+                    return Err(contract(
+                        "pair config lacks the frozen parentSchedule requested by generation",
+                    ));
+                }
+            }
+            Some(raw) => {
+                let frozen = frozen_parent_schedule(raw)?;
+                if self.parent_schedule != Some(frozen) {
+                    return Err(contract(
+                        "pair config parentSchedule diverged from generation request",
+                    ));
+                }
+            }
+        }
+
+        let schema = config_fields.get("schemaVersion").and_then(Value::as_str);
+        let allocation = config_fields.get("reproductionAllocation");
+        let legacy = schema == Some(PAIR_GENERATION_SCHEMA_LEGACY)
+            || (schema == Some(PAIR_GENERATION_SCHEMA)
+                && allocation.is_none()
+                && frozen_qd_version(config_fields)
+                    .is_some_and(|version| FROZEN_LEGACY_QD_VERSIONS.contains(&version)));
+        if legacy {
+            if allocation.is_some() {
+                return Err(contract(
+                    "legacy pair config must not carry a partial reproduction allocation",
+                ));
+            }
+            return Ok(ReproductionPolicy::LegacyProjection);
+        }
+        if schema != Some(PAIR_GENERATION_SCHEMA) {
+            return Err(contract(
+                "pair config schema is not admitted for native generation",
+            ));
+        }
+        let allocation = allocation
+            .and_then(Value::as_object)
+            .ok_or_else(|| contract("pair config lacks frozen reproduction allocation"))?;
+        let has_supported_parents = self
+            .parent_schedule
+            .is_some_and(|schedule| schedule.breeder_parent_count > 0);
+        let expected_immigrants = crate::schedule::accepted_quota_immigrant_count(
+            self.target_unique_candidates,
+            has_supported_parents,
+        );
+        let desired_offspring = self.target_unique_candidates - expected_immigrants;
+        let accepted_terms = allocation.get("schemaVersion").and_then(Value::as_str)
+            == Some(REPRODUCTION_ALLOCATION_SCHEMA_ACCEPTED);
+        if (!accepted_terms
+            && allocation.get("schemaVersion").and_then(Value::as_str)
+                != Some(REPRODUCTION_ALLOCATION_SCHEMA))
+            || allocation
+                .get(if accepted_terms {
+                    "targetAcceptedCandidates"
+                } else {
+                    "targetEvaluatedCandidates"
+                })
+                .and_then(Value::as_u64)
+                != Some(self.target_unique_candidates)
+            || allocation
+                .get(if accepted_terms {
+                    "desiredAcceptedImmigrantCount"
+                } else {
+                    "desiredEvaluatedImmigrantCount"
+                })
+                .and_then(Value::as_u64)
+                != Some(expected_immigrants)
+            || allocation
+                .get(if accepted_terms {
+                    "desiredAcceptedOffspringCount"
+                } else {
+                    "desiredEvaluatedOffspringCount"
+                })
+                .and_then(Value::as_u64)
+                != Some(desired_offspring)
+            || allocation
+                .get("minimumImmigrantNumerator")
+                .and_then(Value::as_u64)
+                != Some(1)
+            || allocation
+                .get("minimumImmigrantDenominator")
+                .and_then(Value::as_u64)
+                != Some(5)
+            || allocation.get("parentSampling").and_then(Value::as_str)
+                != Some("with_replacement_supported_parents_v1")
+            || allocation
+                .get("unsupportedParentPolicy")
+                .and_then(Value::as_str)
+                != Some("immigrant_only_authority_bound_v1")
+            || allocation.get("allocationMethod").and_then(Value::as_str)
+                != Some("accepted_quota_prefix_balance_v1")
+        {
+            return Err(contract("pair config reproduction allocation is invalid"));
+        }
+        Ok(ReproductionPolicy::FrozenAcceptedQuota {
+            desired_offspring,
+            desired_immigrants: expected_immigrants,
+        })
+    }
+
+    fn reproduction_allocation_for_parents(&self, has_parents: bool) -> Result<(u64, u64)> {
+        let mut material = self.pair_config.clone();
+        let fields = material
+            .as_object_mut()
+            .ok_or_else(|| contract("pair config must be an object"))?;
+        fields.remove("configSha256");
+        match self.reproduction_policy(fields)? {
+            ReproductionPolicy::LegacyProjection => {
+                let immigrants = if has_parents {
+                    if self.target_unique_candidates < 5 {
+                        0
+                    } else {
+                        (self.target_unique_candidates + 4) / 5
+                    }
+                } else {
+                    self.target_unique_candidates
+                };
+                Ok((self.target_unique_candidates - immigrants, immigrants))
+            }
+            ReproductionPolicy::FrozenAcceptedQuota {
+                desired_offspring,
+                desired_immigrants,
+            } => {
+                let expected_immigrants = crate::schedule::accepted_quota_immigrant_count(
+                    self.target_unique_candidates,
+                    has_parents,
+                );
+                if desired_immigrants != expected_immigrants
+                    || desired_offspring != self.target_unique_candidates - expected_immigrants
+                {
+                    return Err(contract(
+                        "frozen reproduction allocation disagrees with the supplied parent selector",
+                    ));
+                }
+                Ok((desired_offspring, desired_immigrants))
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         sha(&self.config_sha256, "generation config SHA-256")?;
         let mut config_material = self.pair_config.clone();
@@ -126,6 +391,10 @@ impl GenerateGenerationRequest {
                 "pair config immigrant construction policy diverged from request",
             ));
         }
+        let policy_fields = config_material
+            .as_object()
+            .ok_or_else(|| contract("pair config must be an object"))?;
+        let _ = self.reproduction_policy(policy_fields)?;
         sha(
             &self.expected_native_authority_sha256,
             "native proposal authority SHA-256",
@@ -445,10 +714,14 @@ pub fn generate_generation(
             "G0 is an initial random-immigrant handoff and cannot run with parent sources",
         ));
     }
+    let (desired_evaluated_offspring, desired_evaluated_immigrants) =
+        request.reproduction_allocation_for_parents(parents.has_parents())?;
     let schedule = ProposalSchedule {
         config_sha256: request.config_sha256.clone(),
         generation_index: request.generation_index,
         parent_schedule: request.parent_schedule,
+        desired_evaluated_offspring,
+        desired_evaluated_immigrants,
     };
     let mut factory =
         PairFactory::new(authority, request.expected_native_authority_sha256.clone())?;

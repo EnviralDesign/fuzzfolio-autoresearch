@@ -24,8 +24,16 @@ from .play_hand_lab import LabGatewayClient
 from .play_hand_lab_auth import load_lab_gateway_token
 from .result_codec import read_json_object
 from .temporal_discovery_base import TemporalDiscoveryContractError, _clone, canonical_sha256
+from .temporal_discovery_results import _window_record
+from .temporal_direction_selection import classify_direction_selection
 from .temporal_qd_evaluation_population import load_evaluation_population
+from .temporal_qd_evolution import _load_archive
 from .temporal_qd_rotating_evidence import validate_rotating_evidence_contract
+from .temporal_realized_behavior import (
+    REALIZED_BEHAVIOR_SCHEMA,
+    aggregate_realized_behavior,
+    behavior_family_clusters,
+)
 from .temporal_search import (
     TEMPORAL_SEARCH_PREPARATION_SCHEMA,
     build_authority,
@@ -35,8 +43,14 @@ from .temporal_search import (
 )
 
 
-SCRUTINY_SCHEMA = "temporal_qd_post_campaign_scrutiny_v1"
+SCRUTINY_SCHEMA = "temporal_qd_post_campaign_scrutiny_v3"
+LEGACY_SCRUTINY_SCHEMA = "temporal_qd_post_campaign_scrutiny_v1"
+READ_ONLY_SCRUTINY_SCHEMAS = frozenset((
+    LEGACY_SCRUTINY_SCHEMA,
+    "temporal_qd_post_campaign_scrutiny_v2",
+))
 PROMOTION_POLICY_SCHEMA = "temporal_qd_post_campaign_promotion_policy_v1"
+BEHAVIOR_FAMILY_INDEX_SCHEMA = "temporal_qd_scrutiny_behavior_family_index_v1"
 _SHA_PREFIX = "sha256:"
 
 
@@ -76,8 +90,12 @@ def _controller_identity(repo: Path) -> dict[str, Any]:
         "play_hand_lab.py",
         "result_codec.py",
         "temporal_discovery_base.py",
+        "temporal_discovery_results.py",
+        "temporal_direction_selection.py",
         "temporal_qd_evaluation_population.py",
+        "temporal_qd_evolution.py",
         "temporal_qd_rotating_evidence.py",
+        "temporal_realized_behavior.py",
         "temporal_search.py",
     )
     dependencies = [
@@ -257,9 +275,181 @@ def _completed_generation_root(campaign_root: Path, generation_index: int) -> Pa
     return root
 
 
+def _source_candidate(
+    candidate: Mapping[str, Any], *, source_role: str,
+    expected_resolved_program_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Normalize a candidate retained by one immutable scrutiny source.
+
+    ``archive_incumbent`` describes membership in the final campaign archive;
+    it does not assert that the candidate is mechanically valid on a new
+    replay, terminal-complete, or promoted.  ``new_proposal`` likewise only
+    describes origin in the generation's proposal cohort.
+    """
+
+    candidate_id = candidate.get("candidateId")
+    profile = candidate.get("sourceProfile")
+    profile_sha = candidate.get("sourceProfileSha256")
+    candidate_identity = candidate.get("candidateIdentitySha256")
+    authored_program = candidate.get("programSha256")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise TemporalQDScrutinyError("scrutiny source candidate ID is invalid")
+    if not isinstance(profile, Mapping) or canonical_sha256(profile) != profile_sha:
+        raise TemporalQDScrutinyError("scrutiny source candidate profile identity mismatch")
+    candidate_identity = _sha(candidate_identity, name="scrutiny source candidate identity")
+    authored_program = _sha(authored_program, name="scrutiny source authored program")
+    return {
+        **_clone(candidate, name="scrutiny source candidate"),
+        "sourceRoles": [source_role],
+        "sourceCandidateIdentitySha256": candidate_identity,
+        "authoredProgramSha256": authored_program,
+        **({"expectedResolvedProgramSha256": _sha(
+            expected_resolved_program_sha256,
+            name="archive incumbent expected resolved program",
+        )} if expected_resolved_program_sha256 is not None else {}),
+    }
+
+
+def _final_archive_incumbents(
+    archive_path: Path,
+    *,
+    expected_generation_index: int,
+    expected_qd_version: str,
+    expected_policy_name: str,
+    expected_policy_sha256: str,
+    expected_frozen_policy: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load the exact final archive members, without re-running reduction.
+
+    This intentionally consumes the published generation archive rather than
+    an earlier parent archive or a reconstructed breeding cohort.  The archive
+    member's resolved-program hash is an expected post-replay value, distinct
+    from its authored candidate program.
+    """
+
+    # Reuse the same authoritative archive reader used before parent selection.
+    # Self-hashing alone is insufficient: a self-consistent archive from another
+    # generation, policy, or malformed cell geometry must not become a scrutiny
+    # incumbent source.
+    try:
+        archive, archive_sha = _load_archive(archive_path)
+    except TemporalDiscoveryContractError as exc:
+        raise TemporalQDScrutinyError(
+            "final generation archive is not an authoritative QD archive"
+        ) from exc
+    if archive.get("generationIndex") != expected_generation_index:
+        raise TemporalQDScrutinyError("final generation archive generation index drifted")
+    if archive.get("qdVersion") != expected_qd_version:
+        raise TemporalQDScrutinyError("final generation archive QD version drifted")
+    if (
+        archive.get("policyName") != expected_policy_name
+        or archive.get("policySha256") != expected_policy_sha256
+        or archive.get("frozenPolicy") != expected_frozen_policy
+    ):
+        raise TemporalQDScrutinyError("final generation archive policy drifted")
+    cells = archive.get("cells")
+    if not isinstance(cells, list):
+        raise TemporalQDScrutinyError("final generation archive cells are invalid")
+    incumbents: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for cell in cells:
+        if not isinstance(cell, Mapping) or not isinstance(cell.get("members"), list):
+            raise TemporalQDScrutinyError("final generation archive cell is invalid")
+        for member in cell["members"]:
+            if not isinstance(member, Mapping):
+                raise TemporalQDScrutinyError("final generation archive member is invalid")
+            candidate = member.get("candidate")
+            aggregate = member.get("aggregate")
+            candidate_id = member.get("candidateId")
+            if (
+                not isinstance(candidate, Mapping)
+                or not isinstance(aggregate, Mapping)
+                or not isinstance(candidate_id, str)
+                or candidate.get("candidateId") != candidate_id
+                or candidate_id in seen_ids
+            ):
+                raise TemporalQDScrutinyError("final generation archive member identity is invalid")
+            seen_ids.add(candidate_id)
+            incumbents.append(_source_candidate(
+                candidate,
+                source_role="archive_incumbent",
+                expected_resolved_program_sha256=aggregate.get("resolvedProgramSha256"),
+            ))
+    if archive.get("memberCount") != len(incumbents):
+        raise TemporalQDScrutinyError("final generation archive member count mismatch")
+    descriptor = {
+        "path": str(archive_path.resolve()),
+        "fileSha256": _file_sha(archive_path),
+        "archiveSha256": archive_sha,
+        "memberCount": len(incumbents),
+    }
+    return incumbents, descriptor
+
+
+def _source_union(
+    *, archive_incumbents: Sequence[Mapping[str, Any]], new_proposals: Sequence[Mapping[str, Any]],
+    archive: Mapping[str, Any], cohort: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Create the deterministic replay universe from the two exact sources."""
+
+    indexed: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    candidate_material: dict[str, tuple[str, str, str]] = {}
+    for raw in [*archive_incumbents, *new_proposals]:
+        candidate_id = str(raw.get("candidateId") or "")
+        candidate_identity = _sha(raw.get("sourceCandidateIdentitySha256"), name="scrutiny source candidate identity")
+        authored_program = _sha(raw.get("authoredProgramSha256"), name="scrutiny source authored program")
+        profile_sha = _sha(raw.get("sourceProfileSha256"), name="scrutiny source profile")
+        roles = raw.get("sourceRoles")
+        if not candidate_id or not isinstance(profile_sha, str) or not isinstance(roles, list) or len(roles) != 1:
+            raise TemporalQDScrutinyError("scrutiny source candidate is malformed")
+        material = (candidate_identity, authored_program, profile_sha)
+        prior_material = candidate_material.setdefault(candidate_id, material)
+        if prior_material != material:
+            raise TemporalQDScrutinyError("candidate ID has conflicting authored source material")
+        key = (candidate_id, *material)
+        existing = indexed.get(key)
+        if existing is None:
+            indexed[key] = _clone(raw, name="scrutiny source union candidate")
+            continue
+        existing["sourceRoles"] = sorted(set(existing["sourceRoles"]) | set(roles))
+        existing_expected = existing.get("expectedResolvedProgramSha256")
+        raw_expected = raw.get("expectedResolvedProgramSha256")
+        if raw_expected is not None:
+            raw_expected = _sha(raw_expected, name="archive incumbent expected resolved program")
+        if existing_expected is not None and raw_expected is not None and existing_expected != raw_expected:
+            raise TemporalQDScrutinyError("candidate source has conflicting expected resolved programs")
+        if existing_expected is None and raw_expected is not None:
+            existing["expectedResolvedProgramSha256"] = raw_expected
+
+    candidates = [indexed[key] for key in sorted(indexed)]
+    source_rows = [
+        {
+            "candidateId": row["candidateId"],
+            "sourceCandidateIdentitySha256": row["sourceCandidateIdentitySha256"],
+            "authoredProgramSha256": row["authoredProgramSha256"],
+            "sourceProfileSha256": row["sourceProfileSha256"],
+            "sourceRoles": row["sourceRoles"],
+            **({"expectedResolvedProgramSha256": row["expectedResolvedProgramSha256"]}
+                if row.get("expectedResolvedProgramSha256") is not None else {}),
+        }
+        for row in candidates
+    ]
+    universe = {
+        "schemaVersion": "temporal_qd_post_campaign_scrutiny_source_universe_v1",
+        "archive": dict(archive),
+        "newProposalCohortSha256": cohort["cohortSha256"],
+        "archiveIncumbentCount": len(archive_incumbents),
+        "newProposalCandidateCount": len(new_proposals),
+        "deduplicatedCandidateIdentityCount": len(candidates),
+        "candidates": source_rows,
+    }
+    universe["sourceUniverseSha256"] = canonical_sha256(universe)
+    return candidates, universe
+
+
 def _load_source(
     *, campaign_root: Path, generation_index: int, expected_cohort_size: int
-) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     generation_root = _completed_generation_root(campaign_root, generation_index)
     cohort_path = generation_root / "evidence" / "cohort.json"
     population_path = generation_root / "proposal" / "population.json"
@@ -286,7 +476,27 @@ def _load_source(
         raise TemporalQDScrutinyError("evaluation population and cohort new-proposal candidate IDs disagree")
     config = _read(campaign_root / "config.json", name="campaign config")
     rotating = validate_rotating_evidence_contract(_read(campaign_root / "rotating-evidence.json", name="rotating evidence"))
-    return ([_clone(by_id[item], name="evaluation candidate") for item in sorted(selected)], cohort, config, rotating)
+    new_proposals = [
+        _source_candidate(
+            by_id[item], source_role="new_proposal",
+        )
+        for item in sorted(selected)
+    ]
+    archive_incumbents, archive = _final_archive_incumbents(
+        generation_root / "archive.json",
+        expected_generation_index=generation_index,
+        expected_qd_version=str(config.get("qdVersion") or ""),
+        expected_policy_name=str(config.get("policyName") or ""),
+        expected_policy_sha256=str(config.get("policySha256") or ""),
+        expected_frozen_policy=config.get("frozenPolicy")
+        if isinstance(config.get("frozenPolicy"), Mapping)
+        else {},
+    )
+    candidates, universe = _source_union(
+        archive_incumbents=archive_incumbents, new_proposals=new_proposals,
+        archive=archive, cohort=cohort,
+    )
+    return candidates, cohort, config, rotating, universe
 
 
 def _common_binding_request(
@@ -350,7 +560,26 @@ def _stage_preparation(
     return preparation
 
 
-def _read_stage_results(stage_root: Path, authority: Mapping[str, Any], *, expected_worker_environment: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _require_expected_resolved_program(
+    source: Mapping[str, Any], resolved_program_sha256: Any
+) -> None:
+    """Enforce an archive execution expectation only against replay output."""
+
+    expected = source.get("expectedResolvedProgramSha256")
+    if expected is None:
+        return
+    if _sha(expected, name="archive incumbent expected resolved program") != _sha(
+        resolved_program_sha256, name="scrutiny replay resolved program"
+    ):
+        raise TemporalQDScrutinyError(
+            "scrutiny replay resolved program differs from the archive incumbent expectation"
+        )
+
+
+def _read_stage_results(
+    stage_root: Path, authority: Mapping[str, Any], *, expected_worker_environment: Mapping[str, Any],
+    candidate_sources: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
     checkpoint = _read(stage_root / "checkpoint.json", name="stage checkpoint")
     completed = checkpoint.get("completed")
     if not isinstance(completed, Mapping):
@@ -362,7 +591,9 @@ def _read_stage_results(stage_root: Path, authority: Mapping[str, Any], *, expec
     for task_id in sorted(tasks):
         record = completed[task_id]
         if not isinstance(record, Mapping) or record.get("outcome") == "rejected":
-            rows.append({"candidateId": tasks[task_id]["payload"]["candidate_id"], "validReplay": False, "reason": "terminal_rejection"})
+            rows.append({"candidateId": tasks[task_id]["payload"]["candidate_id"],
+                "mechanicallyValidReplay": False, "terminalCompleteReplay": False,
+                "reason": "terminal_rejection"})
             continue
         path = Path(str(record.get("resultPath") or ""))
         try:
@@ -371,17 +602,37 @@ def _read_stage_results(stage_root: Path, authority: Mapping[str, Any], *, expec
         except Exception as exc:
             raise TemporalQDScrutinyError(f"invalid completed scrutiny result for {task_id}") from exc
         metrics = material["cost_view_results"]["research_conservative"]["replay_result"]["metrics"]
+        replay = material["cost_view_results"]["research_conservative"]["replay_result"]
+        candidate_id = str(tasks[task_id]["payload"]["candidate_id"])
+        source = candidate_sources.get(candidate_id)
+        if source is None:
+            raise TemporalQDScrutinyError("completed scrutiny result is outside the frozen source universe")
+        _require_expected_resolved_program(source, replay.get("programSha256"))
         terminal = metrics["terminalValuation"]
         _require_worker_environment(
             material.get("worker_attribution"), expected=expected_worker_environment
         )
-        rows.append({"candidateId": tasks[task_id]["payload"]["candidate_id"], "validReplay": True,
+        try:
+            realized_behavior = aggregate_realized_behavior([_window_record(material)])
+        except TemporalDiscoveryContractError as exc:
+            raise TemporalQDScrutinyError(
+                f"completed scrutiny result has invalid realized behavior for {task_id}"
+            ) from exc
+        terminal_complete = not bool(metrics["unresolvedPosition"]) and not bool(metrics["unresolvedPendingEffect"])
+        rows.append({"candidateId": candidate_id, "mechanicallyValidReplay": True,
+            # A terminal valuation is evaluated as returned.  We neither
+            # synthesize a liquidation nor call an unresolved state complete.
+            "terminalCompleteReplay": terminal_complete,
             "netConservativeR": float(metrics["terminalAdjustedTotalNetR"]), "maxDrawdownR": float(metrics["terminalAdjustedMaxDrawdownR"]),
             "closedTrades": int(metrics["tradesClosed"]), "unresolvedPosition": bool(metrics["unresolvedPosition"]),
             "unresolvedPendingEffect": bool(metrics["unresolvedPendingEffect"]),
             "terminalPositionStatus": terminal["positionStatus"], "observationStreamSha256": material["observation_stream_sha256"],
             "sharedObservationStreamId": material["shared_observation_stream_id"], "taskId": task_id,
-            "resultSha256": canonical_sha256(material)})
+            "resultSha256": canonical_sha256(material),
+            "resolvedProgramSha256": _sha(
+                replay.get("programSha256"), name="scrutiny replay resolved program"
+            ),
+            "realizedBehavior": realized_behavior})
     return rows
 
 
@@ -389,16 +640,24 @@ def _rank_validation(*, results: Sequence[Mapping[str, Any]], candidates: Mappin
     ranked: list[dict[str, Any]] = []
     for row in results:
         item = dict(row)
-        complete = bool(item.get("validReplay")) and not item.get("unresolvedPosition") and not item.get("unresolvedPendingEffect")
+        mechanically_valid = bool(item.get("mechanicallyValidReplay"))
+        complete = bool(item.get("terminalCompleteReplay"))
         raw_net = item.get("netConservativeR")
         raw_drawdown = item.get("maxDrawdownR")
         net = float(raw_net) if isinstance(raw_net, (int, float)) and math.isfinite(float(raw_net)) else None
         drawdown = float(raw_drawdown) if isinstance(raw_drawdown, (int, float)) and math.isfinite(float(raw_drawdown)) else None
         trades = int(item.get("closedTrades") or 0)
-        passes = complete and trades >= 24 and net is not None and net > 0.0
-        item["completeValidReplay"] = complete
-        item["promotionEligible"] = passes
-        item["descriptor"] = _descriptor(candidates[str(item["candidateId"])])
+        passes = mechanically_valid and complete and trades >= 24 and net is not None and net > 0.0
+        item["mechanicallyValidReplay"] = mechanically_valid
+        item["terminalCompleteReplay"] = complete
+        item["promotionEligibleAfterValidation"] = passes
+        source = candidates[str(item["candidateId"])]
+        item["sourceRoles"] = list(source["sourceRoles"])
+        item["sourceCandidateIdentitySha256"] = source["sourceCandidateIdentitySha256"]
+        item["authoredProgramSha256"] = source["authoredProgramSha256"]
+        if source.get("expectedResolvedProgramSha256") is not None:
+            item["expectedResolvedProgramSha256"] = source["expectedResolvedProgramSha256"]
+        item["descriptor"] = _descriptor(source)
         # Explicit, deterministic balanced ordering: net gain leads; then less
         # drawdown; then greater trade support; ID is the final non-economic tie.
         # The leading eligibility bucket keeps rejected/malformed rows behind
@@ -413,7 +672,7 @@ def _rank_validation(*, results: Sequence[Mapping[str, Any]], candidates: Mappin
         ]
         ranked.append(item)
     ranked.sort(key=lambda item: tuple(item["promotionSortKey"]))
-    passers = [item for item in ranked if item["promotionEligible"]]
+    passers = [item for item in ranked if item["promotionEligibleAfterValidation"]]
     if len(passers) <= 128:
         return ranked, passers
     # Diversity floor: first take each descriptor's strongest passer, then
@@ -431,7 +690,10 @@ def _rank_validation(*, results: Sequence[Mapping[str, Any]], candidates: Mappin
 
 
 def _stage_evaluation_identity(*, stage: str, authority: Mapping[str, Any], results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    records = [{"candidateId": item["candidateId"], "resultSha256": item.get("resultSha256"), "validReplay": item["validReplay"]} for item in sorted(results, key=lambda value: str(value["candidateId"]))]
+    records = [{"candidateId": item["candidateId"], "resultSha256": item.get("resultSha256"),
+        "mechanicallyValidReplay": item["mechanicallyValidReplay"],
+        "terminalCompleteReplay": item["terminalCompleteReplay"]}
+        for item in sorted(results, key=lambda value: str(value["candidateId"]))]
     payload = {"schemaVersion": "temporal_qd_post_campaign_stage_evaluation_v1", "stage": stage,
         "authorityId": authority["authorityId"], "taskMatrixSha256": canonical_sha256(build_task_matrix(authority)), "results": records}
     payload["evaluationSha256"] = canonical_sha256(payload)
@@ -442,7 +704,7 @@ def _observation_stream_consistency(results: Sequence[Mapping[str, Any]]) -> dic
     streams: dict[str, set[str]] = {}
     missing = 0
     for item in results:
-        if item.get("validReplay") is False:
+        if item.get("mechanicallyValidReplay") is False:
             continue
         shared_id = item.get("sharedObservationStreamId")
         stream_hash = item.get("observationStreamSha256")
@@ -460,6 +722,213 @@ def _observation_stream_consistency(results: Sequence[Mapping[str, Any]]) -> dic
     }
 
 
+def _verified_realized_behavior(value: Any, *, name: str) -> dict[str, Any]:
+    """Verify the immutable behavior projection before it becomes reporting evidence.
+
+    A behavior-family index is deliberately non-semantic: it cannot change
+    replay, archive membership, or promotion.  It is still evidence, though,
+    so accepting an unbound/stale behavior hash would make its duplicate and
+    direction reporting untrustworthy.
+    """
+
+    if not isinstance(value, Mapping):
+        raise TemporalQDScrutinyError(f"{name} realized behavior is missing")
+    if value.get("schemaVersion") != REALIZED_BEHAVIOR_SCHEMA:
+        raise TemporalQDScrutinyError(f"{name} realized behavior schema is unsupported")
+    material = value.get("identityMaterial")
+    if not isinstance(material, Mapping):
+        raise TemporalQDScrutinyError(f"{name} realized behavior identity material is invalid")
+    identity = _sha(value.get("identitySha256"), name=f"{name} realized behavior identity")
+    if canonical_sha256(material) != identity:
+        raise TemporalQDScrutinyError(f"{name} realized behavior identity mismatch")
+    return _clone(value, name=f"{name} realized behavior")
+
+
+def _behavior_family_index(
+    *,
+    stage: str,
+    source_identity_sha256: str,
+    evaluation_sha256: str,
+    results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build an immutable, reporting-only family map for one scrutiny stage.
+
+    Every mechanically valid row must carry finalized aggregate behavior.  A
+    terminal rejection remains in the source/result universe as explicitly
+    unmeasured rather than being silently discarded.  Families are formed by
+    ``behavior_family_clusters`` only; their representative ordering is an ID
+    display convention and never a survivor selection rule.
+    """
+
+    source_identity_sha256 = _sha(source_identity_sha256, name="behavior index source identity")
+    evaluation_sha256 = _sha(evaluation_sha256, name="behavior index evaluation identity")
+    rows = sorted(results, key=lambda row: str(row.get("candidateId") or ""))
+    candidate_ids: list[str] = []
+    measured: list[dict[str, Any]] = []
+    unmeasured_ids: list[str] = []
+    for index, row in enumerate(rows):
+        candidate_id = str(row.get("candidateId") or "")
+        if not candidate_id:
+            raise TemporalQDScrutinyError("behavior index result candidate ID is invalid")
+        if candidate_id in candidate_ids:
+            raise TemporalQDScrutinyError("behavior index result candidate IDs are not unique")
+        candidate_ids.append(candidate_id)
+        if not bool(row.get("mechanicallyValidReplay")):
+            unmeasured_ids.append(candidate_id)
+            continue
+        behavior = _verified_realized_behavior(
+            row.get("realizedBehavior"), name=f"behavior index candidate {candidate_id}"
+        )
+        result_sha = _sha(row.get("resultSha256"), name=f"behavior index candidate {candidate_id} result")
+        source_candidate = _sha(
+            row.get("sourceCandidateIdentitySha256"),
+            name=f"behavior index candidate {candidate_id} source candidate",
+        )
+        authored_program = _sha(
+            row.get("authoredProgramSha256"),
+            name=f"behavior index candidate {candidate_id} authored program",
+        )
+        resolved_program = _sha(
+            row.get("resolvedProgramSha256"),
+            name=f"behavior index candidate {candidate_id} resolved program",
+        )
+        try:
+            direction = classify_direction_selection(behavior)
+        except TemporalDiscoveryContractError as exc:
+            raise TemporalQDScrutinyError(
+                f"behavior index candidate {candidate_id} direction classification is invalid"
+            ) from exc
+        measured.append({
+            "candidateId": candidate_id,
+            "sourceCandidateIdentitySha256": source_candidate,
+            "authoredProgramSha256": authored_program,
+            "resolvedProgramSha256": resolved_program,
+            "resultSha256": result_sha,
+            "realizedBehavior": behavior,
+            "directionClassification": direction,
+        })
+
+    clusters = behavior_family_clusters(measured)
+    by_family = {
+        str(cluster["behaviorIdentitySha256"]): sorted(
+            (
+                row for row in measured
+                if row["realizedBehavior"]["identitySha256"] == cluster["behaviorIdentitySha256"]
+            ),
+            key=lambda row: row["candidateId"],
+        )
+        for cluster in clusters
+    }
+    families: list[dict[str, Any]] = []
+    passenger_candidate_count = 0
+    behavior_duplicate_excess_count = 0
+    program_equivalent_duplicate_count = 0
+    for cluster in clusters:
+        family_id = str(cluster["behaviorIdentitySha256"])
+        members = by_family[family_id]
+        display_ids = [row["candidateId"] for row in members]
+        representative = members[0]
+        authored_programs = sorted({row["authoredProgramSha256"] for row in members})
+        resolved_programs = sorted({row["resolvedProgramSha256"] for row in members})
+        genotype_ids = sorted({row["sourceCandidateIdentitySha256"] for row in members})
+        lane_mix: dict[str, int] = {}
+        for row in members:
+            lane = str(row["directionClassification"]["lane"])
+            lane_mix[lane] = lane_mix.get(lane, 0) + 1
+        # A passenger is a distinct authored program whose realized evidence is
+        # identical to the deterministic display representative.  Candidates
+        # sharing that exact program are reported separately as duplicate
+        # submissions, not mislabeled as a mutation.
+        passenger_ids = [
+            row["candidateId"] for row in members[1:]
+            if row["authoredProgramSha256"] != representative["authoredProgramSha256"]
+        ]
+        passenger_candidate_count += len(passenger_ids)
+        behavior_duplicate_excess_count += max(0, len(members) - 1)
+        program_equivalent_duplicate_count += len(members) - len(authored_programs)
+        families.append({
+            "schemaVersion": BEHAVIOR_FAMILY_INDEX_SCHEMA,
+            "familyId": family_id,
+            "behaviorIdentitySha256": family_id,
+            "memberCount": len(members),
+            "exactGenotypeCount": len(genotype_ids),
+            "exactAuthoredProgramCount": len(authored_programs),
+            "exactResolvedProgramCount": len(resolved_programs),
+            "exactGenotypeIdentitySha256s": genotype_ids,
+            "exactAuthoredProgramSha256s": authored_programs,
+            "exactResolvedProgramSha256s": resolved_programs,
+            "directionLaneMix": dict(sorted(lane_mix.items())),
+            "memberResultSha256ByCandidateId": {
+                row["candidateId"]: row["resultSha256"] for row in members
+            },
+            "memberSourceCandidateIdentitySha256ByCandidateId": {
+                row["candidateId"]: row["sourceCandidateIdentitySha256"] for row in members
+            },
+            "representativeCandidateIdForDisplay": representative["candidateId"],
+            "representativeDirectionClassificationForDisplay": representative["directionClassification"],
+            "memberCandidateIdsForDisplay": display_ids,
+            "passengerCandidateIdsForDisplay": passenger_ids,
+            "passengerMutationCandidateCount": len(passenger_ids),
+            "programEquivalentDuplicateCandidateCount": len(members) - len(authored_programs),
+        })
+
+    payload = {
+        "schemaVersion": BEHAVIOR_FAMILY_INDEX_SCHEMA,
+        "reportingOnly": True,
+        "sourceIdentitySha256": source_identity_sha256,
+        "stage": stage,
+        "evaluationSha256": evaluation_sha256,
+        "candidateCount": len(candidate_ids),
+        "candidateIdsSha256": canonical_sha256(candidate_ids),
+        "measuredCandidateCount": len(measured),
+        "unmeasuredCandidateCount": len(unmeasured_ids),
+        "unmeasuredCandidateIds": unmeasured_ids,
+        "families": families,
+        "summary": {
+            "familyCount": len(families),
+            "multiMemberFamilyCount": sum(1 for family in families if family["memberCount"] > 1),
+            "exactBehaviorDuplicateCandidateCount": sum(
+                family["memberCount"] for family in families if family["memberCount"] > 1
+            ),
+            "exactBehaviorDuplicateExcessCandidateCount": behavior_duplicate_excess_count,
+            "passengerMutationCandidateCount": passenger_candidate_count,
+            "programEquivalentDuplicateCandidateCount": program_equivalent_duplicate_count,
+            "candidateDeletionCount": 0,
+        },
+    }
+    payload["behaviorFamilyIndexSha256"] = canonical_sha256(payload)
+    return payload
+
+
+def _completed_legacy_result(root: Path) -> dict[str, Any] | None:
+    """Return a sealed v1 result without attempting to migrate its evidence.
+
+    The v1 controller did not bind the final archive source.  Reopening an
+    already-completed v1 run is therefore read-only: re-running it under the
+    broader v2 universe would be a different experiment, not a resume.
+    """
+
+    identity_path = root / "source-identity.json"
+    if not identity_path.is_file():
+        return None
+    identity = _read(identity_path, name="legacy scrutiny source identity")
+    schema = identity.get("schemaVersion")
+    if schema not in READ_ONLY_SCRUTINY_SCHEMAS:
+        return None
+    source_sha = _sha(identity.get("sourceIdentitySha256"), name="legacy scrutiny source identity")
+    result = _read(root / "result.json", name="legacy scrutiny result")
+    if result.get("schemaVersion") != schema or result.get("status") != "completed":
+        raise TemporalQDScrutinyError("legacy scrutiny output is incomplete and cannot be migrated")
+    if result.get("sourceIdentitySha256") != source_sha:
+        raise TemporalQDScrutinyError("legacy scrutiny result source binding mismatch")
+    supplied = _sha(result.get("resultSha256"), name="legacy scrutiny result identity")
+    material = dict(result)
+    material.pop("resultSha256", None)
+    if canonical_sha256(material) != supplied:
+        raise TemporalQDScrutinyError("legacy scrutiny result identity mismatch")
+    return result
+
+
 def run_qd_post_campaign_scrutiny(
     *, campaign_root: Path | str, generation_index: int, output_root: Path | str,
     target_worker_contract_path: Path | str,
@@ -468,13 +937,19 @@ def run_qd_post_campaign_scrutiny(
     attestor: Callable[..., LakeWindowBinding] = resolve_lake_window_binding,
     client: Any | None = None, expected_cohort_size: int = 1024,
 ) -> dict[str, Any]:
-    """Run 12m for all exact new G5 proposals then 36m for pre-registered passers."""
+    """Run 12m for the final archive/new-proposal union, then 36m passers."""
     campaign = Path(campaign_root).resolve()
     root = Path(output_root).resolve()
     repo = Path(__file__).resolve().parents[1]
     if _inside(root, campaign) or _inside(root, repo):
         raise TemporalQDScrutinyError("scrutiny output must be outside both campaign source and repository")
-    candidates, cohort, config, rotating = _load_source(campaign_root=campaign, generation_index=generation_index, expected_cohort_size=expected_cohort_size)
+    legacy_result = _completed_legacy_result(root)
+    if legacy_result is not None:
+        return legacy_result
+    candidates, cohort, config, rotating, source_universe = _load_source(
+        campaign_root=campaign, generation_index=generation_index,
+        expected_cohort_size=expected_cohort_size,
+    )
     evidence = config.get("evaluation", {}).get("predeclaredEvidenceContext", {}) if isinstance(config.get("evaluation"), Mapping) else {}
     catalog_record = evidence.get("constructionCatalog") if isinstance(evidence, Mapping) else None
     if not isinstance(catalog_record, Mapping):
@@ -501,19 +976,29 @@ def run_qd_post_campaign_scrutiny(
         raise TemporalQDScrutinyError(
             "scrutiny controller repository must be clean before freezing evidence"
         )
+    _write_once(root / "source-universe.json", source_universe)
     source_identity = {"schemaVersion": SCRUTINY_SCHEMA, "campaignRoot": str(campaign), "generationIndex": generation_index,
         "controllerIdentity": controller_identity,
         "campaignConfigSha256": _file_sha(campaign / "config.json"), "rotatingEvidenceSha256": rotating["rotatingEvidenceSha256"],
         "cohortSha256": cohort["cohortSha256"], "evaluationPopulationSha256": candidates and _read(campaign / "generations" / f"generation-{generation_index:04d}" / "proposal" / "evaluation-population.json", name="evaluation population")["evaluationPopulationSha256"],
         "targetWorkerContract": target_worker,
-        "newProposalCandidateIds": [row["candidateId"] for row in candidates], "newProposalCandidateIdsSha256": canonical_sha256([row["candidateId"] for row in candidates]),
+        "sourceUniverseSha256": source_universe["sourceUniverseSha256"],
+        "archive": source_universe["archive"],
+        "archiveIncumbentCandidateCount": source_universe["archiveIncumbentCount"],
+        "newProposalCandidateCount": source_universe["newProposalCandidateCount"],
+        "deduplicatedCandidateIdentityCount": source_universe["deduplicatedCandidateIdentityCount"],
+        "newProposalCandidateIds": [row["candidateId"] for row in candidates if "new_proposal" in row["sourceRoles"]],
+        "newProposalCandidateIdsSha256": canonical_sha256([row["candidateId"] for row in candidates if "new_proposal" in row["sourceRoles"]]),
+        "scrutinyCandidateIds": [row["candidateId"] for row in candidates],
+        "scrutinyCandidateIdsSha256": canonical_sha256([row["candidateId"] for row in candidates]),
         "outerTailTouched": False}
     source_identity["sourceIdentitySha256"] = canonical_sha256(source_identity)
     _write_once(root / "source-identity.json", source_identity)
     _write_once(root / "target-worker-contract.json", target_worker)
     policy = {"schemaVersion": PROMOTION_POLICY_SCHEMA, "sourceIdentitySha256": source_identity["sourceIdentitySha256"],
         "validationStage": "validation_12m", "criteria": {"netConservativeR": {"operator": ">", "value": 0.0}, "minimumClosedTrades": 24,
-            "completeValidReplay": True, "noUnresolvedState": True}, "maxPromotions": 128,
+            "mechanicallyValidReplay": True, "terminalCompleteReplay": True}, "maxPromotions": 128,
+        "capScope": "deduplicated final-archive/new-proposal source union",
         "ordering": ["netConservativeR_desc", "maxDrawdownR_asc", "closedTrades_desc", "candidateId_asc"],
         "diversity": {"enabled": True, "descriptor": "direction_mode_state_count_indicator_family_set", "floor": "one strongest passer per descriptor before ranked fill"}}
     policy["promotionPolicySha256"] = canonical_sha256(policy)
@@ -588,7 +1073,20 @@ def run_qd_post_campaign_scrutiny(
             run_qd = run_temporal_search_tasks(gateway, authority, output_root=stage_root, timeout_seconds=timeout_seconds,
                 poll_interval_seconds=poll_interval_seconds, resume=(stage_root / "checkpoint.json").is_file(), enqueue_batch_size=enqueue_batch_size,
                 include_selection_summary=False, summary_filename="run-summary.json")
-            results = _read_stage_results(stage_root, authority, expected_worker_environment=target_worker["environment"])
+            source_by_id = {str(row["candidateId"]): row for row in selected}
+            results = _read_stage_results(
+                stage_root, authority, expected_worker_environment=target_worker["environment"],
+                candidate_sources=source_by_id,
+            )
+            for row in results:
+                source = source_by_id.get(str(row["candidateId"]))
+                if source is None:
+                    raise TemporalQDScrutinyError("stage result is outside the frozen scrutiny source universe")
+                row["sourceRoles"] = list(source["sourceRoles"])
+                row["sourceCandidateIdentitySha256"] = source["sourceCandidateIdentitySha256"]
+                row["authoredProgramSha256"] = source["authoredProgramSha256"]
+                if source.get("expectedResolvedProgramSha256") is not None:
+                    row["expectedResolvedProgramSha256"] = source["expectedResolvedProgramSha256"]
             stage_results[stage] = results
             stream_consistency = _observation_stream_consistency(results)
             if not stream_consistency["valid"]:
@@ -597,9 +1095,16 @@ def run_qd_post_campaign_scrutiny(
                 )
             evaluation = _stage_evaluation_identity(stage=stage, authority=authority, results=results)
             _write_once(stage_root / "evaluation-identity.json", evaluation)
+            behavior_index = _behavior_family_index(
+                stage=stage,
+                source_identity_sha256=source_identity["sourceIdentitySha256"],
+                evaluation_sha256=evaluation["evaluationSha256"],
+                results=results,
+            )
+            _write_once(stage_root / "behavior-family-index.json", behavior_index)
             _write_once(stage_root / "candidate-rankings.json", {"schemaVersion": SCRUTINY_SCHEMA, "stage": stage, "authorityId": authority["authorityId"], "rows": sorted(results, key=lambda row: str(row["candidateId"])), "observationStreamConsistency": stream_consistency})
             _write_once(stage_root / "summary.json", {"schemaVersion": SCRUTINY_SCHEMA, "stage": stage, "authorityId": authority["authorityId"], "run": run_qd,
-                "candidateCount": len(selected), "validReplayCount": sum(bool(row.get("validReplay")) for row in results), "observationStreamConsistency": stream_consistency, "evaluationSha256": evaluation["evaluationSha256"]})
+                "candidateCount": len(selected), "mechanicallyValidReplayCount": sum(bool(row.get("mechanicallyValidReplay")) for row in results), "terminalCompleteReplayCount": sum(bool(row.get("terminalCompleteReplay")) for row in results), "observationStreamConsistency": stream_consistency, "evaluationSha256": evaluation["evaluationSha256"], "behaviorFamilyIndexSha256": behavior_index["behaviorFamilyIndexSha256"]})
             checkpoint["stages"][stage] = evaluation["evaluationSha256"]
             _write_checkpoint(checkpoint_path, checkpoint)
             if stage == "validation_12m":
@@ -607,19 +1112,49 @@ def run_qd_post_campaign_scrutiny(
                 rankings, promoted = _rank_validation(results=results, candidates=by_id)
                 _write_once(root / "validation-rankings.json", {"schemaVersion": SCRUTINY_SCHEMA, "policySha256": policy["promotionPolicySha256"], "rows": rankings})
                 manifest = {"schemaVersion": SCRUTINY_SCHEMA, "sourceIdentitySha256": source_identity["sourceIdentitySha256"], "promotionPolicySha256": policy["promotionPolicySha256"],
-                    "validationEvaluationSha256": evaluation["evaluationSha256"], "eligiblePasserCount": sum(bool(row["promotionEligible"]) for row in rankings),
-                    "promotedCandidateIds": [row["candidateId"] for row in promoted], "promotionCount": len(promoted), "outerTailTouched": False}
+                    "validationEvaluationSha256": evaluation["evaluationSha256"], "validationPromotionEligibleCount": sum(bool(row["promotionEligibleAfterValidation"]) for row in rankings),
+                    "promotedCandidateIds": [row["candidateId"] for row in promoted],
+                    "promotedCandidates": [{"candidateId": row["candidateId"], "sourceRoles": row["sourceRoles"], "sourceCandidateIdentitySha256": row["sourceCandidateIdentitySha256"], "authoredProgramSha256": row["authoredProgramSha256"], **({"expectedResolvedProgramSha256": row["expectedResolvedProgramSha256"]} if row.get("expectedResolvedProgramSha256") is not None else {})} for row in promoted],
+                    "promotionCount": len(promoted), "outerTailTouched": False}
                 manifest["promotionManifestSha256"] = canonical_sha256(manifest)
                 _write_once(root / "promotion-manifest.json", manifest)
         promotion = _read(root / "promotion-manifest.json", name="promotion manifest")
         validation_summary = _read(root / "validation_12m" / "summary.json", name="validation summary")
         scrutiny_summary = _read(root / "scrutiny_36m" / "summary.json", name="scrutiny summary")
+        stage_behavior_indexes: dict[str, dict[str, Any]] = {}
+        for stage in stages:
+            index_path = root / stage / "behavior-family-index.json"
+            if not index_path.is_file():
+                continue
+            index = _read(index_path, name=f"{stage} behavior-family index")
+            supplied = _sha(index.get("behaviorFamilyIndexSha256"), name=f"{stage} behavior-family index identity")
+            material = dict(index)
+            material.pop("behaviorFamilyIndexSha256", None)
+            if canonical_sha256(material) != supplied:
+                raise TemporalQDScrutinyError(f"{stage} behavior-family index identity mismatch")
+            if index.get("sourceIdentitySha256") != source_identity["sourceIdentitySha256"]:
+                raise TemporalQDScrutinyError(f"{stage} behavior-family index source identity mismatch")
+            stage_behavior_indexes[stage] = {
+                "path": str(index_path),
+                "evaluationSha256": index.get("evaluationSha256"),
+                "behaviorFamilyIndexSha256": supplied,
+            }
+        behavior_index_manifest = {
+            "schemaVersion": BEHAVIOR_FAMILY_INDEX_SCHEMA,
+            "reportingOnly": True,
+            "sourceIdentitySha256": source_identity["sourceIdentitySha256"],
+            "stageIndexes": stage_behavior_indexes,
+        }
+        behavior_index_manifest["behaviorFamilyIndexManifestSha256"] = canonical_sha256(behavior_index_manifest)
+        _write_once(root / "behavior-family-index.json", behavior_index_manifest)
         result = {"schemaVersion": SCRUTINY_SCHEMA, "sourceIdentitySha256": source_identity["sourceIdentitySha256"], "promotionPolicySha256": policy["promotionPolicySha256"],
             "targetWorkerContractHash": target_worker["contractHash"],
-            "validationCandidateCount": len(candidates), "validationEvaluationSha256": validation_summary.get("evaluationSha256"),
+            "validationCandidateCount": len(candidates), "archiveIncumbentCandidateCount": source_universe["archiveIncumbentCount"],
+            "newProposalCandidateCount": source_universe["newProposalCandidateCount"], "validationEvaluationSha256": validation_summary.get("evaluationSha256"),
             "promotionManifest": str(root / "promotion-manifest.json"), "promotionManifestSha256": promotion["promotionManifestSha256"],
             "promotionCount": int(promotion["promotionCount"]), "scrutinyStageOutcome": checkpoint["stages"].get("scrutiny_36m"),
             "scrutinyCandidateCount": int(scrutiny_summary.get("candidateCount") or 0), "outerTailTouched": False,
+            "behaviorFamilyIndexManifestSha256": behavior_index_manifest["behaviorFamilyIndexManifestSha256"],
             "status": "completed"}
         result["resultSha256"] = canonical_sha256(result)
         _write_once(root / "result.json", result)

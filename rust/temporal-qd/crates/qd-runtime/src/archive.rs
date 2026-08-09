@@ -20,9 +20,17 @@ use temporal_qd_kernel::{
 
 pub const QD_ARCHIVE_SCHEMA: &str = "temporal_qd_archive_v3";
 pub const QD_VERSION: &str = "temporal_qd_evolution_v3";
-pub const QD_POLICY_NAME: &str = "stage5e7_v3_robust_quality_archive";
-pub const QD_POLICY_SHA256: &str =
+pub const LEGACY_QD_POLICY_NAME: &str = "stage5e7_v3_robust_quality_archive";
+pub const LEGACY_QD_POLICY_SHA256: &str =
     "sha256:837c670a3cec80246a3231397d945b7cfd602035752eddbe0593dc9644579ca8";
+pub const QD_POLICY_NAME: &str = "stage5e7_v4_corrected_descriptor_archive";
+pub const QD_POLICY_SHA256: &str =
+    "sha256:f4ab045e2962aea0ac3336122592205a7d42274df4695ac51415e9b2facca2bd";
+pub const CORRECTED_QD_POLICY_NAME: &str = QD_POLICY_NAME;
+pub const CORRECTED_QD_POLICY_SHA256: &str = QD_POLICY_SHA256;
+pub const DIRECTIONAL_QD_POLICY_NAME: &str = "stage5e7_v5_direction_aware_breeding_archive";
+pub const DIRECTIONAL_QD_POLICY_SHA256: &str =
+    "sha256:c8ea30b0a9d2825844d4267be9e4ccf82f36dc43a741ac061d41508fe486c3da";
 pub const ARCHIVE_PARENT_STATE_SCHEMA: &str = "temporal_qd_archive_parent_state_v1";
 pub const PAIR_PARENT_SELECTION_SCHEMA: &str = "temporal_qd_pair_parent_selection_v1";
 
@@ -141,6 +149,8 @@ struct SelectionState {
 pub struct VerifiedArchiveMember {
     candidate_id: String,
     archive_lane: String,
+    direction_policy_bound: bool,
+    direction_breeding_eligible: bool,
     pair_identity_sha256: String,
     /// The exact frozen-pair bytes are needed only by a member which can be
     /// selected.  A real archive contains many observational members, so
@@ -292,18 +302,35 @@ impl VerifiedParentArchive {
         let archive_map = map(archive, "QD parent archive")?;
         if archive_map.get("schemaVersion").and_then(Value::as_str) != Some(QD_ARCHIVE_SCHEMA)
             || archive_map.get("qdVersion").and_then(Value::as_str) != Some(QD_VERSION)
-            || archive_map.get("policyName").and_then(Value::as_str) != Some(QD_POLICY_NAME)
-            || archive_map.get("policySha256").and_then(Value::as_str) != Some(QD_POLICY_SHA256)
         {
             return Err(invalid("unknown QD archive schema"));
         }
         let frozen_policy = field(archive_map, "frozenPolicy", "QD parent archive")?;
         let frozen_policy_sha256 = canonical_sha256(frozen_policy)
             .map_err(|error| invalid(format!("frozen QD policy is not canonical: {error}")))?;
-        if frozen_policy_sha256 != QD_POLICY_SHA256 {
-            return Err(invalid("unknown frozen QD archive policy"));
-        }
-
+        let policy_kind = match (
+            archive_map.get("policyName").and_then(Value::as_str),
+            archive_map.get("policySha256").and_then(Value::as_str),
+            frozen_policy_sha256.as_str(),
+        ) {
+            (
+                Some(DIRECTIONAL_QD_POLICY_NAME),
+                Some(DIRECTIONAL_QD_POLICY_SHA256),
+                DIRECTIONAL_QD_POLICY_SHA256,
+            ) => "directional",
+            (
+                Some(CORRECTED_QD_POLICY_NAME),
+                Some(CORRECTED_QD_POLICY_SHA256),
+                CORRECTED_QD_POLICY_SHA256,
+            ) => "corrected",
+            (
+                Some(LEGACY_QD_POLICY_NAME),
+                Some(LEGACY_QD_POLICY_SHA256),
+                LEGACY_QD_POLICY_SHA256,
+            ) => "legacy",
+            _ => return Err(invalid("unknown frozen QD archive policy")),
+        };
+        let direction_aware = policy_kind == "directional";
         let pair_policy = map(
             field(archive_map, "bidirectionalPairPolicy", "QD parent archive")?,
             "QD bidirectional pair policy",
@@ -363,6 +390,7 @@ impl VerifiedParentArchive {
                 cell_index,
                 &compiler_authority,
                 &pair_policy_sha256,
+                direction_aware,
                 &mut seen_cells,
                 &mut seen_candidates,
             )?);
@@ -761,6 +789,7 @@ fn parse_cell(
     index: usize,
     compiler_authority: &IdentitySnapshot,
     pair_policy_sha256: &str,
+    direction_aware: bool,
     seen_cells: &mut BTreeSet<String>,
     seen_candidates: &mut BTreeSet<String>,
 ) -> Result<SourceCell> {
@@ -793,6 +822,9 @@ fn parse_cell(
                 &format!("{label} member {member_index}"),
                 compiler_authority,
                 pair_policy_sha256,
+                direction_aware,
+                &cell_id,
+                &coordinates,
                 seen_candidates,
             )
         })
@@ -812,11 +844,149 @@ fn parse_cell(
     })
 }
 
+fn direction_side(
+    behavior: &Map<String, Value>,
+    side: &str,
+    window_count: u64,
+    label: &str,
+) -> Result<(bool, bool, bool)> {
+    let sides = map(field(behavior, "sides", label)?, "realized behavior sides")?;
+    let row = map(
+        field(sides, side, "realized behavior sides")?,
+        "realized behavior side",
+    )?;
+    let closed = nonnegative_count(row.get("closedTrades"), "direction closedTrades")?;
+    let active_windows =
+        nonnegative_count(row.get("activeWindowCount"), "direction activeWindowCount")?;
+    if active_windows > window_count {
+        return Err(invalid(
+            "direction active-window count exceeds behavior window count",
+        ));
+    }
+    let fraction = finite(
+        field(row, "activeWindowFraction", "realized behavior side")?,
+        "direction activeWindowFraction",
+    )?;
+    if !(0.0..=1.0).contains(&fraction)
+        || (fraction - active_windows as f64 / window_count as f64).abs() > 1e-12
+    {
+        return Err(invalid("direction active-window evidence is inconsistent"));
+    }
+    let gross = finite(
+        field(row, "grossR", "realized behavior side")?,
+        "direction grossR",
+    )?;
+    let net = finite(
+        field(row, "netR", "realized behavior side")?,
+        "direction netR",
+    )?;
+    let cost = finite(
+        field(row, "costR", "realized behavior side")?,
+        "direction costR",
+    )?;
+    if ((gross - net) - cost).abs() > 1e-9 {
+        return Err(invalid("direction gross/net/cost R does not reconcile"));
+    }
+    let terminal = nonnegative_count(
+        row.get("terminalDirectionCount"),
+        "direction terminalDirectionCount",
+    )?;
+    if row.get("active").and_then(Value::as_bool) != Some(closed > 0 || terminal > 0) {
+        return Err(invalid("direction active flag is inconsistent"));
+    }
+    let supported = closed >= 1 && active_windows >= 1;
+    Ok((
+        supported,
+        supported && net >= 0.0,
+        supported && net <= -0.25,
+    ))
+}
+
+fn validate_direction_selection(
+    member: &Map<String, Value>,
+    label: &str,
+    quality_eligible: bool,
+) -> Result<bool> {
+    let aggregate = map(field(member, "aggregate", label)?, "direction aggregate")?;
+    let behavior = field(aggregate, "realizedBehavior", "direction aggregate")?;
+    let behavior_map = map(behavior, "realized behavior")?;
+    if behavior_map.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_realized_behavior_v1")
+    {
+        return Err(invalid("direction realized behavior schema is unsupported"));
+    }
+    canonical_identity(behavior, "identitySha256", "realized behavior")?;
+    let window_count = nonnegative_count(behavior_map.get("windowCount"), "direction windowCount")?;
+    if window_count < 1 {
+        return Err(invalid("direction behavior windowCount must be positive"));
+    }
+    let (long_supported, long_acceptable, long_harmful) =
+        direction_side(behavior_map, "long", window_count, label)?;
+    let (short_supported, short_acceptable, short_harmful) =
+        direction_side(behavior_map, "short", window_count, label)?;
+    let (expected_lane, expected_eligible, expected_specialist) =
+        if (long_acceptable && short_harmful) || (short_acceptable && long_harmful) {
+            ("harmful_opposite_side", false, None)
+        } else if long_acceptable && short_acceptable {
+            ("balanced_bidirectional", true, None)
+        } else if long_acceptable && !short_supported {
+            ("long_specialist", true, Some("long"))
+        } else if short_acceptable && !long_supported {
+            ("short_specialist", true, Some("short"))
+        } else {
+            ("inactive_or_unsupported", false, None)
+        };
+    let selection = map(
+        field(member, "directionSelection", label)?,
+        "direction selection",
+    )?;
+    if selection.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_direction_selection_v1")
+    {
+        return Err(invalid("direction selection schema is unsupported"));
+    }
+    canonical_identity(
+        &Value::Object(selection.clone()),
+        "identitySha256",
+        "direction selection",
+    )?;
+    if selection
+        .get("policyIdentitySha256")
+        .and_then(Value::as_str)
+        != Some("sha256:2567175ff6ae6063baa485484c0faa0d742507af6814a593076020a68aef3ed1")
+        || selection
+            .get("realizedBehaviorIdentitySha256")
+            .and_then(Value::as_str)
+            != behavior_map.get("identitySha256").and_then(Value::as_str)
+        || selection.get("lane").and_then(Value::as_str) != Some(expected_lane)
+        || selection.get("selectionEligible").and_then(Value::as_bool) != Some(expected_eligible)
+        || selection.get("specialistSide").and_then(Value::as_str) != expected_specialist
+        || member.get("directionBehaviorLane").and_then(Value::as_str) != Some(expected_lane)
+    {
+        return Err(invalid(
+            "direction selection is not bound to realized behavior",
+        ));
+    }
+    let expected_breeding_lane = if quality_eligible && expected_eligible {
+        Some(expected_lane)
+    } else {
+        None
+    };
+    let actual_breeding_lane = member.get("directionBreedingLane").and_then(Value::as_str);
+    if actual_breeding_lane != expected_breeding_lane {
+        return Err(invalid("direction breeding lane is inconsistent"));
+    }
+    Ok(expected_breeding_lane.is_some())
+}
+
 fn parse_member(
     value: &Value,
     label: &str,
     compiler_authority: &IdentitySnapshot,
     pair_policy_sha256: &str,
+    direction_aware: bool,
+    cell_id: &str,
+    coordinates: &[String; 7],
     seen_candidates: &mut BTreeSet<String>,
 ) -> Result<Arc<VerifiedArchiveMember>> {
     let member = map(value, label)?;
@@ -831,6 +1001,20 @@ fn parse_member(
     ) {
         return Err(invalid(format!("{label} has an unknown archiveLane")));
     }
+    let descriptor = map(field(member, "descriptor", label)?, "QD member descriptor")?;
+    let member_coordinates: [String; 7] = DESCRIPTOR_KEYS
+        .map(|key| string(descriptor, key, "QD member descriptor"))
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .expect("descriptor has seven coordinates");
+    if descriptor.get("cellId").and_then(Value::as_str) != Some(cell_id)
+        || member_coordinates != *coordinates
+    {
+        return Err(invalid(
+            "QD archive member descriptor does not match its cell",
+        ));
+    }
     let validity = map(
         field(member, "finiteDataValidity", label)?,
         "finite data validity",
@@ -844,6 +1028,12 @@ fn parse_member(
             return Err(invalid(format!("{label} validity {key} must be boolean")));
         }
     }
+    let quality_eligible = finite_data && passes_support_gate && valid_for_quality;
+    let direction_breeding_eligible = if direction_aware {
+        validate_direction_selection(member, label, quality_eligible)?
+    } else {
+        false
+    };
     let objectives = map(field(member, "objectives", label)?, "QD member objectives")?;
     let robust_return = finite(
         field(
@@ -1046,6 +1236,8 @@ fn parse_member(
     let mut result = VerifiedArchiveMember {
         candidate_id,
         archive_lane,
+        direction_policy_bound: direction_aware,
+        direction_breeding_eligible,
         pair_identity_sha256,
         pair_payload: None,
         pareto_front_audit,
@@ -1090,8 +1282,12 @@ fn reproduction_eligible(member: &VerifiedArchiveMember, rotating_sha: Option<&s
         member.robust_breeder_eligible
             && member.cumulative_evidence_archive_sha256.as_deref() == Some(identity)
     });
-    (member.archive_lane == "quality" && (quality_eligible(member) || rotating_eligible))
-        || (member.archive_lane == "rotating_frontier" && rotating_eligible)
+    (member.archive_lane == "quality"
+        && (!member.direction_policy_bound || member.direction_breeding_eligible)
+        && (quality_eligible(member) || rotating_eligible))
+        || (member.archive_lane == "rotating_frontier"
+            && (!member.direction_policy_bound || member.direction_breeding_eligible)
+            && rotating_eligible)
 }
 
 fn negative_novelty_eligible(member: &VerifiedArchiveMember) -> bool {

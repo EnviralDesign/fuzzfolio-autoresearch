@@ -51,6 +51,13 @@ const WINDOW_SCHEMA: &str = "temporal_qd_candidate_window_evidence_v1";
 const CUMULATIVE_SCHEMA: &str = "temporal_qd_cumulative_breeder_archive_v1";
 const CHECKPOINT_SCHEMA: &str = "temporal_qd_rotating_evidence_checkpoint_v1";
 const ARCHIVE_SCHEMA: &str = "temporal_qd_archive_v3";
+const QD_VERSION: &str = "temporal_qd_evolution_v3";
+const QD_POLICY_NAME: &str = "stage5e7_v4_corrected_descriptor_archive";
+const QD_POLICY_SHA256: &str =
+    "sha256:f4ab045e2962aea0ac3336122592205a7d42274df4695ac51415e9b2facca2bd";
+const DIRECTIONAL_QD_POLICY_NAME: &str = "stage5e7_v5_direction_aware_breeding_archive";
+const DIRECTIONAL_QD_POLICY_SHA256: &str =
+    "sha256:c8ea30b0a9d2825844d4267be9e4ccf82f36dc43a741ac061d41508fe486c3da";
 const FUNNEL_SOURCE_SCHEMA: &str = "temporal_qd_native_funnel_reduction_source_v1";
 const FUNNEL_SCHEMA: &str = "temporal_generation_funnel_v1";
 const FUNNEL_SNAPSHOT_SCHEMA: &str = "temporal_generation_funnel_supervisor_snapshot_v1";
@@ -359,6 +366,7 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         "policyBindingSha256",
         "archive policy binding",
     )?;
+    validate_corrected_archive_policy(&archive_policy)?;
     let rich_members = array(&value, "richMembers")?.to_vec();
     let current_member_count = unsigned(&value, "currentMemberCount")?;
     ensure!(
@@ -408,6 +416,32 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         expected_plan,
         source_sha256: source_sha,
     })
+}
+
+fn validate_corrected_archive_policy(value: &Value) -> Result<()> {
+    object(value, "archive policy binding")?;
+    ensure!(
+        text(value, "schemaVersion")? == "temporal_qd_archive_policy_binding_v1"
+            && text(value, "qdVersion")? == QD_VERSION,
+        "archive policy binding schema is invalid"
+    );
+    let name = text(value, "policyName")?;
+    let policy_sha = sha(value, "policySha256")?;
+    let expected_sha = match name {
+        QD_POLICY_NAME => QD_POLICY_SHA256,
+        DIRECTIONAL_QD_POLICY_NAME => DIRECTIONAL_QD_POLICY_SHA256,
+        _ => {
+            return Err(anyhow!(
+                "archive policy binding is not a recognized v4/v5 policy"
+            ));
+        }
+    };
+    ensure!(
+        policy_sha == expected_sha
+            && canonical_sha256(member(value, "frozenPolicy")?)? == expected_sha,
+        "archive policy frozen identity mismatch"
+    );
+    Ok(())
 }
 
 fn build_auxiliary_plan(source: &Source) -> Result<Value> {
@@ -1227,12 +1261,10 @@ fn build_parent_archive(source: &Source, cumulative: &Value) -> Result<Value> {
         parent_count <= source.breeder_width,
         "parent archive exceeds breeder width"
     );
-    let (num, den) = if parent_count * 5 < source.breeder_width * 4 {
-        (parent_count, source.breeder_width)
-    } else {
-        (4, 5)
-    };
-    let mut schedule = json!({"schemaVersion":"temporal_qd_rotating_parent_schedule_v1","breederWidth":source.breeder_width,"breederParentCount":parent_count,"maximumOffspringNumerator":4,"maximumOffspringDenominator":5,"offspringNumerator":num,"offspringDenominator":den,"immigrantsFillUnsupportedShare":true,"schedulingMethod":"deterministic_rational_prefix_balance"});
+    // Parent count is evidence of supported source material, not a cap on
+    // offspring.  The next generation freezes its evaluated 80/20 quota and
+    // samples these valid parents with replacement.
+    let mut schedule = json!({"schemaVersion":"temporal_qd_rotating_parent_schedule_v2","breederWidth":source.breeder_width,"breederParentCount":parent_count,"minimumImmigrantNumerator":1,"minimumImmigrantDenominator":5,"parentSampling":"with_replacement_supported_parents_v1","unsupportedParentPolicy":"immigrant_only_authority_bound_v1","schedulingMethod":"accepted_quota_prefix_balance_v1"});
     add_self_hash(&mut schedule, "scheduleSha256")?;
     let old_cells = array(&source.previous_parent, "cellIds")?
         .iter()

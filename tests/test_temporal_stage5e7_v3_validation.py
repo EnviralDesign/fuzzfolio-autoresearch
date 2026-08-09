@@ -9,6 +9,7 @@ import autoresearch.temporal_stage5e7_v3_validation as validation_harness
 import autoresearch.temporal_stage5e7_v3_panel_bridge as panel_bridge
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
 from autoresearch.temporal_qd_evolution import _load_archive
+from autoresearch.temporal_qd_evolution import QD_POLICY_NAME
 from autoresearch.temporal_search import build_authority, build_task_matrix
 from autoresearch.temporal_stage5e7_v3_validation import (
     analyze_operator_panel,
@@ -683,7 +684,11 @@ def test_policy_ab_analysis_reduces_one_shared_v3_population_and_result_set(tmp_
     report = json.loads((external / "stage5e7-v3-validation-fixture-v1" / "policy-ab-analysis" / "policy-ab-analysis.json").read_text(encoding="utf-8"))
     assert report["reducedPopulationSha256"] == population["populationSha256"]
     assert report["policyA"]["policyIdentity"]["policyName"] == "stage5e7_v2_like_corrected_archive_reducer"
-    assert report["policyB"]["policyIdentity"]["policyName"] == "stage5e7_v3_robust_quality_archive"
+    # This historical validation harness compares the v2-like reducer against
+    # the currently admitted corrected descriptor policy.  v3 remains a
+    # separately named legacy policy and must not be relabelled as the current
+    # comparison arm.
+    assert report["policyB"]["policyIdentity"]["policyName"] == QD_POLICY_NAME
     assert report["interpretation"].endswith("no_search_or_breeding")
 
     _replace_result_program(results, population["candidates"][0]["candidateId"], "sha256:" + "0" * 64)

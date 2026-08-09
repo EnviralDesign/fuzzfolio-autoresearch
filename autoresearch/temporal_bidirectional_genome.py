@@ -26,6 +26,10 @@ PAIR_SCHEMA = "temporal_bidirectional_pair_snapshot_v1"
 HOLD_MUTATION_SCHEMA = "temporal_management_plan_hold_mutation_v1"
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SIDE = frozenset(("long", "short"))
+_TYPED_FRAGMENT_PROGRAM_SCHEMA = "temporal_typed_fragment_grammar_v2"
+_EVOLVABLE_MODULE_PROGRAM_SCHEMA = "evolvable_module_genome_v1"
+_EVOLVABLE_MODULE_PROGRAM_KIND = "evolvable_module_genome_v1"
+_EVOLVABLE_MODULE_CODEC = "evolvable_module_genome_json_v1"
 _MUTABLE_ALIAS_KEYS = frozenset(
     (
         "alias",
@@ -136,6 +140,53 @@ def _side(value: Any, *, name: str = "direction") -> str:
     return token
 
 
+def _program_direction(program: Mapping[str, Any]) -> str:
+    """Validate one known immutable module program codec without coercion.
+
+    Legacy typed-fragment programs remain the default historical codec.  The
+    evolvable module codec is a separately named, explicit authority: old
+    artifacts therefore keep their original bytes and are never upgraded on
+    read.  This boundary intentionally knows only the program envelope; the
+    evolvable codec itself validates its graph in its owning module.
+    """
+
+    direction = _side(program.get("direction"), name="module program direction")
+    if (
+        set(program) == {"schemaVersion", "grammarVersion", "direction", "fragments"}
+        and program.get("schemaVersion") == _TYPED_FRAGMENT_PROGRAM_SCHEMA
+        # ``grammarVersion: 2`` is a sealed historical typed-fragment codec.
+        # It remains readable so frozen pre-broad artifacts can be inspected or
+        # replayed by their original identity; writers continue to emit v3.
+        and program.get("grammarVersion") in {"2", "3"}
+        and isinstance(program.get("fragments"), list)
+    ):
+        return direction
+    if (
+        program.get("schemaVersion") == _EVOLVABLE_MODULE_PROGRAM_SCHEMA
+        and program.get("programKind") == _EVOLVABLE_MODULE_PROGRAM_KIND
+        and program.get("codec") == _EVOLVABLE_MODULE_CODEC
+        and isinstance(program.get("resources"), Mapping)
+        and isinstance(program.get("nodes"), list)
+        and isinstance(program.get("edges"), list)
+        and isinstance(program.get("budget"), Mapping)
+    ):
+        # Import only for the new explicitly versioned program.  This avoids
+        # changing legacy parser behavior and makes malformed new genomes fail
+        # before they can be frozen or paired.
+        from .evolvable_module_genome import decode_program
+
+        decoded = decode_program(
+            program_kind=str(program["programKind"]),
+            codec=str(program["codec"]),
+            payload=program,
+        )
+        decoded.validate()
+        if decoded.direction != direction:
+            raise BidirectionalGenomeError("evolvable module program direction drifted")
+        return direction
+    raise BidirectionalGenomeError("module program is not a known canonical codec")
+
+
 def _identifier(value: Any, *, name: str) -> str:
     token = "" if value is None else str(value).strip()
     if not token or len(token) > 240:
@@ -238,9 +289,7 @@ class FrozenModule:
         )
 
         validate_entry_route_decision_indicator_cap(canonical_profile)
-        direction = _side(canonical_program.get("direction"), name="module program direction")
-        if set(canonical_program) != {"schemaVersion", "grammarVersion", "direction", "fragments"} or canonical_program.get("schemaVersion") != "temporal_typed_fragment_grammar_v2" or canonical_program.get("grammarVersion") != "3" or not isinstance(canonical_program.get("fragments"), list):
-            raise BidirectionalGenomeError("module program is not a canonical typed v2 program")
+        direction = _program_direction(canonical_program)
         if canonical_profile.get("version") != "v2" or _side(canonical_profile.get("directionMode"), name="v2 profile direction") != direction:
             raise BidirectionalGenomeError("hydrated profile is not the matching v2 module")
         report = _mapping(native_report, name="native module validation report")
@@ -411,8 +460,8 @@ def deterministic_same_side_crossover(
     )
     if _side(child.get("direction"), name="crossover child direction") != left.direction:
         raise BidirectionalGenomeError("same-side crossover emitted a cross-side child")
-    if child.get("schemaVersion") != "temporal_typed_fragment_grammar_v2" or child.get("grammarVersion") != "3":
-        raise BidirectionalGenomeError("same-side crossover emitted a noncanonical v2 program")
+    if _program_direction(child) != left.direction:
+        raise BidirectionalGenomeError("same-side crossover emitted a noncanonical compatible program")
     record = {
         "operation": "same_side_crossover",
         "side": left.direction,

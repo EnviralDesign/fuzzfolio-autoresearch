@@ -71,7 +71,11 @@ def _generation_material(tmp_path: Path) -> tuple[dict[str, object], dict[str, o
         "maxProposalAttempts": 1,
         "runConfig": {
             "parentArchiveSha256": archive["archiveSha256"],
-            "parameters": {},
+            # This compact native witness exercises a frozen v3 archive.  Make
+            # that historical version explicit so the Rust reader can select
+            # its legacy reproduction projection without mistaking this
+            # fixture for a fresh v2 config missing its required allocation.
+            "parameters": {"version": "temporal_qd_evolution_v3"},
             "evidenceIdentityContext": runtime["evidenceIdentityContext"],
         },
         "pairPolicy": runtime["bidirectionalPairPolicy"],

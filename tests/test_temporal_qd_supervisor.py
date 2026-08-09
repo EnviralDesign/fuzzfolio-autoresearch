@@ -268,11 +268,18 @@ def test_rotating_generation_transaction_g1_is_market_free_and_restart_stable(
     member = {
         "candidateId": candidate["candidateId"],
         "candidate": dict(candidate),
-        "aggregate": {"totalConservativeNetR": 4.0},
-        "descriptor": {
-            "cellId": "cell",
-            "structuralMeasurements": {"structuralComplexity": 2.0},
-        },
+            "aggregate": {"totalConservativeNetR": 4.0},
+            "descriptor": {
+                "operatorFamilies": "none",
+                "mutationDepth": "root",
+                "entryEvents": "none",
+                "managementActions": "none",
+                "graphNodes": "small",
+                "tradeFrequency": "moderate",
+                "medianHolding": "medium",
+                "cellId": "none|root|none|none|small|moderate|medium",
+                "structuralMeasurements": {"structuralComplexity": 2.0},
+            },
         "objectives": {
             "worstWindowConservativeNetR": 1.0,
             "maximumDrawdownR": 0.5,
@@ -3003,3 +3010,65 @@ def test_native_authority_rotation_preserves_historical_binary_epoch(
             manifest_path=manifest_path,
             role="generationFinalizer",
         )
+
+
+def test_v5_completed_generation_seals_idempotent_lineage_unavailable_marker(
+    tmp_path: Path,
+) -> None:
+    generation = tmp_path / "generations" / "generation-0002"
+    for relative in (
+        "proposal/generation-journal.json",
+        "campaign/campaign.json",
+        "archive.json",
+        "evidence/generation-ledger.json",
+    ):
+        path = generation / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"sealed":true}\n', encoding="utf-8")
+    config = {
+        "configSha256": "sha256:" + "a" * 64,
+        "evolvableModuleAuthority": {"authoritySha256": "sha256:" + "b" * 64},
+    }
+    first = supervisor._write_v5_lineage_unavailable_marker(
+        root=tmp_path, generation_index=2, config=config
+    )
+    assert first is not None
+    assert first["completedGenerationIndex"] == 2
+    assert len(first["sourceArtifacts"]) == 4
+    assert supervisor._write_v5_lineage_unavailable_marker(
+        root=tmp_path, generation_index=2, config=config
+    ) == first
+    assert supervisor._write_v5_lineage_unavailable_marker(
+        root=tmp_path,
+        generation_index=9,
+        config={"configSha256": "sha256:" + "c" * 64},
+    ) is None
+    (generation / "archive.json").unlink()
+    with pytest.raises(TemporalDiscoveryContractError, match="source artifact is absent"):
+        supervisor._write_v5_lineage_unavailable_marker(
+            root=tmp_path, generation_index=2, config=config
+        )
+
+
+def test_v5_capacity_receipt_must_prove_frozen_campaign_supply() -> None:
+    # This check consumes a receipt only after authority-open validation has
+    # verified its sealed factory identity.  The supervisor additionally
+    # prevents a smaller finite preview from standing in for the frozen G0 +
+    # later-generation unique construction demand.
+    receipt = {
+        "compiledAdmittedCandidateCount": 8_096,
+        "uniqueSemanticPairCount": 8_096,
+    }
+    supervisor._require_evolvable_capacity_receipt_supply(
+        receipt, required_unique_candidates=8_096
+    )
+    for field in ("compiledAdmittedCandidateCount", "uniqueSemanticPairCount"):
+        under_capacity = dict(receipt)
+        under_capacity[field] = 8_095
+        with pytest.raises(
+            TemporalDiscoveryContractError,
+            match="does not prove the frozen campaign candidate supply",
+        ):
+            supervisor._require_evolvable_capacity_receipt_supply(
+                under_capacity, required_unique_candidates=8_096
+            )

@@ -448,7 +448,10 @@ impl NativePairAuthority for DuplicatePairAuthority {
 }
 
 fn request(root: PathBuf, authority_sha256: String) -> GenerateGenerationRequest {
-    let mut pair_config = object([("schemaVersion", Value::String("test_config_v1".to_owned()))]);
+    let mut pair_config = object([(
+        "schemaVersion",
+        Value::String("temporal_qd_pair_generation_v1".to_owned()),
+    )]);
     let config_sha256 = canonical_sha256(&pair_config).expect("hash config");
     pair_config.as_object_mut().expect("config object").insert(
         "configSha256".to_owned(),
@@ -491,7 +494,10 @@ fn request_with_tripwire(root: PathBuf, authority_sha256: String) -> GenerateGen
         ]),
     )]);
     let mut pair_config = object([
-        ("schemaVersion", Value::String("test_config_v1".to_owned())),
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_pair_generation_v1".to_owned()),
+        ),
         ("immigrantConstructionPolicy", policy.clone()),
     ]);
     let config_sha256 = canonical_sha256(&pair_config).expect("hash tripwire config");
@@ -503,6 +509,278 @@ fn request_with_tripwire(root: PathBuf, authority_sha256: String) -> GenerateGen
     generated.config_sha256 = config_sha256;
     generated.factory_construction_policy = Some(policy);
     generated
+}
+
+fn self_hashed_pair_config(
+    entries: impl IntoIterator<Item = (&'static str, Value)>,
+) -> (Value, String) {
+    let mut config = object(entries);
+    let sha = canonical_sha256(&config).expect("hash pair config");
+    config
+        .as_object_mut()
+        .expect("pair config object")
+        .insert("configSha256".to_owned(), Value::String(sha.clone()));
+    (config, sha)
+}
+
+fn legacy_v1_parent_schedule() -> (Value, temporal_qd_kernel::schedule::RotatingParentSchedule) {
+    let schedule = temporal_qd_kernel::schedule::RotatingParentSchedule::from_counts(128, 25)
+        .expect("legacy compact schedule");
+    let mut raw = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_rotating_parent_schedule_v1".to_owned()),
+        ),
+        ("breederWidth", Value::from(128_u64)),
+        ("breederParentCount", Value::from(25_u64)),
+        ("maximumOffspringNumerator", Value::from(4_u64)),
+        ("maximumOffspringDenominator", Value::from(5_u64)),
+        ("offspringNumerator", Value::from(25_u64)),
+        ("offspringDenominator", Value::from(128_u64)),
+        ("immigrantsFillUnsupportedShare", Value::Bool(true)),
+        (
+            "schedulingMethod",
+            Value::String("deterministic_rational_prefix_balance".to_owned()),
+        ),
+    ]);
+    let sha = temporal_qd_kernel::schedule::RotatingParentSchedule::legacy_schedule_sha256(
+        128, 25, 25, 128,
+    );
+    raw.as_object_mut()
+        .expect("legacy schedule object")
+        .insert("scheduleSha256".to_owned(), Value::String(sha));
+    (raw, schedule)
+}
+
+fn v2_parent_schedule() -> (Value, temporal_qd_kernel::schedule::RotatingParentSchedule) {
+    let schedule = temporal_qd_kernel::schedule::RotatingParentSchedule::from_counts(1, 1)
+        .expect("v2 compact schedule");
+    let raw = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_rotating_parent_schedule_v2".to_owned()),
+        ),
+        ("breederWidth", Value::from(1_u64)),
+        ("breederParentCount", Value::from(1_u64)),
+        ("minimumImmigrantNumerator", Value::from(1_u64)),
+        ("minimumImmigrantDenominator", Value::from(5_u64)),
+        (
+            "parentSampling",
+            Value::String("with_replacement_supported_parents_v1".to_owned()),
+        ),
+        (
+            "unsupportedParentPolicy",
+            Value::String("immigrant_only_authority_bound_v1".to_owned()),
+        ),
+        (
+            "schedulingMethod",
+            Value::String("accepted_quota_prefix_balance_v1".to_owned()),
+        ),
+        ("scheduleSha256", Value::String(schedule.schedule_sha256())),
+    ]);
+    (raw, schedule)
+}
+
+fn accepted_quota_allocation(target: u64, offspring: u64, immigrants: u64) -> Value {
+    let mut allocation = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_reproduction_allocation_v2".to_owned()),
+        ),
+        ("targetAcceptedCandidates", Value::from(target)),
+        ("desiredAcceptedOffspringCount", Value::from(offspring)),
+        ("desiredAcceptedImmigrantCount", Value::from(immigrants)),
+        ("minimumImmigrantNumerator", Value::from(1_u64)),
+        ("minimumImmigrantDenominator", Value::from(5_u64)),
+        (
+            "parentSampling",
+            Value::String("with_replacement_supported_parents_v1".to_owned()),
+        ),
+        (
+            "unsupportedParentPolicy",
+            Value::String("immigrant_only_authority_bound_v1".to_owned()),
+        ),
+        (
+            "allocationMethod",
+            Value::String("accepted_quota_prefix_balance_v1".to_owned()),
+        ),
+    ]);
+    let sha = canonical_sha256(&allocation).expect("hash allocation");
+    allocation
+        .as_object_mut()
+        .expect("allocation object")
+        .insert("allocationSha256".to_owned(), Value::String(sha));
+    allocation
+}
+
+#[test]
+fn fresh_accepted_quota_matches_python_one_through_six_and_restarts_exactly() {
+    let root = temp_root("accepted-quota-micro-parity");
+    let authority_sha256 =
+        canonical_sha256(&object([("authority", Value::String("test".to_owned()))]))
+            .expect("hash authority");
+    let expected = [(0_u64, 1_u64), (1, 1), (2, 1), (3, 1), (4, 1), (4, 2)];
+    for (index, (offspring, immigrants)) in expected.into_iter().enumerate() {
+        let target = index as u64 + 1;
+        let (parent_schedule_raw, parent_schedule) = v2_parent_schedule();
+        let (config, config_sha256) = self_hashed_pair_config([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_pair_generation_v2".to_owned()),
+            ),
+            ("parentSchedule", parent_schedule_raw),
+            (
+                "reproductionAllocation",
+                accepted_quota_allocation(target, offspring, immigrants),
+            ),
+        ]);
+        let mut initial = request(root.join(target.to_string()), authority_sha256.clone());
+        initial.pair_config = config.clone();
+        initial.config_sha256 = config_sha256;
+        initial.parent_schedule = Some(parent_schedule);
+        initial.target_unique_candidates = target;
+        initial
+            .validate()
+            .expect("fresh Python-equivalent quota is admitted");
+        let resumed = initial.clone();
+        resumed
+            .validate()
+            .expect("restart preserves sealed accepted quota");
+        assert_eq!(resumed.pair_config, config);
+    }
+    fs::remove_dir_all(&root).expect("remove exact test root");
+}
+
+#[test]
+fn legacy_v1_rejects_rehashed_invalid_sparse_schedule() {
+    let root = temp_root("legacy-v1-ratio-rejection");
+    let authority_sha256 =
+        canonical_sha256(&object([("authority", Value::String("test".to_owned()))]))
+            .expect("hash authority");
+    for (numerator, denominator) in [(0_u64, 0_u64), (0, 1), (26, 128), (129, 128)] {
+        let (mut raw, schedule) = legacy_v1_parent_schedule();
+        let fields = raw.as_object_mut().expect("legacy schedule object");
+        fields.insert("offspringNumerator".to_owned(), Value::from(numerator));
+        fields.insert("offspringDenominator".to_owned(), Value::from(denominator));
+        fields.insert(
+            "scheduleSha256".to_owned(),
+            Value::String(
+                temporal_qd_kernel::schedule::RotatingParentSchedule::legacy_schedule_sha256(
+                    128,
+                    25,
+                    numerator,
+                    denominator,
+                ),
+            ),
+        );
+        let (config, config_sha256) = self_hashed_pair_config([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_pair_generation_v2".to_owned()),
+            ),
+            (
+                "runConfig",
+                object([(
+                    "parameters",
+                    object([(
+                        "version",
+                        Value::String("temporal_qd_evolution_v3".to_owned()),
+                    )]),
+                )]),
+            ),
+            ("parentSchedule", raw),
+        ]);
+        let mut request = request(
+            root.join(format!("{numerator}-{denominator}")),
+            authority_sha256.clone(),
+        );
+        request.pair_config = config;
+        request.config_sha256 = config_sha256;
+        request.parent_schedule = Some(schedule);
+        assert!(
+            request
+                .validate()
+                .expect_err("rehashed but semantically invalid v1 schedule must fail")
+                .to_string()
+                .contains("legacy pair config parentSchedule is invalid")
+        );
+    }
+    fs::remove_dir_all(&root).expect("remove exact test root");
+}
+
+#[test]
+fn frozen_v3_pair_config_without_allocation_reopens_with_its_sealed_parent_schedule() {
+    let root = temp_root("frozen-v3-reproduction-compatibility");
+    let authority_sha256 =
+        canonical_sha256(&object([("authority", Value::String("test".to_owned()))]))
+            .expect("hash authority");
+    let (parent_schedule_raw, parent_schedule) = legacy_v1_parent_schedule();
+    let (config, config_sha256) = self_hashed_pair_config([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_pair_generation_v2".to_owned()),
+        ),
+        (
+            "runConfig",
+            object([(
+                "parameters",
+                object([(
+                    "version",
+                    Value::String("temporal_qd_evolution_v3".to_owned()),
+                )]),
+            )]),
+        ),
+        ("parentSchedule", parent_schedule_raw),
+    ]);
+    let mut request = request(root.clone(), authority_sha256);
+    request.pair_config = config.clone();
+    request.config_sha256 = config_sha256;
+    request.parent_schedule = Some(parent_schedule);
+
+    request
+        .validate()
+        .expect("frozen v3 config remains admitted");
+    assert_eq!(
+        request.pair_config, config,
+        "compatibility validation is read-only over the exact frozen config bytes",
+    );
+    fs::remove_dir_all(&root).expect("remove exact test root");
+}
+
+#[test]
+fn fresh_v2_or_v5_config_without_explicit_allocation_is_rejected() {
+    let root = temp_root("fresh-reproduction-allocation-required");
+    let authority_sha256 =
+        canonical_sha256(&object([("authority", Value::String("test".to_owned()))]))
+            .expect("hash authority");
+    for version in ["temporal_qd_evolution_v5", "temporal_qd_evolution_v6"] {
+        let (config, config_sha256) = self_hashed_pair_config([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_pair_generation_v2".to_owned()),
+            ),
+            (
+                "runConfig",
+                object([(
+                    "parameters",
+                    object([("version", Value::String(version.to_owned()))]),
+                )]),
+            ),
+        ]);
+        let mut request = request(root.join(version), authority_sha256.clone());
+        request.pair_config = config;
+        request.config_sha256 = config_sha256;
+        let error = request
+            .validate()
+            .expect_err("fresh config must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks frozen reproduction allocation"),
+            "unexpected fresh-v2 failure: {error}",
+        );
+    }
+    fs::remove_dir_all(&root).expect("remove exact test root");
 }
 
 #[test]
@@ -570,7 +848,10 @@ fn resume_refuses_a_divergent_pair_config_before_it_can_mutate_state() {
 
     let mut conflicting = request(root.clone(), authority_sha256);
     let mut material = object([
-        ("schemaVersion", Value::String("test_config_v1".to_owned())),
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_pair_generation_v1".to_owned()),
+        ),
         ("changed", Value::Bool(true)),
     ]);
     let changed_sha256 = canonical_sha256(&material).expect("hash changed config");
@@ -1426,7 +1707,7 @@ fn operation_rejection_omits_identity_checks_but_commits_its_ledger_receipt() {
     assert_eq!(
         entry["entrySha256"],
         Value::String(
-            "sha256:b85d3d11a04395a6646961ac557f7931751d00529da6e825e653c8e0ba2cce27".to_owned(),
+            "sha256:9ecc4c2bc400b7401625a69b7d8a257331037f5fad4aac29c374b0a09cc2de92".to_owned(),
         ),
         "the public operation-rejection entry is an exact journal fixture"
     );

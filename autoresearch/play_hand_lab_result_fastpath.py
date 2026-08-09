@@ -307,6 +307,17 @@ def install_play_hand_result_fastpath() -> None:
                     f"task result receipt conflicts for task {task_id}"
                 )
             play_hand_lab.atomic_write_json(path, sealed)
+            # Preserve the base receipt API exactly: callers receive the
+            # validated projection, not merely the JSON-ready sealed form.
+            # In particular, _validated_receipt_derived_tasks normalizes
+            # params_by_index object keys back to integer permutation indices.
+            # Returning `sealed` here made the fast path observably disagree
+            # with the base implementation for Phase 3 follow-on receipts.
+            validated = _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT(
+                path,
+                task_id=task_id,
+                worker_result_sha256=worker_result_sha256,
+            )
             key = _path_key(path)
             with _LOCK:
                 _RECEIPT_CACHE.pop(key, None)
@@ -327,7 +338,7 @@ def install_play_hand_result_fastpath() -> None:
                         stat[1],
                         task_id,
                         worker_result_sha256,
-                        sealed,
+                        validated,
                     ),
                     limit=_RECEIPT_CACHE_LIMIT,
                 )
@@ -338,7 +349,7 @@ def install_play_hand_result_fastpath() -> None:
                     )
             elif not cacheable:
                 _counter("receipt_cache_skipped_derived")
-            return sealed
+            return validated
 
         def validate_task_result_receipt(
             path: Path,

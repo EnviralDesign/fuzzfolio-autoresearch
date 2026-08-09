@@ -35,6 +35,21 @@ TEMPORAL_SEARCH_CAPABILITY = "temporal_graph_candidate_window_v1"
 TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY = (
     "temporal_graph_bidirectional_replay_v1"
 )
+TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_CAPABILITY = (
+    "temporal_candidate_behavior_attribution_v1"
+)
+TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_REQUEST_SCHEMA = (
+    "temporal_candidate_behavior_attribution_request_v1"
+)
+TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_ARTIFACT_SCHEMA = (
+    "temporal_candidate_window_behavior_attribution_artifact_v1"
+)
+TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_SCHEMA = (
+    "temporal_candidate_behavior_attribution_v1"
+)
+TEMPORAL_QD_BEHAVIOR_ATTRIBUTION_REQUIREMENT_SCHEMA = (
+    "temporal_qd_behavior_attribution_requirement_v1"
+)
 TEMPORAL_SEARCH_RESULT_SCHEMA = "temporal_graph_candidate_window_result_v1"
 TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA = "temporal_graph_candidate_window_rejected_result_v1"
 TEMPORAL_SEARCH_CHECKPOINT_SCHEMA = "temporal_graph_candidate_window_checkpoint_v1"
@@ -666,6 +681,42 @@ def validate_v3_candidate_window_result(
         material.get("program_sha256"),
         name="worker material program_sha256",
     )
+    if task_payload is not None:
+        inline_profile = _mapping(
+            task_payload.get("inline_profile_snapshot"), name="task inline_profile_snapshot"
+        )
+        expected_raw_source = _sha(
+            task_payload.get("raw_source_profile_sha256", canonical_sha256(inline_profile)),
+            name="task raw_source_profile_sha256",
+        )
+        if canonical_sha256(inline_profile) != expected_raw_source:
+            raise TemporalSearchContractError("task raw/authored source profile identity mismatch")
+        if "normalized_profile_snapshot_sha256" in task_payload:
+            expected_normalized = _sha(
+                task_payload["normalized_profile_snapshot_sha256"],
+                name="task normalized_profile_snapshot_sha256",
+            )
+            if source_profile_snapshot != expected_normalized:
+                raise TemporalSearchContractError(
+                    "candidate-window normalized profile snapshot does not match task"
+                )
+        expected_resolved_profile = task_payload.get(
+            "expected_resolved_profile_snapshot_sha256"
+        )
+        if expected_resolved_profile is not None and resolved_profile_snapshot != _sha(
+            expected_resolved_profile,
+            name="task expected_resolved_profile_snapshot_sha256",
+        ):
+            raise TemporalSearchContractError(
+                "candidate-window resolved profile does not match task"
+            )
+        expected_resolved_program = task_payload.get("expected_resolved_program_sha256")
+        if expected_resolved_program is not None and resolved_program != _sha(
+            expected_resolved_program, name="task expected_resolved_program_sha256"
+        ):
+            raise TemporalSearchContractError(
+                "candidate-window resolved program does not match task"
+            )
 
     requested = _nonnegative_integer(
         evidence.get("requested_bar_limit"), name="evidence requested_bar_limit", minimum=1
@@ -976,14 +1027,22 @@ def _normalized_candidate(
         "candidateId",
         "sourceProfile",
         "sourceProfileSha256",
+        "profileSnapshotSha256",
+        "programSha256",
+        "resolvedProfileSnapshotSha256",
+        "resolvedProgramSha256",
         "instrument",
         "timeframe",
         "barLimit",
         "windowInputs",
     }
-    if set(candidate) != allowed:
+    required = allowed - {
+        "profileSnapshotSha256", "programSha256", "resolvedProfileSnapshotSha256",
+        "resolvedProgramSha256",
+    }
+    if not required <= set(candidate) or not set(candidate) <= allowed:
         raise TemporalSearchContractError(
-            f"{name} must contain exactly {sorted(allowed)!r}"
+            f"{name} has an invalid candidate identity schema"
         )
     profile = _mapping(candidate["sourceProfile"], name=f"{name}.sourceProfile")
     profile_sha = _sha(
@@ -1043,6 +1102,26 @@ def _normalized_candidate(
         "timeframe": timeframe,
         "barLimit": limit,
     }
+    # The raw authored source is the replay input.  A native validator may
+    # additionally bind a distinct normalized snapshot and resolved program.
+    # Preserve both when supplied; do not relabel one as the other.
+    if "profileSnapshotSha256" in candidate:
+        base["profileSnapshotSha256"] = _sha(
+            candidate["profileSnapshotSha256"], name=f"{name}.profileSnapshotSha256"
+        )
+    if "programSha256" in candidate:
+        base["programSha256"] = _sha(
+            candidate["programSha256"], name=f"{name}.programSha256"
+        )
+    if "resolvedProfileSnapshotSha256" in candidate:
+        base["resolvedProfileSnapshotSha256"] = _sha(
+            candidate["resolvedProfileSnapshotSha256"],
+            name=f"{name}.resolvedProfileSnapshotSha256",
+        )
+    if "resolvedProgramSha256" in candidate:
+        base["resolvedProgramSha256"] = _sha(
+            candidate["resolvedProgramSha256"], name=f"{name}.resolvedProgramSha256"
+        )
     inputs = candidate["windowInputs"]
     if not isinstance(inputs, list) or len(inputs) != len(windows):
         raise TemporalSearchContractError(
@@ -1359,7 +1438,9 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
                 "schema_version": TEMPORAL_SEARCH_JOB_SCHEMA,
                 "job_id": task_id,
                 "candidate_id": candidate["candidateId"],
+                "window_id": window["windowId"],
                 "authority_id": frozen["authorityId"],
+                "raw_source_profile_sha256": candidate["sourceProfileSha256"],
                 "lake_window_semantic_sha256": evidence["lakeWindowSemanticSha256"],
                 "shared_observation_stream_id": shared_id,
                 "user_id": "temporal-search",
@@ -1383,6 +1464,22 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
                 "campaign_id": frozen["authorityId"],
                 "lane_id": candidate["candidateId"],
                 "attempt_id": task_id,
+                **(
+                    {"normalized_profile_snapshot_sha256": candidate["profileSnapshotSha256"]}
+                    if "profileSnapshotSha256" in candidate else {}
+                ),
+                **(
+                    {"authored_program_sha256": candidate["programSha256"]}
+                    if "programSha256" in candidate else {}
+                ),
+                **(
+                    {"expected_resolved_profile_snapshot_sha256": candidate["resolvedProfileSnapshotSha256"]}
+                    if "resolvedProfileSnapshotSha256" in candidate else {}
+                ),
+                **(
+                    {"expected_resolved_program_sha256": candidate["resolvedProgramSha256"]}
+                    if "resolvedProgramSha256" in candidate else {}
+                ),
                 **execution_binding,
             }
             tasks.append(
@@ -1402,11 +1499,95 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
     return tasks
 
 
+def enable_candidate_behavior_attribution(
+    task: Mapping[str, Any],
+    *,
+    requirement: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a new, opt-in task with an immutable behavior sidecar request.
+
+    The Stage 5E7 authority and its normal QD loop intentionally remain
+    untouched.  A caller must explicitly opt in while constructing *new*
+    evidence; old task/request/result bytes remain valid and do not acquire a
+    diagnostic field just because this capability exists in a newer worker.
+    """
+
+    output = _mapping(task, name="candidate behavior attribution task")
+    if output.get("task_kind") != TEMPORAL_SEARCH_TASK_KIND:
+        raise TemporalSearchContractError(
+            "candidate behavior attribution requires a candidate-window task"
+        )
+    payload = _mapping(output.get("payload"), name="candidate behavior attribution payload")
+    window_id = _safe(payload.get("window_id"), name="candidate behavior window_id")
+    if payload.get("candidate_behavior_attribution_request") is not None:
+        raise TemporalSearchContractError(
+            "candidate behavior attribution is already requested for this task"
+        )
+    request: dict[str, Any] = {
+        "schema_version": TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_REQUEST_SCHEMA,
+        "enabled": True,
+        "attribution_schema": TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_SCHEMA,
+        "replay_cost_view": "research_conservative",
+    }
+    if requirement is not None:
+        request["behavior_attribution_requirement"] = (
+            _validated_behavior_attribution_requirement(requirement)
+        )
+    capabilities = sorted(
+        {
+            *[str(value) for value in payload.get("required_capabilities") or []],
+            TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_CAPABILITY,
+        }
+    )
+    payload["window_id"] = window_id
+    payload["candidate_behavior_attribution_request"] = request
+    payload["required_capabilities"] = list(capabilities)
+    output["payload"] = payload
+    output["required_worker_capabilities"] = list(capabilities)
+    return output
+
+
+def _validated_behavior_attribution_requirement(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the sealed v5-only diagnostic policy before task binding."""
+
+    requirement = _mapping(value, name="behavior attribution requirement")
+    supplied = _sha(
+        requirement.pop("requirementSha256", None),
+        name="behavior attribution requirement hash",
+    )
+    expected = {
+        "schemaVersion": TEMPORAL_QD_BEHAVIOR_ATTRIBUTION_REQUIREMENT_SCHEMA,
+        "observerSchema": TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_SCHEMA,
+        "required": True,
+        "fuzzyMemberAttribution": "required_fail_closed_v1",
+        "checkpointRestore": "required_exact_v1",
+        "taskIdentityBinding": "required_v5_candidate_window_v1",
+    }
+    if requirement != expected or canonical_sha256(requirement) != supplied:
+        raise TemporalSearchContractError(
+            "behavior attribution requirement is not the sealed v5 diagnostic policy"
+        )
+    return {**requirement, "requirementSha256": supplied}
+
+
 def materialize_plan(
-    authority: Mapping[str, Any], output_root: Path | str
+    authority: Mapping[str, Any],
+    output_root: Path | str,
+    *,
+    behavior_attribution_requirement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     frozen = validate_authority(authority)
     tasks = _build_task_matrix_validated(frozen)
+    if behavior_attribution_requirement is not None:
+        tasks = [
+            enable_candidate_behavior_attribution(
+                task,
+                requirement=behavior_attribution_requirement,
+            )
+            for task in tasks
+        ]
     root = Path(output_root)
     manifest = {
         "schemaVersion": TEMPORAL_SEARCH_MANIFEST_SCHEMA,
@@ -1631,6 +1812,101 @@ def validate_warmup_rejected_candidate_window_result(
         raise TemporalSearchContractError("warmup rejection artifact byte count mismatch")
 
 
+def _validate_candidate_behavior_attribution_artifact(
+    artifact: Any,
+    *,
+    job: Mapping[str, Any],
+    material: Mapping[str, Any],
+) -> None:
+    """Validate the opt-in sidecar at the controller trust boundary.
+
+    The Dashboard contract owns row-level observer validation.  This mirror
+    only verifies the immutable wrapper and its bindings before a remote worker
+    result is persisted, so stale/tampered diagnostics cannot be relabelled as
+    evidence for another candidate/window/program/stream.
+    """
+
+    item = _mapping(artifact, name="candidate behavior attribution artifact")
+    required = {
+        "schema_version": TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_ARTIFACT_SCHEMA,
+        "request_schema_version": TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_REQUEST_SCHEMA,
+        "attribution_schema": TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_SCHEMA,
+        "replay_cost_view": "research_conservative",
+        "authority_id": job.get("authority_id"),
+        "window_id": job.get("window_id"),
+        "candidate_id": job.get("candidate_id"),
+        "job_id": job.get("job_id"),
+        "lake_window_semantic_sha256": job.get("lake_window_semantic_sha256"),
+        "shared_observation_stream_id": job.get("shared_observation_stream_id"),
+        "analysis_window_start": material.get("analysis_window_start"),
+        "analysis_window_end": material.get("analysis_window_end"),
+        "resolved_profile_snapshot_sha256": material.get(
+            "resolved_profile_snapshot_sha256"
+        ),
+        "program_sha256": material.get("program_sha256"),
+        "observation_stream_sha256": material.get("observation_stream_sha256"),
+    }
+    request = _mapping(
+        job.get("candidate_behavior_attribution_request"),
+        name="candidate behavior attribution request",
+    )
+    requirement = request.get("behavior_attribution_requirement")
+    if requirement is not None:
+        sealed_requirement = _validated_behavior_attribution_requirement(
+            _mapping(
+                requirement,
+                name="candidate behavior attribution requirement",
+            )
+        )
+        required["behavior_attribution_requirement_sha256"] = sealed_requirement[
+            "requirementSha256"
+        ]
+    for key, expected in required.items():
+        if item.get(key) != expected:
+            raise TemporalSearchContractError(
+                f"candidate behavior attribution mismatch for {key}"
+            )
+    supplied = _sha(
+        item.pop("artifact_sha256", None),
+        name="candidate behavior attribution artifact_sha256",
+    )
+    if canonical_sha256(item) != supplied:
+        raise TemporalSearchContractError(
+            "candidate behavior attribution artifact identity mismatch"
+        )
+    attribution = _mapping(
+        item.get("attribution"), name="candidate behavior observer payload"
+    )
+    if (
+        attribution.get("schemaVersion")
+        != TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_SCHEMA
+        or attribution.get("collectionStatus") != "complete"
+        or attribution.get("incompleteReasons") != []
+        or attribution.get("profileSnapshotSha256")
+        != material.get("resolved_profile_snapshot_sha256")
+        or attribution.get("streamSha256")
+        != material.get("observation_stream_sha256")
+    ):
+        raise TemporalSearchContractError(
+            "candidate behavior attribution observer binding is incomplete or stale"
+        )
+    if requirement is not None:
+        fuzzy = attribution.get("fuzzyMemberAttribution")
+        if not isinstance(fuzzy, Mapping) or fuzzy.get("status") != "available":
+            raise TemporalSearchContractError(
+                "v5 behavior attribution requires available fuzzy member attribution"
+            )
+    observer_identity = dict(attribution)
+    observer_supplied = _sha(
+        observer_identity.pop("attributionSha256", None),
+        name="candidate behavior observer attributionSha256",
+    )
+    if canonical_sha256(observer_identity) != observer_supplied:
+        raise TemporalSearchContractError(
+            "candidate behavior observer identity mismatch"
+        )
+
+
 def _result_material(
     task: Mapping[str, Any], completion: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1690,6 +1966,45 @@ def _result_material(
             "both cost views must be evaluated from the identical observation stream"
         )
     validate_v3_candidate_window_result(material, task_payload=job)
+    attribution_request = job.get("candidate_behavior_attribution_request")
+    attribution = material.get("candidate_behavior_attribution")
+    if attribution_request is None:
+        if attribution is not None:
+            raise TemporalSearchContractError(
+                "legacy candidate-window result unexpectedly contains behavior attribution"
+            )
+    else:
+        request = _mapping(
+            attribution_request, name="candidate behavior attribution request"
+        )
+        if (
+            request.get("schema_version")
+            != TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_REQUEST_SCHEMA
+            or request.get("enabled") is not True
+            or request.get("attribution_schema")
+            != TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_SCHEMA
+            or request.get("replay_cost_view") != "research_conservative"
+            or TEMPORAL_CANDIDATE_BEHAVIOR_ATTRIBUTION_CAPABILITY
+            not in set(job.get("required_capabilities") or [])
+        ):
+            raise TemporalSearchContractError(
+                "candidate behavior attribution request is invalid"
+            )
+        requirement = request.get("behavior_attribution_requirement")
+        if requirement is not None:
+            _validated_behavior_attribution_requirement(
+                _mapping(
+                    requirement,
+                    name="candidate behavior attribution requirement",
+                )
+            )
+        if attribution is None:
+            raise TemporalSearchContractError(
+                "candidate behavior attribution was requested but not returned"
+            )
+        _validate_candidate_behavior_attribution_artifact(
+            attribution, job=job, material=material
+        )
     artifact_sha256 = _sha(
         material.get("artifact_sha256"), name="worker material artifact_sha256"
     )
@@ -1803,6 +2118,7 @@ def run_temporal_search_tasks(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     include_selection_summary: bool = True,
     summary_filename: str = "summary.json",
+    behavior_attribution_requirement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute an already finite plan; intentionally no search expansion occurs."""
     summary_name = str(summary_filename or "").strip()
@@ -1814,7 +2130,11 @@ def run_temporal_search_tasks(
         raise TemporalSearchContractError(
             "summary filename must be one local JSON filename"
         )
-    manifest = materialize_plan(authority, output_root)
+    manifest = materialize_plan(
+        authority,
+        output_root,
+        behavior_attribution_requirement=behavior_attribution_requirement,
+    )
     root = Path(output_root)
     checkpoint_path = root / "checkpoint.json"
     checkpoint = _mapping(
@@ -2027,7 +2347,9 @@ __all__ = [name for name in globals() if name.startswith("TEMPORAL_SEARCH_")] + 
     "build_authority",
     "build_task_matrix",
     "canonical_sha256",
+    "enable_candidate_behavior_attribution",
     "materialize_plan",
     "run_temporal_search_tasks",
+    "TEMPORAL_QD_BEHAVIOR_ATTRIBUTION_REQUIREMENT_SCHEMA",
     "validate_authority",
 ]

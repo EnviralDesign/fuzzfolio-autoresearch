@@ -23,6 +23,7 @@ from .temporal_qd_evolution import (
     _read,
     qd_canonical_evidence_identity,
     qd_predeclared_evidence_context,
+    _resolve_archive_policy_authority,
 )
 from .temporal_qd_evidence_ladder import validate_template_discovery_windows
 from .temporal_qd_rotating_evidence import (
@@ -77,7 +78,16 @@ def freeze_qd_screening_campaign(
     rotating_evidence: Mapping[str, Any] | None = None,
     campaign_role: str = "proposal_current_panel",
     panel_id: str | None = None,
+    archive_policy_authority: Mapping[str, Any] | None = None,
+    behavior_attribution_requirement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    policy_name, policy_sha256, frozen_policy, direction_aware = (
+        _resolve_archive_policy_authority(archive_policy_authority)
+    )
+    if behavior_attribution_requirement is not None and not direction_aware:
+        raise TemporalDiscoveryContractError(
+            "behavior attribution requirement is reserved for a direction-aware v5 campaign"
+        )
     population_file = Path(population_path)
     if campaign_role not in {
         "proposal_current_panel",
@@ -86,8 +96,9 @@ def freeze_qd_screening_campaign(
     }:
         raise TemporalDiscoveryContractError("unknown QD screening campaign role")
     projection_file = evaluation_population_path(population_file)
+    using_evaluation_population = projection_file.is_file()
     evaluation_population_sha256: str | None = None
-    if projection_file.is_file():
+    if using_evaluation_population:
         population_payload = load_evaluation_population(
             population_path=population_file,
             journal_path=population_file.with_name("generation-journal.json"),
@@ -184,10 +195,19 @@ def freeze_qd_screening_campaign(
         construction_catalog_path=construction_catalog_path,
     )
     if population_schema == QD_POPULATION_SCHEMA:
-        if population_payload.get("policyName") != QD_POLICY_NAME or (
-            population_payload.get("policySha256") != QD_POLICY_SHA256
+        if population_payload.get("policyName") != policy_name or (
+            population_payload.get("policySha256") != policy_sha256
         ):
-            raise TemporalDiscoveryContractError("QD v3 population policy mismatch")
+            raise TemporalDiscoveryContractError("QD population policy mismatch")
+        if using_evaluation_population:
+            if direction_aware and population_payload.get(
+                "archivePolicyAuthority"
+            ) != archive_policy_authority:
+                raise TemporalDiscoveryContractError(
+                    "v5 evaluation population archive policy authority mismatch"
+                )
+        elif population_payload.get("frozenPolicy") != frozen_policy:
+            raise TemporalDiscoveryContractError("QD population policy mismatch")
         if rotating_evidence is None and (
             population_payload.get("predeclaredEvidenceContextSha256")
             != evidence_context["predeclaredEvidenceContextSha256"]
@@ -364,8 +384,8 @@ def freeze_qd_screening_campaign(
         )
     evaluation_identity = {
         "schemaVersion": "temporal_qd_evaluation_identity_v3",
-        "policyName": QD_POLICY_NAME,
-        "policySha256": QD_POLICY_SHA256,
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
         "populationSha256": population_sha,
         **({"evaluationPopulationSha256": evaluation_population_sha256} if evaluation_population_sha256 is not None else {}),
         "constructionCatalog": construction_catalog_identity,
@@ -402,6 +422,20 @@ def freeze_qd_screening_campaign(
         **({"rotatingEvidence": _clone(rotating_evidence, name="rotating QD evidence")} if rotating_evidence is not None else {}),
         "candidates": evaluation_candidates,
         **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
+        **(
+            {
+                "archivePolicyAuthority": _clone(
+                    archive_policy_authority,
+                    name="v5 archive policy authority",
+                ),
+                "behaviorAttributionRequirement": _clone(
+                    behavior_attribution_requirement,
+                    name="v5 behavior attribution requirement",
+                ),
+            }
+            if direction_aware
+            else {}
+        ),
     }
     evaluation_identity["evaluationIdentitySha256"] = canonical_sha256(
         evaluation_identity
@@ -410,7 +444,11 @@ def freeze_qd_screening_campaign(
     _write_once(root / "preparation.json", preparation)
     _write_once(root / "authority.json", authority)
     _write_once(root / "evaluation-identity.json", evaluation_identity)
-    manifest = materialize_plan(authority, root / "screening-run")
+    manifest = materialize_plan(
+        authority,
+        root / "screening-run",
+        behavior_attribution_requirement=behavior_attribution_requirement,
+    )
     campaign = {
         "schemaVersion": QD_CAMPAIGN_SCHEMA,
         "generationIndex": generation_index,
@@ -431,6 +469,20 @@ def freeze_qd_screening_campaign(
         "reservedEvidencePermitted": False,
         **({"evidenceLadderSha256": evidence_ladder["evidenceLadderSha256"]} if evidence_ladder is not None else {}),
         **({"rotatingEvidenceSha256": rotating_evidence["rotatingEvidenceSha256"], "panelId": resolved_panel_id} if rotating_evidence is not None else {}),
+        **(
+            {
+                "archivePolicyAuthority": _clone(
+                    archive_policy_authority,
+                    name="v5 archive policy authority",
+                ),
+                "behaviorAttributionRequirement": _clone(
+                    behavior_attribution_requirement,
+                    name="v5 behavior attribution requirement",
+                ),
+            }
+            if direction_aware
+            else {}
+        ),
     }
     campaign["campaignSha256"] = canonical_sha256(campaign)
     _write_once(root / "campaign.json", campaign)

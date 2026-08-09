@@ -675,7 +675,11 @@ def test_early_terminal_sequence_resume_matches_uninterrupted(
     policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": parent.pair_compiler.canonical_payload()}
     common = dict(
         generation_index=1,
-        target_unique_candidates=1,
+        # The v2 reproduction authority enforces a real 20% immigrant floor.
+        # A one-slot generation is therefore necessarily an immigrant; use a
+        # five-slot target so the accepted-prefix schedule starts with an
+        # offspring while this test exercises structural early termination.
+        target_unique_candidates=5,
         run_config={"seed": f"early-terminal-{mutation_depth}-{terminal_disposition}"},
         pair_policy=policy,
         parent_pairs=[parent],
@@ -841,7 +845,7 @@ def test_explicit_parent_ring_resume_matches_uninterrupted_after_twelve_proposal
     assert [row["entrySha256"] for row in split] == [row["entrySha256"] for row in full]
     assert split[6]["proposal"]["proposalKind"] == "temporal_qd_same_side_crossover_v1"
     assert split[12]["proposal"]["parentPairIdentitySha256"] == full[12]["proposal"]["parentPairIdentitySha256"]
-    assert _explicit_parent_draw_count(split[:12]) == 11
+    assert _explicit_parent_draw_count(split[:12]) == 12
 
     malformed = copy.deepcopy(split[:7])
     malformed[6]["proposal"]["mateSelectionAttempts"] = [{"unexpected": "archive-audit"}]
@@ -1313,7 +1317,7 @@ def test_optimized_parent_and_crossover_path_matches_legacy(tmp_path) -> None:
             "indicator": "frozen",
             "hold": "frozen",
         },
-        "max_new_proposals": 7,
+        "max_new_proposals": 14,
     }
     roots: dict[str, Path] = {}
     results: dict[str, dict] = {}
@@ -1334,9 +1338,10 @@ def test_optimized_parent_and_crossover_path_matches_legacy(tmp_path) -> None:
     assert [path.read_bytes() for path in optimized_entries] == [
         path.read_bytes() for path in legacy_entries
     ]
-    crossover = json.loads(optimized_entries[6].read_text(encoding="utf-8"))
-    assert crossover["proposal"]["proposalKind"] == (
-        "temporal_qd_same_side_crossover_v1"
+    assert any(
+        json.loads(path.read_text(encoding="utf-8"))["proposal"].get("proposalKind")
+        == "temporal_qd_same_side_crossover_v1"
+        for path in optimized_entries
     )
 
 def test_pair_resume_rejects_provenance_distinct_duplicate_executable_semantics(tmp_path) -> None:

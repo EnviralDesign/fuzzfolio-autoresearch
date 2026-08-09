@@ -670,7 +670,10 @@ def _task_spec_from_durable_payload(
     if not isinstance(payload, dict):
         raise DurableExecutionError(f"durable task job payload is missing: {task_id}")
     policy_assignment = payload.get("policy_assignment")
-    if policy_assignment != lane.policy_assignment:
+    if (
+        _compact_policy_assignment_snapshot(policy_assignment)
+        != _compact_policy_assignment_snapshot(lane.policy_assignment)
+    ):
         raise DurableExecutionError(f"durable task policy assignment mismatch: {task_id}")
     spec: dict[str, Any] = {
         "phase": phase,
@@ -777,7 +780,12 @@ def _recover_unresolved_journal_task_graph(
         lane = lanes_by_id.get(str(envelope.get("lane_id") or ""))
         if lane is None:
             raise DurableExecutionError(f"durable task references unknown lane: {task_id}")
-        if _durable_task_policy_assignment(envelope) != lane.policy_assignment:
+        if (
+            _compact_policy_assignment_snapshot(
+                _durable_task_policy_assignment(envelope)
+            )
+            != _compact_policy_assignment_snapshot(lane.policy_assignment)
+        ):
             raise DurableExecutionError(
                 f"durable task policy assignment mismatch: {task_id}"
             )
@@ -1501,7 +1509,10 @@ def _recompute_campaign_policy_state_from_durable_lanes(
         lane = lanes_by_task.get(task_id)
         if (
             lane is None
-            or _durable_task_policy_assignment(task) != lane.policy_assignment
+            or _compact_policy_assignment_snapshot(
+                _durable_task_policy_assignment(task)
+            )
+            != _compact_policy_assignment_snapshot(lane.policy_assignment)
         ):
             raise DurableExecutionError(
                 f"durable journal task policy assignment mismatch: {task_id or '<missing>'}"
@@ -7797,9 +7808,17 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     raise DurableExecutionError(
                         f"journal and artifact receipts conflict for task {task_id}"
                     )
-                if history.campaign_policy_state is not None and recorded.get(
-                    "policy_assignment"
-                ) != lane.policy_assignment:
+                # Terminal lanes intentionally retain only the canonical policy
+                # assignment.  Their large audit narration is compacted after
+                # completion, so resume must compare the same durable projection
+                # rather than rejecting a valid sealed receipt for containing
+                # historical-only decision detail.
+                if history.campaign_policy_state is not None and (
+                    _compact_policy_assignment_snapshot(
+                        recorded.get("policy_assignment")
+                    )
+                    != _compact_policy_assignment_snapshot(lane.policy_assignment)
+                ):
                     raise DurableExecutionError(
                         f"terminal receipt policy assignment mismatch: {task_id}"
                     )

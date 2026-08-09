@@ -16,6 +16,11 @@ import statistics
 from typing import Any
 
 from .temporal_discovery_base import TemporalDiscoveryContractError, _clone, canonical_sha256
+from .temporal_direction_selection import classify_direction_selection
+from .temporal_realized_behavior import (
+    REALIZED_BEHAVIOR_SCHEMA,
+    aggregate_realized_behavior,
+)
 
 
 ROTATING_EVIDENCE_INPUT_SCHEMA = "temporal_qd_rotating_evidence_input_v1"
@@ -66,6 +71,87 @@ def _identity(value: Mapping[str, Any], *, field: str, name: str) -> str:
     if canonical_sha256(material) != supplied:
         raise TemporalDiscoveryContractError(f"{name} identity mismatch")
     return supplied
+
+
+def _sha(value: Any, *, name: str) -> str:
+    """Require a canonical digest, never merely a SHA-shaped placeholder."""
+    if (
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise TemporalDiscoveryContractError(f"{name} must be a canonical sha256 digest")
+    return value
+
+
+def _validated_realized_behavior(value: Any) -> dict[str, Any]:
+    """Require the exact aggregate behavior identity before v5 aggregation.
+
+    The direction classifier deliberately consumes a compact aggregate.  At
+    the rotating evidence seam that aggregate must still carry its immutable
+    identity material, otherwise a caller could relabel a side projection
+    while retaining only a SHA-shaped string.
+    """
+    row = _clone(value, name="window realized behavior")
+    if row.get("schemaVersion") != REALIZED_BEHAVIOR_SCHEMA:
+        raise TemporalDiscoveryContractError("window realized behavior schema is invalid")
+    identity = row.get("identityMaterial")
+    supplied = row.get("identitySha256")
+    if not isinstance(identity, Mapping) or canonical_sha256(identity) != supplied:
+        raise TemporalDiscoveryContractError(
+            "window realized behavior identity mismatch"
+        )
+    return row
+
+
+def _candidate_execution_binding(candidate: Mapping[str, Any], *, name: str) -> dict[str, str]:
+    """Keep authored source and normalized execution snapshots distinct.
+
+    ``sourceProfileSha256`` names the raw/authored profile.  ``profileSnapshotSha256``
+    names the normalized snapshot accepted by the evaluator.  They may be equal,
+    but are not aliases and must never be silently substituted for one another.
+    Historical receipts which predate ``sourceProfileSha256`` explicitly use
+    their only frozen snapshot as the raw-source alias; newly materialized
+    records always write the distinct field.
+    """
+    candidate_id = candidate.get("candidateId")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise TemporalDiscoveryContractError(f"{name} lacks candidateId")
+    binding = {
+        "candidateId": candidate_id,
+        "candidateIdentitySha256": _sha(
+            candidate.get("candidateIdentitySha256"), name=f"{name}.candidateIdentitySha256"
+        ),
+        "programSha256": _sha(candidate.get("programSha256"), name=f"{name}.programSha256"),
+        "sourceProfileSha256": _sha(
+            candidate.get("sourceProfileSha256") or candidate.get("profileSnapshotSha256"),
+            name=f"{name}.sourceProfileSha256",
+        ),
+        "profileSnapshotSha256": _sha(
+            candidate.get("profileSnapshotSha256"), name=f"{name}.profileSnapshotSha256"
+        ),
+    }
+    source_profile = candidate.get("sourceProfile")
+    if source_profile is not None and candidate.get("sourceProfileSha256") is not None:
+        if not isinstance(source_profile, Mapping) or canonical_sha256(source_profile) != binding["sourceProfileSha256"]:
+            raise TemporalDiscoveryContractError(f"{name} raw/authored source profile identity mismatch")
+    return binding
+
+
+def _bound_window(window: Mapping[str, Any], *, name: str) -> dict[str, str]:
+    window_id = window.get("windowId")
+    if not isinstance(window_id, str) or not window_id:
+        raise TemporalDiscoveryContractError(f"{name}.windowId is required")
+    start = _stamp(window.get("analysisWindowStart"), name=f"{name}.analysisWindowStart")
+    end = _stamp(window.get("analysisWindowEnd"), name=f"{name}.analysisWindowEnd")
+    if start >= end:
+        raise TemporalDiscoveryContractError(f"{name} must use a nonempty half-open interval")
+    return {
+        "windowId": window_id,
+        "analysisWindowStart": _iso(start),
+        "analysisWindowEnd": _iso(end),
+    }
 
 
 def _quarter_windows(years: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
@@ -319,35 +405,53 @@ def panel_scoped_evaluation_identity(*, candidate: Mapping[str, Any], evidence_c
 
 def build_candidate_window_evidence(*, candidate: Mapping[str, Any], panel: Mapping[str, Any], window: Mapping[str, Any], metrics: Mapping[str, Any], evidence_plan_semantic_sha256: str, provenance: Mapping[str, Any]) -> dict[str, Any]:
     """Make one authority-independent result digest with authority-bound provenance."""
-    candidate_id = candidate.get("candidateId")
-    identity = candidate.get("candidateIdentitySha256")
-    program = candidate.get("programSha256")
-    if not all(isinstance(value, str) and value for value in (candidate_id, identity, program, evidence_plan_semantic_sha256)):
-        raise TemporalDiscoveryContractError("candidate-window evidence lacks immutable candidate identity")
-    if not isinstance(panel.get("panelId"), str) or not isinstance(window.get("windowId"), str):
+    binding = _candidate_execution_binding(candidate, name="candidate-window candidate")
+    candidate_id = binding["candidateId"]
+    if not isinstance(panel.get("panelId"), str) or not panel["panelId"]:
         raise TemporalDiscoveryContractError("candidate-window evidence lacks panel/window identity")
+    frozen_window = _bound_window(window, name="candidate-window window")
+    evidence_plan_semantic_sha256 = _sha(
+        evidence_plan_semantic_sha256, name="candidate-window evidence plan semantic identity"
+    )
     if not isinstance(provenance.get("authorityId"), str) or not isinstance(provenance.get("taskMatrixSha256"), str) or not isinstance(provenance.get("taskId"), str) or not isinstance(provenance.get("resultSha256"), str):
         raise TemporalDiscoveryContractError("candidate-window raw result provenance is incomplete")
+    for field in ("authorityId", "taskMatrixSha256", "resultSha256"):
+        _sha(provenance.get(field), name=f"candidate-window provenance.{field}")
+    if not provenance["taskId"]:
+        raise TemporalDiscoveryContractError("candidate-window raw result provenance taskId is invalid")
     frozen_metrics = _clone(metrics, name="candidate window metrics")
-    source_snapshot = frozen_metrics.get("sourceProfileSnapshotSha256")
-    resolved_snapshot = frozen_metrics.get("resolvedProfileSnapshotSha256")
-    resolved_program = frozen_metrics.get("resolvedProgramSha256")
-    if not all(
-        isinstance(value, str) and value.startswith("sha256:")
-        for value in (source_snapshot, resolved_snapshot, resolved_program)
+    source_snapshot = _sha(
+        frozen_metrics.get("sourceProfileSnapshotSha256"),
+        name="candidate-window normalized authored profile identity",
+    )
+    resolved_snapshot = _sha(
+        frozen_metrics.get("resolvedProfileSnapshotSha256"),
+        name="candidate-window resolved profile identity",
+    )
+    resolved_program = _sha(
+        frozen_metrics.get("resolvedProgramSha256"),
+        name="candidate-window resolved program identity",
+    )
+    if source_snapshot != binding["profileSnapshotSha256"]:
+        raise TemporalDiscoveryContractError(
+            "candidate-window normalized authored profile identity drifted"
+        )
+    expected_resolved_program = candidate.get("resolvedProgramSha256")
+    if expected_resolved_program is not None and resolved_program != _sha(
+        expected_resolved_program, name="candidate-window expected resolved program identity"
     ):
         raise TemporalDiscoveryContractError(
-            "candidate-window evidence lacks exact execution identities"
-        )
-    if source_snapshot != candidate.get("profileSnapshotSha256"):
-        raise TemporalDiscoveryContractError(
-            "candidate-window source profile identity drifted"
+            "candidate-window resolved program identity drifted"
         )
     digest_material = {
         "schemaVersion": CANDIDATE_WINDOW_EVIDENCE_SCHEMA, "candidateId": candidate_id,
-        "candidateIdentitySha256": identity, "programSha256": program,
-        "panelId": panel["panelId"], "windowId": window["windowId"],
-        "analysisWindowStart": window["analysisWindowStart"], "analysisWindowEnd": window["analysisWindowEnd"],
+        "candidateIdentitySha256": binding["candidateIdentitySha256"], "programSha256": binding["programSha256"],
+        # These explicit aliases resolve the historic source/snapshot naming
+        # ambiguity without changing either identity's hash semantics.
+        "rawSourceProfileSha256": binding["sourceProfileSha256"],
+        "normalizedProfileSnapshotSha256": binding["profileSnapshotSha256"],
+        "panelId": panel["panelId"], "windowId": frozen_window["windowId"],
+        "analysisWindowStart": frozen_window["analysisWindowStart"], "analysisWindowEnd": frozen_window["analysisWindowEnd"],
         "evidencePlanSemanticSha256": evidence_plan_semantic_sha256, "metrics": frozen_metrics,
     }
     # The digest intentionally excludes authority/task identifiers.  Those
@@ -357,24 +461,85 @@ def build_candidate_window_evidence(*, candidate: Mapping[str, Any], panel: Mapp
     return output
 
 
+def _validate_candidate_window_evidence(
+    record: Mapping[str, Any], *, candidate: Mapping[str, Any], panel_id: str,
+    window: Mapping[str, Any], name: str,
+) -> dict[str, Any]:
+    """Rebind a stored record before any panel or cumulative reduction uses it."""
+    row = _clone(record, name=name)
+    _identity(row, field="recordSha256", name=name)
+    binding = _candidate_execution_binding(candidate, name=f"{name}.candidate")
+    expected_window = _bound_window(window, name=f"{name}.expectedWindow")
+    expected = {
+        "schemaVersion": CANDIDATE_WINDOW_EVIDENCE_SCHEMA,
+        "candidateId": binding["candidateId"],
+        "candidateIdentitySha256": binding["candidateIdentitySha256"],
+        "programSha256": binding["programSha256"],
+        "rawSourceProfileSha256": binding["sourceProfileSha256"],
+        "normalizedProfileSnapshotSha256": binding["profileSnapshotSha256"],
+        "panelId": panel_id,
+        **expected_window,
+    }
+    if any(row.get(field) != value for field, value in expected.items()):
+        raise TemporalDiscoveryContractError(f"{name} is not canonically bound to its candidate/panel/window")
+    metrics = _mapping(row.get("metrics"), f"{name}.metrics")
+    if (
+        metrics.get("sourceProfileSnapshotSha256") != binding["profileSnapshotSha256"]
+        or (
+            candidate.get("resolvedProgramSha256") is not None
+            and metrics.get("resolvedProgramSha256")
+            != _sha(candidate.get("resolvedProgramSha256"), name=f"{name}.candidate.resolvedProgramSha256")
+        )
+    ):
+        raise TemporalDiscoveryContractError(f"{name} execution identities are not bound to its candidate")
+    for field in (
+        "evidenceDigestSha256", "evidencePlanSemanticSha256", "rawSourceProfileSha256",
+        "normalizedProfileSnapshotSha256",
+    ):
+        _sha(row.get(field), name=f"{name}.{field}")
+    provenance = _mapping(row.get("rawTaskProvenance"), f"{name}.rawTaskProvenance")
+    for field in ("authorityId", "taskMatrixSha256", "resultSha256"):
+        _sha(provenance.get(field), name=f"{name}.rawTaskProvenance.{field}")
+    if not isinstance(provenance.get("taskId"), str) or not provenance["taskId"]:
+        raise TemporalDiscoveryContractError(f"{name}.rawTaskProvenance.taskId is invalid")
+    digest_material = {
+        key: row[key]
+        for key in (
+            "schemaVersion", "candidateId", "candidateIdentitySha256", "programSha256",
+            "rawSourceProfileSha256", "normalizedProfileSnapshotSha256", "panelId", "windowId",
+            "analysisWindowStart", "analysisWindowEnd", "evidencePlanSemanticSha256", "metrics",
+        )
+    }
+    if canonical_sha256(digest_material) != row["evidenceDigestSha256"]:
+        raise TemporalDiscoveryContractError(f"{name} evidence digest mismatch")
+    return row
+
+
 def build_candidate_panel_bundle(*, contract: Mapping[str, Any], candidate: Mapping[str, Any], panel_id: str, records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     contract = validate_rotating_evidence_contract(contract)
     panel = next((row for row in contract["panels"] if row["panelId"] == panel_id), None)
     if panel is None:
         raise TemporalDiscoveryContractError("candidate panel bundle names an unknown panel")
-    expected = list(panel["windowIds"])
+    binding = _candidate_execution_binding(candidate, name="candidate panel bundle candidate")
+    expected_windows = {
+        str(window["windowId"]): _bound_window(window, name="candidate panel window")
+        for window in panel["windows"]
+    }
+    expected = list(expected_windows)
     rows = sorted((_clone(row, name="candidate window evidence") for row in records), key=lambda row: str(row.get("windowId")))
     if [row.get("windowId") for row in rows] != sorted(expected):
         raise TemporalDiscoveryContractError("candidate panel bundle must cover each panel window exactly once")
-    candidate_id = candidate.get("candidateId")
-    if any(row.get("candidateId") != candidate_id or row.get("panelId") != panel_id for row in rows):
-        raise TemporalDiscoveryContractError("candidate panel bundle mixes candidate or panel evidence")
     for row in rows:
-        _identity(row, field="recordSha256", name="candidate window evidence")
+        _validate_candidate_window_evidence(
+            row, candidate=candidate, panel_id=panel_id,
+            window=expected_windows[str(row["windowId"])], name="candidate window evidence",
+        )
     output = {
         "schemaVersion": CANDIDATE_PANEL_BUNDLE_SCHEMA, "rotatingEvidenceSha256": contract["rotatingEvidenceSha256"],
-        "candidateId": candidate_id, "candidateIdentitySha256": candidate.get("candidateIdentitySha256"),
-        "programSha256": candidate.get("programSha256"), "panelId": panel_id,
+        "candidateId": binding["candidateId"], "candidateIdentitySha256": binding["candidateIdentitySha256"],
+        "programSha256": binding["programSha256"],
+        "rawSourceProfileSha256": binding["sourceProfileSha256"],
+        "normalizedProfileSnapshotSha256": binding["profileSnapshotSha256"], "panelId": panel_id,
         "windowEvidenceDigests": [{"windowId": row["windowId"], "evidenceDigestSha256": row["evidenceDigestSha256"], "recordSha256": row["recordSha256"]} for row in rows],
         # Exact semantic records are retained so cumulative reduction never
         # depends on reopening mutable or authority-specific raw result paths.
@@ -383,6 +548,60 @@ def build_candidate_panel_bundle(*, contract: Mapping[str, Any], candidate: Mapp
     }
     output["bundleSha256"] = canonical_sha256(output)
     return output
+
+
+def _validate_candidate_panel_bundle(
+    bundle: Mapping[str, Any], *, contract: Mapping[str, Any], candidate: Mapping[str, Any],
+    panel_id: str, name: str,
+) -> dict[str, Any]:
+    """Validate the aggregate hash *and* every embedded evidence binding."""
+    row = _clone(bundle, name=name)
+    _identity(row, field="bundleSha256", name=name)
+    binding = _candidate_execution_binding(candidate, name=f"{name}.candidate")
+    panel = next(
+        (item for item in contract["panels"] if item["panelId"] == panel_id), None
+    )
+    if panel is None:
+        raise TemporalDiscoveryContractError(f"{name} names an unknown panel")
+    expected = {
+        "schemaVersion": CANDIDATE_PANEL_BUNDLE_SCHEMA,
+        "rotatingEvidenceSha256": contract["rotatingEvidenceSha256"],
+        "candidateId": binding["candidateId"],
+        "candidateIdentitySha256": binding["candidateIdentitySha256"],
+        "programSha256": binding["programSha256"],
+        "rawSourceProfileSha256": binding["sourceProfileSha256"],
+        "normalizedProfileSnapshotSha256": binding["profileSnapshotSha256"],
+        "panelId": panel_id,
+    }
+    if any(row.get(field) != value for field, value in expected.items()):
+        raise TemporalDiscoveryContractError(f"{name} identity mismatch")
+    records = row.get("windowEvidence")
+    if not isinstance(records, list):
+        raise TemporalDiscoveryContractError(f"{name} lacks exact window evidence")
+    windows = {str(window["windowId"]): window for window in panel["windows"]}
+    if len(records) != len(windows) or {record.get("windowId") for record in records if isinstance(record, Mapping)} != set(windows):
+        raise TemporalDiscoveryContractError(f"{name} must cover each panel window exactly once")
+    validated = [
+        _validate_candidate_window_evidence(
+            _mapping(record, f"{name}.windowEvidence"), candidate=candidate,
+            panel_id=panel_id, window=windows[str(record["windowId"])],
+            name=f"{name}.windowEvidence[{record['windowId']}]",
+        )
+        for record in records
+    ]
+    expected_digests = [
+        {"windowId": item["windowId"], "evidenceDigestSha256": item["evidenceDigestSha256"], "recordSha256": item["recordSha256"]}
+        for item in sorted(validated, key=lambda item: item["windowId"])
+    ]
+    if row.get("windowEvidenceDigests") != expected_digests:
+        raise TemporalDiscoveryContractError(f"{name} window digest projection mismatch")
+    expected_provenance = [
+        {"windowId": item["windowId"], **item["rawTaskProvenance"]}
+        for item in sorted(validated, key=lambda item: item["windowId"])
+    ]
+    if row.get("rawTaskProvenance") != expected_provenance:
+        raise TemporalDiscoveryContractError(f"{name} raw provenance projection mismatch")
+    return row
 
 
 def reduce_provisional_diverse_survivors(rows: Iterable[Mapping[str, Any]], *, limit: int) -> list[dict[str, Any]]:
@@ -607,7 +826,13 @@ def _robust_pareto_reduce(
     return selected
 
 
-def classify_robust_breeders(*, candidate_rows: Sequence[Mapping[str, Any]], breeder_width: int, policy: Mapping[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+def classify_robust_breeders(
+    *,
+    candidate_rows: Sequence[Mapping[str, Any]],
+    breeder_width: int,
+    policy: Mapping[str, Any] | None = None,
+    direction_aware: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
     """Classify equal-coverage rows into quality and a bounded frontier lane."""
     frozen = robust_breeder_policy(policy)
     if breeder_width < 1:
@@ -636,6 +861,14 @@ def classify_robust_breeders(*, candidate_rows: Sequence[Mapping[str, Any]], bre
         trades = sum(float(item.get("closedTrades") or 0) for item in windows)
         supported = active / len(windows) >= float(frozen["minimumActiveWindowFraction"]) and trades / float(months) >= float(frozen["minimumAverageClosedTradesPerCandidateMonth"])
         median = float(statistics.median(net))
+        direction_selection = None
+        if direction_aware:
+            realized_behavior = row.get("cumulativeRealizedBehavior")
+            if not isinstance(realized_behavior, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "direction-aware robust breeder lacks cumulative realized behavior"
+                )
+            direction_selection = classify_direction_selection(realized_behavior)
         enriched = {
             **row,
             "robustSupport": {
@@ -657,10 +890,27 @@ def classify_robust_breeders(*, candidate_rows: Sequence[Mapping[str, Any]], bre
                 "costDrag": sum(cost_drag),
                 "novelty": novelty,
             },
+            **(
+                {
+                    "directionSelection": direction_selection,
+                    "directionBehaviorLane": direction_selection["lane"],
+                    "directionBreedingLane": (
+                        direction_selection["lane"]
+                        if direction_selection["selectionEligible"] is True
+                        else None
+                    ),
+                }
+                if direction_selection is not None
+                else {}
+            ),
         }
         positive_cumulative = sum(net) > 0
         positive_median = median > 0
-        if supported and (
+        direction_eligible = (
+            direction_selection is None
+            or direction_selection["selectionEligible"] is True
+        )
+        if supported and direction_eligible and (
             positive_cumulative
             if frozen["qualityRequiresPositiveCumulativeConservativeNetR"]
             else True
@@ -670,7 +920,7 @@ def classify_robust_breeders(*, candidate_rows: Sequence[Mapping[str, Any]], bre
             else True
         ):
             quality.append(enriched)
-        elif supported:
+        elif supported and direction_eligible:
             frontier.append(enriched)
     quality = _robust_pareto_reduce(quality, capacity=breeder_width)
     frontier_cap = int(breeder_width * float(frozen["frontierMaximumFraction"]))
@@ -689,31 +939,29 @@ def cumulative_candidate_row(
     cell_id: str,
     current_panel_rank: float,
     novelty: float = 0.0,
+    direction_aware: bool = False,
 ) -> dict[str, Any]:
     """Rebuild one candidate's robust metrics from exact equal coverage."""
 
     contract = validate_rotating_evidence_contract(contract)
     required = required_panel_ids(contract, generation_index)
+    candidate_binding = _candidate_execution_binding(candidate, name="cumulative candidate")
     by_panel: dict[str, Mapping[str, Any]] = {}
     for bundle in bundles:
-        _identity(bundle, field="bundleSha256", name="candidate panel bundle")
-        if (
-            bundle.get("rotatingEvidenceSha256") != contract["rotatingEvidenceSha256"]
-            or bundle.get("candidateId") != candidate.get("candidateId")
-            or bundle.get("candidateIdentitySha256") != candidate.get("candidateIdentitySha256")
-            or bundle.get("programSha256") != candidate.get("programSha256")
-        ):
-            raise TemporalDiscoveryContractError("cumulative candidate bundle identity mismatch")
         panel_id = str(bundle.get("panelId"))
         if panel_id in by_panel:
             raise TemporalDiscoveryContractError("cumulative candidate repeats a panel bundle")
-        by_panel[panel_id] = bundle
+        by_panel[panel_id] = _validate_candidate_panel_bundle(
+            bundle, contract=contract, candidate=candidate, panel_id=panel_id,
+            name="cumulative candidate panel bundle",
+        )
     if set(by_panel) != set(required):
         raise TemporalDiscoveryContractError("cumulative breeder candidate lacks exact required panel coverage")
     windows: list[dict[str, Any]] = []
     source_profile_snapshots: set[str] = set()
     resolved_profile_snapshots: set[str] = set()
     resolved_programs: set[str] = set()
+    realized_behavior_windows: list[dict[str, Any]] = []
     for panel_id in required:
         bundle = by_panel[panel_id]
         records = bundle.get("windowEvidence")
@@ -722,7 +970,16 @@ def cumulative_candidate_row(
         for record in records:
             if not isinstance(record, Mapping):
                 raise TemporalDiscoveryContractError("candidate window evidence is invalid")
-            _identity(record, field="recordSha256", name="candidate window evidence")
+            # Repeat record-level rebinding at the cumulative boundary.  A
+            # valid bundle hash alone cannot authorize a copied record under a
+            # different candidate, panel, or half-open window.
+            panel = next(item for item in contract["panels"] if item["panelId"] == panel_id)
+            panel_windows = {str(item["windowId"]): item for item in panel["windows"]}
+            _validate_candidate_window_evidence(
+                record, candidate=candidate, panel_id=panel_id,
+                window=panel_windows.get(str(record.get("windowId"))) or {},
+                name="cumulative candidate window evidence",
+            )
             metrics = _mapping(record.get("metrics"), "candidate window metrics")
             conservative = metrics.get("conservativeNetR", metrics.get("netR"))
             closed = metrics.get("closedTrades", metrics.get("trades", 0))
@@ -734,13 +991,18 @@ def cumulative_candidate_row(
                     "noCostNetR": float(metrics.get("noCostNetR", conservative)),
                     "maxDrawdownR": float(metrics.get("maxDrawdownR", 0.0)),
                     "closedTrades": int(closed),
-                    "sourceProfileSnapshotSha256": str(
-                        metrics["sourceProfileSnapshotSha256"]
+                    "sourceProfileSnapshotSha256": _sha(
+                        metrics["sourceProfileSnapshotSha256"],
+                        name="cumulative normalized authored profile identity",
                     ),
-                    "resolvedProfileSnapshotSha256": str(
-                        metrics["resolvedProfileSnapshotSha256"]
+                    "resolvedProfileSnapshotSha256": _sha(
+                        metrics["resolvedProfileSnapshotSha256"],
+                        name="cumulative resolved profile identity",
                     ),
-                    "resolvedProgramSha256": str(metrics["resolvedProgramSha256"]),
+                    "resolvedProgramSha256": _sha(
+                        metrics["resolvedProgramSha256"],
+                        name="cumulative resolved program identity",
+                    ),
                 }
             except (TypeError, ValueError, KeyError) as exc:
                 raise TemporalDiscoveryContractError("candidate window metrics are incomplete") from exc
@@ -758,21 +1020,21 @@ def cumulative_candidate_row(
                 }
             ) or row["closedTrades"] < 0:
                 raise TemporalDiscoveryContractError("candidate window metrics are invalid")
-            for field in (
-                "sourceProfileSnapshotSha256",
-                "resolvedProfileSnapshotSha256",
-                "resolvedProgramSha256",
-            ):
-                if not row[field].startswith("sha256:"):
-                    raise TemporalDiscoveryContractError(
-                        "candidate window execution identity is invalid"
-                    )
             source_profile_snapshots.add(row["sourceProfileSnapshotSha256"])
             resolved_profile_snapshots.add(row["resolvedProfileSnapshotSha256"])
             resolved_programs.add(row["resolvedProgramSha256"])
+            if direction_aware:
+                realized = metrics.get("realizedBehavior")
+                if not isinstance(realized, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware cumulative evidence lacks realized behavior"
+                    )
+                realized_behavior_windows.append(
+                    {"realizedBehavior": _validated_realized_behavior(realized)}
+                )
             windows.append(row)
     if (
-        source_profile_snapshots != {str(candidate.get("profileSnapshotSha256"))}
+        source_profile_snapshots != {candidate_binding["profileSnapshotSha256"]}
         or len(resolved_profile_snapshots) != 1
         or len(resolved_programs) != 1
     ):
@@ -780,7 +1042,7 @@ def cumulative_candidate_row(
             "cumulative candidate execution identity changed across panels"
         )
     months = sum(int(next(panel["totalMonths"] for panel in contract["panels"] if panel["panelId"] == panel_id)) for panel_id in required)
-    return {
+    output = {
         "candidateId": candidate["candidateId"],
         "candidateIdentitySha256": candidate["candidateIdentitySha256"],
         "programSha256": candidate["programSha256"],
@@ -789,11 +1051,18 @@ def cumulative_candidate_row(
         "coveredMonths": months,
         "windowMetrics": windows,
         "panelBundleSha256s": [by_panel[panel_id]["bundleSha256"] for panel_id in required],
+        "rawSourceProfileSha256": candidate_binding["sourceProfileSha256"],
+        "normalizedProfileSnapshotSha256": candidate_binding["profileSnapshotSha256"],
         "sourceProfileSnapshotSha256": next(iter(source_profile_snapshots)),
         "resolvedProfileSnapshotSha256": next(iter(resolved_profile_snapshots)),
         "resolvedProgramSha256": next(iter(resolved_programs)),
         "novelty": float(novelty),
     }
+    if direction_aware:
+        output["cumulativeRealizedBehavior"] = aggregate_realized_behavior(
+            realized_behavior_windows
+        )
+    return output
 
 
 def missing_backfill_panel_ids(*, contract: Mapping[str, Any], generation_index: int, bundles: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -833,7 +1102,15 @@ def build_generation_evidence_checkpoint(*, contract: Mapping[str, Any], generat
     return output
 
 
-def build_cumulative_breeder_archive(*, contract: Mapping[str, Any], generation_index: int, provisional: Sequence[Mapping[str, Any]], bundles: Mapping[str, Sequence[Mapping[str, Any]]], previous_archive: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def build_cumulative_breeder_archive(
+    *,
+    contract: Mapping[str, Any],
+    generation_index: int,
+    provisional: Sequence[Mapping[str, Any]],
+    bundles: Mapping[str, Sequence[Mapping[str, Any]],],
+    previous_archive: Mapping[str, Any] | None = None,
+    direction_aware: bool = False,
+) -> dict[str, Any]:
     """Replace-mode archive: every member is rebuilt from equal required coverage."""
     contract = validate_rotating_evidence_contract(contract)
     if previous_archive is not None:
@@ -844,16 +1121,17 @@ def build_cumulative_breeder_archive(*, contract: Mapping[str, Any], generation_
     members: list[dict[str, Any]] = []
     for raw in sorted(provisional, key=lambda row: str(row.get("candidateId"))):
         candidate_id = raw.get("candidateId")
+        _candidate_execution_binding(raw, name="cumulative archive provisional candidate")
         candidate_bundles = list(bundles.get(str(candidate_id)) or [])
         by_panel: dict[str, Mapping[str, Any]] = {}
         for bundle in candidate_bundles:
-            _identity(bundle, field="bundleSha256", name="candidate panel bundle")
-            if bundle.get("rotatingEvidenceSha256") != contract["rotatingEvidenceSha256"] or bundle.get("candidateId") != candidate_id:
-                raise TemporalDiscoveryContractError("cumulative bundle provenance mismatch")
             panel_id = bundle.get("panelId")
             if panel_id in by_panel:
                 raise TemporalDiscoveryContractError("cumulative candidate has duplicate panel bundle")
-            by_panel[str(panel_id)] = bundle
+            by_panel[str(panel_id)] = _validate_candidate_panel_bundle(
+                bundle, contract=contract, candidate=raw, panel_id=str(panel_id),
+                name="cumulative candidate panel bundle",
+            )
         missing = [panel_id for panel_id in required if panel_id not in by_panel]
         if missing:
             raise TemporalDiscoveryContractError("cumulative breeder candidate lacks required panel coverage")
@@ -865,6 +1143,7 @@ def build_cumulative_breeder_archive(*, contract: Mapping[str, Any], generation_
             cell_id=str(raw.get("cellId")),
             current_panel_rank=float(raw.get("currentPanelRank")),
             novelty=float(raw.get("novelty", 0.0)),
+            direction_aware=direction_aware,
         )
         members.append({
             **row,
@@ -876,6 +1155,7 @@ def build_cumulative_breeder_archive(*, contract: Mapping[str, Any], generation_
         candidate_rows=members,
         breeder_width=int(contract["robustSelection"]["breederWidth"]),
         policy=contract["robustSelection"]["policy"],
+        direction_aware=direction_aware,
     )
     classified_rows = {
         str(row["candidateId"]): {

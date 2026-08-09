@@ -1,0 +1,225 @@
+{
+  "archivePolicyAuthority": {
+    "frozenPolicy": {
+      "archive": {
+        "defaultCellCapacity": 4,
+        "lanes": {
+          "negativeNovelty": "finite_supported_negative_robust_return",
+          "observational": "retained_without_quality_breeding_rights",
+          "quality": "finite_support_and_nonnegative_robust_return"
+        },
+        "negativeNoveltyMaxMembersPerCell": 1
+      },
+      "descriptorPolicy": {
+        "axes": [
+          "operatorFamilies",
+          "mutationDepth",
+          "entryEvents",
+          "managementActions",
+          "graphNodes",
+          "tradeFrequency",
+          "medianHolding"
+        ],
+        "graphNodeBounds": [40, 55, 70],
+        "lineageFamilyFields": ["operatorId", "operation", "kind"],
+        "managementActionKinds": [
+          "activate_trailing_stop_next_open",
+          "cancel_target_next_open",
+          "deactivate_trailing_stop_next_open",
+          "move_stop_to_break_even_next_open",
+          "set_target_next_open",
+          "tighten_stop_next_open"
+        ],
+        "rootConstructionOperations": ["rich_immigrant_construction", "typed_seed"],
+        "schemaVersion": "temporal_qd_descriptor_policy_v2"
+      },
+      "directionSelection": {
+        "breedingLanes": {
+          "balanced_bidirectional": "supported_nonnegative_long_and_short",
+          "long_specialist": "supported_nonnegative_long_with_inactive_or_unsupported_short",
+          "short_specialist": "supported_nonnegative_short_with_inactive_or_unsupported_long"
+        },
+        "fallback": "remaining_direction_eligible_quality_pareto_then_crowding",
+        "ineligibleLanes": ["harmful_opposite_side", "inactive_or_unsupported"],
+        "memberBinding": "aggregate.realizedBehavior_then_direction_selection_v1",
+        "perCellBreedingQuotas": {
+          "balanced_bidirectional": 2,
+          "long_specialist": 1,
+          "short_specialist": 1
+        },
+        "schemaVersion": "temporal_qd_directional_breeding_policy_v1",
+        "selectionPolicy": {
+          "harmful_opposite_net_r": -0.25,
+          "minimum_acceptable_side_net_r": 0.0,
+          "minimum_active_windows_per_side": 1,
+          "minimum_closed_trades_per_side": 1,
+          "schemaVersion": "temporal_direction_selection_policy_v1"
+        },
+        "selectionPolicySha256": "sha256:2567175ff6ae6063baa485484c0faa0d742507af6814a593076020a68aef3ed1"
+      },
+      "economicObjectives": [
+        {"direction": "max", "name": "worstWindowConservativeNetR"},
+        {"direction": "min", "name": "maximumDrawdownR"},
+        {"direction": "min", "name": "structuralComplexity"}
+      ],
+      "identity": {
+        "candidateIdentity": "reject_exact_repeat",
+        "canonicalEvidence": "candidate_program_ordered_window_semantic_cost_execution",
+        "program": "allow_only_for_different_canonical_evidence",
+        "sourceProfile": "reject_same_evidence_repeat"
+      },
+      "parentSelection": {
+        "negativeNoveltyMaxFraction": 0.1,
+        "negativeNoveltySchedule": "every_tenth_structural_parent_selection",
+        "quality": "pareto_front_then_crowding_then_robust_return_then_capped_support_then_complexity"
+      },
+      "policyName": "stage5e7_v5_direction_aware_breeding_archive",
+      "resolvedExecutionDeduplication": {
+        "identity": "aggregate.resolvedProgramSha256",
+        "representativeOrdering": [
+          {"direction": "max", "field": "finiteDataValidity.validForQuality"},
+          {"direction": "max", "field": "objectives.worstWindowConservativeNetR"},
+          {"direction": "max", "field": "cappedTradeSupport"},
+          {"direction": "min", "field": "objectives.maximumDrawdownR"},
+          {"direction": "min", "field": "objectives.structuralComplexity"},
+          {"direction": "min", "field": "candidateId"}
+        ],
+        "required": true,
+        "stage": "before_archive_reduction"
+      },
+      "schemaVersion": "temporal_qd_policy_v5",
+      "tradeSupport": {
+        "capTrades": 20,
+        "minimumTotalTrades": 8,
+        "minimumTradesPerWindow": 4,
+        "role": "eligibility_then_capped_tie_break"
+      }
+    },
+    "policyName": "stage5e7_v5_direction_aware_breeding_archive",
+    "policySha256": "sha256:c8ea30b0a9d2825844d4267be9e4ccf82f36dc43a741ac061d41508fe486c3da",
+    "qdVersion": "temporal_qd_evolution_v3"
+  },
+  "authoritySha256": "sha256:7fbf45787ea91ef707f58c71a04c00fc275d8df0791ed190b1182d553130f164",
+  "behaviorAttributionRequirement": {
+    "checkpointRestore": "required_exact_v1",
+    "fuzzyMemberAttribution": "required_fail_closed_v1",
+    "observerSchema": "temporal_candidate_behavior_attribution_v1",
+    "required": true,
+    "requirementSha256": "sha256:a4092d022602e9561927576e55a875503aafa6ee46d5b72f5ab59409f67863f4",
+    "schemaVersion": "temporal_qd_behavior_attribution_requirement_v1",
+    "taskIdentityBinding": "required_v5_candidate_window_v1"
+  },
+  "budget": {
+    "maxEntryBranches": 3,
+    "maxEvents": 4,
+    "maxEvidenceGroups": 4,
+    "maxExitRegions": 3,
+    "maxGroupMembers": 3,
+    "maxGuardDepth": 4,
+    "maxIndicators": 12,
+    "maxManagementRegions": 4,
+    "maxRecoveryRegions": 3,
+    "maxSccNodes": 3,
+    "maxStates": 14,
+    "maxTimeoutBars": 64,
+    "maxTransitions": 56
+  },
+  "capacityContract": {
+    "admission": "no_market_native_v2_and_compiled_v3_v1",
+    "minimumUniquePairs": 4096,
+    "minimumUniqueResourceFingerprintsPerSide": 64,
+    "minimumUniqueTopologiesPerSide": 8,
+    "previewStreamSize": 8192,
+    "requiredDirections": ["long", "short"],
+    "schemaVersion": "temporal_qd_evolvable_module_capacity_contract_v1"
+  },
+  "capacityReceipt": {
+    "admission": "native_v2_then_compiled_v3_no_market_v1",
+    "authoritySha256": "sha256:7fbf45787ea91ef707f58c71a04c00fc275d8df0791ed190b1182d553130f164",
+    "capacityContract": {
+      "admission": "no_market_native_v2_and_compiled_v3_v1",
+      "minimumUniquePairs": 4096,
+      "minimumUniqueResourceFingerprintsPerSide": 64,
+      "minimumUniqueTopologiesPerSide": 8,
+      "previewStreamSize": 8192,
+      "requiredDirections": ["long", "short"],
+      "schemaVersion": "temporal_qd_evolvable_module_capacity_contract_v1"
+    },
+    "catalogSha256": "sha256:e870e59811079ac4be601380a6f507b7be0c34bccf9ce3699eded4e65e6bae3b",
+    "codec": "evolvable_module_genome_json_v1",
+    "compiledAdmittedCandidateCount": 8192,
+    "compilerPolicySha256": "sha256:677d0d764b2877040b8f7d14b0d53acb22594dcb41ccf042b9eb244067cd56f4",
+    "factoryPolicySha256": "sha256:8a4091aa23a3c7224f17681806fb58def4033d696a901f83ba71f1e0119a579c",
+    "nativeOrCompilerRejectionCounts": {},
+    "noMarket": true,
+    "operatorRegistrySha256": "sha256:4eb3c2e7f76e2e679fc40d68308f1b3553dafdb0c109222121b1c4b4c35465a5",
+    "pairRunConfigSha256": "sha256:2fe936bec06e5b8541eff8869703350ae7203c22e555e9eac038aa4dad752e8c",
+    "passed": true,
+    "perSide": {
+      "long": {
+        "exitPresenceCounts": {"False": 4149, "True": 4043},
+        "managementEffectCounts": {
+          "None": 2020,
+          "activate_trailing_stop_next_open": 2048,
+          "move_stop_to_break_even_next_open": 2076,
+          "tighten_stop_next_open": 2048
+        },
+        "uniqueResourceFingerprintCount": 288,
+        "uniqueSemanticTopologyCount": 32
+      },
+      "short": {
+        "exitPresenceCounts": {"False": 4094, "True": 4098},
+        "managementEffectCounts": {
+          "None": 2098,
+          "activate_trailing_stop_next_open": 2009,
+          "move_stop_to_break_even_next_open": 2036,
+          "tighten_stop_next_open": 2049
+        },
+        "uniqueResourceFingerprintCount": 288,
+        "uniqueSemanticTopologyCount": 32
+      }
+    },
+    "previewStreamSize": 8192,
+    "programKind": "evolvable_module_genome_v1",
+    "rawPreview": {
+      "perSide": {
+        "long": {"uniqueResourceFingerprintCount": 288, "uniqueSemanticTopologyCount": 32},
+        "short": {"uniqueResourceFingerprintCount": 288, "uniqueSemanticTopologyCount": 32}
+      },
+      "uniqueSemanticPairCount": 8192
+    },
+    "schemaVersion": "temporal_qd_evolvable_module_capacity_receipt_v1",
+    "semanticReceiptSha256": "sha256:3c403c9c68f2796ec6fe79bc601ab2891ef0fdfa0bfe7cf1affdc143169ed594",
+    "uniqueCompiledV3ProfileCount": 8192,
+    "uniqueSemanticPairCount": 8192
+  },
+  "catalogSha256": "sha256:e870e59811079ac4be601380a6f507b7be0c34bccf9ce3699eded4e65e6bae3b",
+  "codec": "evolvable_module_genome_json_v1",
+  "compilerPolicy": {
+    "compilerId": "autoresearch.evolvable-module-v1-to-dashboard-v2",
+    "executionSemantics": {
+      "completedBarDecisions": true,
+      "managementTopology": "shared_position_hub_deterministic_priority_v1",
+      "maxPendingNextOpenEffects": 1,
+      "nextOpenApplication": true,
+      "onePosition": true
+    },
+    "schemaVersion": "evolvable_module_compiler_policy_v1",
+    "targetProfileVersion": "v2"
+  },
+  "compilerPolicySha256": "sha256:677d0d764b2877040b8f7d14b0d53acb22594dcb41ccf042b9eb244067cd56f4",
+  "operatorRegistry": {
+    "crossover": "evolvable_module_compatible_motif_crossover_v1",
+    "crossoverPorts": ["entry_setup", "management_hub", "exit_hub"],
+    "crossoverResourceTransfer": "recipient_closed_only_no_implicit_import_v1",
+    "replay": "content_bound_plan_then_native_compile_v1",
+    "resourceOperators": "evolvable_module_resource_operators_v1",
+    "schemaVersion": "temporal_qd_evolvable_module_operator_registry_v1",
+    "selection": "sha256_length_prefixed_rejection_uniform_v1",
+    "temporalOperators": "evolvable_module_temporal_operators_v1",
+    "topologyOperators": "evolvable_module_topology_operator_v1"
+  },
+  "pairRunConfigSha256": "sha256:2fe936bec06e5b8541eff8869703350ae7203c22e555e9eac038aa4dad752e8c",
+  "programKind": "evolvable_module_genome_v1",
+  "schemaVersion": "temporal_qd_evolvable_module_authority_v1"
+}

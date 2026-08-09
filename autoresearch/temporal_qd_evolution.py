@@ -84,6 +84,15 @@ from .temporal_bidirectional_genome import (
     FrozenPair,
     IdentitySnapshot,
 )
+from .temporal_direction_selection import (
+    DEFAULT_DIRECTION_SELECTION_POLICY,
+    DIRECTION_SELECTION_SCHEMA,
+    LANE_BALANCED_BIDIRECTIONAL,
+    LANE_LONG_SPECIALIST,
+    LANE_SHORT_SPECIALIST,
+    classify_direction_selection,
+)
+from .temporal_realized_behavior import validate_aggregate_realized_behavior_identity
 
 QD_VERSION = "temporal_qd_evolution_v3"
 QD_ARCHIVE_SCHEMA = "temporal_qd_archive_v3"
@@ -97,10 +106,10 @@ QD_MANIFEST_SCHEMA = "temporal_qd_generation_manifest_v3"
 QD_IDENTITY_LEDGER_SCHEMA = "temporal_qd_identity_ledger_v3"
 BIDIRECTIONAL_QD_POLICY_SCHEMA = "temporal_qd_bidirectional_pair_policy_v1"
 
-QD_POLICY_NAME = "stage5e7_v3_robust_quality_archive"
-QD_POLICY = {
+LEGACY_QD_POLICY_NAME = "stage5e7_v3_robust_quality_archive"
+LEGACY_QD_POLICY = {
     "schemaVersion": "temporal_qd_policy_v3",
-    "policyName": QD_POLICY_NAME,
+    "policyName": LEGACY_QD_POLICY_NAME,
     "economicObjectives": [
         {"name": "worstWindowConservativeNetR", "direction": "max"},
         {"name": "maximumDrawdownR", "direction": "min"},
@@ -146,7 +155,205 @@ QD_POLICY = {
         ],
     },
 }
+LEGACY_QD_POLICY_SHA256 = canonical_sha256(LEGACY_QD_POLICY)
+
+# The descriptor is archive geometry, not an implementation detail.  v3
+# archives retain this legacy policy unchanged; every corrected archive binds a
+# new exact policy identity before it is eligible for parent selection.
+QD_POLICY_NAME = "stage5e7_v4_corrected_descriptor_archive"
+QD_POLICY = {
+    **LEGACY_QD_POLICY,
+    "schemaVersion": "temporal_qd_policy_v4",
+    "policyName": QD_POLICY_NAME,
+    "descriptorPolicy": {
+        "schemaVersion": "temporal_qd_descriptor_policy_v2",
+        "axes": [
+            "operatorFamilies",
+            "mutationDepth",
+            "entryEvents",
+            "managementActions",
+            "graphNodes",
+            "tradeFrequency",
+            "medianHolding",
+        ],
+        "lineageFamilyFields": ["operatorId", "operation", "kind"],
+        "rootConstructionOperations": [
+            "rich_immigrant_construction",
+            "typed_seed",
+        ],
+        "managementActionKinds": [
+            "activate_trailing_stop_next_open",
+            "cancel_target_next_open",
+            "deactivate_trailing_stop_next_open",
+            "move_stop_to_break_even_next_open",
+            "set_target_next_open",
+            "tighten_stop_next_open",
+        ],
+        "graphNodeBounds": [40, 55, 70],
+    },
+}
 QD_POLICY_SHA256 = canonical_sha256(QD_POLICY)
+# Explicit compatibility aliases make the version boundary legible at callers
+# that need to distinguish v4's read-only admission from a v5 fresh run.
+CORRECTED_QD_POLICY_NAME = QD_POLICY_NAME
+CORRECTED_QD_POLICY = QD_POLICY
+CORRECTED_QD_POLICY_SHA256 = QD_POLICY_SHA256
+
+# v5 deliberately does *not* reinterpret a prior archive.  It is a new
+# campaign authority: aggregate quality remains necessary, while the realized
+# long/short evidence is bound to each member and decides whether it can breed
+# as a balanced profile or a one-sided specialist.  A profitable side can no
+# longer conceal a supported materially harmful opposite side behind one
+# aggregate objective.
+DIRECTIONAL_QD_POLICY_NAME = "stage5e7_v5_direction_aware_breeding_archive"
+DIRECTIONAL_QD_POLICY = {
+    **QD_POLICY,
+    "schemaVersion": "temporal_qd_policy_v5",
+    "policyName": DIRECTIONAL_QD_POLICY_NAME,
+    "directionSelection": {
+        "schemaVersion": "temporal_qd_directional_breeding_policy_v1",
+        "selectionPolicy": DEFAULT_DIRECTION_SELECTION_POLICY.material(),
+        "selectionPolicySha256": DEFAULT_DIRECTION_SELECTION_POLICY.identity_sha256,
+        "memberBinding": "aggregate.realizedBehavior_then_direction_selection_v1",
+        "breedingLanes": {
+            LANE_BALANCED_BIDIRECTIONAL: "supported_nonnegative_long_and_short",
+            LANE_LONG_SPECIALIST: "supported_nonnegative_long_with_inactive_or_unsupported_short",
+            LANE_SHORT_SPECIALIST: "supported_nonnegative_short_with_inactive_or_unsupported_long",
+        },
+        "ineligibleLanes": [
+            "harmful_opposite_side",
+            "inactive_or_unsupported",
+        ],
+        # The capacity is four.  These are admissions, not a requirement that
+        # either side must be profitable; absent lanes deterministically lend
+        # their spare capacity to the remaining eligible lane(s).
+        "perCellBreedingQuotas": {
+            LANE_BALANCED_BIDIRECTIONAL: 2,
+            LANE_LONG_SPECIALIST: 1,
+            LANE_SHORT_SPECIALIST: 1,
+        },
+        "fallback": "remaining_direction_eligible_quality_pareto_then_crowding",
+    },
+}
+DIRECTIONAL_QD_POLICY_SHA256 = canonical_sha256(DIRECTIONAL_QD_POLICY)
+DIRECTIONAL_QD_POLICY_AUTHORITY = {
+    "qdVersion": QD_VERSION,
+    "policyName": DIRECTIONAL_QD_POLICY_NAME,
+    "policySha256": DIRECTIONAL_QD_POLICY_SHA256,
+    "frozenPolicy": DIRECTIONAL_QD_POLICY,
+}
+
+# Descriptor coordinates are part of an archive's immutable identity.  Keep
+# their order in one place: the Python reader and the Rust runtime use this
+# exact seven-axis geometry.
+QD_DESCRIPTOR_AXES = (
+    "operatorFamilies",
+    "mutationDepth",
+    "entryEvents",
+    "managementActions",
+    "graphNodes",
+    "tradeFrequency",
+    "medianHolding",
+)
+QD_ARCHIVE_LANES = frozenset(
+    {"quality", "observational", "negative_novelty", "rotating_frontier"}
+)
+
+# Pair-factory lineage records describe construction of a generation-zero
+# genome, not a QD mutation.  They are persisted beside real operations, so
+# descriptor extraction must identify them explicitly rather than relying on
+# a record's position in the history.
+QD_ROOT_CONSTRUCTION_OPERATIONS = frozenset(
+    {"typed_seed", "rich_immigrant_construction"}
+)
+QD_MANAGEMENT_ACTION_KINDS = frozenset(
+    {
+        "move_stop_to_break_even_next_open",
+        "tighten_stop_next_open",
+        "set_target_next_open",
+        "cancel_target_next_open",
+        "activate_trailing_stop_next_open",
+        "deactivate_trailing_stop_next_open",
+    }
+)
+
+
+def _archive_policy_kind(archive: Mapping[str, Any]) -> str | None:
+    """Return the one recognized frozen archive policy, never a near match."""
+
+    for kind, name, policy, policy_sha in (
+        ("legacy", LEGACY_QD_POLICY_NAME, LEGACY_QD_POLICY, LEGACY_QD_POLICY_SHA256),
+        (
+            "corrected",
+            CORRECTED_QD_POLICY_NAME,
+            CORRECTED_QD_POLICY,
+            CORRECTED_QD_POLICY_SHA256,
+        ),
+        (
+            "directional",
+            DIRECTIONAL_QD_POLICY_NAME,
+            DIRECTIONAL_QD_POLICY,
+            DIRECTIONAL_QD_POLICY_SHA256,
+        ),
+    ):
+        if (
+            archive.get("policyName") == name
+            and archive.get("policySha256") == policy_sha
+            and archive.get("frozenPolicy") == policy
+        ):
+            return kind
+    return None
+
+
+def _require_directional_archive_policy(archive: Mapping[str, Any], *, context: str) -> None:
+    if _archive_policy_kind(archive) != "directional":
+        raise TemporalDiscoveryContractError(
+            f"{context} cannot mix legacy/corrected and direction-aware QD policies"
+        )
+
+
+def directional_qd_archive_policy_authority() -> dict[str, Any]:
+    """Return the sealed v5 writer authority for a fresh evolvable campaign."""
+
+    return _clone(
+        DIRECTIONAL_QD_POLICY_AUTHORITY,
+        name="direction-aware QD archive policy authority",
+    )
+
+
+def _resolve_archive_policy_authority(
+    authority: Mapping[str, Any] | None,
+) -> tuple[str, str, Mapping[str, Any], bool]:
+    """Resolve only exact v4 or v5 archive writer authorities.
+
+    ``None`` intentionally retains the existing v4 writer for legacy callers.
+    A new evolvable campaign must supply the exact v5 object, never a boolean
+    switch or a near-match copied policy.
+    """
+
+    if authority is None:
+        return QD_POLICY_NAME, QD_POLICY_SHA256, QD_POLICY, False
+    material = _clone(authority, name="QD archive policy authority")
+    if set(material) != {"qdVersion", "policyName", "policySha256", "frozenPolicy"}:
+        raise TemporalDiscoveryContractError("QD archive policy authority fields are invalid")
+    if material.get("qdVersion") != QD_VERSION:
+        raise TemporalDiscoveryContractError("QD archive policy authority QD version is invalid")
+    for name, sha, policy, directional in (
+        (QD_POLICY_NAME, QD_POLICY_SHA256, QD_POLICY, False),
+        (
+            DIRECTIONAL_QD_POLICY_NAME,
+            DIRECTIONAL_QD_POLICY_SHA256,
+            DIRECTIONAL_QD_POLICY,
+            True,
+        ),
+    ):
+        if (
+            material.get("policyName") == name
+            and material.get("policySha256") == sha
+            and material.get("frozenPolicy") == policy
+        ):
+            return name, sha, policy, directional
+    raise TemporalDiscoveryContractError("unknown QD archive policy authority")
 
 QD_OBJECTIVES = (
     ("worstWindowConservativeNetR", "max"),
@@ -518,18 +725,47 @@ def _walk_guards(value: Any):
             yield from _walk_guards(child)
 
 
+def _lineage_operator_family_ids(history: Sequence[Any]) -> list[str]:
+    """Return the persisted family label from every supported lineage shape.
+
+    Older controller offspring store ``operatorId`` directly.  Pair evolution
+    records the selected family as ``operation`` and legacy immigrants retain a
+    ``kind`` wrapper.  These are mutually exclusive record formats; inspecting
+    nested plan/audit payloads would incorrectly turn one operation into
+    several families.
+    """
+
+    families: set[str] = set()
+    for item in history:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("operation") in QD_ROOT_CONSTRUCTION_OPERATIONS:
+            continue
+        for field in ("operatorId", "operation", "kind"):
+            value = item.get(field)
+            if value:
+                families.add(str(value))
+                break
+    return sorted(families)
+
+
+def _mutation_history_depth(history: Sequence[Any]) -> int:
+    """Count actual mutations while excluding pair-root construction records."""
+
+    return sum(
+        1
+        for item in history
+        if isinstance(item, Mapping)
+        and item.get("operation") not in QD_ROOT_CONSTRUCTION_OPERATIONS
+    )
+
+
 def _graph_structure(candidate: Mapping[str, Any]) -> dict[str, Any]:
     profile = candidate.get("sourceProfile") or {}
     graph = profile.get("graph") or {}
     transitions = list(graph.get("transitions") or [])
     history = list(candidate.get("structuralOperatorHistory") or [])
-    operator_ids = sorted(
-        {
-            str(item.get("operatorId"))
-            for item in history
-            if isinstance(item, Mapping) and item.get("operatorId")
-        }
-    )
+    operator_ids = _lineage_operator_family_ids(history)
     entry_event_ids: set[str] = set()
     management_action_count = 0
     guard_count = 0
@@ -543,12 +779,7 @@ def _graph_structure(candidate: Mapping[str, Any]) -> dict[str, Any]:
         )
         management_action_count += sum(
             isinstance(action, Mapping)
-            and action.get("kind")
-            in {
-                "exit_next_open",
-                "move_stop_to_break_even_next_open",
-                "move_stop_next_open",
-            }
+            and action.get("kind") in QD_MANAGEMENT_ACTION_KINDS
             for action in actions
         )
         for guard in _walk_guards(transition.get("guard")):
@@ -567,7 +798,7 @@ def _graph_structure(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "operatorFamilyIds": operator_ids,
         "operatorFamilyCount": len(operator_ids),
-        "mutationDepth": len(history),
+        "mutationDepth": _mutation_history_depth(history),
         "entryEventCount": len(entry_event_ids),
         "managementActionCount": int(management_action_count),
         "stateCount": state_count,
@@ -650,7 +881,10 @@ def qd_behavior_descriptor(
         ),
         "graphNodes": _bucket(
             structure["graphNodeCount"],
-            (9, 13, 19, math.inf),
+            # Compiled v3 pairs currently span 9--21 states and 23--57
+            # transitions (32--78 composite nodes).  The old 9/13/19 cutoffs
+            # collapsed that entire observed range into ``very_large``.
+            (40, 55, 70, math.inf),
             ("small", "medium", "large", "very_large"),
         ),
         "tradeFrequency": (
@@ -675,15 +909,7 @@ def qd_behavior_descriptor(
     descriptor["structuralMeasurements"] = structure
     descriptor["cellId"] = "|".join(
         str(descriptor[key])
-        for key in (
-            "operatorFamilies",
-            "mutationDepth",
-            "entryEvents",
-            "managementActions",
-            "graphNodes",
-            "tradeFrequency",
-            "medianHolding",
-        )
+        for key in QD_DESCRIPTOR_AXES
     )
     return descriptor
 
@@ -872,6 +1098,69 @@ def _quality_member(member: Mapping[str, Any]) -> bool:
     )
 
 
+def _direction_selection_for_aggregate(aggregate: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind v5 breeding decisions to exact cost-inclusive realized behavior."""
+
+    realized = aggregate.get("realizedBehavior")
+    if not isinstance(realized, Mapping):
+        raise TemporalDiscoveryContractError(
+            "direction-aware QD archive requires aggregate realizedBehavior"
+        )
+    selection = classify_direction_selection(
+        validate_aggregate_realized_behavior_identity(realized)
+    )
+    policy = DIRECTIONAL_QD_POLICY["directionSelection"]
+    if (
+        selection.get("schemaVersion") != DIRECTION_SELECTION_SCHEMA
+        or selection.get("policyIdentitySha256")
+        != policy["selectionPolicySha256"]
+        or selection.get("policy") != policy["selectionPolicy"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "direction selection does not match the frozen v5 policy"
+        )
+    return selection
+
+
+def _direction_breeding_lane(member: Mapping[str, Any]) -> str | None:
+    """Return a v5 member's explicitly admitted breeding lane, if any."""
+
+    selection = member.get("directionSelection")
+    if not isinstance(selection, Mapping):
+        return None
+    lane = selection.get("lane")
+    if (
+        selection.get("selectionEligible") is True
+        and lane in {
+            LANE_BALANCED_BIDIRECTIONAL,
+            LANE_LONG_SPECIALIST,
+            LANE_SHORT_SPECIALIST,
+        }
+        and member.get("directionBreedingLane") == lane
+        and (
+            _quality_member(member)
+            or (
+                member.get("archiveLane") == "rotating_frontier"
+                and member.get("robustBreederEligible") is True
+                and isinstance(member.get("cumulativeEvidence"), Mapping)
+            )
+        )
+    ):
+        return str(lane)
+    return None
+
+
+def _rank_pareto_quality(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return the ordinary quality ordering with audit front/crowding fields."""
+
+    ordered: list[dict[str, Any]] = []
+    for front_index, front in enumerate(_pareto_fronts(rows)):
+        for row in _crowding_order(front):
+            row["paretoFront"] = front_index
+            ordered.append(row)
+    return ordered
+
+
 def _negative_novelty_member(member: Mapping[str, Any]) -> bool:
     validity = member.get("finiteDataValidity") or {}
     return (
@@ -967,7 +1256,10 @@ def deduplicate_resolved_execution_members(
 
 
 def select_qd_archive(
-    members: Sequence[Mapping[str, Any]], *, cell_capacity: int = 4
+    members: Sequence[Mapping[str, Any]],
+    *,
+    cell_capacity: int = 4,
+    direction_aware: bool = False,
 ) -> list[dict[str, Any]]:
     if not 1 <= cell_capacity <= 32:
         raise TemporalDiscoveryContractError("QD cell capacity must be 1..32")
@@ -986,18 +1278,71 @@ def select_qd_archive(
             for row in groups[cell_id]
             if row not in quality and row not in negative_novelty
         ]
+        direction_eligible: list[Mapping[str, Any]] = []
+        direction_ineligible: list[Mapping[str, Any]] = []
+        if direction_aware:
+            for row in quality:
+                if _direction_breeding_lane(row) is None:
+                    direction_ineligible.append(row)
+                else:
+                    direction_eligible.append(row)
+            # A v5 candidate can still be retained for observation, but it
+            # must never consume a quality/breeding slot merely because its
+            # aggregate objective is attractive.
+            observational.extend(direction_ineligible)
+            quality = direction_eligible
         if quality:
-            fronts = _pareto_fronts(quality)
-            for front_index, front in enumerate(fronts):
-                ranked = _crowding_order(front)
-                remaining = cell_capacity - len(selected)
-                for row in ranked[:remaining]:
-                    row["paretoFront"] = front_index
+            if direction_aware:
+                quotas = DIRECTIONAL_QD_POLICY["directionSelection"]["perCellBreedingQuotas"]
+                consumed: set[str] = set()
+                for lane in (
+                    LANE_BALANCED_BIDIRECTIONAL,
+                    LANE_LONG_SPECIALIST,
+                    LANE_SHORT_SPECIALIST,
+                ):
+                    lane_rows = [
+                        row
+                        for row in quality
+                        if _direction_breeding_lane(row) == lane
+                    ]
+                    for row in _rank_pareto_quality(lane_rows)[: min(
+                        int(quotas[lane]), cell_capacity - len(selected)
+                    )]:
+                        chosen = _clone(row, name="directional quality archive member")
+                        chosen.update(
+                            {
+                                "archiveLane": "quality",
+                                "directionBreedingLane": lane,
+                                "retentionReason": f"direction_{lane}_quota",
+                            }
+                        )
+                        selected.append(chosen)
+                        consumed.add(str(chosen["candidateId"]))
+                # Quotas reserve lane representation but do not make a sparse
+                # cell artificially empty.  Any unused capacity is filled by
+                # the exact normal quality ordering over all *eligible* lanes.
+                for row in _rank_pareto_quality(quality):
+                    if len(selected) == cell_capacity:
+                        break
+                    if str(row["candidateId"]) in consumed:
+                        continue
+                    lane = _direction_breeding_lane(row)
+                    assert lane is not None
+                    chosen = _clone(row, name="directional quality fallback member")
+                    chosen.update(
+                        {
+                            "archiveLane": "quality",
+                            "directionBreedingLane": lane,
+                            "retentionReason": "direction_eligible_quality_fallback",
+                        }
+                    )
+                    selected.append(chosen)
+                    consumed.add(str(chosen["candidateId"]))
+            else:
+                for row in _rank_pareto_quality(quality)[:cell_capacity]:
                     row["archiveLane"] = "quality"
                     row["retentionReason"] = "quality_pareto"
                     selected.append(row)
-                if len(selected) == cell_capacity:
-                    break
         if len(selected) < cell_capacity and negative_novelty:
             row = sorted(negative_novelty, key=_observational_order)[0]
             selected.append(
@@ -1027,6 +1372,29 @@ def select_qd_archive(
                 "descriptor": _clone(selected[0]["descriptor"], name="QD descriptor"),
                 "candidateCountBeforeCapacity": len(groups[cell_id]),
                 "qualityEligibleCountBeforeCapacity": len(quality),
+                **(
+                    {
+                        "directionBreedingEligibleCountBeforeCapacity": len(
+                            direction_eligible
+                        ),
+                        "directionIneligibleQualityCountBeforeCapacity": len(
+                            direction_ineligible
+                        ),
+                        "directionBreedingLaneCountsBeforeCapacity": {
+                            lane: sum(
+                                _direction_breeding_lane(row) == lane
+                                for row in direction_eligible
+                            )
+                            for lane in (
+                                LANE_BALANCED_BIDIRECTIONAL,
+                                LANE_LONG_SPECIALIST,
+                                LANE_SHORT_SPECIALIST,
+                            )
+                        },
+                    }
+                    if direction_aware
+                    else {}
+                ),
                 "negativeNoveltyEligibleCountBeforeCapacity": len(negative_novelty),
                 "observationalCountBeforeCapacity": len(observational),
                 "breedingEligibleMemberCount": sum(
@@ -1034,6 +1402,23 @@ def select_qd_archive(
                 ),
                 "negativeNoveltyMemberCount": sum(
                     item.get("archiveLane") == "negative_novelty" for item in selected
+                ),
+                **(
+                    {
+                        "directionBreedingLaneCounts": {
+                            lane: sum(
+                                item.get("directionBreedingLane") == lane
+                                for item in selected
+                            )
+                            for lane in (
+                                LANE_BALANCED_BIDIRECTIONAL,
+                                LANE_LONG_SPECIALIST,
+                                LANE_SHORT_SPECIALIST,
+                            )
+                        }
+                    }
+                    if direction_aware
+                    else {}
                 ),
                 "members": sorted(selected, key=lambda item: str(item["candidateId"])),
             }
@@ -1138,6 +1523,7 @@ def build_qd_archive(
     minimum_total_trades: int = 8,
     minimum_trades_per_window: int = 4,
     cap_trades: int = 20,
+    archive_policy_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if generation_index < 0:
         raise TemporalDiscoveryContractError("QD generation index must be nonnegative")
@@ -1149,6 +1535,9 @@ def build_qd_archive(
         raise TemporalDiscoveryContractError(
             "QD archive must use the frozen Stage 5E7-v3 trade-support policy"
         )
+    policy_name, policy_sha, policy, direction_aware = _resolve_archive_policy_authority(
+        archive_policy_authority
+    )
     population_file = Path(population_path)
     projection_file = evaluation_population_path(population_file)
     evaluation_population: Mapping[str, Any] | None = None
@@ -1161,6 +1550,15 @@ def build_qd_archive(
             population_path=population_file,
             journal_path=Path(generation_journal_path),
         )
+        if direction_aware and (
+            evaluation_population.get("policyName") != policy_name
+            or evaluation_population.get("policySha256") != policy_sha
+            or evaluation_population.get("archivePolicyAuthority")
+            != archive_policy_authority
+        ):
+            raise TemporalDiscoveryContractError(
+                "direction-aware QD evaluation population policy authority mismatch"
+            )
         bidirectional_policy = _bidirectional_pair_policy(
             {"bidirectionalPairPolicy": evaluation_population["bidirectionalPairPolicy"]}
         )
@@ -1196,6 +1594,12 @@ def build_qd_archive(
     previous_member_ids: set[str] = set()
     if previous_archive_path is not None:
         previous, previous_sha = _load_archive(Path(previous_archive_path))
+        if direction_aware:
+            _require_directional_archive_policy(previous, context="QD archive reduction")
+        elif _archive_policy_kind(previous) != "corrected":
+            raise TemporalDiscoveryContractError(
+                "QD archive reduction cannot mix legacy and corrected descriptor policies"
+            )
         if _bidirectional_pair_policy(previous) != bidirectional_policy:
             raise TemporalDiscoveryContractError("QD archive cannot mix bidirectional and legacy candidate policies")
         prior_candidate_count_seen = int(previous.get("candidateCountSeen") or 0)
@@ -1272,6 +1676,9 @@ def build_qd_archive(
                 "QD v3 archive requires terminal-adjusted Stage 5E7-v3 result evidence"
             )
         descriptor = qd_behavior_descriptor(candidate, aggregate)
+        direction_selection = (
+            _direction_selection_for_aggregate(aggregate) if direction_aware else None
+        )
         members[candidate_id] = {
             "candidateId": candidate_id,
             "generationIndex": generation_index,
@@ -1288,6 +1695,19 @@ def build_qd_archive(
             "cappedTradeSupport": float(
                 min(max(0, int(aggregate.get("totalTrades") or 0)), cap_trades)
             ),
+            **(
+                {
+                    "directionSelection": direction_selection,
+                    "directionBehaviorLane": direction_selection["lane"],
+                    "directionBreedingLane": (
+                        direction_selection["lane"]
+                        if direction_selection["selectionEligible"] is True
+                        else None
+                    ),
+                }
+                if direction_selection is not None
+                else {}
+            ),
         }
     members_before_resolved_deduplication = list(members.values())
     reduced_members, resolved_duplicate_provenance = (
@@ -1295,7 +1715,9 @@ def build_qd_archive(
             members_before_resolved_deduplication
         )
     )
-    cells = select_qd_archive(reduced_members, cell_capacity=cell_capacity)
+    cells = select_qd_archive(
+        reduced_members, cell_capacity=cell_capacity, direction_aware=direction_aware
+    )
     if evaluation_population is not None:
         assert generation_journal_path is not None and bidirectional_policy is not None
         _hydrate_selected_pair_members(
@@ -1351,11 +1773,7 @@ def build_qd_archive(
             if str(member["candidateId"]) not in admitted_ids:
                 continue
             history = member["candidate"].get("structuralOperatorHistory") or []
-            for operator_id in {
-                str(item.get("operatorId"))
-                for item in history
-                if isinstance(item, Mapping) and item.get("operatorId")
-            }:
+            for operator_id in _lineage_operator_family_ids(history):
                 family_survivors[operator_id] += 1
     authored_programs_seen = {
         str(
@@ -1371,9 +1789,9 @@ def build_qd_archive(
     archive = {
         "schemaVersion": QD_ARCHIVE_SCHEMA,
         "qdVersion": QD_VERSION,
-        "policyName": QD_POLICY_NAME,
-        "policySha256": QD_POLICY_SHA256,
-        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
+        "policyName": policy_name,
+        "policySha256": policy_sha,
+        "frozenPolicy": _clone(policy, name="frozen QD policy"),
         "generationIndex": generation_index,
         "populationSha256": population_sha,
         **(
@@ -1392,9 +1810,18 @@ def build_qd_archive(
             "qualityRequiresNonnegativeRobustReturn": True,
             "undersupportedRetainedOnlyInObservationalLane": True,
         },
-        "archiveRetentionPolicy": _clone(QD_POLICY["archive"], name="QD archive policy"),
+        "archiveRetentionPolicy": _clone(policy["archive"], name="QD archive policy"),
         "parentSelectionPolicy": _clone(
-            QD_POLICY["parentSelection"], name="QD parent policy"
+            policy["parentSelection"], name="QD parent policy"
+        ),
+        **(
+            {
+                "directionSelectionPolicy": _clone(
+                    policy["directionSelection"], name="QD direction selection policy"
+                )
+            }
+            if direction_aware
+            else {}
         ),
         "objectives": [
             {"name": name, "direction": direction} for name, direction in QD_OBJECTIVES
@@ -1418,7 +1845,7 @@ def build_qd_archive(
             "schemaVersion": "temporal_qd_resolved_execution_deduplication_v1",
             "stage": "before_archive_reduction",
             "frozenPolicy": _clone(
-                QD_POLICY["resolvedExecutionDeduplication"],
+                policy["resolvedExecutionDeduplication"],
                 name="resolved execution deduplication policy",
             ),
             "inputMemberCount": len(members_before_resolved_deduplication),
@@ -1446,12 +1873,37 @@ def build_qd_archive(
             for cell in cells
             for member in cell["members"]
         ),
+        **(
+            {
+                "directionBreedingLaneMemberCounts": {
+                    lane: sum(
+                        member.get("directionBreedingLane") == lane
+                        for cell in cells
+                        for member in cell["members"]
+                    )
+                    for lane in (
+                        LANE_BALANCED_BIDIRECTIONAL,
+                        LANE_LONG_SPECIALIST,
+                        LANE_SHORT_SPECIALIST,
+                    )
+                },
+                "directionIneligibleObservableMemberCount": sum(
+                    isinstance(member.get("directionSelection"), Mapping)
+                    and member["directionSelection"].get("selectionEligible") is not True
+                    for cell in cells
+                    for member in cell["members"]
+                ),
+            }
+            if direction_aware
+            else {}
+        ),
         "paretoAdmissionCount": len(admitted_ids),
         "paretoEvictionCount": len(evicted_ids),
         "survivingDescendantsByOperatorFamily": dict(sorted(family_survivors.items())),
         "generationProposalAccounting": generation_accounting,
         "cells": cells,
     }
+    validate_qd_archive_geometry(archive)
     archive["archiveSha256"] = canonical_sha256(archive)
     _write_once(Path(output_path), archive)
     return {
@@ -1479,6 +1931,7 @@ def load_qd_evaluated_members(
     minimum_trades_per_window: int = 4,
     cap_trades: int = 20,
     tail_result_index: Mapping[str, Any] | None = None,
+    direction_aware: bool = False,
 ) -> dict[str, Any]:
     """Load every evaluated member without applying archive capacity.
 
@@ -1569,6 +2022,9 @@ def load_qd_evaluated_members(
                 "rotating QD aggregate execution identity mismatch"
             )
         descriptor = qd_behavior_descriptor(candidate, aggregate)
+        direction_selection = (
+            _direction_selection_for_aggregate(aggregate) if direction_aware else None
+        )
         members.append(
             {
                 "candidateId": candidate_id,
@@ -1585,6 +2041,19 @@ def load_qd_evaluated_members(
                 ),
                 "cappedTradeSupport": float(
                     min(max(0, int(aggregate.get("totalTrades") or 0)), cap_trades)
+                ),
+                **(
+                    {
+                        "directionSelection": direction_selection,
+                        "directionBehaviorLane": direction_selection["lane"],
+                        "directionBreedingLane": (
+                            direction_selection["lane"]
+                            if direction_selection["selectionEligible"] is True
+                            else None
+                        ),
+                    }
+                    if direction_selection is not None
+                    else {}
                 ),
             }
         )
@@ -1628,6 +2097,14 @@ def build_rotating_qd_parent_archive(
     """
 
     previous, previous_sha = _load_archive(Path(previous_archive_path))
+    previous_policy_kind = _archive_policy_kind(previous)
+    if previous_policy_kind not in {"corrected", "directional"}:
+        raise TemporalDiscoveryContractError(
+            "rotating QD parent archive cannot mix legacy and corrected/directional descriptor policies"
+        )
+    policy_name = str(previous["policyName"])
+    policy_sha256 = str(previous["policySha256"])
+    frozen_policy = _clone(previous["frozenPolicy"], name="rotating parent policy")
     material = _clone(cumulative_archive, name="cumulative breeder archive")
     cumulative_sha = _identity_payload(
         material, "archiveSha256", name="cumulative breeder archive"
@@ -1681,6 +2158,43 @@ def build_rotating_qd_parent_archive(
                 "crowdingDistance": None,
             }
         )
+        if previous_policy_kind == "directional":
+            cumulative_behavior = cumulative.get("cumulativeRealizedBehavior")
+            cumulative_selection = cumulative.get("directionSelection")
+            if not isinstance(cumulative_behavior, Mapping) or not isinstance(
+                cumulative_selection, Mapping
+            ):
+                raise TemporalDiscoveryContractError(
+                    "direction-aware rotating breeder lacks cumulative direction evidence"
+                )
+            aggregate = _clone(row.get("aggregate"), name="current panel aggregate")
+            if not isinstance(aggregate, dict):
+                raise TemporalDiscoveryContractError(
+                    "direction-aware rotating breeder lacks current aggregate"
+                )
+            # The scalar objectives above are robust cumulative economics; the
+            # direction admission must be equally cumulative.  Retain all
+            # current-panel aggregate fields, but replace only the behavior
+            # projection used by the v5 direction policy.
+            aggregate["realizedBehavior"] = _clone(
+                cumulative_behavior, name="cumulative realized behavior"
+            )
+            aggregate["behaviorIdentitySha256"] = cumulative_behavior.get(
+                "identitySha256"
+            )
+            row["aggregate"] = aggregate
+            expected_selection = _direction_selection_for_aggregate(aggregate)
+            if cumulative_selection != expected_selection:
+                raise TemporalDiscoveryContractError(
+                    "cumulative direction selection identity drifted"
+                )
+            row["directionSelection"] = expected_selection
+            row["directionBehaviorLane"] = expected_selection["lane"]
+            row["directionBreedingLane"] = (
+                expected_selection["lane"]
+                if expected_selection["selectionEligible"] is True
+                else None
+            )
         selected.append(row)
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in selected:
@@ -1740,33 +2254,23 @@ def build_rotating_qd_parent_archive(
         raise TemporalDiscoveryContractError(
             "rotating breeder width does not cover the projected parent archive"
         )
-    # Preserve the ordinary 80/20 evolutionary mix only when the robust
-    # archive can actually support it.  Sparse robust evidence earns only its
-    # proportional offspring share; deterministic immigrants fill the rest.
-    if breeder_parent_count * 5 < breeder_width * 4:
-        offspring_numerator = breeder_parent_count
-        offspring_denominator = breeder_width
-    else:
-        offspring_numerator = 4
-        offspring_denominator = 5
     parent_schedule = {
-        "schemaVersion": "temporal_qd_rotating_parent_schedule_v1",
+        "schemaVersion": "temporal_qd_rotating_parent_schedule_v2",
         "breederWidth": breeder_width,
         "breederParentCount": breeder_parent_count,
-        "maximumOffspringNumerator": 4,
-        "maximumOffspringDenominator": 5,
-        "offspringNumerator": offspring_numerator,
-        "offspringDenominator": offspring_denominator,
-        "immigrantsFillUnsupportedShare": True,
-        "schedulingMethod": "deterministic_rational_prefix_balance",
+        "minimumImmigrantNumerator": 1,
+        "minimumImmigrantDenominator": 5,
+        "parentSampling": "with_replacement_supported_parents_v1",
+        "unsupportedParentPolicy": "immigrant_only_authority_bound_v1",
+        "schedulingMethod": "accepted_quota_prefix_balance_v1",
     }
     parent_schedule["scheduleSha256"] = canonical_sha256(parent_schedule)
     archive = {
         "schemaVersion": QD_ARCHIVE_SCHEMA,
         "qdVersion": QD_VERSION,
-        "policyName": QD_POLICY_NAME,
-        "policySha256": QD_POLICY_SHA256,
-        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
+        "frozenPolicy": frozen_policy,
         "generationIndex": generation_index,
         "populationSha256": canonical_sha256({"cumulativeArchiveSha256": cumulative_sha, "candidateIds": sorted(allowed)}),
         "resultSetSha256": cumulative_sha,
@@ -1794,6 +2298,7 @@ def build_rotating_qd_parent_archive(
         **({"bidirectionalPairPolicy": {key: value for key, value in policy.items() if key != "policySha256"}} if policy is not None else {}),
         "cells": cells,
     }
+    validate_qd_archive_geometry(archive)
     archive["archiveSha256"] = canonical_sha256(archive)
     _write_once(Path(output_path), archive)
     return {
@@ -2077,6 +2582,135 @@ def _predeclared_lake_scope_report(
     return {"acceptable": True, "reason": None, "windows": reports}
 
 
+def _descriptor_coordinates_from_mapping(
+    descriptor: Mapping[str, Any], *, label: str
+) -> tuple[str, ...]:
+    """Validate and return one archive descriptor's ordered coordinates."""
+
+    coordinates: list[str] = []
+    for axis in QD_DESCRIPTOR_AXES:
+        value = descriptor.get(axis)
+        if not isinstance(value, str) or not value:
+            raise TemporalDiscoveryContractError(
+                f"{label} descriptor {axis} must be a nonempty string"
+            )
+        coordinates.append(value)
+    return tuple(coordinates)
+
+
+def validate_qd_archive_geometry(archive: Mapping[str, Any]) -> None:
+    """Validate immutable archive cell geometry before it is used as parents.
+
+    This is deliberately structural: it does not recompute an archived
+    descriptor from its candidate.  A semantically valid, already-frozen v3
+    authority therefore remains readable, while malformed joins cannot route a
+    member into another cell or consume a second global identity slot.
+    """
+
+    if archive.get("schemaVersion") != QD_ARCHIVE_SCHEMA:
+        raise TemporalDiscoveryContractError("QD archive geometry schema is invalid")
+    policy_kind = _archive_policy_kind(archive)
+    if policy_kind is None:
+        raise TemporalDiscoveryContractError("QD archive policy is unknown")
+    cells = archive.get("cells")
+    if not isinstance(cells, list):
+        raise TemporalDiscoveryContractError("QD archive cells must be an array")
+    seen_cells: set[str] = set()
+    seen_candidates: set[str] = set()
+    for cell_index, cell in enumerate(cells):
+        cell_label = f"QD archive cell {cell_index}"
+        if not isinstance(cell, Mapping):
+            raise TemporalDiscoveryContractError(f"{cell_label} must be an object")
+        cell_id = cell.get("cellId")
+        if not isinstance(cell_id, str) or not cell_id:
+            raise TemporalDiscoveryContractError(f"{cell_label} cellId must be a nonempty string")
+        if cell_id in seen_cells:
+            raise TemporalDiscoveryContractError("QD archive cell IDs must be unique")
+        seen_cells.add(cell_id)
+        descriptor = cell.get("descriptor")
+        if not isinstance(descriptor, Mapping):
+            raise TemporalDiscoveryContractError(f"{cell_label} descriptor must be an object")
+        coordinates = _descriptor_coordinates_from_mapping(
+            descriptor, label=cell_label
+        )
+        if descriptor.get("cellId") != cell_id or "|".join(coordinates) != cell_id:
+            raise TemporalDiscoveryContractError("QD cell descriptor identity mismatch")
+        members = cell.get("members")
+        if not isinstance(members, list):
+            raise TemporalDiscoveryContractError(f"{cell_label} members must be an array")
+        for member_index, member in enumerate(members):
+            member_label = f"{cell_label} member {member_index}"
+            if not isinstance(member, Mapping):
+                raise TemporalDiscoveryContractError(f"{member_label} must be an object")
+            candidate_id = member.get("candidateId")
+            if not isinstance(candidate_id, str) or not candidate_id:
+                raise TemporalDiscoveryContractError(
+                    f"{member_label} candidateId must be a nonempty string"
+                )
+            if candidate_id in seen_candidates:
+                raise TemporalDiscoveryContractError(
+                    "QD archive candidate IDs must be unique"
+                )
+            seen_candidates.add(candidate_id)
+            lane = member.get("archiveLane")
+            if lane not in QD_ARCHIVE_LANES:
+                raise TemporalDiscoveryContractError(
+                    f"{member_label} has an unknown archiveLane"
+                )
+            member_descriptor = member.get("descriptor")
+            if not isinstance(member_descriptor, Mapping):
+                raise TemporalDiscoveryContractError(
+                    f"{member_label} descriptor must be an object"
+                )
+            member_coordinates = _descriptor_coordinates_from_mapping(
+                member_descriptor, label=member_label
+            )
+            if (
+                member_descriptor.get("cellId") != cell_id
+                or member_coordinates != coordinates
+            ):
+                raise TemporalDiscoveryContractError(
+                    "QD archive member descriptor does not match its cell"
+                )
+            if policy_kind == "directional":
+                aggregate = member.get("aggregate")
+                embedded = member.get("directionSelection")
+                if not isinstance(aggregate, Mapping) or not isinstance(embedded, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware QD member lacks bound realized behavior selection"
+                    )
+                expected = _direction_selection_for_aggregate(aggregate)
+                if embedded != expected:
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware QD member selection identity mismatch"
+                    )
+                if member.get("directionBehaviorLane") != expected["lane"]:
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware QD member behavior lane mismatch"
+                    )
+                expected_breeding_lane = (
+                    expected["lane"]
+                    if expected["selectionEligible"] is True
+                    and (
+                        _quality_member(member)
+                        or (
+                            member.get("archiveLane") == "rotating_frontier"
+                            and member.get("robustBreederEligible") is True
+                            and isinstance(member.get("cumulativeEvidence"), Mapping)
+                        )
+                    )
+                    else None
+                )
+                if member.get("directionBreedingLane") != expected_breeding_lane:
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware QD member breeding lane mismatch"
+                    )
+                if lane == "quality" and expected_breeding_lane is None:
+                    raise TemporalDiscoveryContractError(
+                        "direction-ineligible member cannot occupy a quality breeding lane"
+                    )
+
+
 def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
     archive = _read(path, name="QD parent archive")
     archive_sha = _identity_payload(archive, "archiveSha256", name="QD parent archive")
@@ -2084,11 +2718,10 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
     if (
         archive.get("schemaVersion") != QD_ARCHIVE_SCHEMA
         or archive.get("qdVersion") != QD_VERSION
-        or archive.get("policyName") != QD_POLICY_NAME
-        or archive.get("policySha256") != QD_POLICY_SHA256
-        or archive.get("frozenPolicy") != QD_POLICY
+        or _archive_policy_kind(archive) is None
     ):
         raise TemporalDiscoveryContractError("unknown QD archive schema")
+    validate_qd_archive_geometry(archive)
     bidirectional_policy = _bidirectional_pair_policy(archive)
     if bidirectional_policy is not None:
         for cell in archive.get("cells") or []:
@@ -2183,10 +2816,82 @@ def canonical_empty_bidirectional_archive_template() -> dict[str, Any]:
     return archive
 
 
+def canonical_empty_directional_bidirectional_archive_template() -> dict[str, Any]:
+    """Return a fresh v5-only empty archive template.
+
+    This is intentionally a separate constructor.  Re-labelling a completed
+    v3/v4 archive as direction-aware would invent the missing realized-side
+    evidence, which is precisely what the v5 policy refuses to do.
+    """
+
+    archive = canonical_empty_bidirectional_archive_template()
+    empty_population = {
+        "schemaVersion": QD_POPULATION_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": DIRECTIONAL_QD_POLICY_NAME,
+        "policySha256": DIRECTIONAL_QD_POLICY_SHA256,
+        "generationIndex": 0,
+        "candidateCount": 0,
+        "candidates": [],
+    }
+    archive.update(
+        {
+            "policyName": DIRECTIONAL_QD_POLICY_NAME,
+            "policySha256": DIRECTIONAL_QD_POLICY_SHA256,
+            "frozenPolicy": _clone(
+                DIRECTIONAL_QD_POLICY, name="frozen direction-aware QD policy"
+            ),
+            "populationSha256": canonical_sha256(empty_population),
+            "directionSelectionPolicy": _clone(
+                DIRECTIONAL_QD_POLICY["directionSelection"],
+                name="empty direction selection policy",
+            ),
+        }
+    )
+    archive.pop("archiveSha256", None)
+    archive["archiveSha256"] = canonical_sha256(archive)
+    return archive
+
+
+def initialize_empty_directional_bidirectional_archive(
+    template: Mapping[str, Any], pair_policy: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind the v5 empty template to its pair compiler without v4 fallback."""
+
+    archive = _clone(template, name="empty direction-aware QD archive template")
+    supplied = archive.pop("archiveSha256", None)
+    if supplied != canonical_sha256(archive):
+        raise TemporalDiscoveryContractError(
+            "empty direction-aware QD archive template identity mismatch"
+        )
+    if (
+        archive.get("schemaVersion") != QD_ARCHIVE_SCHEMA
+        or archive.get("qdVersion") != QD_VERSION
+        or archive.get("policyName") != DIRECTIONAL_QD_POLICY_NAME
+        or archive.get("policySha256") != DIRECTIONAL_QD_POLICY_SHA256
+        or archive.get("frozenPolicy") != DIRECTIONAL_QD_POLICY
+        or archive.get("directionSelectionPolicy")
+        != DIRECTIONAL_QD_POLICY["directionSelection"]
+        or archive.get("cells") != []
+    ):
+        raise TemporalDiscoveryContractError(
+            "unknown empty direction-aware QD archive template schema"
+        )
+    policy = _clone(pair_policy, name="bidirectional pair policy")
+    if _bidirectional_pair_policy({"bidirectionalPairPolicy": policy}) is None:
+        raise TemporalDiscoveryContractError(
+            "direction-aware pair archive initialization requires an enabled pair policy"
+        )
+    archive["bidirectionalPairPolicy"] = policy
+    archive["archiveSha256"] = canonical_sha256(archive)
+    return archive
+
+
 def _reproduction_cells(
     archive: Mapping[str, Any], *, allow_empty_quality_bootstrap: bool = False
 ) -> list[dict[str, Any]]:
     rotating = isinstance(archive.get("rotatingEvidenceTransaction"), Mapping)
+    direction_aware = _archive_policy_kind(archive) == "directional"
     eligible = []
     for cell in archive.get("cells") or []:
         members = [
@@ -2194,6 +2899,10 @@ def _reproduction_cells(
             for member in cell.get("members") or []
             if (
                 member.get("archiveLane") == "quality"
+                and (
+                    not direction_aware
+                    or _direction_breeding_lane(member) is not None
+                )
                 and (
                     _quality_member(member)
                     or (
@@ -2209,6 +2918,10 @@ def _reproduction_cells(
             or (
                 rotating
                 and member.get("archiveLane") == "rotating_frontier"
+                and (
+                    not direction_aware
+                    or _direction_breeding_lane(member) is not None
+                )
                 and member.get("robustBreederEligible") is True
                 and member.get("cumulativeEvidenceArchiveSha256")
                 == archive["rotatingEvidenceTransaction"].get(
@@ -2291,18 +3004,7 @@ def _negative_novelty_slot(
 
 def _descriptor_coordinates(cell: Mapping[str, Any]) -> tuple[str, ...]:
     descriptor = cell.get("descriptor") or {}
-    return tuple(
-        str(descriptor.get(key))
-        for key in (
-            "operatorFamilies",
-            "mutationDepth",
-            "entryEvents",
-            "managementActions",
-            "graphNodes",
-            "tradeFrequency",
-            "medianHolding",
-        )
-    )
+    return tuple(str(descriptor.get(key)) for key in QD_DESCRIPTOR_AXES)
 
 
 def _boundary_cell_ids(cells: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -2650,13 +3352,19 @@ def qd_canonical_evidence_identity(
     )
 
 
-def _empty_identity_ledger() -> dict[str, Any]:
+def _empty_identity_ledger(
+    *,
+    policy_name: str = QD_POLICY_NAME,
+    policy_sha256: str = QD_POLICY_SHA256,
+    identity_policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity_policy = identity_policy or QD_POLICY["identity"]
     ledger = {
         "schemaVersion": QD_IDENTITY_LEDGER_SCHEMA,
         "qdVersion": QD_VERSION,
-        "policyName": QD_POLICY_NAME,
-        "policySha256": QD_POLICY_SHA256,
-        "identityPolicy": _clone(QD_POLICY["identity"], name="QD identity policy"),
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
+        "identityPolicy": _clone(identity_policy, name="QD identity policy"),
         "records": [],
         "uniqueCounts": {
             "candidateIdentity": 0,
@@ -2697,9 +3405,20 @@ def _save_identity_ledger(path: Path, ledger: dict[str, Any]) -> None:
     _replace(path, ledger)
 
 
-def _load_identity_ledger(path: Path) -> dict[str, Any]:
+def _load_identity_ledger(
+    path: Path,
+    *,
+    policy_name: str = QD_POLICY_NAME,
+    policy_sha256: str = QD_POLICY_SHA256,
+    identity_policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity_policy = identity_policy or QD_POLICY["identity"]
     if not path.exists():
-        ledger = _empty_identity_ledger()
+        ledger = _empty_identity_ledger(
+            policy_name=policy_name,
+            policy_sha256=policy_sha256,
+            identity_policy=identity_policy,
+        )
         _write_once(path, ledger)
         return ledger
     ledger = _read(path, name="QD identity ledger")
@@ -2707,9 +3426,9 @@ def _load_identity_ledger(path: Path) -> dict[str, Any]:
     if (
         ledger.get("schemaVersion") != QD_IDENTITY_LEDGER_SCHEMA
         or ledger.get("qdVersion") != QD_VERSION
-        or ledger.get("policyName") != QD_POLICY_NAME
-        or ledger.get("policySha256") != QD_POLICY_SHA256
-        or ledger.get("identityPolicy") != QD_POLICY["identity"]
+        or ledger.get("policyName") != policy_name
+        or ledger.get("policySha256") != policy_sha256
+        or ledger.get("identityPolicy") != identity_policy
     ):
         raise TemporalDiscoveryContractError("QD identity ledger is bound to another policy")
     return ledger
@@ -3682,6 +4401,7 @@ def generate_qd_generation(
     pair_generation_runtime: Mapping[str, Any] | None = None,
     bidirectional_pair_run_config: Mapping[str, Any] | None = None,
     qd_publication_authority: Mapping[str, Any] | None = None,
+    archive_policy_authority: Mapping[str, Any] | None = None,
     bidirectional_pair_policy: Mapping[str, Any] | None = None,
     bidirectional_pair_factory: Any | None = None,
     bidirectional_module_authority: Any | None = None,
@@ -3724,6 +4444,11 @@ def generate_qd_generation(
         archive_pair_policy = None
     else:
         archive, archive_sha = _load_archive(Path(parent_archive_path))
+        archive_policy_kind = _archive_policy_kind(archive)
+        if archive_policy_kind not in {"corrected", "directional"}:
+            raise TemporalDiscoveryContractError(
+                "QD generation cannot use a legacy archive; v4 and fresh v5 authorities are distinct"
+            )
         if (
             parent_archive_sha256 is not None
             and _sha(
@@ -3736,6 +4461,21 @@ def generate_qd_generation(
                 "QD parent archive identity differs from its supplied binding"
             )
         archive_pair_policy = _bidirectional_pair_policy(archive)
+        supplied_policy_name, supplied_policy_sha, supplied_policy, _ = (
+            _resolve_archive_policy_authority(archive_policy_authority)
+        )
+        if archive_policy_authority is None and archive_policy_kind == "directional":
+            raise TemporalDiscoveryContractError(
+                "fresh direction-aware QD generation requires its exact archive policy authority"
+            )
+        if (
+            archive.get("policyName") != supplied_policy_name
+            or archive.get("policySha256") != supplied_policy_sha
+            or archive.get("frozenPolicy") != supplied_policy
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD generation archive policy authority differs from its parent archive"
+            )
     supplied_pair_policy = (
         _bidirectional_pair_policy({"bidirectionalPairPolicy": bidirectional_pair_policy})
         if bidirectional_pair_policy is not None
@@ -3792,6 +4532,20 @@ def generate_qd_generation(
         construction_width = int(initial_construction_pool_size) if is_g0 else requested_width
         pair_run_config = {
             "parentArchiveSha256": archive_sha,
+            "archivePolicyAuthority": (
+                _clone(archive_policy_authority, name="QD archive policy authority")
+                if archive_policy_authority is not None
+                else (
+                    {
+                        "qdVersion": QD_VERSION,
+                        "policyName": archive["policyName"],
+                        "policySha256": archive["policySha256"],
+                        "frozenPolicy": archive["frozenPolicy"],
+                    }
+                    if archive is not None
+                    else None
+                )
+            ),
             "parameters": _normalize_parameters(parameters),
             "evidenceIdentityContext": pair_evidence_context,
             **(
@@ -3809,7 +4563,6 @@ def generate_qd_generation(
             key: value for key, value in pair_policy.items() if key != "policySha256"
         }
         if runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST:
-            _load_identity_ledger(pair_ledger_file)
             publication_authority = _clone(
                 qd_publication_authority,
                 name="native QD publication authority",
@@ -3825,6 +4578,35 @@ def generate_qd_generation(
                 raise TemporalDiscoveryContractError(
                     "native QD publication authority is invalid"
                 )
+            publication_name, publication_sha, publication_policy, publication_directional = (
+                _resolve_archive_policy_authority(publication_authority)
+            )
+            if publication_directional and archive_policy_authority is None:
+                raise TemporalDiscoveryContractError(
+                    "native direction-aware QD generation requires its exact archive policy authority"
+                )
+            if archive_policy_authority is not None and (
+                _resolve_archive_policy_authority(archive_policy_authority)
+                != (
+                    publication_name,
+                    publication_sha,
+                    publication_policy,
+                    publication_directional,
+                )
+            ):
+                raise TemporalDiscoveryContractError(
+                    "native QD archive and publication policy authorities differ"
+                )
+            if publication_directional:
+                _load_identity_ledger(
+                    pair_ledger_file,
+                    policy_name=publication_name,
+                    policy_sha256=publication_sha,
+                    identity_policy=publication_policy["identity"],
+                )
+            else:
+                # Preserve the old v4 native-ledger call signature and bytes.
+                _load_identity_ledger(pair_ledger_file)
             immigrant_policy = bidirectional_pair_run_config.get(
                 "immigrantConstructionPolicy"
             )
@@ -3929,6 +4711,16 @@ def generate_qd_generation(
             ),
             max_new_proposals=max_new_proposals,
             g0_evaluation_width=(requested_width if is_g0 else None),
+            archive_policy_authority=(
+                archive_policy_authority
+                if archive_policy_authority is not None
+                else {
+                    "qdVersion": QD_VERSION,
+                    "policyName": archive["policyName"],
+                    "policySha256": archive["policySha256"],
+                    "frozenPolicy": archive["frozenPolicy"],
+                }
+            ),
         )
     if any(
         value is None
@@ -4586,11 +5378,25 @@ if __name__ == "__main__":
 
 __all__ = [
     "DEFAULT_QD_PARAMETERS",
+    "LEGACY_QD_POLICY",
+    "LEGACY_QD_POLICY_NAME",
+    "LEGACY_QD_POLICY_SHA256",
+    "CORRECTED_QD_POLICY",
+    "CORRECTED_QD_POLICY_NAME",
+    "CORRECTED_QD_POLICY_SHA256",
+    "DIRECTIONAL_QD_POLICY",
+    "DIRECTIONAL_QD_POLICY_AUTHORITY",
+    "DIRECTIONAL_QD_POLICY_NAME",
+    "DIRECTIONAL_QD_POLICY_SHA256",
+    "QD_DESCRIPTOR_AXES",
     "QD_POLICY",
     "QD_POLICY_NAME",
     "QD_POLICY_SHA256",
     "QD_VERSION",
     "build_qd_archive",
+    "canonical_empty_directional_bidirectional_archive_template",
+    "directional_qd_archive_policy_authority",
+    "initialize_empty_directional_bidirectional_archive",
     "build_rotating_qd_parent_archive",
     "generate_qd_generation",
     "load_qd_evaluated_members",
@@ -4599,4 +5405,5 @@ __all__ = [
     "qd_construction_operator_policy",
     "qd_predeclared_evidence_context",
     "select_qd_archive",
+    "validate_qd_archive_geometry",
 ]

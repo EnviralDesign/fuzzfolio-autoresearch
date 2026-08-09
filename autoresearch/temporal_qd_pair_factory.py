@@ -1364,6 +1364,22 @@ class PairAuthorityBundle:
     def __enter__(self) -> "PairAuthorityBundle": return self
     def __exit__(self, *_: object) -> None: self.close()
 
+    def open_evolvable_module_authority(
+        self, config: Mapping[str, Any]
+    ) -> Any:
+        """Open the separate v1 module-genome search authority explicitly.
+
+        This does not alter ``factory``/``operator`` or any legacy campaign
+        hash.  Callers opt in and pass the returned factory/operator through
+        the existing pair-generation protocol.
+        """
+
+        from .evolvable_module_qd_authority import (
+            open_evolvable_module_pair_authority,
+        )
+
+        return open_evolvable_module_pair_authority(bundle=self, config=config)
+
     def _side(self, direction: str) -> Mapping[str, Any]: return self.config[f"{direction}Module"]
 
     def immigrant_runtime(self, direction: str) -> _ImmigrantSideRuntime:

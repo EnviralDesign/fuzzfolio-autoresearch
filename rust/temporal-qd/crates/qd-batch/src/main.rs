@@ -235,27 +235,69 @@ fn parse_parent_schedule(value: Option<&Value>) -> Result<Option<RotatingParentS
     let fields = value
         .as_object()
         .ok_or_else(|| anyhow!("parent schedule must be an object"))?;
-    let schedule = RotatingParentSchedule::validated(
-        fields
-            .get("breederWidth")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("parent schedule breederWidth is invalid"))?,
-        fields
-            .get("breederParentCount")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("parent schedule breederParentCount is invalid"))?,
-        fields
+    let breeder_width = fields
+        .get("breederWidth")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("parent schedule breederWidth is invalid"))?;
+    let breeder_parent_count = fields
+        .get("breederParentCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("parent schedule breederParentCount is invalid"))?;
+    let schema = fields.get("schemaVersion").and_then(Value::as_str);
+    let schedule = if schema == Some("temporal_qd_rotating_parent_schedule_v1") {
+        let numerator = fields
             .get("offspringNumerator")
             .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("parent schedule offspringNumerator is invalid"))?,
-        fields
+            .ok_or_else(|| anyhow!("legacy parent schedule offspringNumerator is invalid"))?;
+        let denominator = fields
             .get("offspringDenominator")
             .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("parent schedule offspringDenominator is invalid"))?,
-    )
-    .context("validate rotating parent schedule")?;
-    if fields.get("scheduleSha256").and_then(Value::as_str)
-        != Some(schedule.schedule_sha256().as_str())
+            .ok_or_else(|| anyhow!("legacy parent schedule offspringDenominator is invalid"))?;
+        let expected = temporal_qd_kernel::schedule::RotatingParentSchedule::legacy_schedule_sha256(
+            breeder_width,
+            breeder_parent_count,
+            numerator,
+            denominator,
+        );
+        if fields.get("scheduleSha256").and_then(Value::as_str) != Some(expected.as_str()) {
+            bail!("legacy parent schedule identity mismatch")
+        }
+        // v1 is recovery-only, but its self-hash is not sufficient: prove
+        // the sealed sparse projection before mapping it to v2 allocation.
+        RotatingParentSchedule::validated_legacy_fields(
+            breeder_width,
+            breeder_parent_count,
+            numerator,
+            denominator,
+        )
+        .context("validate legacy rotating parent schedule")?
+    } else {
+        if schema != Some("temporal_qd_rotating_parent_schedule_v2")
+            || fields
+                .get("minimumImmigrantNumerator")
+                .and_then(Value::as_u64)
+                != Some(1)
+            || fields
+                .get("minimumImmigrantDenominator")
+                .and_then(Value::as_u64)
+                != Some(5)
+            || fields.get("parentSampling").and_then(Value::as_str)
+                != Some("with_replacement_supported_parents_v1")
+            || fields
+                .get("unsupportedParentPolicy")
+                .and_then(Value::as_str)
+                != Some("immigrant_only_authority_bound_v1")
+            || fields.get("schedulingMethod").and_then(Value::as_str)
+                != Some("accepted_quota_prefix_balance_v1")
+        {
+            bail!("parent schedule v2 policy is invalid")
+        }
+        RotatingParentSchedule::from_counts(breeder_width, breeder_parent_count)
+            .context("validate rotating parent schedule")?
+    };
+    if schema == Some("temporal_qd_rotating_parent_schedule_v2")
+        && fields.get("scheduleSha256").and_then(Value::as_str)
+            != Some(schedule.schedule_sha256().as_str())
     {
         bail!("parent schedule identity mismatch")
     }

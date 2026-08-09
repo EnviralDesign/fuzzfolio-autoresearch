@@ -119,6 +119,81 @@ def _depth_seed(depth: int) -> str:
     raise AssertionError("fixed depth witness seed was not found")
 
 
+def _materialized_depth_witness(
+    *,
+    depth: int,
+    parent: FrozenPair,
+    runtime: PairAuthorityBundle,
+) -> tuple[FrozenPair, dict[str, Any]]:
+    """Find the first deterministic executable witness for the requested depth.
+
+    The fixture is explicitly coupled to the current local Dashboard authority.
+    A syntactically valid seeded mutation can legitimately be rejected when a
+    newly enforced invariant (for example the entry-indicator cap) applies.
+    Search only the predeclared seed stream and retain the first *admitted*
+    depth witness, rather than weakening that invariant or claiming a rejected
+    operation exercised the requested positive path.
+    """
+
+    seed_prefix = {2: 14, 3: 19}[depth]
+    for ordinal in range(10_000):
+        seed = f"runtime-oracle-depth:{seed_prefix}:{ordinal}"
+        if _unbiased_choice(seed, size=20) != seed_prefix or _mutation_depth_for_seed(seed) != depth:
+            continue
+        transcript_start = len(_RecordingClient.records)
+        pair, proposal = _propose_pair_sequence(
+            proposal_seed=seed,
+            parent=parent,
+            mutation_depth=depth,
+            module_authority=runtime.operator,
+            native_validator=runtime.validator,
+            pair_compiler=runtime.compiler,
+        )
+        if pair is not None and len(proposal.get("mutationSteps") or []) == depth:
+            return pair, proposal
+        # Witness probing must not leak Dashboard requests for a proposal the
+        # runtime transcript will never replay.  The retained record range is
+        # therefore exactly the selected, materialized operation.
+        del _RecordingClient.records[transcript_start:]
+    raise AssertionError(f"depth-{depth} real authority witness did not materialize")
+
+
+def _materialized_crossover_witness(
+    *,
+    parent: FrozenPair,
+    mate: FrozenPair,
+    runtime: PairAuthorityBundle,
+) -> tuple[FrozenPair, dict[str, Any]]:
+    """Find the first deterministic same-side crossover the authority admits.
+
+    The fixture must cover the positive crossover path, but a particular
+    syntactically deterministic splice may now be invalid under a tightened
+    program policy or may be a semantic no-op.  Keep the witness selection
+    reproducible and require a real materialized pair; never loosen either
+    the crossover or compiler admission rules merely to retain this fixture.
+    """
+
+    for ordinal in range(10_000):
+        seed = f"runtime-oracle-crossover-materialized:{ordinal}"
+        transcript_start = len(_RecordingClient.records)
+        pair, proposal = _propose_crossover(
+            proposal_seed=seed,
+            parent=parent,
+            mate=mate,
+            module_authority=runtime.operator,
+            pair_compiler=runtime.compiler,
+            parent_selection=None,
+            mate_selection=None,
+            mate_selection_attempts=[],
+        )
+        if pair is not None and proposal.get("disposition") == "materialized":
+            return pair, proposal
+        # As above, do not leave orphaned native requests from rejected or
+        # semantic-no-op crossover probes ahead of the selected witness.
+        del _RecordingClient.records[transcript_start:]
+    raise AssertionError("same-side crossover real authority witness did not materialize")
+
+
 def _scope_context() -> dict[str, Any]:
     value = {
         "schemaVersion": "temporal_qd_predeclared_evidence_context_v3",
@@ -173,13 +248,17 @@ def materialize_runtime_oracle_fixture(output_root: Path | str, *, dashboard_roo
             rich_proposal["proposalSha256"] = canonical_sha256(rich_proposal)
             cases: dict[str, tuple[FrozenPair | None, dict[str, Any]]] = {"richImmigrant": (immigrant, rich_proposal)}
             for depth in (2, 3):
-                pair, proposal = _propose_pair_sequence(proposal_seed=_depth_seed(depth), parent=immigrant, mutation_depth=depth, module_authority=runtime.operator, native_validator=runtime.validator, pair_compiler=runtime.compiler)
-                if pair is None or len(proposal.get("mutationSteps") or []) != depth:
-                    raise AssertionError(f"depth-{depth} real authority witness did not materialize")
+                pair, proposal = _materialized_depth_witness(
+                    depth=depth,
+                    parent=immigrant,
+                    runtime=runtime,
+                )
                 cases[f"sequentialMutationDepth{depth}"] = (pair, proposal)
-            materialized, crossover = _propose_crossover(proposal_seed="runtime-oracle-crossover-materialized-v1", parent=cases["sequentialMutationDepth2"][0], mate=cases["sequentialMutationDepth3"][0], module_authority=runtime.operator, pair_compiler=runtime.compiler, parent_selection=None, mate_selection=None, mate_selection_attempts=[])
-            if materialized is None or crossover.get("disposition") != "materialized":
-                raise AssertionError("same-side crossover witness did not materialize")
+            materialized, crossover = _materialized_crossover_witness(
+                parent=cases["sequentialMutationDepth2"][0],
+                mate=cases["sequentialMutationDepth3"][0],
+                runtime=runtime,
+            )
             cases["sameSideCrossoverMaterialized"] = (materialized, crossover)
             rejection_seed = next(
                 f"runtime-oracle-crossover-rejected:{ordinal}"

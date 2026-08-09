@@ -11,8 +11,15 @@ use temporal_qd_kernel::{
 };
 use temporal_qd_runtime::{
     DashboardPort, RuntimeManifest, RuntimePairAuthority, RuntimeParentSelector,
-    archive::{ArchiveParentSelector, QD_POLICY_SHA256, VerifiedParentArchive},
+    archive::{
+        ArchiveParentSelector, CORRECTED_QD_POLICY_NAME, CORRECTED_QD_POLICY_SHA256,
+        LEGACY_QD_POLICY_NAME, LEGACY_QD_POLICY_SHA256, VerifiedParentArchive,
+    },
 };
+
+const DIRECTIONAL_QD_POLICY_NAME: &str = "stage5e7_v5_direction_aware_breeding_archive";
+const DIRECTIONAL_QD_POLICY_SHA256: &str =
+    "sha256:c8ea30b0a9d2825844d4267be9e4ccf82f36dc43a741ac061d41508fe486c3da";
 
 const GENERATION_SEED: &str =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -161,8 +168,8 @@ fn pair(candidate_id: &str) -> FrozenPair {
 
 fn frozen_policy() -> Value {
     json!({
-        "schemaVersion": "temporal_qd_policy_v3",
-        "policyName": "stage5e7_v3_robust_quality_archive",
+        "schemaVersion": "temporal_qd_policy_v4",
+        "policyName": "stage5e7_v4_corrected_descriptor_archive",
         "economicObjectives": [
             {"name": "worstWindowConservativeNetR", "direction": "max"},
             {"name": "maximumDrawdownR", "direction": "min"},
@@ -193,6 +200,14 @@ fn frozen_policy() -> Value {
             "sourceProfile": "reject_same_evidence_repeat",
             "program": "allow_only_for_different_canonical_evidence",
             "canonicalEvidence": "candidate_program_ordered_window_semantic_cost_execution"
+        },
+        "descriptorPolicy": {
+            "schemaVersion": "temporal_qd_descriptor_policy_v2",
+            "axes": ["operatorFamilies", "mutationDepth", "entryEvents", "managementActions", "graphNodes", "tradeFrequency", "medianHolding"],
+            "lineageFamilyFields": ["operatorId", "operation", "kind"],
+            "rootConstructionOperations": ["rich_immigrant_construction", "typed_seed"],
+            "managementActionKinds": ["activate_trailing_stop_next_open", "cancel_target_next_open", "deactivate_trailing_stop_next_open", "move_stop_to_break_even_next_open", "set_target_next_open", "tighten_stop_next_open"],
+            "graphNodeBounds": [40, 55, 70]
         },
         "resolvedExecutionDeduplication": {
             "required": true,
@@ -434,7 +449,13 @@ fn member(
     value
 }
 
-fn cell(descriptor: Value, visits: u64, attempts: u64, members: Vec<Value>) -> Value {
+fn cell(descriptor: Value, visits: u64, attempts: u64, mut members: Vec<Value>) -> Value {
+    for member in &mut members {
+        member
+            .as_object_mut()
+            .unwrap()
+            .insert("descriptor".to_owned(), descriptor.clone());
+    }
     json!({
         "cellId": descriptor["cellId"],
         "descriptor": descriptor,
@@ -446,12 +467,15 @@ fn cell(descriptor: Value, visits: u64, attempts: u64, members: Vec<Value>) -> V
 
 fn archive() -> Value {
     let policy = frozen_policy();
-    assert_eq!(canonical_sha256(&policy).unwrap(), QD_POLICY_SHA256);
+    assert_eq!(
+        canonical_sha256(&policy).unwrap(),
+        CORRECTED_QD_POLICY_SHA256
+    );
     let mut archive = json!({
         "schemaVersion": "temporal_qd_archive_v3",
         "qdVersion": "temporal_qd_evolution_v3",
-        "policyName": "stage5e7_v3_robust_quality_archive",
-        "policySha256": QD_POLICY_SHA256,
+        "policyName": CORRECTED_QD_POLICY_NAME,
+        "policySha256": CORRECTED_QD_POLICY_SHA256,
         "frozenPolicy": policy,
         "bidirectionalPairPolicy": pair_policy(),
         "rotatingEvidenceTransaction": {
@@ -502,6 +526,217 @@ fn archive() -> Value {
     let identity = canonical_sha256(&archive).unwrap();
     archive["archiveSha256"] = Value::String(identity);
     archive
+}
+
+fn direction_behavior(
+    long_net: f64,
+    long_trades: u64,
+    long_windows: u64,
+    short_net: f64,
+    short_trades: u64,
+    short_windows: u64,
+) -> Value {
+    let side = |net: f64, closed: u64, active_windows: u64| {
+        let cost = if closed > 0 { 0.2 } else { 0.0 };
+        json!({
+            "closedTrades": closed,
+            "activeWindowCount": active_windows,
+            "activeWindowFraction": active_windows as f64 / 4.0,
+            "grossR": net + cost,
+            "netR": net,
+            "costR": cost,
+            "active": closed > 0,
+            "terminalDirectionCount": 0
+        })
+    };
+    let mut value = json!({
+        "schemaVersion": "temporal_realized_behavior_v1",
+        "windowCount": 4,
+        "sides": {
+            "long": side(long_net, long_trades, long_windows),
+            "short": side(short_net, short_trades, short_windows)
+        }
+    });
+    value["identitySha256"] = Value::String(canonical_sha256(&value).unwrap());
+    value
+}
+
+fn direction_selection(
+    behavior: &Value,
+    lane: &str,
+    eligible: bool,
+    specialist: Option<&str>,
+) -> Value {
+    let mut value = json!({
+        "schemaVersion": "temporal_direction_selection_v1",
+        "policyIdentitySha256": "sha256:2567175ff6ae6063baa485484c0faa0d742507af6814a593076020a68aef3ed1",
+        "realizedBehaviorIdentitySha256": behavior["identitySha256"],
+        "lane": lane,
+        "selectionEligible": eligible,
+        "specialistSide": specialist
+    });
+    value["identitySha256"] = Value::String(canonical_sha256(&value).unwrap());
+    value
+}
+
+fn directional_archive(mut archive: Value, scenario: &str) -> Value {
+    let mut policy = frozen_policy();
+    let fields = policy.as_object_mut().unwrap();
+    fields.insert(
+        "schemaVersion".into(),
+        Value::String("temporal_qd_policy_v5".into()),
+    );
+    fields.insert(
+        "policyName".into(),
+        Value::String(DIRECTIONAL_QD_POLICY_NAME.into()),
+    );
+    fields.insert("directionSelection".into(), json!({
+        "schemaVersion": "temporal_qd_directional_breeding_policy_v1",
+        "selectionPolicy": {
+            "schemaVersion": "temporal_direction_selection_policy_v1",
+            "minimum_closed_trades_per_side": 1,
+            "minimum_active_windows_per_side": 1,
+            "minimum_acceptable_side_net_r": 0.0,
+            "harmful_opposite_net_r": -0.25
+        },
+        "selectionPolicySha256": "sha256:2567175ff6ae6063baa485484c0faa0d742507af6814a593076020a68aef3ed1",
+        "memberBinding": "aggregate.realizedBehavior_then_direction_selection_v1",
+        "breedingLanes": {
+            "balanced_bidirectional": "supported_nonnegative_long_and_short",
+            "long_specialist": "supported_nonnegative_long_with_inactive_or_unsupported_short",
+            "short_specialist": "supported_nonnegative_short_with_inactive_or_unsupported_long"
+        },
+        "ineligibleLanes": ["harmful_opposite_side", "inactive_or_unsupported"],
+        "perCellBreedingQuotas": {"balanced_bidirectional": 2, "long_specialist": 1, "short_specialist": 1},
+        "fallback": "remaining_direction_eligible_quality_pareto_then_crowding"
+    }));
+    assert_eq!(
+        canonical_sha256(&policy).unwrap(),
+        DIRECTIONAL_QD_POLICY_SHA256
+    );
+    archive["policyName"] = Value::String(DIRECTIONAL_QD_POLICY_NAME.into());
+    archive["policySha256"] = Value::String(DIRECTIONAL_QD_POLICY_SHA256.into());
+    archive["frozenPolicy"] = policy;
+    for cell in archive["cells"].as_array_mut().unwrap() {
+        for member in cell["members"].as_array_mut().unwrap() {
+            let (behavior, lane, eligible, specialist) = match scenario {
+                "harmful" if member["candidateId"] == "q-best" => (
+                    direction_behavior(2.0, 2, 1, -1.0, 2, 1),
+                    "harmful_opposite_side",
+                    false,
+                    None,
+                ),
+                "long_specialist" => (
+                    direction_behavior(2.0, 2, 1, 0.0, 0, 0),
+                    "long_specialist",
+                    true,
+                    Some("long"),
+                ),
+                "short_specialist" => (
+                    direction_behavior(0.0, 0, 0, 2.0, 2, 1),
+                    "short_specialist",
+                    true,
+                    Some("short"),
+                ),
+                "inactive" => (
+                    direction_behavior(0.0, 0, 0, 0.0, 0, 0),
+                    "inactive_or_unsupported",
+                    false,
+                    None,
+                ),
+                _ => (
+                    direction_behavior(2.0, 2, 1, 1.0, 2, 1),
+                    "balanced_bidirectional",
+                    true,
+                    None,
+                ),
+            };
+            member["aggregate"] = json!({"realizedBehavior": behavior});
+            member["directionSelection"] = direction_selection(
+                &member["aggregate"]["realizedBehavior"],
+                lane,
+                eligible,
+                specialist,
+            );
+            member["directionBehaviorLane"] = Value::String(lane.into());
+            member["directionBreedingLane"] = if eligible {
+                Value::String(lane.into())
+            } else {
+                Value::Null
+            };
+        }
+    }
+    archive.as_object_mut().unwrap().remove("archiveSha256");
+    archive["archiveSha256"] = Value::String(canonical_sha256(&archive).unwrap());
+    archive
+}
+
+#[test]
+fn direction_aware_archive_admits_balanced_breeding_and_rejects_harmful_hiding() {
+    let balanced = directional_archive(archive(), "balanced");
+    assert!(VerifiedParentArchive::from_archive(&balanced).is_ok());
+
+    let harmful = directional_archive(archive(), "harmful");
+    assert!(VerifiedParentArchive::from_archive(&harmful).is_ok());
+    let selector = ArchiveParentSelector::from_archive(&harmful, GENERATION_SEED, false).unwrap();
+    assert!(selector.eligible_parent_count() < 5);
+
+    let mut forged = harmful;
+    let member = &mut forged["cells"][0]["members"][0];
+    member["directionBreedingLane"] = Value::String("balanced_bidirectional".into());
+    forged.as_object_mut().unwrap().remove("archiveSha256");
+    forged["archiveSha256"] = Value::String(canonical_sha256(&forged).unwrap());
+    assert!(VerifiedParentArchive::from_archive(&forged).is_err());
+}
+
+#[test]
+fn direction_aware_archive_preserves_specialists_and_excludes_inactive_lanes() {
+    for scenario in ["long_specialist", "short_specialist"] {
+        let archive = directional_archive(archive(), scenario);
+        let selector = ArchiveParentSelector::from_archive(&archive, GENERATION_SEED, false)
+            .expect("direction-specialist archive must parse");
+        assert!(selector.eligible_parent_count() > 0, "{scenario}");
+    }
+
+    let inactive = directional_archive(archive(), "inactive");
+    assert!(VerifiedParentArchive::from_archive(&inactive).is_ok());
+    let selector = ArchiveParentSelector::from_archive(&inactive, GENERATION_SEED, true)
+        .expect("inactive archive remains observable/readable");
+    assert_eq!(selector.eligible_parent_count(), 0);
+}
+
+fn legacy_frozen_policy() -> Value {
+    let mut policy = frozen_policy();
+    let fields = policy.as_object_mut().unwrap();
+    fields.insert(
+        "schemaVersion".to_owned(),
+        Value::String("temporal_qd_policy_v3".to_owned()),
+    );
+    fields.insert(
+        "policyName".to_owned(),
+        Value::String(LEGACY_QD_POLICY_NAME.to_owned()),
+    );
+    fields.remove("descriptorPolicy");
+    assert_eq!(canonical_sha256(&policy).unwrap(), LEGACY_QD_POLICY_SHA256);
+    policy
+}
+
+#[test]
+fn legacy_archive_is_readable_but_cross_policy_identity_is_rejected() {
+    let mut legacy = archive();
+    legacy["policyName"] = Value::String(LEGACY_QD_POLICY_NAME.to_owned());
+    legacy["policySha256"] = Value::String(LEGACY_QD_POLICY_SHA256.to_owned());
+    legacy["frozenPolicy"] = legacy_frozen_policy();
+    legacy.as_object_mut().unwrap().remove("archiveSha256");
+    let hash = canonical_sha256(&legacy).unwrap();
+    legacy["archiveSha256"] = Value::String(hash);
+    VerifiedParentArchive::from_archive(&legacy).unwrap();
+
+    legacy["policyName"] = Value::String("stage5e7_v4_corrected_descriptor_archive".to_owned());
+    legacy.as_object_mut().unwrap().remove("archiveSha256");
+    let hash = canonical_sha256(&legacy).unwrap();
+    legacy["archiveSha256"] = Value::String(hash);
+    assert!(VerifiedParentArchive::from_archive(&legacy).is_err());
 }
 
 fn audit_field<'a>(
