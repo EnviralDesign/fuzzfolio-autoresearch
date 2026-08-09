@@ -2,6 +2,36 @@
 
 Run commands from `C:\repos\fuzzfolio-autoresearch` with `uv run <command>`.
 
+## temporal-qd-post-campaign-scrutiny
+
+Runs the post-campaign tribunal for exactly the frozen `newProposalCandidateIds`
+cohort of one completed Temporal-QD generation. It writes a separate immutable
+authority and restartable result root; it does not resume or alter the source
+campaign and never touches the outer tail.
+
+```powershell
+uv run temporal-qd-post-campaign-scrutiny `
+  --campaign-root C:\fuzzfolio-research\...\run\broad-4000x1024x5 `
+  --generation-index 5 `
+  --output-root C:\fuzzfolio-research\...\scrutiny\g5-12m-36m `
+  --target-worker-contract C:\fuzzfolio-research\contracts\replay-worker-contract-v2.json `
+  --gateway-url http://127.0.0.1:8799
+```
+
+It freshly attests the declared 12-month research-validation window, evaluates
+all 1,024 new proposals, and only then applies the immutable promotion policy:
+positive conservative R, at least 24 closed trades, valid complete replay, and
+no unresolved state. At most 128 passers proceed to the separately attested
+36-month research-scrutiny window, using deterministic net-R/drawdown/trade
+support ordering with a structural diversity floor. Both windows intentionally
+overlap development evidence and are not an untouched-tail verdict.
+
+`--target-worker-contract` is mandatory. It must be the exact digest-bound
+`replay-worker-contract-v2` manifest for the deployed worker image; scrutiny
+does not infer a hash from the local coordinator or gateway. Every accepted
+result must attest that same contract, OCI image digest, Rust build, and runtime
+platform identity.
+
 ## doctor
 
 ```powershell

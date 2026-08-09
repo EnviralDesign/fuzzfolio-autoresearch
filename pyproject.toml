@@ -64,6 +64,7 @@ temporal-search-stage5e4-diagnostics = "autoresearch.temporal_search_stage5e4_di
 temporal-qd-supervisor = "autoresearch.temporal_qd_supervisor:main"
 temporal-qd-materialize-evidence-ladder = "autoresearch.temporal_qd_evidence_ladder_materializer:main"
 temporal-qd-materialize-rotating-evidence = "autoresearch.temporal_qd_rotating_evidence_materializer:main"
+temporal-qd-post-campaign-scrutiny = "autoresearch.temporal_qd_post_campaign_scrutiny:main"
 temporal-confirmed-entry-admission = "autoresearch.temporal_confirmed_entry_admission:main"
 temporal-confirmed-entry-determinism = "autoresearch.temporal_confirmed_entry_determinism:main"
 atlas-lab = "autoresearch.__main__:main"
