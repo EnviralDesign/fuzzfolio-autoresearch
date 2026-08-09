@@ -185,6 +185,7 @@ def test_scrutiny_preregisters_policy_then_uses_fake_attestor_and_gateway(
     gateway = FakeGateway()
     def fake_run(client, authority, *, output_root, **kwargs):
         assert client is gateway
+        assert kwargs["summary_filename"] == "run-summary.json"
         gateway.calls.append(Path(output_root).name)
         gateway.resume_flags.append(bool(kwargs["resume"]))
         checkpoint_path = Path(output_root) / "checkpoint.json"

@@ -512,6 +512,10 @@ def test_plan_checkpoint_is_mutable_but_immutable_manifest_is_not(
 ) -> None:
     authority = build_authority(_preparation())
     first = materialize_plan(authority, tmp_path)
+    authority_path = tmp_path / "authority.json"
+    assert b"\r\n" not in authority_path.read_bytes()
+    crlf_authority = authority_path.read_bytes().replace(b"\n", b"\r\n")
+    authority_path.write_bytes(crlf_authority)
     checkpoint = tmp_path / "checkpoint.json"
     state = json.loads(checkpoint.read_text(encoding="utf-8"))
     state["journal"].append({"taskId": "already-seen"})
@@ -520,6 +524,7 @@ def test_plan_checkpoint_is_mutable_but_immutable_manifest_is_not(
         materialize_plan(authority, tmp_path)["taskMatrixSha256"]
         == first["taskMatrixSha256"]
     )
+    assert authority_path.read_bytes() == crlf_authority
     other = build_authority({**_preparation(), "authorityLabel": "different-authority"})
     with pytest.raises(TemporalSearchContractError, match="divergent immutable file"):
         materialize_plan(other, tmp_path)
@@ -739,6 +744,35 @@ def test_controller_materializes_both_cost_results_from_one_stream(
     )
     assert resumed == result
     assert len(gateway.enqueued) == 1
+
+
+def test_controller_can_use_a_distinct_local_summary_filename(
+    tmp_path: Path,
+) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+    gateway = _Gateway(task)
+
+    result = run_temporal_search_tasks(
+        gateway,
+        authority,
+        output_root=tmp_path,
+        timeout_seconds=1,
+        summary_filename="run-summary.json",
+    )
+
+    assert result["completedTaskCount"] == 1
+    assert (tmp_path / "run-summary.json").is_file()
+    assert not (tmp_path / "summary.json").exists()
+    with pytest.raises(TemporalSearchContractError, match="summary filename"):
+        run_temporal_search_tasks(
+            gateway,
+            authority,
+            output_root=tmp_path,
+            timeout_seconds=1,
+            resume=True,
+            summary_filename="../escape.json",
+        )
 
 
 def test_controller_can_defer_selection_reduction_without_reopening_results(

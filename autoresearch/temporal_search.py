@@ -786,11 +786,16 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
         )
         + "\n"
     )
-    if path.exists() and path.read_text(encoding="utf-8") != encoded:
-        raise TemporalSearchContractError(
-            f"refusing to overwrite divergent immutable file: {path}"
-        )
-    path.write_text(encoded, encoding="utf-8")
+    if path.exists():
+        if path.read_text(encoding="utf-8") != encoded:
+            raise TemporalSearchContractError(
+                f"refusing to overwrite divergent immutable file: {path}"
+            )
+        # Immutable evidence is not rewritten merely to normalize a platform's
+        # newline convention.  This also keeps an outer byte-exact freezer from
+        # observing a false authority divergence on Windows resume.
+        return
+    path.write_bytes(encoded.encode("utf-8"))
 
 
 def _write_checkpoint(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1797,8 +1802,18 @@ def run_temporal_search_tasks(
     enqueue_batch_size: int = 128,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     include_selection_summary: bool = True,
+    summary_filename: str = "summary.json",
 ) -> dict[str, Any]:
     """Execute an already finite plan; intentionally no search expansion occurs."""
+    summary_name = str(summary_filename or "").strip()
+    if (
+        not summary_name
+        or Path(summary_name).name != summary_name
+        or not summary_name.endswith(".json")
+    ):
+        raise TemporalSearchContractError(
+            "summary filename must be one local JSON filename"
+        )
     manifest = materialize_plan(authority, output_root)
     root = Path(output_root)
     checkpoint_path = root / "checkpoint.json"
@@ -2001,7 +2016,7 @@ def run_temporal_search_tasks(
         "completedTaskCount": len(completed),
         "selection": rows,
     }
-    _write_json(root / "summary.json", summary)
+    _write_json(root / summary_name, summary)
     return summary
 
 

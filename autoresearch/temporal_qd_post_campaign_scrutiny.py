@@ -587,7 +587,7 @@ def run_qd_post_campaign_scrutiny(
                 "temporalSearchAuthority": authority})
             run_qd = run_temporal_search_tasks(gateway, authority, output_root=stage_root, timeout_seconds=timeout_seconds,
                 poll_interval_seconds=poll_interval_seconds, resume=(stage_root / "checkpoint.json").is_file(), enqueue_batch_size=enqueue_batch_size,
-                include_selection_summary=False)
+                include_selection_summary=False, summary_filename="run-summary.json")
             results = _read_stage_results(stage_root, authority, expected_worker_environment=target_worker["environment"])
             stage_results[stage] = results
             stream_consistency = _observation_stream_consistency(results)
