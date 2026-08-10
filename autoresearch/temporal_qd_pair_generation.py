@@ -1451,6 +1451,195 @@ def _write_once(path: Path, value: Mapping[str, Any]) -> int:
     return encoded_bytes
 
 
+_G0_CONSTRUCTION_HANDOFF_SCHEMA = "temporal_qd_native_g0_construction_handoff_v1"
+_G0_CONSTRUCTION_HANDOFF_PATH = (
+    Path("internal") / "g0-funnel" / "construction-handoff.json"
+)
+_G0_RECEIPT_PATH = Path("internal") / "g0-funnel" / "receipt.json"
+
+
+def _g0_identity_ledger_binding(
+    *,
+    identity_ledger_path: Path | str | None,
+    policy_name: str,
+    policy_sha256: str,
+    policy_frozen: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Build a path/authority-only native ledger binding.
+
+    Deliberately do not call the historical Python ledger loader or reduce its
+    ``pairExecutableSemantics`` rows here.  Rust owns that durable read and
+    compares the exact semantic-to-candidate set with journal admission.
+    """
+
+    if identity_ledger_path is None:
+        return None
+    identity_policy = policy_frozen.get("identity")
+    if not isinstance(identity_policy, Mapping):
+        raise TemporalDiscoveryContractError(
+            "G0 native finalization identity policy is unavailable"
+        )
+    return {
+        "schemaVersion": "temporal_qd_native_g0_identity_ledger_binding_v1",
+        "ledgerPath": str(Path(identity_ledger_path).resolve()),
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
+        "identityPolicy": _clone(identity_policy),
+        "identityPolicySha256": canonical_sha256(identity_policy),
+    }
+
+
+def _g0_native_publication_policy(
+    *,
+    policy_name: str,
+    policy_sha256: str,
+    pair_policy: Mapping[str, Any],
+    operator_implementation_identity: Mapping[str, Any],
+    archive_policy_authority: Mapping[str, Any] | None,
+    directional: bool,
+) -> dict[str, Any]:
+    return {
+        "qdVersion": "temporal_qd_evolution_v3",
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
+        "pairPolicy": _clone(pair_policy),
+        "operatorImplementationIdentity": _clone(operator_implementation_identity),
+        # The v5 G0 oracle omits this field from its population shell and
+        # therefore publishes null in evaluation/journal as well.
+        "predeclaredEvidenceContextSha256": None,
+        "archivePolicyAuthority": (
+            _clone(archive_policy_authority)
+            if directional and archive_policy_authority is not None
+            else None
+        ),
+    }
+
+
+def _g0_journal_inventory_sha256(
+    *,
+    config_sha256: str,
+    generation_index: int,
+    operator_implementation_identity: Mapping[str, Any],
+    entry_sha256s: Sequence[str],
+) -> str:
+    return canonical_sha256(
+        {
+            "schemaVersion": "temporal_qd_native_g0_journal_inventory_v1",
+            "configSha256": config_sha256,
+            "generationIndex": generation_index,
+            "operatorImplementationSha256": canonical_sha256(
+                operator_implementation_identity
+            ),
+            "entrySha256s": list(entry_sha256s),
+        }
+    )
+
+
+def _write_g0_construction_handoff(
+    *,
+    root: Path,
+    config_sha256: str,
+    generation_index: int,
+    construction_pool_size: int,
+    evaluation_population_size: int,
+    proposal_count: int,
+    accepted_count: int,
+    operator_implementation_identity: Mapping[str, Any],
+    entry_sha256s: Sequence[str],
+) -> dict[str, Any]:
+    if accepted_count != construction_pool_size or proposal_count < accepted_count:
+        raise TemporalDiscoveryContractError(
+            "G0 construction handoff requires a complete accepted pool"
+        )
+    value: dict[str, Any] = {
+        "schemaVersion": _G0_CONSTRUCTION_HANDOFF_SCHEMA,
+        "configSha256": config_sha256,
+        "generationIndex": generation_index,
+        "constructionPoolSize": construction_pool_size,
+        "evaluationPopulationSize": evaluation_population_size,
+        "acceptedCount": accepted_count,
+        "proposalCount": proposal_count,
+        "lastProposalOrdinal": proposal_count - 1,
+        "constructionComplete": True,
+        "journalInventorySha256": _g0_journal_inventory_sha256(
+            config_sha256=config_sha256,
+            generation_index=generation_index,
+            operator_implementation_identity=operator_implementation_identity,
+            entry_sha256s=entry_sha256s,
+        ),
+        "operatorImplementationSha256": canonical_sha256(
+            operator_implementation_identity
+        ),
+    }
+    value["handoffSha256"] = canonical_sha256(value)
+    _write_once(root / _G0_CONSTRUCTION_HANDOFF_PATH, value)
+    return value
+
+
+def _g0_native_dispatch_signal(
+    *, root: Path, construction_pool_size: int
+) -> tuple[bool, bool]:
+    """Return ``(attempt_native, must_be_sealed)`` without reading row bytes.
+
+    File count is only an inexpensive *dispatch hint*.  Rust is the sole
+    authority that establishes completeness by admitting contiguous immutable
+    entries, so rejected proposals can never make Python infer completion.
+    """
+
+    marker = root / _G0_CONSTRUCTION_HANDOFF_PATH
+    receipt = root / _G0_RECEIPT_PATH
+    final_paths = (
+        root / "g0-bootstrap" / "accepted-pool.json",
+        root / "g0-bootstrap" / "selection.json",
+        root / "g0-bootstrap" / "campaign-construction-ledger.json",
+        root / "population.json",
+        root / "evaluation-population.json",
+        root / "generation-journal.json",
+    )
+    must_be_sealed = marker.exists() or receipt.exists() or any(
+        path.exists() for path in final_paths
+    )
+    # A handoff or receipt is already a compact native-dispatch authority.
+    # Do not even enumerate proposal names on this restart path: receipt
+    # adoption subsequently hashes only the sealed public outputs and must
+    # remain independent of the 4,000-entry source directory.
+    if must_be_sealed:
+        return True, True
+    journal_root = root / "proposal-journal"
+    count = (
+        sum(1 for _ in journal_root.glob("*.json"))
+        if journal_root.is_dir()
+        else 0
+    )
+    return count >= construction_pool_size, False
+
+
+def _run_native_g0_finalization(
+    *,
+    root: Path,
+    g0_finalization_runtime: Mapping[str, Any],
+    config: Mapping[str, Any],
+    evaluation_population_size: int,
+    publication_policy: Mapping[str, Any],
+    identity_ledger_binding: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    from .temporal_qd_native import TemporalQDNativeError, run_native_g0_funnel
+
+    try:
+        return run_native_g0_funnel(
+            output_root=root,
+            g0_finalization_runtime=g0_finalization_runtime,
+            generation_config=config,
+            evaluation_population_size=evaluation_population_size,
+            publication_policy=publication_policy,
+            identity_ledger_binding=identity_ledger_binding,
+        )
+    except TemporalQDNativeError as exc:
+        # Rust selection is terminal for this phase.  In particular, this is
+        # not a signal to fall through to the historical Python finalizer.
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+
+
 def _counter_increment(target: dict[str, int], value: Any) -> None:
     key = canonical_json(value) if isinstance(value, (Mapping, list, tuple)) else str(value)
     target[key] = target.get(key, 0) + 1
@@ -3152,6 +3341,7 @@ def _generate_pair_population_optimized_impl(
     max_new_proposals: int | None = None,
     population_finalizer: str = DEFAULT_POPULATION_FINALIZER,
     g0_evaluation_width: int | None = None,
+    g0_finalization_runtime: Mapping[str, Any] | None = None,
     archive_policy_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Memory-bounded equivalent of the preserved legacy implementation.
@@ -3188,6 +3378,40 @@ def _generate_pair_population_optimized_impl(
             raise TemporalDiscoveryContractError(
                 "pair generation requires a frozen operator implementation identity"
             )
+    g0_runtime: dict[str, Any] | None = None
+    if g0_evaluation_width is not None:
+        from .temporal_qd_native import (
+            G0_FINALIZATION_RUNTIME_PYTHON_ORACLE,
+            G0_FINALIZATION_RUNTIME_RUST,
+            TemporalQDNativeError,
+            build_g0_finalization_runtime_config,
+            validate_g0_finalization_runtime_config,
+        )
+
+        try:
+            g0_runtime = (
+                validate_g0_finalization_runtime_config(g0_finalization_runtime)
+                if g0_finalization_runtime is not None
+                else build_g0_finalization_runtime_config()
+            )
+        except TemporalQDNativeError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+        if g0_runtime["engine"] == G0_FINALIZATION_RUNTIME_PYTHON_ORACLE:
+            if population_finalizer != POPULATION_FINALIZER_PYTHON:
+                raise TemporalDiscoveryContractError(
+                    "the explicit Python G0 oracle requires the Python population finalizer"
+                )
+        elif g0_runtime["engine"] == G0_FINALIZATION_RUNTIME_RUST:
+            if population_finalizer == POPULATION_FINALIZER_PYTHON:
+                raise TemporalDiscoveryContractError(
+                    "production G0 finalization cannot select the Python population finalizer"
+                )
+        else:
+            raise TemporalDiscoveryContractError("G0 finalization runtime selected an unknown engine")
+    elif g0_finalization_runtime is not None:
+        raise TemporalDiscoveryContractError(
+            "G0 finalization runtime is only valid for generation-1 G0"
+        )
     from .temporal_qd_evolution import _resolve_archive_policy_authority
 
     policy_name, policy_sha256, policy_frozen, _policy_directional = (
@@ -3254,6 +3478,56 @@ def _generate_pair_population_optimized_impl(
         )
     with timed_span("generation.persist_config"):
         _write_once(root / "pair-config.json", config)
+    if (
+        g0_runtime is not None
+        and g0_runtime["engine"] == G0_FINALIZATION_RUNTIME_RUST
+    ):
+        should_dispatch, must_be_sealed = _g0_native_dispatch_signal(
+            root=root, construction_pool_size=target_unique_candidates
+        )
+        if should_dispatch:
+            # This branch intentionally precedes *all* Python resume replay.
+            # A receipt/marker gives native code enough compact authority to
+            # adopt in O(receipt/output metadata), while a preserved complete
+            # journal without a marker gets one native slow audit.
+            with timed_span("generation.g0_native.early_dispatch") as span:
+                identity_ledger_binding = _g0_identity_ledger_binding(
+                    identity_ledger_path=identity_ledger_path,
+                    policy_name=policy_name,
+                    policy_sha256=policy_sha256,
+                    policy_frozen=policy_frozen,
+                )
+                native_outcome = _run_native_g0_finalization(
+                    root=root,
+                    g0_finalization_runtime=g0_runtime,
+                    config=config,
+                    evaluation_population_size=int(g0_evaluation_width),
+                    publication_policy=_g0_native_publication_policy(
+                        policy_name=policy_name,
+                        policy_sha256=policy_sha256,
+                        pair_policy=policy,
+                        operator_implementation_identity=operator_implementation_identity,
+                        archive_policy_authority=archive_policy_authority,
+                        directional=_policy_directional,
+                    ),
+                    identity_ledger_binding=identity_ledger_binding,
+                )
+                span.annotate(status=native_outcome["status"])
+            if native_outcome["status"] in {"completed", "adopted"}:
+                result = native_outcome.get("pairGenerationResult")
+                if not isinstance(result, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "native G0 finalization lacks its pair-generation handoff"
+                    )
+                return dict(result)
+            if native_outcome["status"] != "construction_incomplete":
+                raise TemporalDiscoveryContractError(
+                    "native G0 finalization returned an unknown construction status"
+                )
+            if must_be_sealed:
+                raise TemporalDiscoveryContractError(
+                    "sealed G0 construction marker/receipt did not finalize natively"
+                )
     with timed_span("generation.resume.scan_journal") as span:
         journal_paths = sorted((root / "proposal-journal").glob("*.json"))
         span.annotate(existingProposalCount=len(journal_paths))
@@ -3754,6 +4028,58 @@ def _generate_pair_population_optimized_impl(
                 ),
                 "completed": False,
             }
+    if (
+        g0_runtime is not None
+        and g0_runtime["engine"] == G0_FINALIZATION_RUNTIME_RUST
+    ):
+        # Proposal construction has durably reached its frozen target.  Publish
+        # only a compact handoff, then cross into the one native transaction;
+        # none of the historical Python allocation/selection/publication code
+        # below is permitted to run for production G0.
+        with timed_span("generation.g0_native.persist_construction_handoff"):
+            _write_g0_construction_handoff(
+                root=root,
+                config_sha256=config["configSha256"],
+                generation_index=generation_index,
+                construction_pool_size=target_unique_candidates,
+                evaluation_population_size=int(g0_evaluation_width),
+                proposal_count=state.proposal_count,
+                accepted_count=len(state.accepted),
+                operator_implementation_identity=operator_implementation_identity,
+                entry_sha256s=state.entry_sha256s,
+            )
+        with timed_span("generation.g0_native.finalize") as span:
+            native_outcome = _run_native_g0_finalization(
+                root=root,
+                g0_finalization_runtime=g0_runtime,
+                config=config,
+                evaluation_population_size=int(g0_evaluation_width),
+                publication_policy=_g0_native_publication_policy(
+                    policy_name=policy_name,
+                    policy_sha256=policy_sha256,
+                    pair_policy=policy,
+                    operator_implementation_identity=operator_implementation_identity,
+                    archive_policy_authority=archive_policy_authority,
+                    directional=_policy_directional,
+                ),
+                identity_ledger_binding=_g0_identity_ledger_binding(
+                    identity_ledger_path=identity_ledger_path,
+                    policy_name=policy_name,
+                    policy_sha256=policy_sha256,
+                    policy_frozen=policy_frozen,
+                ),
+            )
+            span.annotate(status=native_outcome["status"])
+        if native_outcome["status"] not in {"completed", "adopted"}:
+            raise TemporalDiscoveryContractError(
+                "complete G0 construction did not finalize natively"
+            )
+        result = native_outcome.get("pairGenerationResult")
+        if not isinstance(result, Mapping):
+            raise TemporalDiscoveryContractError(
+                "native G0 finalization lacks its pair-generation handoff"
+            )
+        return dict(result)
     allocation_accounting = _reproduction_allocation_accounting(
         [_load_pair_proposal_entry(path, ordinal=ordinal) for ordinal, path in enumerate(journal_paths)],
         allocation=config["reproductionAllocation"],
@@ -4069,6 +4395,7 @@ def generate_pair_population(
     implementation: str = PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED,
     population_finalizer: str = DEFAULT_POPULATION_FINALIZER,
     g0_evaluation_width: int | None = None,
+    g0_finalization_runtime: Mapping[str, Any] | None = None,
     archive_policy_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate a pair population with identity-excluded performance evidence.
@@ -4148,6 +4475,9 @@ def generate_pair_population(
                         effective_population_finalizer
                     )
                     implementation_arguments["g0_evaluation_width"] = g0_evaluation_width
+                    implementation_arguments["g0_finalization_runtime"] = (
+                        g0_finalization_runtime
+                    )
                 result = implementation_function(**implementation_arguments)
                 trace.set_result(result)
             flush_performance_events()

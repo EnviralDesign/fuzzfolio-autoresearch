@@ -6,6 +6,7 @@
 pub mod construction;
 pub mod factory;
 pub mod g0;
+pub mod g0_funnel;
 pub mod generation;
 pub mod genome;
 pub mod grammar;

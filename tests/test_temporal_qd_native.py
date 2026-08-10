@@ -205,6 +205,140 @@ def test_pair_generation_runtime_choice_is_self_hashed_and_binds_timeout() -> No
         )
 
 
+def test_g0_finalization_runtime_is_distinct_rust_only_production_authority() -> None:
+    assert native.G0_FINALIZATION_RUNTIME_DEFAULT == native.G0_FINALIZATION_RUNTIME_RUST
+    value = native.build_g0_finalization_runtime_config()
+    assert value["engine"] == native.G0_FINALIZATION_RUNTIME_RUST
+    assert value["fallbackPolicy"] == "forbidden"
+    assert native.validate_g0_finalization_runtime_config(value) == value
+
+    tampered = dict(value)
+    tampered["executionTimeoutSeconds"] = 7200
+    with pytest.raises(native.TemporalQDNativeError, match="identity mismatch"):
+        native.validate_g0_finalization_runtime_config(tampered)
+
+    # Python remains an explicit test/oracle authority, never an implicit
+    # production alternative for the native funnel manifest.
+    oracle = native.build_g0_finalization_runtime_config(
+        engine=native.G0_FINALIZATION_RUNTIME_PYTHON_ORACLE
+    )
+    with pytest.raises(native.TemporalQDNativeError, match="requires the Rust G0 runtime"):
+        native.build_g0_funnel_manifest(
+            g0_finalization_runtime=oracle,
+            output_root=Path.cwd(),
+            generation_config={
+                "schemaVersion": native.PAIR_GENERATION_SCHEMA,
+                "generationIndex": 1,
+                "targetUniqueCandidates": 1,
+                "maxProposalAttempts": 1,
+                "configSha256": "sha256:" + "a" * 64,
+            },
+            evaluation_population_size=1,
+            publication_policy={},
+            global_identity_ledger=None,
+        )
+
+
+def test_g0_admission_thread_cap_is_bounded_operational_diagnostic() -> None:
+    assert (
+        native.validate_g0_admission_thread_cap(
+            native.G0_ADMISSION_THREAD_CAP_DEFAULT
+        )
+        == native.G0_ADMISSION_THREAD_CAP_DEFAULT
+    )
+    for invalid in (0, native.G0_ADMISSION_THREAD_CAP_MAXIMUM + 1, True, "4"):
+        with pytest.raises(native.TemporalQDNativeError, match="thread cap"):
+            native.validate_g0_admission_thread_cap(invalid)
+
+
+def test_g0_manifest_binds_the_concrete_native_batch_authority(
+    tmp_path: Path,
+) -> None:
+    """A rebuild/source drift changes the sealed transaction identity."""
+
+    binary = tmp_path / "temporal-qd-batch.exe"
+    binary.write_bytes(b"bounded native batch authority fixture")
+    batch = native.build_native_authority(
+        binary=binary,
+        version=_version(),
+        source_sha256="sha256:" + "b" * 64,
+    )
+    allocation = {
+        "schemaVersion": "temporal_qd_reproduction_allocation_v2",
+        "targetAcceptedCandidates": 1,
+        "desiredAcceptedOffspringCount": 0,
+        "desiredAcceptedImmigrantCount": 1,
+    }
+    allocation["allocationSha256"] = sha256(canonical_json_bytes(allocation))
+    config = {
+        "schemaVersion": native.PAIR_GENERATION_SCHEMA,
+        "generationIndex": 1,
+        "targetUniqueCandidates": 1,
+        "maxProposalAttempts": 1,
+        "reproductionAllocation": allocation,
+    }
+    config["configSha256"] = sha256(canonical_json_bytes(config))
+    frozen_policy = {"fixture": "g0-authority"}
+    policy_sha = sha256(canonical_json_bytes(frozen_policy))
+    policy = {
+        "qdVersion": "temporal_qd_evolution_v3",
+        "policyName": "native-g0-authority-fixture",
+        "policySha256": policy_sha,
+        "pairPolicy": {},
+        "operatorImplementationIdentity": {},
+        "predeclaredEvidenceContextSha256": None,
+        "archivePolicyAuthority": {
+            "qdVersion": "temporal_qd_evolution_v3",
+            "policyName": "native-g0-authority-fixture",
+            "policySha256": policy_sha,
+            "frozenPolicy": frozen_policy,
+        },
+    }
+    runtime = native.build_g0_finalization_runtime_config()
+    manifest = native.build_g0_funnel_manifest(
+        g0_finalization_runtime=runtime,
+        output_root=tmp_path / "proposal",
+        generation_config=config,
+        evaluation_population_size=1,
+        publication_policy=policy,
+        native_batch_authority=batch,
+        identity_ledger_binding=None,
+    )
+    assert (
+        manifest["executionAuthority"]["nativeBatchAuthority"] == batch
+    )
+    assert (
+        manifest["executionAuthority"]["nativeBatchAuthoritySha256"]
+        == batch["authoritySha256"]
+    )
+
+    drifted_batch = dict(batch)
+    drifted_batch["executableSha256"] = "sha256:" + "c" * 64
+    drifted_batch["authoritySha256"] = sha256(
+        canonical_json_bytes(
+            {key: value for key, value in drifted_batch.items() if key != "authoritySha256"}
+        )
+    )
+    drifted = native.build_g0_funnel_manifest(
+        g0_finalization_runtime=runtime,
+        output_root=tmp_path / "proposal",
+        generation_config=config,
+        evaluation_population_size=1,
+        publication_policy=policy,
+        native_batch_authority=drifted_batch,
+        identity_ledger_binding=None,
+    )
+    assert drifted["authoritySha256"] != manifest["authoritySha256"]
+    assert drifted["manifestSha256"] != manifest["manifestSha256"]
+
+    tampered = json.loads(json.dumps(manifest))
+    tampered["executionAuthority"]["nativeBatchAuthority"]["sourceSha256"] = (
+        "sha256:" + "d" * 64
+    )
+    with pytest.raises(native.TemporalQDNativeError, match="native authority identity mismatch"):
+        native.validate_g0_funnel_manifest(tampered)
+
+
 def test_native_prelaunch_resource_guard_binds_memory_and_output_volume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -277,6 +411,73 @@ def test_native_checked_command_forwards_explicit_environment(tmp_path: Path) ->
     )
     expected = b"forwarded\r\n" if os.name == "nt" else b"forwarded\n"
     assert completed.stdout == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object ordering only")
+def test_windows_fast_child_is_assigned_before_it_is_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the former attach race against a real, very short-lived child."""
+
+    events: list[str] = []
+    real_job = native._WindowsKillOnCloseJob
+    real_resume = native._resume_windows_suspended_process
+
+    class RecordingJob:
+        def __init__(self, process: subprocess.Popen[bytes]) -> None:
+            events.append("assigned")
+            self._job = real_job(process)
+
+        def close(self) -> None:
+            events.append("closed")
+            self._job.close()
+
+    def resume_after_assignment(process: subprocess.Popen[bytes]) -> None:
+        assert events and events[-1] == "assigned"
+        events.append("resumed")
+        real_resume(process)
+
+    monkeypatch.setattr(native, "_WindowsKillOnCloseJob", RecordingJob)
+    monkeypatch.setattr(native, "_resume_windows_suspended_process", resume_after_assignment)
+    command_shell = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
+    for _ in range(8):
+        completed = native._run_checked(
+            (command_shell, "/d", "/c", "exit 0"), cwd=tmp_path, timeout=5
+        )
+        assert completed.returncode == 0
+    assert [event for event in events if event != "closed"] == [
+        event
+        for _ in range(8)
+        for event in ("assigned", "resumed")
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object ordering only")
+def test_windows_failed_job_assignment_never_resumes_the_suspended_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An attach error leaves no execution window for an unowned process tree."""
+
+    assignment_attempts: list[int] = []
+
+    def fail_assignment(process: subprocess.Popen[bytes]) -> None:
+        assignment_attempts.append(process.pid)
+        raise OSError(5, "synthetic AssignProcessToJobObject failure")
+
+    def unexpected_resume(_: subprocess.Popen[bytes]) -> None:
+        pytest.fail("a child must not resume before Windows Job Object assignment")
+
+    monkeypatch.setattr(native, "_WindowsKillOnCloseJob", fail_assignment)
+    monkeypatch.setattr(native, "_resume_windows_suspended_process", unexpected_resume)
+    command_shell = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
+    with pytest.raises(
+        native.TemporalQDNativeError,
+        match="could not bind native Temporal QD command to a Windows job object",
+    ):
+        native._run_checked(
+            (command_shell, "/d", "/c", "exit 0"), cwd=tmp_path, timeout=5
+        )
+    assert len(assignment_attempts) == 1
 
 
 def test_native_build_uses_owned_launcher_with_cargo_environment(

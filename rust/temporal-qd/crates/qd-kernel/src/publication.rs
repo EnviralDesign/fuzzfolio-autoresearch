@@ -4,7 +4,11 @@
 //! journal. G0 descriptor projections were derived and sealed by the kernel at
 //! admission time, then travel only as compact accepted-reference material.
 
-use std::{collections::BTreeMap, io::Write};
+use std::{
+    collections::BTreeMap,
+    io::{SeekFrom, Write},
+    time::Instant,
+};
 
 use temporal_qd_contract::{
     CanonicalSha256Writer, ContractError, Map, Value, canonical_json, canonical_sha256,
@@ -16,13 +20,17 @@ use crate::{
         build_accepted_pool, materialize_campaign_ledger,
         project_accepted_pair_entry_with_descriptor, select_g0_bootstrap,
     },
-    journal::{AcceptedReference, JournalError, ProposalJournal, WrittenArtifact},
+    journal::{
+        AcceptedReference, JournalError, ProposalJournal, RewritableTemporaryWrite, WrittenArtifact,
+    },
 };
 
 pub const POPULATION_SCHEMA: &str = "temporal_qd_generation_population_v3";
 pub const EVALUATION_POPULATION_SCHEMA: &str = "temporal_qd_evaluation_population_v1";
 pub const GENERATION_JOURNAL_SCHEMA: &str = "temporal_qd_generation_journal_v3";
 pub const FRONT_GENERATION_RESULT_SCHEMA: &str = "temporal_qd_front_generation_result_v1";
+const POPULATION_SHA256_PLACEHOLDER: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PublicationError {
@@ -40,6 +48,15 @@ pub type Result<T> = std::result::Result<T, PublicationError>;
 
 fn contract(message: impl Into<String>) -> PublicationError {
     PublicationError::Contract(message.into())
+}
+
+fn publication_error_as_journal(error: PublicationError) -> JournalError {
+    match error {
+        PublicationError::Journal(error) => error,
+        PublicationError::Canonical(error) => JournalError::Canonical(error),
+        PublicationError::Contract(message) => JournalError::Contract(message),
+        PublicationError::G0(error) => JournalError::Contract(error.to_string()),
+    }
 }
 
 fn object(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -72,6 +89,10 @@ pub struct PublicationPolicy {
     pub pair_policy: Value,
     pub operator_implementation_identity: Value,
     pub predeclared_evidence_context_sha256: Option<String>,
+    /// Direction-aware v5 generations bind the complete archive-policy
+    /// authority into every public artifact.  Earlier authorities deliberately
+    /// omit it, so this remains an explicit optional compatibility field.
+    pub archive_policy_authority: Option<Value>,
 }
 
 impl PublicationPolicy {
@@ -87,6 +108,11 @@ impl PublicationPolicy {
         }
         if let Some(evidence) = &self.predeclared_evidence_context_sha256 {
             sha(evidence, "predeclared evidence context SHA-256")?;
+        }
+        if let Some(authority) = &self.archive_policy_authority {
+            if !authority.is_object() {
+                return Err(contract("archive policy authority must be an object"));
+            }
         }
         Ok(())
     }
@@ -111,6 +137,16 @@ pub struct PublicationRequest {
     /// identity ledger.  The full ledger remains its own artifact; this exact
     /// summary is what the Python generation journal publishes.
     pub global_identity_ledger: Option<Value>,
+    /// These two values were added by the v5/evolvable Python oracle after
+    /// the original native front-half admission.  They are optional only for
+    /// historical v4 compatibility; a v5 G0 funnel must provide both.
+    pub reproduction_allocation: Option<Value>,
+    pub reproduction_allocation_accounting: Option<Value>,
+    /// The Python oracle's pair-genome count is the number of accepted
+    /// executable pair semantics, not merely the number of construction
+    /// references.  A native post-construction admission computes it while
+    /// streaming the rich journal and supplies it here.
+    pub unique_pair_genome_count: Option<u64>,
     pub policy: PublicationPolicy,
 }
 
@@ -164,6 +200,19 @@ impl PublicationRequest {
                 }
             }
         }
+        match (
+            &self.reproduction_allocation,
+            &self.reproduction_allocation_accounting,
+        ) {
+            (None, None) => {}
+            (Some(allocation), Some(accounting))
+                if allocation.is_object() && accounting.is_object() => {}
+            _ => {
+                return Err(contract(
+                    "reproduction allocation and accounting must be paired objects",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -179,6 +228,29 @@ pub struct PublishedGeneration {
     pub population_artifact: WrittenArtifact,
     pub evaluation_artifact: WrittenArtifact,
     pub journal_artifact: WrittenArtifact,
+    /// Untrusted G0 telemetry: source journal bytes reopened to stream the
+    /// selected rich population after admission.  It is not public state.
+    pub population_source_journal_bytes_read: u64,
+    /// Untrusted wall-clock diagnostic for the rich population stream only.
+    pub population_stream_seconds: f64,
+}
+
+/// Compact values produced while a G0 construction journal is admitted in a
+/// single streaming pass.  Keeping this separate from the public request lets
+/// the normal native front-half retain its historical behavior while the v5
+/// post-construction funnel avoids reopening every rich entry to derive the
+/// same descriptor and constructor distribution a second time.
+#[derive(Clone, Debug)]
+pub struct PrecomputedG0Admission {
+    pub accepted_references: Vec<Value>,
+    pub immigrant_construction_distribution: Option<Value>,
+    /// Compact projections derived while each sealed journal row is already
+    /// authenticated by the funnel.  Keeping these avoids reopening every
+    /// selected rich entry merely to build the small evaluation artifact.
+    /// They are keyed by immutable proposal ordinal and re-bound to the
+    /// selected reference before publication.
+    pub evaluation_candidates: BTreeMap<u64, Value>,
+    pub funnel_entries: BTreeMap<u64, Value>,
 }
 
 struct G0Materialization {
@@ -190,47 +262,102 @@ pub fn publish_generation(
     store: &ProposalJournal,
     request: &PublicationRequest,
 ) -> Result<PublishedGeneration> {
+    publish_generation_with_precomputed_g0(store, request, None)
+}
+
+pub fn publish_generation_with_precomputed_g0(
+    store: &ProposalJournal,
+    request: &PublicationRequest,
+    precomputed_g0: Option<&PrecomputedG0Admission>,
+) -> Result<PublishedGeneration> {
     request.validate()?;
     let (selected_references, g0_binding) = if let Some(width) = request.g0_evaluation_width {
-        let g0 = materialize_g0(store, request, width)?;
+        let g0 = materialize_g0(
+            store,
+            request,
+            width,
+            precomputed_g0.map(|admission| admission.accepted_references.as_slice()),
+        )?;
         (g0.selected_references, Some(g0.binding))
     } else {
         let mut references = request.construction_references.clone();
         references.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
         (references, None)
     };
-    let immigrant_distribution = rich_immigrant_distribution(store, &request.entry_ordinals)?;
+    let immigrant_distribution = match precomputed_g0 {
+        Some(admission) => admission.immigrant_construction_distribution.clone(),
+        None => rich_immigrant_distribution(store, &request.entry_ordinals)?,
+    };
     let mut population = population_template(
         request,
         &selected_references,
         g0_binding.as_ref(),
         immigrant_distribution.as_ref(),
     )?;
-    // A full population can be tens or hundreds of megabytes. Stream rich
-    // candidates directly from sealed entries for the identity and final
-    // publication; retain only the compact public envelope.
-    let population_sha256 = population_stream_sha256(&population, &selected_references, store)?;
-    population
-        .as_object_mut()
-        .expect("population is object")
-        .insert(
-            "populationSha256".to_owned(),
-            Value::String(population_sha256.clone()),
-        );
-    let population_artifact = store.write_canonical_once_streaming(
-        std::path::Path::new("population.json"),
-        store.public_newline(),
-        |writer| {
-            stream_population_value(&population, &selected_references, store, writer).map_err(
-                |error| match error {
-                    PublicationError::Journal(error) => error,
-                    PublicationError::Canonical(error) => JournalError::Canonical(error),
-                    PublicationError::Contract(message) => JournalError::Contract(message),
-                    PublicationError::G0(error) => JournalError::Contract(error.to_string()),
+    // A full population can be tens or hundreds of megabytes.  For the G0
+    // transaction, stream each selected rich candidate only once into a
+    // private temporary file while simultaneously hashing the exact object
+    // without its self-hash field.  The fixed-width placeholder is patched
+    // before fsync/file hashing/write-once publication, so it can never escape
+    // as a public artifact.  The non-G0 front-half retains its established
+    // two-pass writer unchanged.
+    let population_stream_started = Instant::now();
+    let (population_sha256, population_artifact, population_source_journal_bytes_read) =
+        if g0_binding.is_some() {
+            population
+                .as_object_mut()
+                .expect("population is object")
+                .insert(
+                    "populationSha256".to_owned(),
+                    Value::String(POPULATION_SHA256_PLACEHOLDER.to_owned()),
+                );
+            let mut population_sha256 = None;
+            let mut source_journal_bytes_read = 0_u64;
+            let artifact = store.write_canonical_once_streaming_rewritable(
+                std::path::Path::new("population.json"),
+                store.public_newline(),
+                |writer| {
+                    population_sha256 = Some(
+                        stream_population_value_with_self_hash(
+                            &population,
+                            &selected_references,
+                            store,
+                            writer,
+                            &mut source_journal_bytes_read,
+                        )
+                        .map_err(publication_error_as_journal)?,
+                    );
+                    Ok(())
                 },
+            )?;
+            (
+                population_sha256.ok_or_else(|| {
+                    contract("G0 population stream did not produce its self-hash")
+                })?,
+                artifact,
+                source_journal_bytes_read,
             )
-        },
-    )?;
+        } else {
+            let population_sha256 =
+                population_stream_sha256(&population, &selected_references, store)?;
+            population
+                .as_object_mut()
+                .expect("population is object")
+                .insert(
+                    "populationSha256".to_owned(),
+                    Value::String(population_sha256.clone()),
+                );
+            let artifact = store.write_canonical_once_streaming(
+                std::path::Path::new("population.json"),
+                store.public_newline(),
+                |writer| {
+                    stream_population_value(&population, &selected_references, store, writer)
+                        .map_err(publication_error_as_journal)
+                },
+            )?;
+            (population_sha256, artifact, 0)
+        };
+    let population_stream_seconds = population_stream_started.elapsed().as_secs_f64();
 
     let evaluation = evaluation_value(
         request,
@@ -239,6 +366,7 @@ pub fn publish_generation(
         &population_artifact.file_sha256,
         g0_binding.as_ref(),
         store,
+        precomputed_g0,
     )?;
     let evaluation_population_sha256 = canonical_sha256_streaming(&evaluation)?;
     let mut evaluation = evaluation;
@@ -288,6 +416,8 @@ pub fn publish_generation(
         population_artifact,
         evaluation_artifact,
         journal_artifact,
+        population_source_journal_bytes_read,
+        population_stream_seconds,
     })
 }
 
@@ -295,6 +425,7 @@ fn materialize_g0(
     store: &ProposalJournal,
     request: &PublicationRequest,
     evaluation_width: u64,
+    precomputed_references: Option<&[Value]>,
 ) -> Result<G0Materialization> {
     let construction_identity = canonical_sha256(&object([
         (
@@ -313,20 +444,47 @@ fn materialize_g0(
     let mut by_key = BTreeMap::new();
     let mut construction = request.construction_references.clone();
     construction.sort_by_key(|reference| reference.proposal_ordinal);
-    for reference in &construction {
-        let descriptor = reference.descriptor_projection.as_ref().ok_or_else(|| {
-            contract(
-                "G0 requires an exact Dashboard descriptor projection captured during construction",
-            )
-        })?;
-        let entry = store.read_public_entry(reference.proposal_ordinal)?;
-        let projected = project_accepted_pair_entry_with_descriptor(
-            &construction_identity,
-            reference.proposal_ordinal,
-            &format!("proposal-journal/{:08}.json", reference.proposal_ordinal),
-            &entry,
-            descriptor,
-        )?;
+    for (index, reference) in construction.iter().enumerate() {
+        let projected = if let Some(references) = precomputed_references {
+            let value = references.get(index).ok_or_else(|| {
+                contract("precomputed G0 accepted references do not bind construction count")
+            })?;
+            let fields = value
+                .as_object()
+                .ok_or_else(|| contract("precomputed G0 accepted reference is invalid"))?;
+            if fields
+                .get("constructionPoolIdentitySha256")
+                .and_then(Value::as_str)
+                != Some(construction_identity.as_str())
+                || fields.get("proposalOrdinal").and_then(Value::as_u64)
+                    != Some(reference.proposal_ordinal)
+                || fields.get("candidateId").and_then(Value::as_str)
+                    != Some(reference.candidate_id.as_str())
+                || fields
+                    .get("candidateIdentitySha256")
+                    .and_then(Value::as_str)
+                    != Some(reference.candidate_identity_sha256.as_str())
+            {
+                return Err(contract(
+                    "precomputed G0 accepted reference diverges from construction reference",
+                ));
+            }
+            value.clone()
+        } else {
+            let descriptor = reference.descriptor_projection.as_ref().ok_or_else(|| {
+                contract(
+                    "G0 requires an exact Dashboard descriptor projection captured during construction",
+                )
+            })?;
+            let entry = store.read_public_entry(reference.proposal_ordinal)?;
+            project_accepted_pair_entry_with_descriptor(
+                &construction_identity,
+                reference.proposal_ordinal,
+                &format!("proposal-journal/{:08}.json", reference.proposal_ordinal),
+                &entry,
+                descriptor,
+            )?
+        };
         by_key.insert(
             (
                 reference.proposal_ordinal,
@@ -518,6 +676,27 @@ fn population_template(
                 distribution.clone(),
             );
     }
+    if let Some(allocation) = &request.reproduction_allocation {
+        population
+            .as_object_mut()
+            .expect("population is object")
+            .insert("reproductionAllocation".to_owned(), allocation.clone());
+    }
+    if let Some(accounting) = &request.reproduction_allocation_accounting {
+        population
+            .as_object_mut()
+            .expect("population is object")
+            .insert(
+                "reproductionAllocationAccounting".to_owned(),
+                accounting.clone(),
+            );
+    }
+    if let Some(authority) = &request.policy.archive_policy_authority {
+        population
+            .as_object_mut()
+            .expect("population is object")
+            .insert("archivePolicyAuthority".to_owned(), authority.clone());
+    }
     Ok(population)
 }
 
@@ -529,6 +708,105 @@ fn population_stream_sha256(
     let mut writer = CanonicalSha256Writer::default();
     stream_population_value(population, selected, store, &mut writer)?;
     Ok(writer.finish())
+}
+
+/// One-pass G0 population writer.  The caller supplies a private seekable
+/// temporary file containing a fixed-width `populationSha256` placeholder.
+/// This streams the final rich candidate bytes once to both the temporary and
+/// a semantic hash that omits exactly that self-hash field, then patches the
+/// placeholder before the journal publisher fsyncs or exposes the file.
+fn stream_population_value_with_self_hash(
+    population: &Value,
+    selected: &[AcceptedReference],
+    store: &ProposalJournal,
+    writer: &mut dyn RewritableTemporaryWrite,
+    source_journal_bytes_read: &mut u64,
+) -> Result<String> {
+    let fields = population
+        .as_object()
+        .ok_or_else(|| contract("population template must be an object"))?;
+    if fields.get("populationSha256").and_then(Value::as_str) != Some(POPULATION_SHA256_PLACEHOLDER)
+    {
+        return Err(contract(
+            "G0 population temporary lacks the exact self-hash placeholder",
+        ));
+    }
+    let ordered: BTreeMap<&str, &Value> = fields
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    let mut semantic = CanonicalSha256Writer::default();
+    stream_bytes(writer, b"{")?;
+    stream_bytes(&mut semantic, b"{")?;
+    let mut output_first = true;
+    let mut semantic_first = true;
+    let mut placeholder_offset = None;
+    for (key, value) in ordered {
+        if !output_first {
+            stream_bytes(writer, b",")?;
+        }
+        output_first = false;
+        write_canonical_json(&Value::String(key.to_owned()), writer)?;
+        stream_bytes(writer, b":")?;
+
+        let is_self_hash = key == "populationSha256";
+        if !is_self_hash {
+            if !semantic_first {
+                stream_bytes(&mut semantic, b",")?;
+            }
+            semantic_first = false;
+            write_canonical_json(&Value::String(key.to_owned()), &mut semantic)?;
+            stream_bytes(&mut semantic, b":")?;
+        }
+        if key == "candidates" {
+            stream_rich_candidate_array_tee(
+                selected,
+                store,
+                writer,
+                &mut semantic,
+                source_journal_bytes_read,
+            )?;
+        } else if is_self_hash {
+            let before_value = writer
+                .stream_position()
+                .map_err(JournalError::Io)
+                .map_err(PublicationError::Journal)?;
+            write_canonical_json(value, writer)?;
+            // Canonical JSON strings are quoted and the placeholder has the
+            // same 71-byte `sha256:` shape as every real identity.
+            placeholder_offset = Some(
+                before_value
+                    .checked_add(1)
+                    .ok_or_else(|| contract("G0 population placeholder offset overflow"))?,
+            );
+        } else {
+            write_canonical_json(value, writer)?;
+            write_canonical_json(value, &mut semantic)?;
+        }
+    }
+    stream_bytes(writer, b"}")?;
+    stream_bytes(&mut semantic, b"}")?;
+    let population_sha256 = semantic.finish();
+    if population_sha256.len() != POPULATION_SHA256_PLACEHOLDER.len() {
+        return Err(contract(
+            "G0 population self-hash does not match its fixed placeholder width",
+        ));
+    }
+    let offset = placeholder_offset
+        .ok_or_else(|| contract("G0 population stream never wrote self-hash placeholder"))?;
+    writer
+        .seek(SeekFrom::Start(offset))
+        .map_err(JournalError::Io)
+        .map_err(PublicationError::Journal)?;
+    writer
+        .write_all(population_sha256.as_bytes())
+        .map_err(JournalError::Io)
+        .map_err(PublicationError::Journal)?;
+    writer
+        .seek(SeekFrom::End(0))
+        .map_err(JournalError::Io)
+        .map_err(PublicationError::Journal)?;
+    Ok(population_sha256)
 }
 
 /// Serialize the population object in exact canonical field order while
@@ -580,6 +858,52 @@ fn stream_rich_candidate_array(
     stream_bytes(writer, b"]")
 }
 
+fn stream_rich_candidate_array_tee(
+    selected: &[AcceptedReference],
+    store: &ProposalJournal,
+    output: &mut dyn RewritableTemporaryWrite,
+    semantic: &mut CanonicalSha256Writer,
+    source_journal_bytes_read: &mut u64,
+) -> Result<()> {
+    stream_bytes(output, b"[")?;
+    stream_bytes(semantic, b"[")?;
+    for (index, reference) in selected.iter().enumerate() {
+        if index != 0 {
+            stream_bytes(output, b",")?;
+            stream_bytes(semantic, b",")?;
+        }
+        let (entry, entry_bytes) =
+            store.read_public_entry_with_bytes(reference.proposal_ordinal)?;
+        *source_journal_bytes_read = source_journal_bytes_read
+            .checked_add(entry_bytes)
+            .ok_or_else(|| contract("G0 population source journal byte counter overflow"))?;
+        let fields = entry
+            .as_object()
+            .ok_or_else(|| contract("rich proposal entry is invalid"))?;
+        if fields.get("entrySha256").and_then(Value::as_str) != Some(&reference.entry_sha256) {
+            return Err(contract("accepted reference entry identity drifted"));
+        }
+        let candidate = fields
+            .get("candidate")
+            .ok_or_else(|| contract("accepted proposal entry lacks rich candidate"))?;
+        if candidate
+            .as_object()
+            .and_then(|candidate| candidate.get("candidateId"))
+            .and_then(Value::as_str)
+            != Some(&reference.candidate_id)
+        {
+            return Err(contract("accepted reference candidate ID drifted"));
+        }
+        let mut writer = TeeWriter {
+            left: output,
+            right: semantic,
+        };
+        write_canonical_json(candidate, &mut writer)?;
+    }
+    stream_bytes(output, b"]")?;
+    stream_bytes(semantic, b"]")
+}
+
 fn stream_rich_candidate(
     reference: &AcceptedReference,
     store: &ProposalJournal,
@@ -607,11 +931,29 @@ fn stream_rich_candidate(
     Ok(())
 }
 
-fn stream_bytes(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
+fn stream_bytes<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> Result<()> {
     writer
         .write_all(bytes)
         .map_err(JournalError::Io)
         .map_err(PublicationError::Journal)
+}
+
+struct TeeWriter<'a, Left: Write + ?Sized, Right: Write + ?Sized> {
+    left: &'a mut Left,
+    right: &'a mut Right,
+}
+
+impl<Left: Write + ?Sized, Right: Write + ?Sized> Write for TeeWriter<'_, Left, Right> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.left.write_all(bytes)?;
+        self.right.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.left.flush()?;
+        self.right.flush()
+    }
 }
 
 fn evaluation_value(
@@ -621,11 +963,26 @@ fn evaluation_value(
     population_file_sha256: &str,
     g0_binding: Option<&BTreeMap<String, String>>,
     store: &ProposalJournal,
+    precomputed_g0: Option<&PrecomputedG0Admission>,
 ) -> Result<Value> {
-    let candidates = selected
-        .iter()
-        .map(|reference| evaluation_candidate(store, reference))
-        .collect::<Result<Vec<_>>>()?;
+    let candidates = match precomputed_g0 {
+        Some(admission) => selected
+            .iter()
+            .map(|reference| {
+                let candidate = admission
+                    .evaluation_candidates
+                    .get(&reference.proposal_ordinal)
+                    .cloned()
+                    .ok_or_else(|| contract("precomputed G0 evaluation candidate is missing"))?;
+                validate_precomputed_evaluation_candidate(&candidate, reference)?;
+                Ok(candidate)
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => selected
+            .iter()
+            .map(|reference| evaluation_candidate(store, reference))
+            .collect::<Result<Vec<_>>>()?,
+    };
     let funnel_ordinals = if g0_binding.is_some() {
         selected
             .iter()
@@ -634,10 +991,24 @@ fn evaluation_value(
     } else {
         request.entry_ordinals.clone()
     };
-    let funnel_entries = funnel_ordinals
-        .iter()
-        .map(|ordinal| funnel_entry(store, *ordinal))
-        .collect::<Result<Vec<_>>>()?;
+    let funnel_entries = match precomputed_g0 {
+        Some(admission) if g0_binding.is_some() => selected
+            .iter()
+            .map(|reference| {
+                let funnel = admission
+                    .funnel_entries
+                    .get(&reference.proposal_ordinal)
+                    .cloned()
+                    .ok_or_else(|| contract("precomputed G0 funnel entry is missing"))?;
+                validate_precomputed_funnel_entry(&funnel, reference)?;
+                Ok(funnel)
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => funnel_ordinals
+            .iter()
+            .map(|ordinal| funnel_entry(store, *ordinal))
+            .collect::<Result<Vec<_>>>()?,
+    };
     let mut value = object([
         (
             "schemaVersion",
@@ -702,6 +1073,12 @@ fn evaluation_value(
                     .collect(),
             ),
         );
+    }
+    if let Some(authority) = &request.policy.archive_policy_authority {
+        value
+            .as_object_mut()
+            .expect("evaluation is object")
+            .insert("archivePolicyAuthority".to_owned(), authority.clone());
     }
     Ok(value)
 }
@@ -817,7 +1194,11 @@ fn generation_journal_value(
                 ("candidateIdentity", Value::from(selected.len() as u64)),
                 (
                     "pairGenome",
-                    Value::from(request.construction_references.len() as u64),
+                    Value::from(
+                        request
+                            .unique_pair_genome_count
+                            .unwrap_or(request.construction_references.len() as u64),
+                    ),
                 ),
             ]),
         ),
@@ -946,6 +1327,24 @@ fn generation_journal_value(
             distribution.clone(),
         );
     }
+    if let Some(allocation) = &request.reproduction_allocation {
+        journal
+            .as_object_mut()
+            .expect("journal is object")
+            .insert("reproductionAllocation".to_owned(), allocation.clone());
+    }
+    if let Some(accounting) = &request.reproduction_allocation_accounting {
+        journal.as_object_mut().expect("journal is object").insert(
+            "reproductionAllocationAccounting".to_owned(),
+            accounting.clone(),
+        );
+    }
+    if let Some(authority) = &request.policy.archive_policy_authority {
+        journal
+            .as_object_mut()
+            .expect("journal is object")
+            .insert("archivePolicyAuthority".to_owned(), authority.clone());
+    }
     if let Some(global_identity_ledger) = &request.global_identity_ledger {
         journal.as_object_mut().expect("journal is object").insert(
             "globalIdentityLedger".to_owned(),
@@ -955,275 +1354,377 @@ fn generation_journal_value(
     Ok(journal)
 }
 
+/// Streaming reducer for the constructor audit retained in the rich proposal
+/// journal.  The post-construction G0 transaction feeds this reducer while it
+/// is already admitting each durable entry, so it never has to reopen the
+/// whole journal merely to produce the public breadth artifact.
+#[derive(Default)]
+pub struct RichImmigrantDistributionAccumulator {
+    attempted: RichImmigrantDistribution,
+    accepted: RichImmigrantDistribution,
+}
+
+#[derive(Default)]
+struct RichImmigrantDistributionSide {
+    module_count: u64,
+    seed_name_counts: BTreeMap<String, u64>,
+    evidence_group_counts: BTreeMap<String, u64>,
+    event_binding_counts: BTreeMap<String, u64>,
+    hold_kind_counts: BTreeMap<String, u64>,
+    planned_grammar_depth_counts: BTreeMap<String, u64>,
+    applied_grammar_depth_counts: BTreeMap<String, u64>,
+    grammar_operation_family_counts: BTreeMap<String, u64>,
+    planned_indicator_depth_counts: BTreeMap<String, u64>,
+    applied_indicator_depth_counts: BTreeMap<String, u64>,
+    indicator_operator_counts: BTreeMap<String, u64>,
+    indicator_construction_kind_counts: BTreeMap<String, u64>,
+    indicator_count_counts: BTreeMap<String, u64>,
+    evidence_group_member_shape_counts: BTreeMap<String, u64>,
+}
+
+impl RichImmigrantDistributionSide {
+    fn merge(&mut self, other: Self) -> Result<()> {
+        self.module_count = self
+            .module_count
+            .checked_add(other.module_count)
+            .ok_or_else(|| contract("rich immigrant distribution module count overflow"))?;
+        merge_count_map(&mut self.seed_name_counts, other.seed_name_counts)?;
+        merge_count_map(&mut self.evidence_group_counts, other.evidence_group_counts)?;
+        merge_count_map(&mut self.event_binding_counts, other.event_binding_counts)?;
+        merge_count_map(&mut self.hold_kind_counts, other.hold_kind_counts)?;
+        merge_count_map(
+            &mut self.planned_grammar_depth_counts,
+            other.planned_grammar_depth_counts,
+        )?;
+        merge_count_map(
+            &mut self.applied_grammar_depth_counts,
+            other.applied_grammar_depth_counts,
+        )?;
+        merge_count_map(
+            &mut self.grammar_operation_family_counts,
+            other.grammar_operation_family_counts,
+        )?;
+        merge_count_map(
+            &mut self.planned_indicator_depth_counts,
+            other.planned_indicator_depth_counts,
+        )?;
+        merge_count_map(
+            &mut self.applied_indicator_depth_counts,
+            other.applied_indicator_depth_counts,
+        )?;
+        merge_count_map(
+            &mut self.indicator_operator_counts,
+            other.indicator_operator_counts,
+        )?;
+        merge_count_map(
+            &mut self.indicator_construction_kind_counts,
+            other.indicator_construction_kind_counts,
+        )?;
+        merge_count_map(
+            &mut self.indicator_count_counts,
+            other.indicator_count_counts,
+        )?;
+        merge_count_map(
+            &mut self.evidence_group_member_shape_counts,
+            other.evidence_group_member_shape_counts,
+        )?;
+        Ok(())
+    }
+
+    fn value(self) -> Value {
+        object([
+            ("moduleCount", Value::from(self.module_count)),
+            ("seedNameCounts", counts_value(&self.seed_name_counts)),
+            (
+                "evidenceGroupCounts",
+                counts_value(&self.evidence_group_counts),
+            ),
+            (
+                "eventBindingCounts",
+                counts_value(&self.event_binding_counts),
+            ),
+            ("holdKindCounts", counts_value(&self.hold_kind_counts)),
+            (
+                "plannedGrammarDepthCounts",
+                counts_value(&self.planned_grammar_depth_counts),
+            ),
+            (
+                "appliedGrammarDepthCounts",
+                counts_value(&self.applied_grammar_depth_counts),
+            ),
+            (
+                "grammarOperationFamilyCounts",
+                counts_value(&self.grammar_operation_family_counts),
+            ),
+            (
+                "plannedIndicatorDepthCounts",
+                counts_value(&self.planned_indicator_depth_counts),
+            ),
+            (
+                "appliedIndicatorDepthCounts",
+                counts_value(&self.applied_indicator_depth_counts),
+            ),
+            (
+                "indicatorOperatorCounts",
+                counts_value(&self.indicator_operator_counts),
+            ),
+            (
+                "indicatorConstructionKindCounts",
+                counts_value(&self.indicator_construction_kind_counts),
+            ),
+            (
+                "indicatorCountCounts",
+                counts_value(&self.indicator_count_counts),
+            ),
+            (
+                "evidenceGroupMemberShapeCounts",
+                counts_value(&self.evidence_group_member_shape_counts),
+            ),
+        ])
+    }
+
+    fn add_module(&mut self, module: &Map<String, Value>) -> Result<()> {
+        self.module_count += 1;
+        let selector = object_field(module, "selector");
+        increment_counter(
+            &mut self.seed_name_counts,
+            value_field(selector, "seedName"),
+        )?;
+        increment_counter(
+            &mut self.evidence_group_counts,
+            value_field(selector, "groupId"),
+        )?;
+        increment_counter(
+            &mut self.event_binding_counts,
+            value_field(selector, "eventId"),
+        )?;
+
+        let grammar = object_field(module, "grammar");
+        let indicator = object_field(module, "indicator");
+        let shape = object_field(module, "profileShape");
+        increment_counter(&mut self.hold_kind_counts, value_field(shape, "holdKind"))?;
+        increment_counter(
+            &mut self.planned_grammar_depth_counts,
+            value_field(grammar, "plannedDepth"),
+        )?;
+        increment_counter(
+            &mut self.applied_grammar_depth_counts,
+            value_field(grammar, "appliedDepth"),
+        )?;
+        if let Some(steps) = grammar.and_then(|fields| fields.get("steps")) {
+            if let Some(steps) = steps.as_array() {
+                for step in steps {
+                    if let Some(step) = step.as_object() {
+                        increment_counter(
+                            &mut self.grammar_operation_family_counts,
+                            step.get("operationFamily"),
+                        )?;
+                    }
+                }
+            }
+        }
+        increment_counter(
+            &mut self.planned_indicator_depth_counts,
+            value_field(indicator, "plannedDepth"),
+        )?;
+        increment_counter(
+            &mut self.applied_indicator_depth_counts,
+            value_field(indicator, "appliedDepth"),
+        )?;
+        if let Some(steps) = indicator.and_then(|fields| fields.get("steps")) {
+            if let Some(steps) = steps.as_array() {
+                for step in steps {
+                    if let Some(step) = step.as_object() {
+                        increment_counter(
+                            &mut self.indicator_operator_counts,
+                            step.get("operatorId"),
+                        )?;
+                        increment_counter(
+                            &mut self.indicator_construction_kind_counts,
+                            step.get("constructionKind"),
+                        )?;
+                    }
+                }
+            }
+        }
+        increment_counter(
+            &mut self.indicator_count_counts,
+            value_field(shape, "indicatorCount"),
+        )?;
+        if let Some(members) = shape
+            .and_then(|fields| fields.get("evidenceGroupMemberCounts"))
+            .filter(|value| !value.is_null())
+        {
+            increment_counter(&mut self.evidence_group_member_shape_counts, Some(members))?;
+        } else {
+            let empty_members = Value::Array(Vec::new());
+            increment_counter(
+                &mut self.evidence_group_member_shape_counts,
+                Some(&empty_members),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RichImmigrantDistribution {
+    proposal_count: u64,
+    long: RichImmigrantDistributionSide,
+    short: RichImmigrantDistributionSide,
+}
+
+impl RichImmigrantDistribution {
+    fn merge(&mut self, other: Self) -> Result<()> {
+        self.proposal_count = self
+            .proposal_count
+            .checked_add(other.proposal_count)
+            .ok_or_else(|| contract("rich immigrant distribution proposal count overflow"))?;
+        self.long.merge(other.long)?;
+        self.short.merge(other.short)
+    }
+
+    fn value(self) -> Value {
+        object([
+            ("proposalCount", Value::from(self.proposal_count)),
+            (
+                "sides",
+                object([("long", self.long.value()), ("short", self.short.value())]),
+            ),
+        ])
+    }
+
+    fn add(&mut self, modules: &Map<String, Value>) -> Result<()> {
+        self.proposal_count += 1;
+        if let Some(module) = modules.get("long").and_then(Value::as_object) {
+            self.long.add_module(module)?;
+        }
+        if let Some(module) = modules.get("short").and_then(Value::as_object) {
+            self.short.add_module(module)?;
+        }
+        Ok(())
+    }
+}
+
+fn object_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Option<&'a Map<String, Value>> {
+    fields.get(name).and_then(Value::as_object)
+}
+
+fn value_field<'a>(fields: Option<&'a Map<String, Value>>, name: &str) -> Option<&'a Value> {
+    fields.and_then(|fields| fields.get(name))
+}
+
+fn python_counter_key(value: Option<&Value>) -> Result<String> {
+    match value.unwrap_or(&Value::Null) {
+        Value::Null => Ok("None".to_owned()),
+        Value::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        rich @ (Value::Array(_) | Value::Object(_)) => Ok(canonical_json(rich)?),
+    }
+}
+
+fn increment_counter(target: &mut BTreeMap<String, u64>, value: Option<&Value>) -> Result<()> {
+    let key = python_counter_key(value)?;
+    *target.entry(key).or_default() += 1;
+    Ok(())
+}
+
+fn merge_count_map(
+    target: &mut BTreeMap<String, u64>,
+    source: BTreeMap<String, u64>,
+) -> Result<()> {
+    for (key, count) in source {
+        let current = target.entry(key).or_default();
+        *current = current
+            .checked_add(count)
+            .ok_or_else(|| contract("rich immigrant distribution count overflow"))?;
+    }
+    Ok(())
+}
+
+impl RichImmigrantDistributionAccumulator {
+    /// Observe one immutable proposal entry.  Entries without a rich factory
+    /// audit intentionally do not participate, matching the Python oracle's
+    /// historical optional-distribution behavior.
+    pub fn observe(&mut self, entry: &Value) -> Result<()> {
+        let modules = entry
+            .as_object()
+            .and_then(|entry| entry.get("proposal"))
+            .and_then(Value::as_object)
+            .and_then(|proposal| proposal.get("factoryConstructionAudit"))
+            .and_then(Value::as_object)
+            .and_then(|audit| audit.get("sides"))
+            .and_then(Value::as_object);
+        let Some(modules) = modules else {
+            return Ok(());
+        };
+        self.attempted.add(modules)?;
+        if entry
+            .as_object()
+            .and_then(|fields| fields.get("disposition"))
+            .and_then(Value::as_str)
+            == Some("accepted")
+        {
+            self.accepted.add(modules)?;
+        }
+        Ok(())
+    }
+
+    /// Merge independently admitted journal ranges.  All exposed state is a
+    /// commutative count reducer, so this preserves the exact serial public
+    /// distribution while allowing bounded parallel source admission.
+    pub fn merge(&mut self, other: Self) -> Result<()> {
+        self.attempted.merge(other.attempted)?;
+        self.accepted.merge(other.accepted)
+    }
+
+    pub fn finish(self) -> Result<Option<Value>> {
+        if self.attempted.proposal_count == 0 {
+            return Ok(None);
+        }
+        let mut distribution = object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_rich_immigrant_distribution_v1".to_owned()),
+            ),
+            ("attempted", self.attempted.value()),
+            ("accepted", self.accepted.value()),
+        ]);
+        let distribution_sha256 = canonical_sha256(&distribution)?;
+        distribution
+            .as_object_mut()
+            .expect("immigrant distribution is object")
+            .insert(
+                "distributionSha256".to_owned(),
+                Value::String(distribution_sha256),
+            );
+        Ok(Some(distribution))
+    }
+}
+
 /// Reduce the constructor audit retained in the rich proposal journal into the
 /// legacy immigrant-breadth artifact.  This deliberately reads the durable
 /// rich entries rather than construction-time summaries: the public aggregate
 /// must describe exactly the bytes that were admitted to the journal.
-fn rich_immigrant_distribution(
+pub fn rich_immigrant_distribution(
     store: &ProposalJournal,
     entry_ordinals: &[u64],
 ) -> Result<Option<Value>> {
-    #[derive(Default)]
-    struct Side {
-        module_count: u64,
-        seed_name_counts: BTreeMap<String, u64>,
-        evidence_group_counts: BTreeMap<String, u64>,
-        event_binding_counts: BTreeMap<String, u64>,
-        hold_kind_counts: BTreeMap<String, u64>,
-        planned_grammar_depth_counts: BTreeMap<String, u64>,
-        applied_grammar_depth_counts: BTreeMap<String, u64>,
-        grammar_operation_family_counts: BTreeMap<String, u64>,
-        planned_indicator_depth_counts: BTreeMap<String, u64>,
-        applied_indicator_depth_counts: BTreeMap<String, u64>,
-        indicator_operator_counts: BTreeMap<String, u64>,
-        indicator_construction_kind_counts: BTreeMap<String, u64>,
-        indicator_count_counts: BTreeMap<String, u64>,
-        evidence_group_member_shape_counts: BTreeMap<String, u64>,
-    }
-
-    impl Side {
-        fn value(self) -> Value {
-            object([
-                ("moduleCount", Value::from(self.module_count)),
-                ("seedNameCounts", counts_value(&self.seed_name_counts)),
-                (
-                    "evidenceGroupCounts",
-                    counts_value(&self.evidence_group_counts),
-                ),
-                (
-                    "eventBindingCounts",
-                    counts_value(&self.event_binding_counts),
-                ),
-                ("holdKindCounts", counts_value(&self.hold_kind_counts)),
-                (
-                    "plannedGrammarDepthCounts",
-                    counts_value(&self.planned_grammar_depth_counts),
-                ),
-                (
-                    "appliedGrammarDepthCounts",
-                    counts_value(&self.applied_grammar_depth_counts),
-                ),
-                (
-                    "grammarOperationFamilyCounts",
-                    counts_value(&self.grammar_operation_family_counts),
-                ),
-                (
-                    "plannedIndicatorDepthCounts",
-                    counts_value(&self.planned_indicator_depth_counts),
-                ),
-                (
-                    "appliedIndicatorDepthCounts",
-                    counts_value(&self.applied_indicator_depth_counts),
-                ),
-                (
-                    "indicatorOperatorCounts",
-                    counts_value(&self.indicator_operator_counts),
-                ),
-                (
-                    "indicatorConstructionKindCounts",
-                    counts_value(&self.indicator_construction_kind_counts),
-                ),
-                (
-                    "indicatorCountCounts",
-                    counts_value(&self.indicator_count_counts),
-                ),
-                (
-                    "evidenceGroupMemberShapeCounts",
-                    counts_value(&self.evidence_group_member_shape_counts),
-                ),
-            ])
-        }
-
-        fn add_module(&mut self, module: &Map<String, Value>) -> Result<()> {
-            self.module_count += 1;
-            let selector = object_field(module, "selector");
-            increment_counter(
-                &mut self.seed_name_counts,
-                value_field(selector, "seedName"),
-            )?;
-            increment_counter(
-                &mut self.evidence_group_counts,
-                value_field(selector, "groupId"),
-            )?;
-            increment_counter(
-                &mut self.event_binding_counts,
-                value_field(selector, "eventId"),
-            )?;
-
-            let grammar = object_field(module, "grammar");
-            let indicator = object_field(module, "indicator");
-            let shape = object_field(module, "profileShape");
-            increment_counter(&mut self.hold_kind_counts, value_field(shape, "holdKind"))?;
-            increment_counter(
-                &mut self.planned_grammar_depth_counts,
-                value_field(grammar, "plannedDepth"),
-            )?;
-            increment_counter(
-                &mut self.applied_grammar_depth_counts,
-                value_field(grammar, "appliedDepth"),
-            )?;
-            if let Some(steps) = grammar.and_then(|fields| fields.get("steps")) {
-                if let Some(steps) = steps.as_array() {
-                    for step in steps {
-                        if let Some(step) = step.as_object() {
-                            increment_counter(
-                                &mut self.grammar_operation_family_counts,
-                                step.get("operationFamily"),
-                            )?;
-                        }
-                    }
-                }
-            }
-            increment_counter(
-                &mut self.planned_indicator_depth_counts,
-                value_field(indicator, "plannedDepth"),
-            )?;
-            increment_counter(
-                &mut self.applied_indicator_depth_counts,
-                value_field(indicator, "appliedDepth"),
-            )?;
-            if let Some(steps) = indicator.and_then(|fields| fields.get("steps")) {
-                if let Some(steps) = steps.as_array() {
-                    for step in steps {
-                        if let Some(step) = step.as_object() {
-                            increment_counter(
-                                &mut self.indicator_operator_counts,
-                                step.get("operatorId"),
-                            )?;
-                            increment_counter(
-                                &mut self.indicator_construction_kind_counts,
-                                step.get("constructionKind"),
-                            )?;
-                        }
-                    }
-                }
-            }
-            increment_counter(
-                &mut self.indicator_count_counts,
-                value_field(shape, "indicatorCount"),
-            )?;
-            if let Some(members) = shape
-                .and_then(|fields| fields.get("evidenceGroupMemberCounts"))
-                .filter(|value| !value.is_null())
-            {
-                increment_counter(&mut self.evidence_group_member_shape_counts, Some(members))?;
-            } else {
-                let empty_members = Value::Array(Vec::new());
-                increment_counter(
-                    &mut self.evidence_group_member_shape_counts,
-                    Some(&empty_members),
-                )?;
-            }
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct Distribution {
-        proposal_count: u64,
-        long: Side,
-        short: Side,
-    }
-
-    impl Distribution {
-        fn value(self) -> Value {
-            object([
-                ("proposalCount", Value::from(self.proposal_count)),
-                (
-                    "sides",
-                    object([("long", self.long.value()), ("short", self.short.value())]),
-                ),
-            ])
-        }
-
-        fn add(&mut self, entry: &Value) -> Result<bool> {
-            let modules = entry
-                .as_object()
-                .and_then(|entry| entry.get("proposal"))
-                .and_then(Value::as_object)
-                .and_then(|proposal| proposal.get("factoryConstructionAudit"))
-                .and_then(Value::as_object)
-                .and_then(|audit| audit.get("sides"))
-                .and_then(Value::as_object);
-            let Some(modules) = modules else {
-                return Ok(false);
-            };
-            self.proposal_count += 1;
-            if let Some(module) = modules.get("long").and_then(Value::as_object) {
-                self.long.add_module(module)?;
-            }
-            if let Some(module) = modules.get("short").and_then(Value::as_object) {
-                self.short.add_module(module)?;
-            }
-            Ok(true)
-        }
-    }
-
-    fn object_field<'a>(
-        fields: &'a Map<String, Value>,
-        name: &str,
-    ) -> Option<&'a Map<String, Value>> {
-        fields.get(name).and_then(Value::as_object)
-    }
-
-    fn value_field<'a>(fields: Option<&'a Map<String, Value>>, name: &str) -> Option<&'a Value> {
-        fields.and_then(|fields| fields.get(name))
-    }
-
-    fn python_counter_key(value: Option<&Value>) -> Result<String> {
-        match value.unwrap_or(&Value::Null) {
-            Value::Null => Ok("None".to_owned()),
-            Value::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
-            Value::String(value) => Ok(value.clone()),
-            Value::Number(value) => Ok(value.to_string()),
-            rich @ (Value::Array(_) | Value::Object(_)) => Ok(canonical_json(rich)?),
-        }
-    }
-
-    fn increment_counter(target: &mut BTreeMap<String, u64>, value: Option<&Value>) -> Result<()> {
-        let key = python_counter_key(value)?;
-        *target.entry(key).or_default() += 1;
-        Ok(())
-    }
-
-    let mut attempted = Distribution::default();
-    let mut accepted = Distribution::default();
+    let mut distribution = RichImmigrantDistributionAccumulator::default();
     for ordinal in entry_ordinals {
         let entry = store.read_public_entry(*ordinal)?;
-        if attempted.add(&entry)?
-            && entry
-                .as_object()
-                .and_then(|fields| fields.get("disposition"))
-                .and_then(Value::as_str)
-                == Some("accepted")
-        {
-            accepted.add(&entry)?;
-        }
+        distribution.observe(&entry)?;
     }
-    if attempted.proposal_count == 0 {
-        return Ok(None);
-    }
-    let mut distribution = object([
-        (
-            "schemaVersion",
-            Value::String("temporal_qd_rich_immigrant_distribution_v1".to_owned()),
-        ),
-        ("attempted", attempted.value()),
-        ("accepted", accepted.value()),
-    ]);
-    let distribution_sha256 = canonical_sha256(&distribution)?;
-    distribution
-        .as_object_mut()
-        .expect("immigrant distribution is object")
-        .insert(
-            "distributionSha256".to_owned(),
-            Value::String(distribution_sha256),
-        );
-    Ok(Some(distribution))
+    distribution.finish()
 }
 
 fn rich_candidate(store: &ProposalJournal, reference: &AcceptedReference) -> Result<Value> {
     let entry = store.read_public_entry(reference.proposal_ordinal)?;
+    rich_candidate_from_entry(&entry, reference)
+}
+
+fn rich_candidate_from_entry(entry: &Value, reference: &AcceptedReference) -> Result<Value> {
     let fields = entry
         .as_object()
         .ok_or_else(|| contract("rich proposal entry is invalid"))?;
@@ -1247,6 +1748,25 @@ fn rich_candidate(store: &ProposalJournal, reference: &AcceptedReference) -> Res
 
 fn evaluation_candidate(store: &ProposalJournal, reference: &AcceptedReference) -> Result<Value> {
     let candidate = rich_candidate(store, reference)?;
+    evaluation_candidate_from_rich_candidate(&candidate, reference)
+}
+
+/// Derive the compact evaluation projection at the same point the caller has
+/// already authenticated an immutable journal row.  This is crate-visible so
+/// the native G0 admission workers can retain only the projection instead of
+/// reopening the rich source entry during publication.
+pub(crate) fn evaluation_candidate_from_entry(
+    entry: &Value,
+    reference: &AcceptedReference,
+) -> Result<Value> {
+    let candidate = rich_candidate_from_entry(entry, reference)?;
+    evaluation_candidate_from_rich_candidate(&candidate, reference)
+}
+
+fn evaluation_candidate_from_rich_candidate(
+    candidate: &Value,
+    reference: &AcceptedReference,
+) -> Result<Value> {
     let fields = candidate
         .as_object()
         .ok_or_else(|| contract("rich candidate is invalid"))?;
@@ -1293,6 +1813,12 @@ fn evaluation_candidate(store: &ProposalJournal, reference: &AcceptedReference) 
 
 fn funnel_entry(store: &ProposalJournal, ordinal: u64) -> Result<Value> {
     let entry = store.read_public_entry(ordinal)?;
+    funnel_entry_from_entry(&entry)
+}
+
+/// Compact the public funnel row from an already authenticated source entry.
+/// The value is deliberately exact to the historical reread implementation.
+pub(crate) fn funnel_entry_from_entry(entry: &Value) -> Result<Value> {
     let fields = entry
         .as_object()
         .ok_or_else(|| contract("proposal journal entry is invalid"))?;
@@ -1339,6 +1865,43 @@ fn funnel_entry(store: &ProposalJournal, ordinal: u64) -> Result<Value> {
             .insert("funnelCandidate".to_owned(), value.clone());
     }
     Ok(funnel)
+}
+
+fn validate_precomputed_evaluation_candidate(
+    candidate: &Value,
+    reference: &AcceptedReference,
+) -> Result<()> {
+    let fields = candidate
+        .as_object()
+        .ok_or_else(|| contract("precomputed G0 evaluation candidate is invalid"))?;
+    if fields.get("candidateId").and_then(Value::as_str) != Some(&reference.candidate_id)
+        || fields
+            .get("candidateIdentitySha256")
+            .and_then(Value::as_str)
+            != Some(&reference.candidate_identity_sha256)
+        || fields.get("proposalOrdinal").and_then(Value::as_u64) != Some(reference.proposal_ordinal)
+        || fields.get("proposalEntrySha256").and_then(Value::as_str)
+            != Some(&reference.entry_sha256)
+    {
+        return Err(contract(
+            "precomputed G0 evaluation candidate diverges from selected reference",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_precomputed_funnel_entry(funnel: &Value, reference: &AcceptedReference) -> Result<()> {
+    let fields = funnel
+        .as_object()
+        .ok_or_else(|| contract("precomputed G0 funnel entry is invalid"))?;
+    if fields.get("entrySha256").and_then(Value::as_str) != Some(&reference.entry_sha256)
+        || fields.get("proposalOrdinal").and_then(Value::as_u64) != Some(reference.proposal_ordinal)
+    {
+        return Err(contract(
+            "precomputed G0 funnel entry diverges from selected reference",
+        ));
+    }
+    Ok(())
 }
 
 fn proposal_slots(request: &PublicationRequest, accepted: u64, g0: bool) -> Value {

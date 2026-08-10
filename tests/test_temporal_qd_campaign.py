@@ -277,6 +277,175 @@ def test_pair_campaign_uses_compact_evaluation_population_without_loading_rich_s
     assert result["taskCount"] == 1
 
 
+def _write_native_g0_receipt_fixture(population_path: Path, template: dict) -> dict:
+    """Add a small sealed native-G0 receipt without any G0 pool artifacts."""
+
+    projection = _write_pair_evaluation_projection(population_path, template)
+    sidecar_path = population_path.with_name("evaluation-population.json")
+    journal_path = population_path.with_name("generation-journal.json")
+    bootstrap = {
+        "constructionPoolIdentitySha256": "sha256:" + "1" * 64,
+        "acceptedPoolSha256": "sha256:" + "2" * 64,
+        "selectionSha256": "sha256:" + "3" * 64,
+        "ledgerSha256": "sha256:" + "4" * 64,
+    }
+    projection["g0Bootstrap"] = bootstrap
+    projection["evaluationPopulationSha256"] = canonical_sha256(
+        {key: value for key, value in projection.items() if key != "evaluationPopulationSha256"}
+    )
+    _write(sidecar_path, projection)
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    allocation = {
+        "schemaVersion": "temporal_qd_reproduction_allocation_v1",
+        "allocationSha256": "sha256:" + "5" * 64,
+    }
+    accounting = {
+        "schemaVersion": "temporal_qd_reproduction_allocation_accounting_v1",
+        "accountingSha256": "sha256:" + "6" * 64,
+    }
+    journal.update({
+        "evaluationPopulationSha256": projection["evaluationPopulationSha256"],
+        "g0Bootstrap": bootstrap,
+        "globalIdentityLedger": None,
+        "reproductionAllocation": allocation,
+        "reproductionAllocationAccounting": accounting,
+    })
+    journal["journalSha256"] = canonical_sha256(
+        {key: value for key, value in journal.items() if key != "journalSha256"}
+    )
+    _write(journal_path, journal)
+    artifact = lambda path, semantic: {
+        "relativePath": path.name,
+        "semanticSha256": semantic,
+        "fileSha256": raw_file_sha256(path),
+        "encodedBytes": path.stat().st_size,
+    }
+    pair_result = {
+        "schemaVersion": "temporal_qd_pair_generation_result_v1",
+        "configSha256": projection["pairGenerationConfigSha256"],
+        "populationSha256": projection["populationSha256"],
+        "evaluationPopulationSha256": projection["evaluationPopulationSha256"],
+        "journalSha256": journal["journalSha256"],
+        "g0Bootstrap": bootstrap,
+        "reproductionAllocation": allocation,
+        "reproductionAllocationAccounting": accounting,
+    }
+    batch_authority = {
+        "schemaVersion": "temporal_qd_native_authority_v1",
+        "contractVersion": "temporal_qd_native_foundation_v1",
+        "crateVersion": "0.1.0",
+        "binaryName": "temporal-qd-batch",
+        "buildProfile": "release",
+        "executableSha256": "sha256:" + "a" * 64,
+        "sourceSha256": "sha256:" + "b" * 64,
+    }
+    batch_authority["authoritySha256"] = canonical_sha256(batch_authority)
+    execution_authority = {
+        "schemaVersion": "temporal_qd_native_g0_execution_authority_v1",
+        "g0FinalizationRuntimeSha256": "sha256:" + "c" * 64,
+        "nativeBatchAuthority": batch_authority,
+        "nativeBatchAuthoritySha256": batch_authority["authoritySha256"],
+    }
+    execution_authority["authoritySha256"] = canonical_sha256(execution_authority)
+    receipt = {
+        "schemaVersion": "temporal_qd_native_g0_funnel_receipt_v2",
+        "requestSha256": "sha256:" + "7" * 64,
+        "authoritySha256": execution_authority["authoritySha256"],
+        "executionAuthority": execution_authority,
+        "configSha256": projection["pairGenerationConfigSha256"],
+        "generationIndex": projection["generationIndex"],
+        "constructionPoolSize": 1,
+        "evaluationPopulationSize": 1,
+        "operatorImplementationSha256": projection["operatorImplementationSha256"],
+        "archivePolicyAuthoritySha256": None,
+        "journalInventorySha256": "sha256:" + "9" * 64,
+        "sourceHandoffSha256": None,
+        "globalIdentityLedger": None,
+        "identityLedgerBinding": None,
+        "g0Bootstrap": bootstrap,
+        "population": artifact(population_path, projection["populationSha256"]),
+        "evaluationPopulation": artifact(
+            sidecar_path, projection["evaluationPopulationSha256"]
+        ),
+        "generationJournal": artifact(journal_path, journal["journalSha256"]),
+        "pairGenerationResult": pair_result,
+        **bootstrap,
+    }
+    receipt["receiptSha256"] = canonical_sha256(receipt)
+    receipt_path = population_path.parent / "internal" / "g0-funnel" / "receipt.json"
+    receipt_path.parent.mkdir(parents=True)
+    _write(receipt_path, receipt)
+    return receipt
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("population.json", "evaluation-population.json", "generation-journal.json"),
+)
+def test_native_g0_receipt_rehashes_each_public_output_and_rejects_same_length_tamper(
+    tmp_path: Path, artifact_name: str,
+) -> None:
+    population_path = tmp_path / "proposal" / "population.json"
+    population_path.parent.mkdir()
+    _write_native_g0_receipt_fixture(population_path, _template())
+
+    projection = load_evaluation_population(
+        population_path=population_path,
+        journal_path=population_path.with_name("generation-journal.json"),
+        verify_population_file=True,
+    )
+    assert projection["g0Bootstrap"]["selectionSha256"] == "sha256:" + "3" * 64
+    assert not (population_path.parent / "g0-bootstrap").exists()
+    artifact_path = population_path.with_name(artifact_name)
+    original = artifact_path.read_bytes()
+    if artifact_name == "population.json":
+        # The rich population is intentionally not decoded on this fast path.
+        # Replace one authored value directly while retaining valid JSON,
+        # canonical byte length, and its platform newline.
+        encoded = original.replace(b"provenance", b"xrovenance", 1)
+        assert encoded != original
+    else:
+        tampered = json.loads(original)
+        policy_name = tampered["policyName"]
+        assert isinstance(policy_name, str) and policy_name
+        tampered["policyName"] = "x" + policy_name[1:]
+        # Preserve each applicable semantic self-hash so this is specifically
+        # a same-length receipt-file-hash tripwire, not a JSON/schema failure.
+        if artifact_name == "evaluation-population.json":
+            tampered.pop("evaluationPopulationSha256")
+            tampered["evaluationPopulationSha256"] = canonical_sha256(tampered)
+        else:
+            tampered.pop("journalSha256")
+            tampered["journalSha256"] = canonical_sha256(tampered)
+        encoded = json.dumps(tampered, sort_keys=True).encode("utf-8")
+    artifact_path.write_bytes(encoded)
+    assert artifact_path.stat().st_size == len(original)
+    with pytest.raises(TemporalDiscoveryContractError, match="file identity drifted"):
+        load_evaluation_population(
+            population_path=population_path,
+            journal_path=population_path.with_name("generation-journal.json"),
+            verify_population_file=True,
+        )
+
+
+def test_native_g0_receipt_rejects_rehashed_bootstrap_drift(tmp_path: Path) -> None:
+    population_path = tmp_path / "proposal" / "population.json"
+    population_path.parent.mkdir()
+    receipt = _write_native_g0_receipt_fixture(population_path, _template())
+    receipt["selectionSha256"] = "sha256:" + "f" * 64
+    receipt["receiptSha256"] = canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receiptSha256"}
+    )
+    receipt_path = population_path.parent / "internal" / "g0-funnel" / "receipt.json"
+    _write(receipt_path, receipt)
+    with pytest.raises(TemporalDiscoveryContractError, match="bootstrap binding drifted"):
+        load_evaluation_population(
+            population_path=population_path,
+            journal_path=population_path.with_name("generation-journal.json"),
+            verify_population_file=False,
+        )
+
+
 def test_pair_campaign_fails_closed_when_rich_source_bytes_drift(
     tmp_path: Path,
 ) -> None:

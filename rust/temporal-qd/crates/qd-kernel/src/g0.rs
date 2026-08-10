@@ -7,7 +7,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
-use crate::genome::{FrozenModule, FrozenPair};
+use crate::genome::{FrozenModule, FrozenPair, IdentitySnapshot, MODULE_SCHEMA, PAIR_SCHEMA};
 use temporal_qd_contract::{ContractError, Map, Value, canonical_sha256};
 
 pub const ACCEPTED_REFERENCE_SCHEMA: &str = "temporal_qd_g0_accepted_reference_v4";
@@ -93,6 +93,41 @@ pub struct AcceptedEntrySurface {
     pub proposal_ordinal: u64,
     pub generation_index: u64,
     pub birth_ordinal: u64,
+}
+
+/// The compact, independently verified facts a streaming G0 admission needs
+/// from one rich construction entry.  It deliberately exposes no rich graph
+/// or Dashboard payload: callers can retain this across thousands of rows
+/// without retaining a population-sized Python/Rust object graph.
+#[derive(Clone, Debug)]
+pub struct AdmittedAcceptedPairEntry {
+    pub entry_sha256: String,
+    pub proposal_ordinal: u64,
+    pub generation_index: u64,
+    pub birth_ordinal: u64,
+    pub candidate_id: String,
+    pub candidate_identity_sha256: String,
+    pub executable_semantic_sha256: String,
+    pub descriptor_projection: Value,
+}
+
+/// The descriptor layer is deliberately narrower than the construction
+/// codec.  Both the historical typed-fragment pair and the v5 evolvable pair
+/// authenticate their compiled profile, catalog snapshot, and native report
+/// before reaching this shape; from here on descriptor semantics are exactly
+/// shared.
+struct DescriptorModule<'a> {
+    profile: &'a Value,
+    catalog_payload: &'a Value,
+    catalog_sha256: &'a str,
+}
+
+struct DescriptorPair<'a> {
+    profile: &'a Value,
+    long: DescriptorModule<'a>,
+    short: DescriptorModule<'a>,
+    pair_identity_sha256: String,
+    native_validation_report_sha256: &'a str,
 }
 
 fn contract(message: impl Into<String>) -> G0Error {
@@ -1157,36 +1192,89 @@ pub fn validate_accepted_entry_surface(entry: &Value) -> Result<AcceptedEntrySur
     )?;
     if let Some(audit_value) = proposal.get("factoryConstructionAudit") {
         let audit = object_ref(audit_value, "G0 factory construction audit")?;
-        exact_keys(
-            audit,
-            &[
-                "schemaVersion",
-                "pairIdentitySha256",
-                "sides",
-                "auditSha256",
-            ],
-            &[],
-            "G0 factory construction audit",
-        )?;
-        require_schema(
+        match text(
             required(audit, "schemaVersion", "G0 factory construction audit")?,
-            "temporal_qd_rich_immigrant_pair_construction_v1",
-            "G0 factory construction audit",
-        )?;
-        if sha(
-            required(audit, "pairIdentitySha256", "G0 factory construction audit")?,
-            "factory construction audit pairIdentitySha256",
-        )? != sha(
-            required(proposal, "pairIdentitySha256", "G0 immigrant proposal")?,
-            "proposal pairIdentitySha256",
-        )? {
-            return Err(contract("G0 factory construction audit identity drift"));
+            "G0 factory construction audit schema",
+        )?
+        .as_str()
+        {
+            "temporal_qd_rich_immigrant_pair_construction_v1" => {
+                exact_keys(
+                    audit,
+                    &[
+                        "schemaVersion",
+                        "pairIdentitySha256",
+                        "sides",
+                        "auditSha256",
+                    ],
+                    &[],
+                    "G0 factory construction audit",
+                )?;
+                if sha(
+                    required(audit, "pairIdentitySha256", "G0 factory construction audit")?,
+                    "factory construction audit pairIdentitySha256",
+                )? != sha(
+                    required(proposal, "pairIdentitySha256", "G0 immigrant proposal")?,
+                    "proposal pairIdentitySha256",
+                )? {
+                    return Err(contract("G0 factory construction audit identity drift"));
+                }
+                object_ref(
+                    required(audit, "sides", "G0 factory construction audit")?,
+                    "G0 factory construction audit sides",
+                )?;
+                verify_self_hash(audit_value, "auditSha256", "G0 factory construction audit")?;
+            }
+            "temporal_qd_evolvable_module_factory_audit_v1" => {
+                exact_keys(
+                    audit,
+                    &[
+                        "schemaVersion",
+                        "authoritySha256",
+                        "pairIdentitySha256",
+                        "sides",
+                        "auditSha256",
+                    ],
+                    &[],
+                    "G0 evolvable factory construction audit",
+                )?;
+                sha(
+                    required(
+                        audit,
+                        "authoritySha256",
+                        "G0 evolvable factory construction audit",
+                    )?,
+                    "evolvable factory authoritySha256",
+                )?;
+                if sha(
+                    required(
+                        audit,
+                        "pairIdentitySha256",
+                        "G0 evolvable factory construction audit",
+                    )?,
+                    "evolvable factory audit pairIdentitySha256",
+                )? != sha(
+                    required(proposal, "pairIdentitySha256", "G0 immigrant proposal")?,
+                    "proposal pairIdentitySha256",
+                )? {
+                    return Err(contract("G0 evolvable factory audit identity drift"));
+                }
+                object_ref(
+                    required(audit, "sides", "G0 evolvable factory construction audit")?,
+                    "G0 evolvable factory audit sides",
+                )?;
+                verify_self_hash(
+                    audit_value,
+                    "auditSha256",
+                    "G0 evolvable factory construction audit",
+                )?;
+            }
+            _ => {
+                return Err(contract(
+                    "G0 factory construction audit schema is not admitted",
+                ));
+            }
         }
-        object_ref(
-            required(audit, "sides", "G0 factory construction audit")?,
-            "G0 factory construction audit sides",
-        )?;
-        verify_self_hash(audit_value, "auditSha256", "G0 factory construction audit")?;
     }
 
     let candidate_value = required(row, "candidate", "G0 accepted journal entry")?;
@@ -1806,7 +1894,16 @@ fn verify_accepted_entry(entry: &Value) -> Result<(AcceptedEntrySurface, FrozenP
             "accepted candidate does not bind exact pair proposal",
         ));
     }
-    if let Some(audit_value) = proposal.get("factoryConstructionAudit") {
+    if proposal
+        .get("factoryConstructionAudit")
+        .and_then(Value::as_object)
+        .and_then(|audit| audit.get("schemaVersion"))
+        .and_then(Value::as_str)
+        == Some("temporal_qd_rich_immigrant_pair_construction_v1")
+    {
+        let audit_value = proposal
+            .get("factoryConstructionAudit")
+            .expect("schema lookup requires audit");
         let audit = object_ref(audit_value, "G0 factory construction audit")?;
         let mut expected_sides = Value::Object(Default::default());
         for module in [&pair.long, &pair.short] {
@@ -1843,6 +1940,1373 @@ fn verify_accepted_entry(entry: &Value) -> Result<(AcceptedEntrySurface, FrozenP
         }
     }
     Ok((surface, pair))
+}
+
+#[derive(Clone, Debug)]
+struct EvolvableModuleFacts {
+    program_sha256: String,
+    semantic_topology_sha256: String,
+    resource_fingerprint_sha256: String,
+    adapter: FrozenModule,
+}
+
+#[derive(Clone, Debug)]
+struct EvolvablePairFacts {
+    pair_identity_sha256: String,
+    adapter: FrozenPair,
+    long_program_sha256: String,
+    short_program_sha256: String,
+    long_semantic_topology_sha256: String,
+    short_semantic_topology_sha256: String,
+    long_resource_fingerprint_sha256: String,
+    short_resource_fingerprint_sha256: String,
+}
+
+fn is_evolvable_pair_entry(entry: &Value) -> bool {
+    entry
+        .get("candidate")
+        .and_then(Value::as_object)
+        .and_then(|candidate| candidate.get("bidirectionalGenome"))
+        .and_then(Value::as_object)
+        .and_then(|pair| pair.get("long"))
+        .and_then(Value::as_object)
+        .and_then(|module| module.get("program"))
+        .and_then(Value::as_object)
+        .and_then(|program| program.get("programKind"))
+        .and_then(Value::as_str)
+        == Some("evolvable_module_genome_v1")
+}
+
+fn verify_evolvable_accepted_entry(
+    entry: &Value,
+    surface: AcceptedEntrySurface,
+    expected_operator_implementation: Option<&Value>,
+) -> Result<(AcceptedEntrySurface, EvolvablePairFacts)> {
+    let row = object_ref(entry, "G0 evolvable accepted journal entry")?;
+    let candidate_value = required(row, "candidate", "G0 evolvable accepted journal entry")?;
+    let candidate = object_ref(candidate_value, "G0 evolvable accepted candidate")?;
+    let proposal_value = required(row, "proposal", "G0 evolvable accepted journal entry")?;
+    let proposal = object_ref(proposal_value, "G0 evolvable immigrant proposal")?;
+    let pair_value = required(
+        candidate,
+        "bidirectionalGenome",
+        "G0 evolvable accepted candidate",
+    )?;
+    let facts = validate_evolvable_pair(pair_value)?;
+    if required(proposal, "factoryPair", "G0 evolvable immigrant proposal")? != pair_value
+        || sha(
+            required(
+                proposal,
+                "pairIdentitySha256",
+                "G0 evolvable immigrant proposal",
+            )?,
+            "evolvable proposal pairIdentitySha256",
+        )? != facts.pair_identity_sha256
+    {
+        return Err(contract(
+            "evolvable accepted proposal frozen pair does not bind candidate genome",
+        ));
+    }
+    let material = object_ref(
+        required(
+            candidate,
+            "candidateIdentityMaterial",
+            "G0 evolvable accepted candidate",
+        )?,
+        "G0 evolvable candidate identity material",
+    )?;
+    if sha(
+        required(
+            material,
+            "bidirectionalGenomeIdentitySha256",
+            "G0 evolvable candidate identity material",
+        )?,
+        "evolvable candidate pair identity",
+    )? != facts.pair_identity_sha256
+    {
+        return Err(contract(
+            "evolvable candidate identity does not bind frozen pair",
+        ));
+    }
+    let side_lineage = facts.adapter.side_targeted_lineage.clone();
+    if required(
+        material,
+        "orderedSideLineage",
+        "G0 evolvable candidate identity material",
+    )? != &Value::Array(side_lineage.clone())
+        || required(
+            candidate,
+            "structuralOperatorHistory",
+            "G0 evolvable accepted candidate",
+        )? != &Value::Array(side_lineage.clone())
+        || integer(
+            required(
+                candidate,
+                "structuralDepth",
+                "G0 evolvable accepted candidate",
+            )?,
+            "evolvable candidate structuralDepth",
+            0,
+        )? != side_lineage.len() as u64
+    {
+        return Err(contract("evolvable candidate structural lineage drift"));
+    }
+    let lineage = object_ref(
+        required(candidate, "lineage", "G0 evolvable accepted candidate")?,
+        "G0 evolvable candidate lineage",
+    )?;
+    if text(
+        required(lineage, "candidateId", "G0 evolvable candidate lineage")?,
+        "evolvable lineage candidateId",
+    )? != surface.candidate_id
+        || sha(
+            required(
+                lineage,
+                "candidateIdentitySha256",
+                "G0 evolvable candidate lineage",
+            )?,
+            "evolvable lineage candidate identity",
+        )? != surface.candidate_identity_sha256
+        || sha(
+            required(
+                lineage,
+                "pairIdentitySha256",
+                "G0 evolvable candidate lineage",
+            )?,
+            "evolvable lineage pair identity",
+        )? != facts.pair_identity_sha256
+        || required(
+            lineage,
+            "orderedSideLineage",
+            "G0 evolvable candidate lineage",
+        )? != &Value::Array(side_lineage.clone())
+    {
+        return Err(contract(
+            "evolvable candidate lineage does not bind frozen pair",
+        ));
+    }
+    let source_profile = required(
+        candidate,
+        "sourceProfile",
+        "G0 evolvable accepted candidate",
+    )?;
+    if canonical_sha256(source_profile)? != facts.adapter.raw_pair_sha256
+        || sha(
+            required(
+                candidate,
+                "sourceProfileSha256",
+                "G0 evolvable accepted candidate",
+            )?,
+            "evolvable candidate source profile identity",
+        )? != facts.adapter.raw_pair_sha256
+        || sha(
+            required(
+                candidate,
+                "profileSnapshotSha256",
+                "G0 evolvable accepted candidate",
+            )?,
+            "evolvable candidate profile snapshot identity",
+        )? != facts.adapter.profile_sha256
+        || sha(
+            required(
+                candidate,
+                "programSha256",
+                "G0 evolvable accepted candidate",
+            )?,
+            "evolvable candidate program identity",
+        )? != facts.adapter.native_program_sha256
+        || sha(
+            required(
+                candidate,
+                "validationReportSha256",
+                "G0 evolvable accepted candidate",
+            )?,
+            "evolvable candidate validation identity",
+        )? != facts.adapter.native_validation_report_sha256
+    {
+        return Err(contract(
+            "evolvable candidate compiled/native identities diverged",
+        ));
+    }
+    let proposal_sha = sha(
+        required(
+            proposal,
+            "proposalSha256",
+            "G0 evolvable immigrant proposal",
+        )?,
+        "evolvable proposal SHA-256",
+    )?;
+    if sha(
+        required(
+            candidate,
+            "pairProposalSha256",
+            "G0 evolvable accepted candidate",
+        )?,
+        "evolvable candidate pair proposal identity",
+    )? != proposal_sha
+        || required(candidate, "pairProposal", "G0 evolvable accepted candidate")? != proposal_value
+        || sha(
+            required(
+                material,
+                "materializedPairProposalSha256",
+                "G0 evolvable candidate identity material",
+            )?,
+            "evolvable materialized proposal identity",
+        )? != proposal_sha
+    {
+        return Err(contract(
+            "evolvable candidate does not bind exact pair proposal",
+        ));
+    }
+    let audit = proposal
+        .get("factoryConstructionAudit")
+        .ok_or_else(|| contract("evolvable G0 entry lacks factory construction audit"))?;
+    let proposal_seed = text(
+        required(proposal, "proposalSeed", "G0 evolvable immigrant proposal")?,
+        "evolvable proposal seed",
+    )?;
+    verify_evolvable_factory_audit(
+        audit,
+        &facts,
+        &proposal_seed,
+        expected_operator_implementation,
+    )?;
+    if let Some(funnel) = row.get("funnelCandidate") {
+        if funnel != &expected_funnel(candidate, &facts.adapter)? {
+            return Err(contract(
+                "evolvable G0 funnel candidate diverged from frozen authority",
+            ));
+        }
+    }
+    Ok((surface, facts))
+}
+
+fn validate_evolvable_pair(pair_value: &Value) -> Result<EvolvablePairFacts> {
+    let pair = object_ref(pair_value, "evolvable frozen pair")?;
+    exact_keys(
+        pair,
+        &[
+            "schemaVersion",
+            "long",
+            "short",
+            "pairCompiler",
+            "profile",
+            "validation",
+            "sideTargetedLineage",
+            "identities",
+        ],
+        &[],
+        "evolvable frozen pair",
+    )?;
+    require_schema(
+        required(pair, "schemaVersion", "evolvable frozen pair")?,
+        PAIR_SCHEMA,
+        "evolvable frozen pair",
+    )?;
+    let long = validate_evolvable_module(required(pair, "long", "evolvable frozen pair")?, "long")?;
+    let short =
+        validate_evolvable_module(required(pair, "short", "evolvable frozen pair")?, "short")?;
+    let pair_compiler = frozen(IdentitySnapshot::from_payload(
+        required(pair, "pairCompiler", "evolvable frozen pair")?,
+        Some("pairCompiler"),
+    ))?;
+    let profile = required(pair, "profile", "evolvable frozen pair")?.clone();
+    let validation = required(pair, "validation", "evolvable frozen pair")?.clone();
+    let lineage = array_ref(
+        required(pair, "sideTargetedLineage", "evolvable frozen pair")?,
+        "evolvable pair side-targeted lineage",
+    )?
+    .clone();
+    let validation_fields = object_ref(&validation, "evolvable pair validation")?;
+    let raw_pair_sha256 = canonical_sha256(&profile)?;
+    if text(
+        required(
+            object_ref(&profile, "evolvable pair profile")?,
+            "version",
+            "evolvable pair profile",
+        )?,
+        "evolvable pair profile version",
+    )? != "v3"
+        || text(
+            required(
+                object_ref(&profile, "evolvable pair profile")?,
+                "directionMode",
+                "evolvable pair profile",
+            )?,
+            "evolvable pair profile direction",
+        )? != "both"
+        || object_ref(&profile, "evolvable pair profile")?.contains_key("hold")
+        || text(
+            required(
+                validation_fields,
+                "schemaVersion",
+                "evolvable pair validation",
+            )?,
+            "evolvable pair validation schema",
+        )? != "temporal_search_candidate_validation_v1"
+        || required(
+            validation_fields,
+            "rawSourceProfileSha256",
+            "evolvable pair validation",
+        )? != &Value::String(raw_pair_sha256.clone())
+        || text(
+            required(validation_fields, "status", "evolvable pair validation")?,
+            "evolvable pair validation status",
+        )? != "valid_evaluable"
+        || !matches!(
+            validation_fields.get("candidateAcceptable"),
+            Some(Value::Bool(true))
+        )
+    {
+        return Err(contract("evolvable frozen pair validation is not exact"));
+    }
+    let adapter_profile_sha256 = sha(
+        required(
+            validation_fields,
+            "profileSnapshotSha256",
+            "evolvable pair validation",
+        )?,
+        "evolvable pair profile snapshot identity",
+    )?;
+    let adapter_native_program_sha256 = sha(
+        required(
+            validation_fields,
+            "programSha256",
+            "evolvable pair validation",
+        )?,
+        "evolvable pair program identity",
+    )?;
+    let adapter_native_validation_report_sha256 = sha(
+        required(
+            validation_fields,
+            "validationReportSha256",
+            "evolvable pair validation",
+        )?,
+        "evolvable pair validation report identity",
+    )?;
+    let adapter = FrozenPair {
+        long: long.adapter.clone(),
+        short: short.adapter.clone(),
+        pair_compiler,
+        profile,
+        validation,
+        side_targeted_lineage: lineage,
+        raw_pair_sha256,
+        profile_sha256: adapter_profile_sha256,
+        native_program_sha256: adapter_native_program_sha256,
+        native_validation_report_sha256: adapter_native_validation_report_sha256,
+    };
+    // Reopen the normalized adapter through the old strict pair parser.  It
+    // validates the Dashboard v2/v3 compilation and native report without
+    // pretending that the evolvable source program is a typed fragment.
+    let adapter = frozen(FrozenPair::from_payload(&frozen(
+        adapter.canonical_payload(),
+    )?))?;
+    let mut actual_pair_material = frozen(adapter.identity_material())?;
+    for (side, program_sha256) in [
+        ("longModule", long.program_sha256.as_str()),
+        ("shortModule", short.program_sha256.as_str()),
+    ] {
+        actual_pair_material
+            .get_mut(side)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| contract("evolvable pair identity material is malformed"))?
+            .insert(
+                "programSha256".to_owned(),
+                Value::String(program_sha256.to_owned()),
+            );
+    }
+    let pair_identity_sha256 = canonical_sha256(&actual_pair_material)?;
+    let mut expected_identities = frozen(adapter.canonical_payload())?
+        .get("identities")
+        .cloned()
+        .expect("canonical frozen pair has identities");
+    expected_identities
+        .as_object_mut()
+        .expect("canonical pair identities are object")
+        .insert(
+            "pairIdentitySha256".to_owned(),
+            Value::String(pair_identity_sha256.clone()),
+        );
+    if required(pair, "identities", "evolvable frozen pair")? != &expected_identities {
+        return Err(contract("evolvable frozen pair identity material drifted"));
+    }
+    Ok(EvolvablePairFacts {
+        pair_identity_sha256,
+        adapter,
+        long_program_sha256: long.program_sha256,
+        short_program_sha256: short.program_sha256,
+        long_semantic_topology_sha256: long.semantic_topology_sha256,
+        short_semantic_topology_sha256: short.semantic_topology_sha256,
+        long_resource_fingerprint_sha256: long.resource_fingerprint_sha256,
+        short_resource_fingerprint_sha256: short.resource_fingerprint_sha256,
+    })
+}
+
+fn validate_evolvable_module(
+    module_value: &Value,
+    expected_direction: &str,
+) -> Result<EvolvableModuleFacts> {
+    let module = object_ref(module_value, "evolvable frozen module")?;
+    exact_keys(
+        module,
+        &[
+            "schemaVersion",
+            "direction",
+            "program",
+            "profile",
+            "grammarContext",
+            "catalog",
+            "policy",
+            "nativeAuthority",
+            "nativeReport",
+            "lineage",
+            "identities",
+        ],
+        &[],
+        "evolvable frozen module",
+    )?;
+    require_schema(
+        required(module, "schemaVersion", "evolvable frozen module")?,
+        MODULE_SCHEMA,
+        "evolvable frozen module",
+    )?;
+    if text(
+        required(module, "direction", "evolvable frozen module")?,
+        "evolvable module direction",
+    )? != expected_direction
+    {
+        return Err(contract("evolvable frozen module direction drifted"));
+    }
+    let program = required(module, "program", "evolvable frozen module")?;
+    let program_facts = validate_evolvable_program(program, expected_direction)?;
+    let grammar_context = frozen(IdentitySnapshot::from_payload(
+        required(module, "grammarContext", "evolvable frozen module")?,
+        Some("grammarContext"),
+    ))?;
+    let catalog = frozen(IdentitySnapshot::from_payload(
+        required(module, "catalog", "evolvable frozen module")?,
+        Some("catalog"),
+    ))?;
+    let policy = frozen(IdentitySnapshot::from_payload(
+        required(module, "policy", "evolvable frozen module")?,
+        Some("policy"),
+    ))?;
+    let native_authority = frozen(IdentitySnapshot::from_payload(
+        required(module, "nativeAuthority", "evolvable frozen module")?,
+        Some("nativeAuthority"),
+    ))?;
+    let lineage = array_ref(
+        required(module, "lineage", "evolvable frozen module")?,
+        "evolvable module lineage",
+    )?
+    .clone();
+    let adapter_program = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_typed_fragment_grammar_v2".to_owned()),
+        ),
+        ("grammarVersion", Value::String("3".to_owned())),
+        ("direction", Value::String(expected_direction.to_owned())),
+        ("fragments", Value::Array(Vec::new())),
+    ]);
+    let adapter = frozen(FrozenModule::freeze(
+        &adapter_program,
+        required(module, "profile", "evolvable frozen module")?,
+        &grammar_context,
+        &catalog,
+        &policy,
+        &native_authority,
+        required(module, "nativeReport", "evolvable frozen module")?,
+        &lineage,
+    ))?;
+    let mut identity_material = adapter.identity_material();
+    identity_material
+        .as_object_mut()
+        .expect("frozen module identity material is object")
+        .insert(
+            "schemaVersion".to_owned(),
+            Value::String(MODULE_SCHEMA.to_owned()),
+        );
+    identity_material
+        .as_object_mut()
+        .expect("frozen module identity material is object")
+        .insert(
+            "programSha256".to_owned(),
+            Value::String(program_facts.program_sha256.clone()),
+        );
+    let module_identity_sha256 = canonical_sha256(&identity_material)?;
+    let mut expected_identities = frozen(adapter.canonical_payload())?
+        .get("identities")
+        .cloned()
+        .expect("canonical frozen module has identities");
+    let expected_fields = expected_identities
+        .as_object_mut()
+        .expect("canonical frozen module identities are object");
+    expected_fields.insert(
+        "programSha256".to_owned(),
+        Value::String(program_facts.program_sha256.clone()),
+    );
+    expected_fields.insert(
+        "moduleIdentitySha256".to_owned(),
+        Value::String(module_identity_sha256),
+    );
+    if required(module, "identities", "evolvable frozen module")? != &expected_identities {
+        return Err(contract(
+            "evolvable frozen module identity material drifted",
+        ));
+    }
+    Ok(EvolvableModuleFacts {
+        program_sha256: program_facts.program_sha256,
+        semantic_topology_sha256: program_facts.semantic_topology_sha256,
+        resource_fingerprint_sha256: program_facts.resource_fingerprint_sha256,
+        adapter,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct EvolvableProgramFacts {
+    program_sha256: String,
+    semantic_topology_sha256: String,
+    resource_fingerprint_sha256: String,
+}
+
+fn validate_evolvable_program(
+    program: &Value,
+    expected_direction: &str,
+) -> Result<EvolvableProgramFacts> {
+    let fields = object_ref(program, "evolvable module program")?;
+    exact_keys(
+        fields,
+        &[
+            "schemaVersion",
+            "programKind",
+            "codec",
+            "direction",
+            "instrument",
+            "resources",
+            "nodes",
+            "edges",
+            "budget",
+        ],
+        &[],
+        "evolvable module program",
+    )?;
+    if text(
+        required(fields, "schemaVersion", "evolvable module program")?,
+        "evolvable module program schema",
+    )? != "evolvable_module_genome_v1"
+        || text(
+            required(fields, "programKind", "evolvable module program")?,
+            "evolvable module program kind",
+        )? != "evolvable_module_genome_v1"
+        || text(
+            required(fields, "codec", "evolvable module program")?,
+            "evolvable module program codec",
+        )? != "evolvable_module_genome_json_v1"
+        || text(
+            required(fields, "direction", "evolvable module program")?,
+            "evolvable module program direction",
+        )? != expected_direction
+        || text(
+            required(fields, "instrument", "evolvable module program")?,
+            "evolvable module instrument",
+        )?
+        .is_empty()
+    {
+        return Err(contract("evolvable module program identity is invalid"));
+    }
+    validate_evolvable_budget(required(fields, "budget", "evolvable module program")?)?;
+    let resources = object_ref(
+        required(fields, "resources", "evolvable module program")?,
+        "evolvable module resources",
+    )?;
+    exact_keys(
+        resources,
+        &["indicators", "evidenceGroups", "events", "managementRefs"],
+        &[],
+        "evolvable module resources",
+    )?;
+    let indicators = array_ref(
+        required(resources, "indicators", "evolvable module resources")?,
+        "evolvable indicator resources",
+    )?;
+    let groups = array_ref(
+        required(resources, "evidenceGroups", "evolvable module resources")?,
+        "evolvable evidence group resources",
+    )?;
+    let events = array_ref(
+        required(resources, "events", "evolvable module resources")?,
+        "evolvable event resources",
+    )?;
+    let management = array_ref(
+        required(resources, "managementRefs", "evolvable module resources")?,
+        "evolvable management resources",
+    )?;
+    validate_sorted_resource_rows(indicators, "indicator", |row| {
+        row.get("meta")
+            .and_then(Value::as_object)
+            .and_then(|meta| meta.get("instanceId"))
+            .and_then(Value::as_str)
+    })?;
+    for (rows, label) in [
+        (groups, "evidence group"),
+        (events, "event"),
+        (management, "management"),
+    ] {
+        validate_sorted_resource_rows(rows, label, |row| row.get("id").and_then(Value::as_str))?;
+    }
+    let nodes = array_ref(
+        required(fields, "nodes", "evolvable module program")?,
+        "evolvable module nodes",
+    )?;
+    let edges = array_ref(
+        required(fields, "edges", "evolvable module program")?,
+        "evolvable module edges",
+    )?;
+    let node_ids = validate_evolvable_nodes(nodes)?;
+    validate_evolvable_edges(edges, &node_ids)?;
+    let semantic_topology_sha256 = evolvable_semantic_topology(nodes, edges)?;
+    let resource_fingerprint_sha256 = evolvable_resource_fingerprint(resources, edges)?;
+    Ok(EvolvableProgramFacts {
+        program_sha256: canonical_sha256(program)?,
+        semantic_topology_sha256,
+        resource_fingerprint_sha256,
+    })
+}
+
+fn validate_evolvable_budget(value: &Value) -> Result<()> {
+    let fields = object_ref(value, "evolvable module budget")?;
+    let limits = [
+        ("maxStates", 14_u64),
+        ("maxTransitions", 56),
+        ("maxEvidenceGroups", 4),
+        ("maxGroupMembers", 3),
+        ("maxEvents", 4),
+        ("maxIndicators", 12),
+        ("maxEntryBranches", 3),
+        ("maxManagementRegions", 4),
+        ("maxExitRegions", 3),
+        ("maxRecoveryRegions", 3),
+        ("maxSccNodes", 3),
+        ("maxTimeoutBars", 64),
+        ("maxGuardDepth", 4),
+    ];
+    exact_keys(
+        fields,
+        &limits.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        &[],
+        "evolvable module budget",
+    )?;
+    for (name, maximum) in limits {
+        let value = integer(
+            required(fields, name, "evolvable module budget")?,
+            "evolvable module budget value",
+            1,
+        )?;
+        if value > maximum {
+            return Err(contract("evolvable module budget exceeds the v1 ceiling"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sorted_resource_rows<'a>(
+    rows: &'a [Value],
+    label: &str,
+    identifier: impl Fn(&'a Map<String, Value>) -> Option<&'a str>,
+) -> Result<()> {
+    let mut prior = None::<String>;
+    for value in rows {
+        let fields = object_ref(value, &format!("evolvable {label} resource"))?;
+        let id = identifier(fields)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| contract(format!("evolvable {label} resource lacks an ID")))?
+            .to_owned();
+        if prior.as_ref().is_some_and(|previous| previous >= &id) {
+            return Err(contract(format!(
+                "evolvable {label} resources are not canonically sorted and unique"
+            )));
+        }
+        prior = Some(id);
+    }
+    Ok(())
+}
+
+fn validate_evolvable_nodes(nodes: &[Value]) -> Result<BTreeSet<String>> {
+    if nodes.is_empty() {
+        return Err(contract("evolvable module requires nodes"));
+    }
+    let mut ids = BTreeSet::new();
+    let mut prior = None::<String>;
+    let mut starts = 0_u64;
+    let mut hubs = 0_u64;
+    for node in nodes {
+        let fields = object_ref(node, "evolvable module node")?;
+        exact_keys(
+            fields,
+            &["id", "zone", "kind", "guard", "resources", "timeoutBars"],
+            &[],
+            "evolvable module node",
+        )?;
+        let id = text(
+            required(fields, "id", "evolvable module node")?,
+            "evolvable node ID",
+        )?;
+        if id.is_empty()
+            || prior
+                .as_ref()
+                .is_some_and(|previous| previous.as_str() >= id.as_str())
+            || !ids.insert(id.clone())
+        {
+            return Err(contract(
+                "evolvable node IDs are not canonically sorted and unique",
+            ));
+        }
+        prior = Some(id.clone());
+        let zone = text(
+            required(fields, "zone", "evolvable module node")?,
+            "evolvable node zone",
+        )?;
+        let kind = text(
+            required(fields, "kind", "evolvable module node")?,
+            "evolvable node kind",
+        )?;
+        if ![
+            "entry",
+            "setup",
+            "position",
+            "management",
+            "exit",
+            "recovery",
+        ]
+        .contains(&zone.as_str())
+            || kind.is_empty()
+            || !required(fields, "guard", "evolvable module node")?.is_object()
+            || !required(fields, "resources", "evolvable module node")?.is_array()
+        {
+            return Err(contract("evolvable module node shape is invalid"));
+        }
+        if zone == "entry" && kind == "start" {
+            starts += 1;
+        }
+        if zone == "position" && kind == "position_hub" {
+            hubs += 1;
+        }
+        if let Some(timeout) = fields.get("timeoutBars") {
+            if !timeout.is_null() && integer(timeout, "evolvable node timeoutBars", 1)? > 64 {
+                return Err(contract("evolvable node timeout exceeds v1 ceiling"));
+            }
+        }
+    }
+    if starts != 1 || hubs != 1 {
+        return Err(contract(
+            "evolvable module requires exactly one entry start and position hub",
+        ));
+    }
+    Ok(ids)
+}
+
+fn validate_evolvable_edges(edges: &[Value], node_ids: &BTreeSet<String>) -> Result<()> {
+    if edges.is_empty() {
+        return Err(contract("evolvable module requires edges"));
+    }
+    let mut prior = None::<String>;
+    let mut priorities = BTreeSet::new();
+    for edge in edges {
+        let fields = object_ref(edge, "evolvable module edge")?;
+        exact_keys(
+            fields,
+            &[
+                "id",
+                "source",
+                "target",
+                "eventClass",
+                "priority",
+                "guard",
+                "effect",
+            ],
+            &[],
+            "evolvable module edge",
+        )?;
+        let id = text(
+            required(fields, "id", "evolvable module edge")?,
+            "evolvable edge ID",
+        )?;
+        if id.is_empty()
+            || prior
+                .as_ref()
+                .is_some_and(|previous| previous.as_str() >= id.as_str())
+        {
+            return Err(contract(
+                "evolvable edge IDs are not canonically sorted and unique",
+            ));
+        }
+        prior = Some(id);
+        let source = text(
+            required(fields, "source", "evolvable module edge")?,
+            "evolvable edge source",
+        )?;
+        let target = text(
+            required(fields, "target", "evolvable module edge")?,
+            "evolvable edge target",
+        )?;
+        let event_class = text(
+            required(fields, "eventClass", "evolvable module edge")?,
+            "evolvable edge class",
+        )?;
+        let priority = integer(
+            required(fields, "priority", "evolvable module edge")?,
+            "evolvable edge priority",
+            0,
+        )?;
+        if !node_ids.contains(&source)
+            || !node_ids.contains(&target)
+            || event_class != "decision"
+            || priority > 999
+            || !required(fields, "guard", "evolvable module edge")?.is_object()
+            || !required(fields, "effect", "evolvable module edge")?.is_null()
+                && !required(fields, "effect", "evolvable module edge")?.is_string()
+            || !priorities.insert((source, event_class, priority))
+        {
+            return Err(contract("evolvable module edge shape is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn evolvable_resource_fingerprint(
+    resources: &Map<String, Value>,
+    edges: &[Value],
+) -> Result<String> {
+    let indicators = array_ref(
+        required(resources, "indicators", "evolvable module resources")?,
+        "evolvable indicator resources",
+    )?;
+    let groups = array_ref(
+        required(resources, "evidenceGroups", "evolvable module resources")?,
+        "evolvable evidence group resources",
+    )?;
+    let events = array_ref(
+        required(resources, "events", "evolvable module resources")?,
+        "evolvable event resources",
+    )?;
+    let mut indicator_values = Vec::with_capacity(indicators.len());
+    for row in indicators {
+        let fields = object_ref(row, "evolvable indicator resource")?;
+        let meta = object_ref(
+            required(fields, "meta", "evolvable indicator resource")?,
+            "evolvable indicator meta",
+        )?;
+        let config = object_ref(
+            required(fields, "config", "evolvable indicator resource")?,
+            "evolvable indicator config",
+        )?;
+        indicator_values.push(Value::Array(vec![
+            meta.get("id").cloned().unwrap_or(Value::Null),
+            config.get("timeframe").cloned().unwrap_or(Value::Null),
+        ]));
+    }
+    let group_values = groups
+        .iter()
+        .map(|row| {
+            object_ref(row, "evolvable evidence group resource")?
+                .get("indicatorInstanceIds")
+                .cloned()
+                .ok_or_else(|| contract("evolvable evidence group lacks indicator members"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let event_values = events
+        .iter()
+        .map(|row| {
+            object_ref(row, "evolvable event resource")?
+                .get("indicatorInstanceId")
+                .cloned()
+                .ok_or_else(|| contract("evolvable event lacks indicator member"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let management_effects = [
+        "move_stop_to_break_even_next_open",
+        "tighten_stop_next_open",
+        "activate_trailing_stop_next_open",
+        "deactivate_trailing_stop_next_open",
+        "set_target_next_open",
+        "cancel_target_next_open",
+    ];
+    let effects = edges
+        .iter()
+        .filter_map(|edge| edge.get("effect").and_then(Value::as_str))
+        .filter(|effect| management_effects.contains(effect))
+        .map(|effect| Value::String(effect.to_owned()))
+        .collect::<Vec<_>>();
+    let exits = edges
+        .iter()
+        .filter(|edge| edge.get("effect").and_then(Value::as_str) == Some("exit_next_open"))
+        .count() as u64;
+    canonical_sha256(&object([
+        ("indicators", Value::Array(indicator_values)),
+        ("groups", Value::Array(group_values)),
+        ("events", Value::Array(event_values)),
+        ("management", Value::Array(effects)),
+        ("exits", Value::from(exits)),
+    ]))
+    .map_err(Into::into)
+}
+
+fn evolvable_semantic_topology(nodes: &[Value], edges: &[Value]) -> Result<String> {
+    let mut labels = BTreeMap::new();
+    for node in nodes {
+        let fields = object_ref(node, "evolvable module node")?;
+        let id = text(
+            required(fields, "id", "evolvable module node")?,
+            "evolvable node ID",
+        )?;
+        let mut shape = fields.clone();
+        shape.remove("id");
+        shape.insert(
+            "guard".to_owned(),
+            evolvable_guard_shape(required(fields, "guard", "evolvable module node")?)?,
+        );
+        let resources = array_ref(
+            required(fields, "resources", "evolvable module node")?,
+            "evolvable node resources",
+        )?;
+        let mut kinds = resources
+            .iter()
+            .map(|resource| {
+                object_ref(resource, "evolvable node resource").and_then(|fields| {
+                    text(
+                        required(fields, "kind", "evolvable node resource")?,
+                        "evolvable resource kind",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        kinds.sort();
+        shape.insert(
+            "resources".to_owned(),
+            Value::Array(kinds.into_iter().map(Value::String).collect()),
+        );
+        let timeout = fields
+            .get("timeoutBars")
+            .map(|value| Value::Bool(!value.is_null()))
+            .unwrap_or(Value::Bool(false));
+        shape.insert("timeoutBars".to_owned(), timeout);
+        labels.insert(id, canonical_sha256(&Value::Object(shape))?);
+    }
+    for _ in 0..nodes.len().max(1) {
+        let mut updated = BTreeMap::new();
+        for node in nodes {
+            let fields = object_ref(node, "evolvable module node")?;
+            let id = text(
+                required(fields, "id", "evolvable module node")?,
+                "evolvable node ID",
+            )?;
+            let outgoing = evolvable_topology_edges(edges, &id, true, &labels)?;
+            let incoming = evolvable_topology_edges(edges, &id, false, &labels)?;
+            updated.insert(
+                id.clone(),
+                canonical_sha256(&object([
+                    (
+                        "node",
+                        Value::String(
+                            labels
+                                .get(&id)
+                                .cloned()
+                                .ok_or_else(|| contract("evolvable topology lacks node label"))?,
+                        ),
+                    ),
+                    ("out", Value::Array(outgoing)),
+                    ("in", Value::Array(incoming)),
+                ]))?,
+            );
+        }
+        if updated == labels {
+            break;
+        }
+        labels = updated;
+    }
+    let mut final_edges = Vec::new();
+    for edge in edges {
+        let fields = object_ref(edge, "evolvable module edge")?;
+        let source = text(
+            required(fields, "source", "evolvable module edge")?,
+            "evolvable edge source",
+        )?;
+        let target = text(
+            required(fields, "target", "evolvable module edge")?,
+            "evolvable edge target",
+        )?;
+        final_edges.push(Value::Array(vec![
+            Value::String(
+                labels
+                    .get(&source)
+                    .cloned()
+                    .ok_or_else(|| contract("evolvable topology source label is missing"))?,
+            ),
+            Value::String(
+                labels
+                    .get(&target)
+                    .cloned()
+                    .ok_or_else(|| contract("evolvable topology target label is missing"))?,
+            ),
+            required(fields, "eventClass", "evolvable module edge")?.clone(),
+            required(fields, "priority", "evolvable module edge")?.clone(),
+            required(fields, "effect", "evolvable module edge")?.clone(),
+            evolvable_guard_shape(required(fields, "guard", "evolvable module edge")?)?,
+        ]));
+    }
+    final_edges.sort_by_key(python_repr);
+    let mut final_nodes = labels.into_values().collect::<Vec<_>>();
+    final_nodes.sort();
+    canonical_sha256(&object([
+        (
+            "schemaVersion",
+            Value::String("evolvable_module_semantic_topology_v1".to_owned()),
+        ),
+        (
+            "nodes",
+            Value::Array(final_nodes.into_iter().map(Value::String).collect()),
+        ),
+        ("edges", Value::Array(final_edges)),
+    ]))
+    .map_err(Into::into)
+}
+
+fn evolvable_topology_edges(
+    edges: &[Value],
+    node_id: &str,
+    outgoing: bool,
+    labels: &BTreeMap<String, String>,
+) -> Result<Vec<Value>> {
+    let mut result = Vec::new();
+    for edge in edges {
+        let fields = object_ref(edge, "evolvable module edge")?;
+        let source = text(
+            required(fields, "source", "evolvable module edge")?,
+            "evolvable edge source",
+        )?;
+        let target = text(
+            required(fields, "target", "evolvable module edge")?,
+            "evolvable edge target",
+        )?;
+        if (outgoing && source != node_id) || (!outgoing && target != node_id) {
+            continue;
+        }
+        let other = if outgoing { target } else { source };
+        result.push(Value::Array(vec![
+            required(fields, "eventClass", "evolvable module edge")?.clone(),
+            required(fields, "priority", "evolvable module edge")?.clone(),
+            required(fields, "effect", "evolvable module edge")?.clone(),
+            evolvable_guard_shape(required(fields, "guard", "evolvable module edge")?)?,
+            Value::String(
+                labels
+                    .get(&other)
+                    .cloned()
+                    .ok_or_else(|| contract("evolvable topology adjacent label is missing"))?,
+            ),
+        ]));
+    }
+    result.sort_by_key(python_repr);
+    Ok(result)
+}
+
+fn evolvable_guard_shape(value: &Value) -> Result<Value> {
+    let fields = object_ref(value, "evolvable guard")?;
+    let kind = fields
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match kind {
+        "all" | "any" => {
+            let mut children = fields
+                .get("guards")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| item.is_object())
+                .map(evolvable_guard_shape)
+                .collect::<Result<Vec<_>>>()?;
+            children.sort_by_key(python_repr);
+            Ok(Value::Array(vec![
+                Value::String(kind.to_owned()),
+                Value::Array(children),
+            ]))
+        }
+        "predicate_edge" | "consecutive_true" => Ok(Value::Array(vec![
+            Value::String(kind.to_owned()),
+            evolvable_guard_shape(
+                fields
+                    .get("predicate")
+                    .unwrap_or(&Value::Object(Map::new())),
+            )?,
+        ])),
+        _ => Ok(Value::String(kind.to_owned())),
+    }
+}
+
+fn python_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_owned(),
+        Value::Bool(value) => {
+            if *value {
+                "True".to_owned()
+            } else {
+                "False".to_owned()
+            }
+        }
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => format!("{:?}", value),
+        Value::Array(values) => format!(
+            "({}{})",
+            values
+                .iter()
+                .map(python_repr)
+                .collect::<Vec<_>>()
+                .join(", "),
+            if values.len() == 1 { "," } else { "" }
+        ),
+        Value::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{:?}: {}", key, python_repr(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn verify_evolvable_factory_audit(
+    audit_value: &Value,
+    facts: &EvolvablePairFacts,
+    proposal_seed: &str,
+    expected_operator_implementation: Option<&Value>,
+) -> Result<()> {
+    let audit = object_ref(audit_value, "G0 evolvable factory audit")?;
+    exact_keys(
+        audit,
+        &[
+            "schemaVersion",
+            "authoritySha256",
+            "pairIdentitySha256",
+            "sides",
+            "auditSha256",
+        ],
+        &[],
+        "G0 evolvable factory audit",
+    )?;
+    require_schema(
+        required(audit, "schemaVersion", "G0 evolvable factory audit")?,
+        "temporal_qd_evolvable_module_factory_audit_v1",
+        "G0 evolvable factory audit",
+    )?;
+    let authority_sha256 = sha(
+        required(audit, "authoritySha256", "G0 evolvable factory audit")?,
+        "evolvable factory authoritySha256",
+    )?;
+    let expected_operator = match expected_operator_implementation {
+        Some(value) => Some(object_ref(
+            value,
+            "G0 expected evolvable operator implementation",
+        )?),
+        None => None,
+    };
+    let expected_authority = expected_operator
+        .map(|operator| {
+            sha(
+                required(
+                    operator,
+                    "authoritySha256",
+                    "G0 expected evolvable operator implementation",
+                )?,
+                "expected evolvable operator authoritySha256",
+            )
+        })
+        .transpose()?;
+    let expected_compiler_policy = expected_operator
+        .map(|operator| {
+            sha(
+                required(
+                    operator,
+                    "compilerPolicySha256",
+                    "G0 expected evolvable operator implementation",
+                )?,
+                "expected evolvable operator compilerPolicySha256",
+            )
+        })
+        .transpose()?;
+    if expected_authority
+        .as_deref()
+        .is_some_and(|expected| expected != authority_sha256)
+    {
+        return Err(contract(
+            "evolvable factory audit authority does not bind publication operator authority",
+        ));
+    }
+    if sha(
+        required(audit, "pairIdentitySha256", "G0 evolvable factory audit")?,
+        "evolvable audit pair identity",
+    )? != facts.pair_identity_sha256
+        || verify_self_hash(audit_value, "auditSha256", "G0 evolvable factory audit")?.is_empty()
+    {
+        return Err(contract("evolvable factory audit identity drifted"));
+    }
+    let sides = object_ref(
+        required(audit, "sides", "G0 evolvable factory audit")?,
+        "G0 evolvable factory audit sides",
+    )?;
+    exact_keys(
+        sides,
+        &["long", "short"],
+        &[],
+        "G0 evolvable factory audit sides",
+    )?;
+    let lineage = &facts.adapter.side_targeted_lineage;
+    if lineage.len() != 2 {
+        return Err(contract(
+            "evolvable factory audit lacks exact side-targeted seed lineage",
+        ));
+    }
+    let mut lineage_by_side = BTreeMap::new();
+    for row in lineage {
+        let fields = object_ref(row, "evolvable pair seed lineage")?;
+        exact_keys(
+            fields,
+            &[
+                "authoritySha256",
+                "codec",
+                "compilerPolicySha256",
+                "genomeSha256",
+                "operation",
+                "programKind",
+                "proposalSeed",
+                "side",
+            ],
+            &[],
+            "evolvable pair seed lineage",
+        )?;
+        let side = text(
+            required(fields, "side", "evolvable pair seed lineage")?,
+            "evolvable lineage side",
+        )?;
+        if !["long", "short"].contains(&side.as_str())
+            || lineage_by_side.contains_key(&side)
+            || text(
+                required(fields, "operation", "evolvable pair seed lineage")?,
+                "evolvable lineage operation",
+            )? != "evolvable_module_pair_seed"
+            || sha(
+                required(fields, "authoritySha256", "evolvable pair seed lineage")?,
+                "evolvable lineage authority",
+            )? != authority_sha256
+            || text(
+                required(fields, "proposalSeed", "evolvable pair seed lineage")?,
+                "evolvable lineage proposal seed",
+            )? != proposal_seed
+        {
+            return Err(contract("evolvable factory side lineage drifted"));
+        }
+        for field in ["compilerPolicySha256", "genomeSha256"] {
+            sha(
+                required(fields, field, "evolvable pair seed lineage")?,
+                field,
+            )?;
+        }
+        if expected_compiler_policy.as_deref().is_some_and(|expected| {
+            fields.get("compilerPolicySha256").and_then(Value::as_str) != Some(expected)
+        }) {
+            return Err(contract(
+                "evolvable factory lineage compiler policy does not bind publication operator",
+            ));
+        }
+        lineage_by_side.insert(side, fields);
+    }
+    for (side, program_sha256, topology_sha256, fingerprint_sha256) in [
+        (
+            "long",
+            facts.long_program_sha256.as_str(),
+            facts.long_semantic_topology_sha256.as_str(),
+            facts.long_resource_fingerprint_sha256.as_str(),
+        ),
+        (
+            "short",
+            facts.short_program_sha256.as_str(),
+            facts.short_semantic_topology_sha256.as_str(),
+            facts.short_resource_fingerprint_sha256.as_str(),
+        ),
+    ] {
+        let side_audit = object_ref(
+            required(sides, side, "G0 evolvable factory audit sides")?,
+            "G0 evolvable factory side audit",
+        )?;
+        exact_keys(
+            side_audit,
+            &[
+                "programKind",
+                "codec",
+                "genomeSha256",
+                "semanticTopologySha256",
+                "resourceFingerprintSha256",
+            ],
+            &[],
+            "G0 evolvable factory side audit",
+        )?;
+        if text(
+            required(side_audit, "programKind", "G0 evolvable factory side audit")?,
+            "evolvable side program kind",
+        )? != "evolvable_module_genome_v1"
+            || text(
+                required(side_audit, "codec", "G0 evolvable factory side audit")?,
+                "evolvable side codec",
+            )? != "evolvable_module_genome_json_v1"
+            || sha(
+                required(
+                    side_audit,
+                    "genomeSha256",
+                    "G0 evolvable factory side audit",
+                )?,
+                "evolvable side genome identity",
+            )? != program_sha256
+            || sha(
+                required(
+                    side_audit,
+                    "semanticTopologySha256",
+                    "G0 evolvable factory side audit",
+                )?,
+                "evolvable side topology identity",
+            )? != topology_sha256
+            || sha(
+                required(
+                    side_audit,
+                    "resourceFingerprintSha256",
+                    "G0 evolvable factory side audit",
+                )?,
+                "evolvable side resource fingerprint identity",
+            )? != fingerprint_sha256
+        {
+            return Err(contract("evolvable factory side audit program drifted"));
+        }
+        let lineage = lineage_by_side
+            .get(side)
+            .ok_or_else(|| contract("evolvable factory audit lineage side is missing"))?;
+        if text(
+            required(lineage, "programKind", "evolvable pair seed lineage")?,
+            "evolvable lineage program kind",
+        )? != "evolvable_module_genome_v1"
+            || text(
+                required(lineage, "codec", "evolvable pair seed lineage")?,
+                "evolvable lineage codec",
+            )? != "evolvable_module_genome_json_v1"
+            || sha(
+                required(lineage, "genomeSha256", "evolvable pair seed lineage")?,
+                "evolvable lineage genome identity",
+            )? != program_sha256
+        {
+            return Err(contract("evolvable factory side lineage program drifted"));
+        }
+    }
+    Ok(())
 }
 
 fn value_text(value: Option<&Value>) -> String {
@@ -2242,13 +3706,13 @@ fn semantic(
     }
 }
 
-fn indicator_semantics(module: &FrozenModule) -> Result<HashMap<String, Value>> {
-    let profile = object_ref(&module.profile, "frozen module profile")?;
+fn indicator_semantics(module: &DescriptorModule<'_>) -> Result<HashMap<String, Value>> {
+    let profile = object_ref(module.profile, "frozen module profile")?;
     let indicators = array_ref(
         required(profile, "indicators", "frozen module profile")?,
         "frozen module indicators",
     )?;
-    let catalog_payload = object_ref(&module.catalog.payload, "frozen module catalog payload")?;
+    let catalog_payload = object_ref(module.catalog_payload, "frozen module catalog payload")?;
     let catalog = object_ref(
         required(catalog_payload, "catalog", "frozen module catalog payload")?,
         "frozen module catalog",
@@ -2318,7 +3782,7 @@ fn indicator_semantics(module: &FrozenModule) -> Result<HashMap<String, Value>> 
             (
                 "implementationIdentitySha256",
                 Value::from(canonical_sha256(&object([
-                    ("catalogSha256", Value::from(module.catalog.sha256.clone())),
+                    ("catalogSha256", Value::from(module.catalog_sha256)),
                     ("catalogPrimitive", primitive.clone()),
                 ]))?),
             ),
@@ -2343,11 +3807,11 @@ fn bucket(value: &Map<String, Value>, fallback: &str) -> String {
 }
 
 fn module_descriptor(
-    module: &FrozenModule,
+    module: &DescriptorModule<'_>,
     transitions: &[&Value],
     states: &[&Value],
 ) -> Result<HashMap<String, String>> {
-    let profile = object_ref(&module.profile, "frozen module profile")?;
+    let profile = object_ref(module.profile, "frozen module profile")?;
     let graph = object_ref(
         required(profile, "graph", "frozen module profile")?,
         "frozen module graph",
@@ -2707,9 +4171,9 @@ fn module_descriptor(
     ]))
 }
 
-fn per_side_liveness(pair: &FrozenPair, report: &Value) -> Result<Value> {
+fn per_side_liveness(profile: &Value, report: &Value) -> Result<Value> {
     let graph = object_ref(
-        pair.profile
+        profile
             .get("graph")
             .ok_or_else(|| contract("frozen pair lacks graph"))?,
         "frozen pair graph",
@@ -2799,7 +4263,7 @@ fn per_side_liveness(pair: &FrozenPair, report: &Value) -> Result<Value> {
     Ok(proof)
 }
 
-fn pair_descriptor(pair: &FrozenPair, liveness: &Value) -> Result<Value> {
+fn pair_descriptor(pair: &DescriptorPair<'_>, liveness: &Value) -> Result<Value> {
     let graph = object_ref(
         pair.profile
             .get("graph")
@@ -2924,9 +4388,33 @@ fn pair_descriptor(pair: &FrozenPair, liveness: &Value) -> Result<Value> {
     Ok(vector)
 }
 
-pub fn derive_descriptor_projection_from_rich_entry(entry: &Value) -> Result<Value> {
-    let (surface, pair) = verify_accepted_entry(entry)?;
-    let report = static_reachability(&pair.profile)?;
+fn derive_descriptor_projection_from_verified(
+    surface: &AcceptedEntrySurface,
+    pair: &FrozenPair,
+) -> Result<Value> {
+    let descriptor_pair = DescriptorPair {
+        profile: &pair.profile,
+        long: DescriptorModule {
+            profile: &pair.long.profile,
+            catalog_payload: &pair.long.catalog.payload,
+            catalog_sha256: &pair.long.catalog.sha256,
+        },
+        short: DescriptorModule {
+            profile: &pair.short.profile,
+            catalog_payload: &pair.short.catalog.payload,
+            catalog_sha256: &pair.short.catalog.sha256,
+        },
+        pair_identity_sha256: frozen(pair.identity_sha256())?,
+        native_validation_report_sha256: &pair.native_validation_report_sha256,
+    };
+    derive_descriptor_projection_from_descriptor_pair(surface, &descriptor_pair)
+}
+
+fn derive_descriptor_projection_from_descriptor_pair(
+    surface: &AcceptedEntrySurface,
+    pair: &DescriptorPair<'_>,
+) -> Result<Value> {
+    let report = static_reachability(pair.profile)?;
     let reachability_sha = verify_self_hash(
         &report,
         "reachabilitySha256",
@@ -2937,30 +4425,24 @@ pub fn derive_descriptor_projection_from_rich_entry(entry: &Value) -> Result<Val
             "canonical static reachability report is not acceptable",
         ));
     }
-    let liveness = per_side_liveness(&pair, &report)?;
-    let descriptor_vector = pair_descriptor(&pair, &liveness)?;
+    let liveness = per_side_liveness(pair.profile, &report)?;
+    let descriptor_vector = pair_descriptor(pair, &liveness)?;
     let mut projection = object([
         ("schemaVersion", Value::from(DESCRIPTOR_PROJECTION_SCHEMA)),
-        ("candidateId", Value::from(surface.candidate_id)),
+        ("candidateId", Value::from(surface.candidate_id.clone())),
         (
             "candidateIdentitySha256",
-            Value::from(surface.candidate_identity_sha256),
+            Value::from(surface.candidate_identity_sha256.clone()),
         ),
         (
             "pairIdentitySha256",
-            Value::from(frozen(pair.identity_sha256())?),
+            Value::from(pair.pair_identity_sha256.clone()),
         ),
-        (
-            "longCatalogSha256",
-            Value::from(pair.long.catalog.sha256.clone()),
-        ),
-        (
-            "shortCatalogSha256",
-            Value::from(pair.short.catalog.sha256.clone()),
-        ),
+        ("longCatalogSha256", Value::from(pair.long.catalog_sha256)),
+        ("shortCatalogSha256", Value::from(pair.short.catalog_sha256)),
         (
             "nativeValidationReportSha256",
-            Value::from(pair.native_validation_report_sha256.clone()),
+            Value::from(pair.native_validation_report_sha256),
         ),
         (
             "staticReachabilityReportSha256",
@@ -2977,51 +4459,134 @@ pub fn derive_descriptor_projection_from_rich_entry(entry: &Value) -> Result<Val
     Ok(projection)
 }
 
-/// Compatibility entry point for callers carrying a descriptor alongside an
-/// entry.  The provided descriptor is accepted only if it exactly equals an
-/// independently derived native projection.
-pub fn project_accepted_pair_entry_with_descriptor(
-    construction_pool_identity_sha256: &str,
-    proposal_ordinal: u64,
-    journal_relative_path: &str,
+/// Rehydrate one rich G0 entry exactly once, prove its native/static
+/// semantics, derive the descriptor, and return only its compact admission
+/// facts.  This is the streaming handoff used by the v5 post-construction
+/// funnel; it avoids the historical derive-then-rederive path.
+fn admit_accepted_pair_entry_with_operator(
     entry: &Value,
-    descriptor_projection: &Value,
+    expected_operator_implementation: Option<&Value>,
+) -> Result<AdmittedAcceptedPairEntry> {
+    if is_evolvable_pair_entry(entry) {
+        let surface = validate_accepted_entry_surface(entry)?;
+        let (surface, facts) =
+            verify_evolvable_accepted_entry(entry, surface, expected_operator_implementation)?;
+        let descriptor_pair = DescriptorPair {
+            profile: &facts.adapter.profile,
+            long: DescriptorModule {
+                profile: &facts.adapter.long.profile,
+                catalog_payload: &facts.adapter.long.catalog.payload,
+                catalog_sha256: &facts.adapter.long.catalog.sha256,
+            },
+            short: DescriptorModule {
+                profile: &facts.adapter.short.profile,
+                catalog_payload: &facts.adapter.short.catalog.payload,
+                catalog_sha256: &facts.adapter.short.catalog.sha256,
+            },
+            pair_identity_sha256: facts.pair_identity_sha256,
+            native_validation_report_sha256: &facts.adapter.native_validation_report_sha256,
+        };
+        let descriptor_projection =
+            derive_descriptor_projection_from_descriptor_pair(&surface, &descriptor_pair)?;
+        let executable_semantic_sha256 = canonical_sha256(&object([
+            (
+                "schemaVersion",
+                Value::from("temporal_qd_pair_genome_semantics_v1"),
+            ),
+            (
+                "longProfileSha256",
+                Value::from(facts.adapter.long.profile_sha256.clone()),
+            ),
+            (
+                "shortProfileSha256",
+                Value::from(facts.adapter.short.profile_sha256.clone()),
+            ),
+        ]))?;
+        return Ok(AdmittedAcceptedPairEntry {
+            entry_sha256: surface.entry_sha256,
+            proposal_ordinal: surface.proposal_ordinal,
+            generation_index: surface.generation_index,
+            birth_ordinal: surface.birth_ordinal,
+            candidate_id: surface.candidate_id,
+            candidate_identity_sha256: surface.candidate_identity_sha256,
+            executable_semantic_sha256,
+            descriptor_projection,
+        });
+    }
+    let (surface, pair) = verify_accepted_entry(entry)?;
+    let descriptor_projection = derive_descriptor_projection_from_verified(&surface, &pair)?;
+    let executable_semantic_sha256 = canonical_sha256(&object([
+        (
+            "schemaVersion",
+            Value::from("temporal_qd_pair_genome_semantics_v1"),
+        ),
+        (
+            "longProfileSha256",
+            Value::from(pair.long.profile_sha256.clone()),
+        ),
+        (
+            "shortProfileSha256",
+            Value::from(pair.short.profile_sha256.clone()),
+        ),
+    ]))?;
+    Ok(AdmittedAcceptedPairEntry {
+        entry_sha256: surface.entry_sha256,
+        proposal_ordinal: surface.proposal_ordinal,
+        generation_index: surface.generation_index,
+        birth_ordinal: surface.birth_ordinal,
+        candidate_id: surface.candidate_id,
+        candidate_identity_sha256: surface.candidate_identity_sha256,
+        executable_semantic_sha256,
+        descriptor_projection,
+    })
+}
+
+pub fn admit_accepted_pair_entry(entry: &Value) -> Result<AdmittedAcceptedPairEntry> {
+    admit_accepted_pair_entry_with_operator(entry, None)
+}
+
+/// Native G0 funnel admission has the closed publication operator authority
+/// available.  Unlike compatibility callers, it must prove every evolvable
+/// factory audit and side lineage derives from that exact authority/compiler.
+pub fn admit_accepted_pair_entry_bound_to_operator(
+    entry: &Value,
+    expected_operator_implementation: &Value,
+) -> Result<AdmittedAcceptedPairEntry> {
+    admit_accepted_pair_entry_with_operator(entry, Some(expected_operator_implementation))
+}
+
+pub fn derive_descriptor_projection_from_rich_entry(entry: &Value) -> Result<Value> {
+    Ok(admit_accepted_pair_entry(entry)?.descriptor_projection)
+}
+
+/// Materialize the public compact reference from a previously admitted rich
+/// entry.  The admission object is intentionally sufficient to avoid a second
+/// full FrozenPair/static-reachability reconstruction in the streaming path.
+pub fn project_admitted_pair_entry(
+    construction_pool_identity_sha256: &str,
+    journal_relative_path: &str,
+    admitted: &AdmittedAcceptedPairEntry,
 ) -> Result<Value> {
     let pool_identity = sha(
         &Value::from(construction_pool_identity_sha256),
         "constructionPoolIdentitySha256",
     )?;
-    let surface = validate_accepted_entry_surface(entry)?;
-    if surface.proposal_ordinal != proposal_ordinal {
-        return Err(contract(
-            "G0 proposal ordinal does not bind journal/candidate",
-        ));
-    }
     normal_journal_relative_path(&Value::from(journal_relative_path))?;
-    let derived_projection = derive_descriptor_projection_from_rich_entry(entry)?;
-    if descriptor_projection != &derived_projection {
-        return Err(contract(
-            "provided G0 descriptor projection diverges from rich frozen authority",
-        ));
-    }
-    let projection = object_ref(descriptor_projection, "G0 descriptor projection")?;
-    // Reuse the compact-reference validator after assembling the complete
-    // reference, so descriptor closed-schema and self-hash checks have exactly
-    // one authority.
+    let projection = object_ref(&admitted.descriptor_projection, "G0 descriptor projection")?;
     let lineage_without_hash = object([
         (
             "schemaVersion",
             Value::from("temporal_qd_g0_construction_lineage_v1"),
         ),
-        ("entrySha256", Value::from(surface.entry_sha256.clone())),
-        ("proposalOrdinal", Value::from(proposal_ordinal)),
-        ("generationIndex", Value::from(surface.generation_index)),
-        ("birthOrdinal", Value::from(surface.birth_ordinal)),
+        ("entrySha256", Value::from(admitted.entry_sha256.clone())),
+        ("proposalOrdinal", Value::from(admitted.proposal_ordinal)),
+        ("generationIndex", Value::from(admitted.generation_index)),
+        ("birthOrdinal", Value::from(admitted.birth_ordinal)),
         ("originKind", Value::from("random_immigrant")),
-        ("candidateId", Value::from(surface.candidate_id.clone())),
+        ("candidateId", Value::from(admitted.candidate_id.clone())),
         (
             "candidateIdentitySha256",
-            Value::from(surface.candidate_identity_sha256.clone()),
+            Value::from(admitted.candidate_identity_sha256.clone()),
         ),
     ]);
     let mut lineage = lineage_without_hash.clone();
@@ -3040,7 +4605,7 @@ pub fn project_accepted_pair_entry_with_descriptor(
     let reference_without_hash = object([
         ("schemaVersion", Value::from(ACCEPTED_REFERENCE_SCHEMA)),
         ("constructionPoolIdentitySha256", Value::from(pool_identity)),
-        ("proposalOrdinal", Value::from(proposal_ordinal)),
+        ("proposalOrdinal", Value::from(admitted.proposal_ordinal)),
         (
             "journalReference",
             object([
@@ -3049,20 +4614,23 @@ pub fn project_accepted_pair_entry_with_descriptor(
                     Value::from("temporal_qd_g0_journal_reference_v1"),
                 ),
                 ("journalRelativePath", Value::from(journal_relative_path)),
-                ("entrySha256", Value::from(surface.entry_sha256.clone())),
+                ("entrySha256", Value::from(admitted.entry_sha256.clone())),
             ]),
         ),
         (
             "acceptedPairEntrySha256",
-            Value::from(surface.entry_sha256.clone()),
+            Value::from(admitted.entry_sha256.clone()),
         ),
-        ("candidateId", Value::from(surface.candidate_id.clone())),
+        ("candidateId", Value::from(admitted.candidate_id.clone())),
         (
             "candidateIdentitySha256",
-            Value::from(surface.candidate_identity_sha256.clone()),
+            Value::from(admitted.candidate_identity_sha256.clone()),
         ),
         ("constructionLineage", lineage),
-        ("descriptorProjection", descriptor_projection.clone()),
+        (
+            "descriptorProjection",
+            admitted.descriptor_projection.clone(),
+        ),
         ("descriptorProjectionSha256", Value::from(descriptor_sha)),
     ]);
     let mut reference = reference_without_hash.clone();
@@ -3075,6 +4643,35 @@ pub fn project_accepted_pair_entry_with_descriptor(
         );
     validate_accepted_reference(&reference)?;
     Ok(reference)
+}
+
+/// Compatibility entry point for callers carrying a descriptor alongside an
+/// entry.  The provided descriptor is accepted only if it exactly equals an
+/// independently derived native projection.
+pub fn project_accepted_pair_entry_with_descriptor(
+    construction_pool_identity_sha256: &str,
+    proposal_ordinal: u64,
+    journal_relative_path: &str,
+    entry: &Value,
+    descriptor_projection: &Value,
+) -> Result<Value> {
+    let admitted = admit_accepted_pair_entry(entry)?;
+    if admitted.proposal_ordinal != proposal_ordinal {
+        return Err(contract(
+            "G0 proposal ordinal does not bind journal/candidate",
+        ));
+    }
+    normal_journal_relative_path(&Value::from(journal_relative_path))?;
+    if descriptor_projection != &admitted.descriptor_projection {
+        return Err(contract(
+            "provided G0 descriptor projection diverges from rich frozen authority",
+        ));
+    }
+    project_admitted_pair_entry(
+        construction_pool_identity_sha256,
+        journal_relative_path,
+        &admitted,
+    )
 }
 
 /// Rehydrate a closed accepted rich entry, derive its native descriptor, and
@@ -3090,12 +4687,15 @@ pub fn project_accepted_pair_entry(
         "constructionPoolIdentitySha256",
     )?;
     normal_journal_relative_path(&Value::from(journal_relative_path))?;
-    let projection = derive_descriptor_projection_from_rich_entry(entry)?;
-    project_accepted_pair_entry_with_descriptor(
+    let admitted = admit_accepted_pair_entry(entry)?;
+    if admitted.proposal_ordinal != proposal_ordinal {
+        return Err(contract(
+            "G0 proposal ordinal does not bind journal/candidate",
+        ));
+    }
+    project_admitted_pair_entry(
         construction_pool_identity_sha256,
-        proposal_ordinal,
         journal_relative_path,
-        entry,
-        &projection,
+        &admitted,
     )
 }

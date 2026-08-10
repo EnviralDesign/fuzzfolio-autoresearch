@@ -20,7 +20,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,35 @@ PAIR_GENERATION_RUNTIME_PYTHON = "python_optimized_v1"
 PAIR_GENERATION_RUNTIME_RUST = "rust_native_v1"
 PAIR_GENERATION_RUNTIME_DEFAULT = PAIR_GENERATION_RUNTIME_RUST
 PAIR_GENERATION_RUNTIME_FALLBACK_POLICY = "forbidden"
+G0_FINALIZATION_RUNTIME_SCHEMA = "temporal_qd_g0_finalization_runtime_v1"
+G0_FINALIZATION_RUNTIME_RUST = "rust_g0_funnel_v1"
+G0_FINALIZATION_RUNTIME_PYTHON_ORACLE = "python_g0_oracle_v1"
+G0_FINALIZATION_RUNTIME_DEFAULT = G0_FINALIZATION_RUNTIME_RUST
+G0_FINALIZATION_RUNTIME_FALLBACK_POLICY = "forbidden"
+G0_FUNNEL_MANIFEST_SCHEMA = "temporal_qd_native_g0_funnel_manifest_v2"
+G0_FUNNEL_RESULT_SCHEMA = "temporal_qd_native_g0_funnel_result_v2"
+G0_FUNNEL_RECEIPT_SCHEMA = "temporal_qd_native_g0_funnel_receipt_v2"
+G0_EXECUTION_AUTHORITY_SCHEMA = "temporal_qd_native_g0_execution_authority_v1"
+G0_IDENTITY_LEDGER_BINDING_SCHEMA = "temporal_qd_native_g0_identity_ledger_binding_v1"
+G0_FUNNEL_OPERATION = "finalize_g0"
+G0_FUNNEL_RESULT_FILENAME = "g0-funnel-result.json"
+G0_ADMISSION_THREAD_CAP_ENV = "TEMPORAL_QD_G0_ADMISSION_THREAD_CAP"
+G0_ADMISSION_THREAD_CAP_DEFAULT = 8
+G0_ADMISSION_THREAD_CAP_MAXIMUM = 8
+G0_DIAGNOSTICS_SCHEMA = "temporal_qd_native_g0_diagnostics_v1"
+_G0_DIAGNOSTICS_PREFIX = "TEMPORAL_QD_G0_DIAGNOSTICS "
+G0_LEGACY_V5_RUNTIME_MIGRATION_SCHEMA = (
+    "temporal_qd_legacy_v5_g0_runtime_migration_v1"
+)
+G0_LEGACY_V5_RUNTIME_MIGRATION_PATH = (
+    Path("internal") / "g0-funnel" / "legacy-v5-runtime-migration.json"
+)
+# The preserved 4,000 -> 1,024 v5 checkpoint predates the separately frozen
+# G0 finalization runtime.  This is deliberately a singleton migration, not a
+# compatibility mode for arbitrary configurations that omit that authority.
+G0_LEGACY_V5_PRE_CUTOVER_CONFIG_SHA256 = (
+    "sha256:ebe9055522e8e1399c3df0d0fa296a4842a4b4c6ea7a88e8b296ba34479d093d"
+)
 NATIVE_GENERATION_MANIFEST_SCHEMA = (
     "temporal_qd_native_generate_generation_manifest_v1"
 )
@@ -148,6 +177,63 @@ def validate_pair_generation_runtime_config(value: object) -> dict[str, Any]:
     material = {key: item for key, item in value.items() if key != "runtimeSha256"}
     if supplied != sha256(canonical_json_bytes(material)):
         raise TemporalQDNativeError("pair generation runtime config identity mismatch")
+    return dict(value)
+
+
+def build_g0_finalization_runtime_config(
+    *,
+    engine: str = G0_FINALIZATION_RUNTIME_DEFAULT,
+    execution_timeout_seconds: int = 3600,
+) -> dict[str, Any]:
+    """Freeze the independent post-construction G0 authority.
+
+    This is deliberately distinct from ``pairGenerationRuntime``.  v5
+    proposal construction still needs the live Python evolvable factory and
+    compiler, while a completed proposal journal is finalized by one native
+    G0 transaction.
+    """
+
+    value = {
+        "schemaVersion": G0_FINALIZATION_RUNTIME_SCHEMA,
+        "engine": engine,
+        "fallbackPolicy": G0_FINALIZATION_RUNTIME_FALLBACK_POLICY,
+        "executionTimeoutSeconds": execution_timeout_seconds,
+    }
+    value["runtimeSha256"] = sha256(canonical_json_bytes(value))
+    return validate_g0_finalization_runtime_config(value)
+
+
+def validate_g0_finalization_runtime_config(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schemaVersion",
+        "engine",
+        "fallbackPolicy",
+        "executionTimeoutSeconds",
+        "runtimeSha256",
+    }:
+        raise TemporalQDNativeError(
+            "G0 finalization runtime config fields are not exact"
+        )
+    if (
+        value.get("schemaVersion") != G0_FINALIZATION_RUNTIME_SCHEMA
+        or value.get("engine")
+        not in {
+            G0_FINALIZATION_RUNTIME_RUST,
+            G0_FINALIZATION_RUNTIME_PYTHON_ORACLE,
+        }
+        or value.get("fallbackPolicy")
+        != G0_FINALIZATION_RUNTIME_FALLBACK_POLICY
+        or isinstance(value.get("executionTimeoutSeconds"), bool)
+        or not isinstance(value.get("executionTimeoutSeconds"), int)
+        or value["executionTimeoutSeconds"] < 60
+    ):
+        raise TemporalQDNativeError("G0 finalization runtime config is incompatible")
+    supplied = _validate_exact_sha256(
+        value.get("runtimeSha256"), name="G0 finalization runtimeSha256"
+    )
+    material = {key: item for key, item in value.items() if key != "runtimeSha256"}
+    if supplied != sha256(canonical_json_bytes(material)):
+        raise TemporalQDNativeError("G0 finalization runtime config identity mismatch")
     return dict(value)
 
 
@@ -336,6 +422,102 @@ class _WindowsKillOnCloseJob:
             self._handle = None
 
 
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
+_WINDOWS_THREAD_SUSPEND_RESUME = 0x0002
+_WINDOWS_TH32CS_SNAPTHREAD = 0x00000004
+_WINDOWS_ERROR_NO_MORE_FILES = 18
+_WINDOWS_INVALID_DWORD = 0xFFFFFFFF
+
+
+def _resume_windows_suspended_process(process: subprocess.Popen[bytes]) -> None:
+    """Resume exactly the primary thread we deliberately created suspended.
+
+    ``subprocess.Popen`` retains the process handle but closes the initial
+    thread handle before returning.  A ToolHelp snapshot lets us reopen that
+    one suspended primary thread after the process tree has been assigned to
+    its kill-on-close Job Object.  Requiring exactly one owned thread keeps an
+    unexpected process state fail-closed rather than resuming an unbound tree.
+    """
+
+    if os.name != "nt":  # pragma: no cover - defensive call-site guard
+        raise TemporalQDNativeError("Windows suspended-process resume was requested off Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot_threads = kernel32.CreateToolhelp32Snapshot
+    snapshot_threads.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    snapshot_threads.restype = wintypes.HANDLE
+    first_thread = kernel32.Thread32First
+    first_thread.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32))
+    first_thread.restype = wintypes.BOOL
+    next_thread = kernel32.Thread32Next
+    next_thread.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32))
+    next_thread.restype = wintypes.BOOL
+    open_thread = kernel32.OpenThread
+    open_thread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_thread.restype = wintypes.HANDLE
+    resume_thread = kernel32.ResumeThread
+    resume_thread.argtypes = (wintypes.HANDLE,)
+    resume_thread.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    invalid_handle = ctypes.c_void_p(-1).value
+    snapshot = snapshot_threads(_WINDOWS_TH32CS_SNAPTHREAD, 0)
+    if snapshot in (None, invalid_handle):
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    try:
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not first_thread(snapshot, ctypes.byref(entry)):
+            raise OSError(ctypes.get_last_error(), "Thread32First failed")
+        owned_threads: list[int] = []
+        while True:
+            if entry.th32OwnerProcessID == process.pid:
+                owned_threads.append(int(entry.th32ThreadID))
+            entry.dwSize = ctypes.sizeof(entry)
+            if next_thread(snapshot, ctypes.byref(entry)):
+                continue
+            error = ctypes.get_last_error()
+            if error != _WINDOWS_ERROR_NO_MORE_FILES:
+                raise OSError(error, "Thread32Next failed")
+            break
+        if len(owned_threads) != 1:
+            raise OSError(
+                0,
+                "suspended native Temporal QD child did not expose exactly one primary thread",
+            )
+        thread = open_thread(_WINDOWS_THREAD_SUSPEND_RESUME, False, owned_threads[0])
+        if not thread:
+            raise OSError(ctypes.get_last_error(), "OpenThread failed")
+        try:
+            previous_suspend_count = resume_thread(thread)
+            if previous_suspend_count != 1:
+                error = ctypes.get_last_error() if previous_suspend_count == _WINDOWS_INVALID_DWORD else 0
+                raise OSError(
+                    error,
+                    "ResumeThread did not release the expected primary-thread suspension",
+                )
+        finally:
+            close_handle(thread)
+    finally:
+        close_handle(snapshot)
+
+
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     """Best-effort terminate of the process tree which this invocation owns."""
 
@@ -372,6 +554,7 @@ def _run_checked(
     timeout: float = 300.0,
     env: Mapping[str, str] | None = None,
     raise_on_nonzero: bool = True,
+    on_process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one native command with complete child-tree ownership.
 
@@ -390,7 +573,13 @@ def _run_checked(
     if env is not None:
         popen_options["env"] = dict(env)
     if os.name == "nt":
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        # A fast `--version-json` child previously could exit in the small
+        # gap between Popen and AssignProcessToJobObject.  Keep its primary
+        # thread suspended until the Job Object owns the complete process
+        # tree, then explicitly resume it after both output drainers exist.
+        popen_options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | _WINDOWS_CREATE_SUSPENDED
+        )
     else:
         popen_options["start_new_session"] = True
     process = subprocess.Popen(command_strings, **popen_options)
@@ -402,7 +591,6 @@ def _run_checked(
             try:
                 job = _WindowsKillOnCloseJob(process)
             except (AttributeError, OSError) as exc:
-                _terminate_process_group(process)
                 raise TemporalQDNativeError(
                     "could not bind native Temporal QD command to a Windows job object"
                 ) from exc
@@ -415,6 +603,25 @@ def _run_checked(
         )
         stdout_capture.start()
         stderr_capture.start()
+        if on_process_started is not None:
+            try:
+                # Start any external observer only once Windows has assigned
+                # the process to its kill-on-close Job Object.  The callback
+                # therefore never sees an uncontained long-lived child, and
+                # on Windows can sample the process while it is still safely
+                # suspended before its primary thread resumes.
+                on_process_started(process)
+            except BaseException as exc:
+                raise TemporalQDNativeError(
+                    "native Temporal QD process observer could not start"
+                ) from exc
+        if os.name == "nt":
+            try:
+                _resume_windows_suspended_process(process)
+            except (AttributeError, OSError, TemporalQDNativeError) as exc:
+                raise TemporalQDNativeError(
+                    "could not resume native Temporal QD command after Windows job assignment"
+                ) from exc
         try:
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -532,6 +739,93 @@ def build_native_authority(
     _validate_exact_sha256(authority["sourceSha256"], name="sourceSha256")
     authority["authoritySha256"] = sha256(canonical_json_bytes(authority))
     return authority
+
+
+def validate_native_authority(value: object) -> dict[str, str]:
+    """Validate the closed authority of the batch executable itself.
+
+    G0 finalization is intentionally a different runtime from Python proposal
+    construction, but it is still executed by ``temporal-qd-batch``.  Keeping
+    the complete executable/source authority here prevents a receipt from
+    being adopted after a different batch binary has been built in place.
+    """
+
+    expected = {
+        "schemaVersion",
+        "contractVersion",
+        "crateVersion",
+        "binaryName",
+        "buildProfile",
+        "executableSha256",
+        "sourceSha256",
+        "authoritySha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native authority fields are not exact")
+    result = {key: value[key] for key in expected}
+    if (
+        result["schemaVersion"] != NATIVE_AUTHORITY_SCHEMA
+        or result["contractVersion"] != NATIVE_CONTRACT_VERSION
+        or result["binaryName"] != NATIVE_BINARY_NAME
+        or result["buildProfile"] != "release"
+        or not isinstance(result["crateVersion"], str)
+        or not result["crateVersion"].strip()
+    ):
+        raise TemporalQDNativeError("native authority is incompatible")
+    for key in ("executableSha256", "sourceSha256", "authoritySha256"):
+        _validate_exact_sha256(result[key], name=f"native authority {key}")
+    material = {key: item for key, item in result.items() if key != "authoritySha256"}
+    if sha256(canonical_json_bytes(material)) != result["authoritySha256"]:
+        raise TemporalQDNativeError("native authority identity mismatch")
+    return {key: str(item) for key, item in result.items()}
+
+
+def _build_g0_execution_authority(
+    *,
+    g0_finalization_runtime: Mapping[str, Any],
+    native_batch_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the distinct G0 runtime to the concrete batch executable/source."""
+
+    runtime = validate_g0_finalization_runtime_config(g0_finalization_runtime)
+    batch = validate_native_authority(native_batch_authority)
+    value: dict[str, Any] = {
+        "schemaVersion": G0_EXECUTION_AUTHORITY_SCHEMA,
+        "g0FinalizationRuntimeSha256": runtime["runtimeSha256"],
+        "nativeBatchAuthority": batch,
+        "nativeBatchAuthoritySha256": batch["authoritySha256"],
+    }
+    value["authoritySha256"] = sha256(canonical_json_bytes(value))
+    return _validate_g0_execution_authority(value)
+
+
+def _validate_g0_execution_authority(value: object) -> dict[str, Any]:
+    expected = {
+        "schemaVersion",
+        "g0FinalizationRuntimeSha256",
+        "nativeBatchAuthority",
+        "nativeBatchAuthoritySha256",
+        "authoritySha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 execution authority fields are not exact")
+    result = dict(value)
+    if result["schemaVersion"] != G0_EXECUTION_AUTHORITY_SCHEMA:
+        raise TemporalQDNativeError("native G0 execution authority is incompatible")
+    for key in (
+        "g0FinalizationRuntimeSha256",
+        "nativeBatchAuthoritySha256",
+        "authoritySha256",
+    ):
+        _validate_exact_sha256(result[key], name=f"native G0 execution authority {key}")
+    batch = validate_native_authority(result["nativeBatchAuthority"])
+    if result["nativeBatchAuthoritySha256"] != batch["authoritySha256"]:
+        raise TemporalQDNativeError("native G0 execution authority batch binding drifted")
+    material = {key: item for key, item in result.items() if key != "authoritySha256"}
+    if sha256(canonical_json_bytes(material)) != result["authoritySha256"]:
+        raise TemporalQDNativeError("native G0 execution authority identity mismatch")
+    result["nativeBatchAuthority"] = batch
+    return result
 
 
 def ensure_native_batch() -> tuple[Path, dict[str, str]]:
@@ -1155,6 +1449,492 @@ def validate_generation_result(
     return result
 
 
+def _validate_g0_publication_policy(value: object) -> dict[str, Any]:
+    expected = {
+        "qdVersion",
+        "policyName",
+        "policySha256",
+        "pairPolicy",
+        "operatorImplementationIdentity",
+        "predeclaredEvidenceContextSha256",
+        "archivePolicyAuthority",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 publication policy fields are not exact")
+    result = dict(value)
+    if (
+        not isinstance(result["qdVersion"], str)
+        or not result["qdVersion"]
+        or not isinstance(result["policyName"], str)
+        or not result["policyName"]
+        or not isinstance(result["pairPolicy"], Mapping)
+        or not isinstance(result["operatorImplementationIdentity"], Mapping)
+    ):
+        raise TemporalQDNativeError("native G0 publication policy is invalid")
+    _validate_exact_sha256(result["policySha256"], name="G0 publication policySha256")
+    evidence = result["predeclaredEvidenceContextSha256"]
+    if evidence is not None:
+        _validate_exact_sha256(
+            evidence, name="G0 publication predeclaredEvidenceContextSha256"
+        )
+    authority = result["archivePolicyAuthority"]
+    if authority is not None:
+        if not isinstance(authority, Mapping) or set(authority) != {
+            "qdVersion",
+            "policyName",
+            "policySha256",
+            "frozenPolicy",
+        }:
+            raise TemporalQDNativeError(
+                "native G0 archive policy authority fields are not exact"
+            )
+        if (
+            authority.get("qdVersion") != result["qdVersion"]
+            or authority.get("policyName") != result["policyName"]
+            or authority.get("policySha256") != result["policySha256"]
+            or not isinstance(authority.get("frozenPolicy"), Mapping)
+            or sha256(canonical_json_bytes(authority["frozenPolicy"]))
+            != result["policySha256"]
+        ):
+            raise TemporalQDNativeError(
+                "native G0 archive policy authority binding is invalid"
+            )
+    return result
+
+
+def _validate_g0_global_identity_ledger(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    expected = {
+        "pairExecutableSemanticCount",
+        "pairExecutableSemanticDuplicateRejections",
+        "identityLedgerSha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 global identity ledger fields are not exact")
+    result = dict(value)
+    for key in (
+        "pairExecutableSemanticCount",
+        "pairExecutableSemanticDuplicateRejections",
+    ):
+        if isinstance(result[key], bool) or not isinstance(result[key], int) or result[key] < 0:
+            raise TemporalQDNativeError(f"native G0 global identity ledger {key} is invalid")
+    _validate_exact_sha256(
+        result["identityLedgerSha256"], name="G0 identity ledgerSha256"
+    )
+    return result
+
+
+def _validate_g0_identity_ledger_binding(value: object) -> dict[str, Any] | None:
+    """Validate the compact pointer/authority passed to Rust, never its rows."""
+
+    if value is None:
+        return None
+    expected = {
+        "schemaVersion",
+        "ledgerPath",
+        "policyName",
+        "policySha256",
+        "identityPolicy",
+        "identityPolicySha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 identity ledger binding fields are not exact")
+    result = dict(value)
+    if (
+        result["schemaVersion"] != G0_IDENTITY_LEDGER_BINDING_SCHEMA
+        or not isinstance(result["ledgerPath"], str)
+        or not Path(result["ledgerPath"]).is_absolute()
+        or not isinstance(result["policyName"], str)
+        or not result["policyName"]
+        or not isinstance(result["identityPolicy"], Mapping)
+    ):
+        raise TemporalQDNativeError("native G0 identity ledger binding is invalid")
+    for key in ("policySha256", "identityPolicySha256"):
+        _validate_exact_sha256(result[key], name=f"native G0 identity ledger {key}")
+    if sha256(canonical_json_bytes(result["identityPolicy"])) != result[
+        "identityPolicySha256"
+    ]:
+        raise TemporalQDNativeError("native G0 identity ledger policy identity drifted")
+    return result
+
+
+def build_g0_funnel_manifest(
+    *,
+    g0_finalization_runtime: Mapping[str, Any],
+    output_root: Path | str,
+    generation_config: Mapping[str, Any],
+    evaluation_population_size: int,
+    publication_policy: Mapping[str, Any],
+    native_batch_authority: Mapping[str, Any] | None = None,
+    identity_ledger_binding: Mapping[str, Any] | None = None,
+    global_identity_ledger: Mapping[str, Any] | None = None,
+    audit: bool = False,
+) -> dict[str, Any]:
+    """Build the compact native G0 request; rich rows stay on disk."""
+
+    runtime = validate_g0_finalization_runtime_config(g0_finalization_runtime)
+    if runtime["engine"] != G0_FINALIZATION_RUNTIME_RUST:
+        raise TemporalQDNativeError("native G0 manifest requires the Rust G0 runtime")
+    if native_batch_authority is None:
+        raise TemporalQDNativeError("native G0 manifest requires batch executable authority")
+    if global_identity_ledger is not None:
+        raise TemporalQDNativeError(
+            "native G0 manifest accepts only a compact identity ledger binding"
+        )
+    config = dict(generation_config)
+    config_sha = _validate_exact_sha256(
+        config.get("configSha256"), name="G0 generation configSha256"
+    )
+    config_material = {key: item for key, item in config.items() if key != "configSha256"}
+    if (
+        config.get("schemaVersion") != PAIR_GENERATION_SCHEMA
+        or sha256(canonical_json_bytes(config_material)) != config_sha
+        or isinstance(config.get("generationIndex"), bool)
+        or config.get("generationIndex") != 1
+        or isinstance(config.get("targetUniqueCandidates"), bool)
+        or not isinstance(config.get("targetUniqueCandidates"), int)
+        or config["targetUniqueCandidates"] < 1
+        or isinstance(config.get("maxProposalAttempts"), bool)
+        or not isinstance(config.get("maxProposalAttempts"), int)
+        or config["maxProposalAttempts"] < config["targetUniqueCandidates"]
+    ):
+        raise TemporalQDNativeError("G0 generation config is incompatible")
+    if (
+        isinstance(evaluation_population_size, bool)
+        or not isinstance(evaluation_population_size, int)
+        or not 1 <= evaluation_population_size <= config["targetUniqueCandidates"]
+        or not isinstance(audit, bool)
+    ):
+        raise TemporalQDNativeError("G0 funnel dimensions or audit flag are invalid")
+    policy = _validate_g0_publication_policy(publication_policy)
+    execution_authority = _build_g0_execution_authority(
+        g0_finalization_runtime=runtime,
+        native_batch_authority=native_batch_authority,
+    )
+    ledger = _validate_g0_identity_ledger_binding(identity_ledger_binding)
+    value = {
+        "schemaVersion": G0_FUNNEL_MANIFEST_SCHEMA,
+        "contractVersion": NATIVE_CONTRACT_VERSION,
+        "operation": G0_FUNNEL_OPERATION,
+        "authoritySha256": execution_authority["authoritySha256"],
+        "executionAuthority": execution_authority,
+        "outputRoot": str(Path(output_root).resolve()),
+        "finalNewline": "crlf" if os.linesep == "\r\n" else "lf",
+        "generationConfig": config,
+        "generationConfigSha256": config_sha,
+        "generationIndex": config["generationIndex"],
+        "constructionPoolSize": config["targetUniqueCandidates"],
+        "evaluationPopulationSize": evaluation_population_size,
+        "maxProposalAttempts": config["maxProposalAttempts"],
+        "publicationPolicy": policy,
+        "identityLedger": ledger,
+        "audit": audit,
+        "resultPath": G0_FUNNEL_RESULT_FILENAME,
+    }
+    value["manifestSha256"] = sha256(canonical_json_bytes(value))
+    return validate_g0_funnel_manifest(value)
+
+
+def validate_g0_funnel_manifest(value: object) -> dict[str, Any]:
+    expected = {
+        "schemaVersion",
+        "contractVersion",
+        "operation",
+        "authoritySha256",
+        "executionAuthority",
+        "outputRoot",
+        "finalNewline",
+        "generationConfig",
+        "generationConfigSha256",
+        "generationIndex",
+        "constructionPoolSize",
+        "evaluationPopulationSize",
+        "maxProposalAttempts",
+        "publicationPolicy",
+        "identityLedger",
+        "audit",
+        "resultPath",
+        "manifestSha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 funnel manifest fields are not exact")
+    result = dict(value)
+    if (
+        result["schemaVersion"] != G0_FUNNEL_MANIFEST_SCHEMA
+        or result["contractVersion"] != NATIVE_CONTRACT_VERSION
+        or result["operation"] != G0_FUNNEL_OPERATION
+        or result["resultPath"] != G0_FUNNEL_RESULT_FILENAME
+        or result["finalNewline"] != ("crlf" if os.linesep == "\r\n" else "lf")
+        or not isinstance(result["outputRoot"], str)
+        or not Path(result["outputRoot"]).is_absolute()
+        or not isinstance(result["audit"], bool)
+    ):
+        raise TemporalQDNativeError("native G0 funnel manifest is incompatible")
+    for key in ("authoritySha256", "generationConfigSha256", "manifestSha256"):
+        _validate_exact_sha256(result[key], name=f"native G0 funnel {key}")
+    execution_authority = _validate_g0_execution_authority(result["executionAuthority"])
+    if result["authoritySha256"] != execution_authority["authoritySha256"]:
+        raise TemporalQDNativeError("native G0 funnel execution authority drifted")
+    config = result["generationConfig"]
+    if not isinstance(config, Mapping):
+        raise TemporalQDNativeError("native G0 funnel generation config is invalid")
+    material = {key: item for key, item in config.items() if key != "configSha256"}
+    if (
+        config.get("schemaVersion") != PAIR_GENERATION_SCHEMA
+        or config.get("configSha256") != result["generationConfigSha256"]
+        or sha256(canonical_json_bytes(material)) != result["generationConfigSha256"]
+        or result["generationIndex"] != config.get("generationIndex")
+        or result["constructionPoolSize"] != config.get("targetUniqueCandidates")
+        or result["maxProposalAttempts"] != config.get("maxProposalAttempts")
+        or isinstance(result["generationIndex"], bool)
+        or result["generationIndex"] != 1
+        or isinstance(result["constructionPoolSize"], bool)
+        or not isinstance(result["constructionPoolSize"], int)
+        or result["constructionPoolSize"] < 1
+        or isinstance(result["evaluationPopulationSize"], bool)
+        or not isinstance(result["evaluationPopulationSize"], int)
+        or not 1 <= result["evaluationPopulationSize"] <= result["constructionPoolSize"]
+        or isinstance(result["maxProposalAttempts"], bool)
+        or not isinstance(result["maxProposalAttempts"], int)
+        or result["maxProposalAttempts"] < result["constructionPoolSize"]
+    ):
+        raise TemporalQDNativeError("native G0 funnel manifest/config dimensions drifted")
+    _validate_g0_publication_policy(result["publicationPolicy"])
+    _validate_g0_identity_ledger_binding(result["identityLedger"])
+    supplied = result["manifestSha256"]
+    material = {key: item for key, item in result.items() if key != "manifestSha256"}
+    if sha256(canonical_json_bytes(material)) != supplied:
+        raise TemporalQDNativeError("native G0 funnel manifest identity mismatch")
+    return result
+
+
+def _validate_g0_pair_generation_result(
+    value: object, *, manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    required = {
+        "schemaVersion",
+        "configSha256",
+        "populationSha256",
+        "evaluationPopulationSha256",
+        "journalSha256",
+        "proposalCount",
+        "candidateCount",
+        "constructionPoolSize",
+        "constructedAcceptedCount",
+        "g0Bootstrap",
+        "originProposalCounts",
+        "originAcceptedCounts",
+        "reproductionAllocation",
+        "reproductionAllocationAccounting",
+        "proposalSlots",
+        "uniqueIdentityCounts",
+        "duplicateCounters",
+        "proposalSlotCounters",
+        "nextImmigrantContinuationOrdinal",
+        "completed",
+    }
+    optional = {"immigrantConstructionDistribution"}
+    if not isinstance(value, Mapping) or set(value) - optional != required:
+        raise TemporalQDNativeError("native G0 pair generation result fields are not exact")
+    result = dict(value)
+    if (
+        result["schemaVersion"] != PAIR_GENERATION_RESULT_SCHEMA
+        or result["configSha256"] != manifest["generationConfigSha256"]
+        or result["completed"] is not True
+        or result["constructionPoolSize"] != manifest["constructionPoolSize"]
+        or result["constructedAcceptedCount"] != manifest["constructionPoolSize"]
+        or result["proposalCount"] != manifest["evaluationPopulationSize"]
+        or result["candidateCount"] != manifest["evaluationPopulationSize"]
+        or result["nextImmigrantContinuationOrdinal"] != 0
+        or result["reproductionAllocation"]
+        != manifest["generationConfig"].get("reproductionAllocation")
+        or not isinstance(result["g0Bootstrap"], Mapping)
+    ):
+        raise TemporalQDNativeError("native G0 pair generation result is incompatible")
+    for key in ("populationSha256", "evaluationPopulationSha256", "journalSha256"):
+        _validate_exact_sha256(result[key], name=f"native G0 result {key}")
+    for key in (
+        "proposalCount",
+        "candidateCount",
+        "constructionPoolSize",
+        "constructedAcceptedCount",
+        "nextImmigrantContinuationOrdinal",
+    ):
+        if isinstance(result[key], bool) or not isinstance(result[key], int) or result[key] < 0:
+            raise TemporalQDNativeError(f"native G0 result {key} is invalid")
+    for key in (
+        "originProposalCounts",
+        "originAcceptedCounts",
+        "reproductionAllocationAccounting",
+        "proposalSlots",
+        "uniqueIdentityCounts",
+        "duplicateCounters",
+        "proposalSlotCounters",
+    ):
+        if not isinstance(result[key], Mapping):
+            raise TemporalQDNativeError(f"native G0 result {key} is invalid")
+    return result
+
+
+def _validate_g0_receipt(
+    value: object,
+    *,
+    manifest: Mapping[str, Any],
+    pair_generation_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "schemaVersion",
+        "requestSha256",
+        "authoritySha256",
+        "executionAuthority",
+        "configSha256",
+        "generationIndex",
+        "constructionPoolSize",
+        "evaluationPopulationSize",
+        "operatorImplementationSha256",
+        "archivePolicyAuthoritySha256",
+        "journalInventorySha256",
+        "sourceHandoffSha256",
+        "globalIdentityLedger",
+        "identityLedgerBinding",
+        "g0Bootstrap",
+        "population",
+        "evaluationPopulation",
+        "generationJournal",
+        "pairGenerationResult",
+        "constructionPoolIdentitySha256",
+        "acceptedPoolSha256",
+        "selectionSha256",
+        "ledgerSha256",
+        "receiptSha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 receipt fields are not exact")
+    result = dict(value)
+    if (
+        result["schemaVersion"] != G0_FUNNEL_RECEIPT_SCHEMA
+        or result["requestSha256"] != manifest["manifestSha256"]
+        or result["authoritySha256"] != manifest["authoritySha256"]
+        or result["executionAuthority"] != manifest["executionAuthority"]
+        or result["configSha256"] != manifest["generationConfigSha256"]
+        or result["generationIndex"] != manifest["generationIndex"]
+        or result["constructionPoolSize"] != manifest["constructionPoolSize"]
+        or result["evaluationPopulationSize"] != manifest["evaluationPopulationSize"]
+        or result["identityLedgerBinding"] != manifest["identityLedger"]
+        or result["g0Bootstrap"] != pair_generation_result["g0Bootstrap"]
+        or result["pairGenerationResult"] != pair_generation_result
+    ):
+        raise TemporalQDNativeError("native G0 receipt manifest binding drifted")
+    _validate_g0_execution_authority(result["executionAuthority"])
+    _validate_g0_identity_ledger_binding(result["identityLedgerBinding"])
+    _validate_g0_global_identity_ledger(result["globalIdentityLedger"])
+    operator_sha = sha256(
+        canonical_json_bytes(
+            manifest["publicationPolicy"]["operatorImplementationIdentity"]
+        )
+    )
+    if result["operatorImplementationSha256"] != operator_sha:
+        raise TemporalQDNativeError("native G0 receipt operator binding drifted")
+    archive = manifest["publicationPolicy"]["archivePolicyAuthority"]
+    expected_archive_sha = sha256(canonical_json_bytes(archive)) if archive is not None else None
+    if result["archivePolicyAuthoritySha256"] != expected_archive_sha:
+        raise TemporalQDNativeError("native G0 receipt archive authority binding drifted")
+    for key in (
+        "requestSha256",
+        "authoritySha256",
+        "configSha256",
+        "operatorImplementationSha256",
+        "journalInventorySha256",
+        "constructionPoolIdentitySha256",
+        "acceptedPoolSha256",
+        "selectionSha256",
+        "ledgerSha256",
+        "receiptSha256",
+    ):
+        _validate_exact_sha256(result[key], name=f"native G0 receipt {key}")
+    for key in ("archivePolicyAuthoritySha256", "sourceHandoffSha256"):
+        if result[key] is not None:
+            _validate_exact_sha256(result[key], name=f"native G0 receipt {key}")
+    for key, expected_path, expected_sha in (
+        ("population", "population.json", pair_generation_result["populationSha256"]),
+        (
+            "evaluationPopulation",
+            "evaluation-population.json",
+            pair_generation_result["evaluationPopulationSha256"],
+        ),
+        ("generationJournal", "generation-journal.json", pair_generation_result["journalSha256"]),
+    ):
+        artifact = result[key]
+        if (
+            not isinstance(artifact, Mapping)
+            or set(artifact) != {"relativePath", "semanticSha256", "fileSha256", "encodedBytes"}
+            or artifact.get("relativePath") != expected_path
+            or artifact.get("semanticSha256") != expected_sha
+            or isinstance(artifact.get("encodedBytes"), bool)
+            or not isinstance(artifact.get("encodedBytes"), int)
+            or artifact["encodedBytes"] < 1
+        ):
+            raise TemporalQDNativeError(f"native G0 receipt {key} binding is invalid")
+        _validate_exact_sha256(artifact.get("fileSha256"), name=f"native G0 receipt {key} fileSha256")
+    supplied = result["receiptSha256"]
+    material = {key: item for key, item in result.items() if key != "receiptSha256"}
+    if sha256(canonical_json_bytes(material)) != supplied:
+        raise TemporalQDNativeError("native G0 receipt identity mismatch")
+    return result
+
+
+def validate_g0_funnel_result(
+    value: object, *, manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    checked = validate_g0_funnel_manifest(manifest)
+    if not isinstance(value, Mapping):
+        raise TemporalQDNativeError("native G0 funnel result must be an object")
+    result = dict(value)
+    status = result.get("status")
+    if status == "construction_incomplete":
+        if set(result) != {"schemaVersion", "status", "proposalCount", "acceptedCount"}:
+            raise TemporalQDNativeError("incomplete native G0 result fields are not exact")
+        for key in ("proposalCount", "acceptedCount"):
+            if isinstance(result[key], bool) or not isinstance(result[key], int) or result[key] < 0:
+                raise TemporalQDNativeError(f"incomplete native G0 result {key} is invalid")
+        if result["acceptedCount"] >= checked["constructionPoolSize"]:
+            raise TemporalQDNativeError("incomplete native G0 result has a completed pool")
+    elif status in {"completed", "adopted"}:
+        expected = {"schemaVersion", "status", "pairGenerationResult", "receipt"}
+        if status == "adopted":
+            expected.add("adoptionVerification")
+        if set(result) != expected:
+            raise TemporalQDNativeError("sealed native G0 result fields are not exact")
+        pair = _validate_g0_pair_generation_result(
+            result["pairGenerationResult"], manifest=checked
+        )
+        _validate_g0_receipt(result["receipt"], manifest=checked, pair_generation_result=pair)
+        if status == "adopted":
+            verification = result["adoptionVerification"]
+            if not isinstance(verification, Mapping) or set(verification) != {
+                "schemaVersion",
+                "outputBytesHashed",
+                "outputHashElapsedMilliseconds",
+                "proposalJournalBytesRead",
+            } or verification.get("schemaVersion") != "temporal_qd_native_g0_adoption_verification_v1":
+                raise TemporalQDNativeError("native G0 adoption verification fields are invalid")
+            for key in (
+                "outputBytesHashed",
+                "outputHashElapsedMilliseconds",
+                "proposalJournalBytesRead",
+            ):
+                if isinstance(verification.get(key), bool) or not isinstance(verification.get(key), int) or verification[key] < 0:
+                    raise TemporalQDNativeError(f"native G0 adoption verification {key} is invalid")
+            if verification["proposalJournalBytesRead"] != 0:
+                raise TemporalQDNativeError("native G0 adoption must not read proposal journal bytes")
+    else:
+        raise TemporalQDNativeError("native G0 funnel result status is invalid")
+    if result.get("schemaVersion") != G0_FUNNEL_RESULT_SCHEMA:
+        raise TemporalQDNativeError("native G0 funnel result schema is incompatible")
+    return result
+
+
 def _is_link_or_reparse(status: os.stat_result) -> bool:
     reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
     attributes = getattr(status, "st_file_attributes", 0)
@@ -1593,6 +2373,449 @@ def _load_canonical_object(path: Path, *, name: str) -> dict[str, Any]:
         raise TemporalQDNativeError(f"could not read {name}: {path}") from exc
 
 
+def _load_immutable_canonical_object(path: Path, *, name: str) -> dict[str, Any]:
+    """Read a canonical object without following an aliased parent or leaf."""
+
+    target = Path(os.path.abspath(os.fspath(path)))
+    parent = _require_existing_real_directory_tree(
+        target.parent, name=f"{name} parent"
+    )
+    try:
+        parent_status = os.lstat(parent)
+    except OSError as exc:
+        raise TemporalQDNativeError(f"could not inspect {name} parent: {parent}") from exc
+    record = _existing_regular_file(
+        target, name=name, parent_status=parent_status
+    )
+    if record is None:
+        raise TemporalQDNativeError(f"{name} is absent: {target}")
+    return _parse_canonical_json_line(record[0], name=name)
+
+
+def _load_immutable_json_object(path: Path, *, name: str) -> dict[str, Any]:
+    """Read an immutable JSON object while preserving the caller's newline contract.
+
+    Frozen supervisor files are self-hashed semantic JSON and predate the
+    bridge's LF-only internal-manifest convention.  Keep their no-alias file
+    checks without incorrectly rejecting their legitimate CRLF/pretty layout.
+    """
+
+    target = Path(os.path.abspath(os.fspath(path)))
+    parent = _require_existing_real_directory_tree(
+        target.parent, name=f"{name} parent"
+    )
+    try:
+        parent_status = os.lstat(parent)
+    except OSError as exc:
+        raise TemporalQDNativeError(f"could not inspect {name} parent: {parent}") from exc
+    record = _existing_regular_file(
+        target, name=name, parent_status=parent_status
+    )
+    if record is None:
+        raise TemporalQDNativeError(f"{name} is absent: {target}")
+    try:
+        value = json.loads(record[0].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TemporalQDNativeError(f"{name} is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise TemporalQDNativeError(f"{name} must be a JSON object")
+    return value
+
+
+def _legacy_v5_identity_ledger_binding(
+    *, supervisor_config: Mapping[str, Any], ledger_path: Path
+) -> dict[str, Any]:
+    """Reconstruct only the compact binding that production passes to Rust."""
+
+    frozen_policy = supervisor_config.get("frozenPolicy")
+    identity_policy = (
+        frozen_policy.get("identity") if isinstance(frozen_policy, Mapping) else None
+    )
+    policy_name = supervisor_config.get("policyName")
+    policy_sha256 = supervisor_config.get("policySha256")
+    if (
+        not isinstance(identity_policy, Mapping)
+        or not isinstance(policy_name, str)
+        or not policy_name
+    ):
+        raise TemporalQDNativeError(
+            "legacy v5 G0 migration lacks frozen identity-policy authority"
+        )
+    _validate_exact_sha256(policy_sha256, name="legacy v5 G0 policySha256")
+    return {
+        "schemaVersion": G0_IDENTITY_LEDGER_BINDING_SCHEMA,
+        "ledgerPath": str(ledger_path.resolve()),
+        "policyName": policy_name,
+        "policySha256": policy_sha256,
+        "identityPolicy": dict(identity_policy),
+        "identityPolicySha256": sha256(canonical_json_bytes(identity_policy)),
+    }
+
+
+def derive_legacy_v5_g0_finalization_runtime(
+    *,
+    supervisor_config_sha256: object,
+    pair_generation_runtime: object,
+) -> dict[str, Any]:
+    """Derive the singleton pre-cutover Rust G0 runtime, or fail closed.
+
+    The preserved v5 checkpoint froze Python-owned proposal construction before
+    the separate G0 runtime authority existed.  Its exact config identity is
+    intentionally the only one eligible for this deterministic projection.
+    """
+
+    config_sha256 = _validate_exact_sha256(
+        supervisor_config_sha256, name="legacy v5 supervisor configSha256"
+    )
+    if config_sha256 != G0_LEGACY_V5_PRE_CUTOVER_CONFIG_SHA256:
+        raise TemporalQDNativeError(
+            "legacy v5 G0 runtime migration is not authorized for this frozen config"
+        )
+    pair_runtime = validate_pair_generation_runtime_config(pair_generation_runtime)
+    if pair_runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON:
+        raise TemporalQDNativeError(
+            "legacy v5 G0 runtime migration requires the frozen Python construction runtime"
+        )
+    return build_g0_finalization_runtime_config(
+        engine=G0_FINALIZATION_RUNTIME_RUST,
+        execution_timeout_seconds=pair_runtime["executionTimeoutSeconds"],
+    )
+
+
+def _legacy_v5_expected_paths(run_root: Path | str) -> tuple[Path, Path, Path, Path, Path]:
+    root = _require_existing_real_directory_tree(
+        run_root, name="legacy v5 G0 migration run root"
+    )
+    proposal_root = root / "generations" / "generation-0001" / "proposal"
+    proposal_root = _require_existing_real_directory_tree(
+        proposal_root, name="legacy v5 G0 migration proposal root"
+    )
+    config_path = root / "config.json"
+    pair_config_path = proposal_root / "pair-config.json"
+    ledger_path = root / "identity-ledger.json"
+    receipt_path = proposal_root / "internal" / "g0-funnel" / "receipt.json"
+    return config_path, proposal_root, pair_config_path, ledger_path, receipt_path
+
+
+def _legacy_v5_read_pair_config(path: Path) -> dict[str, Any]:
+    value = _load_immutable_json_object(path, name="legacy v5 pair config")
+    config_sha = _validate_exact_sha256(
+        value.get("configSha256"), name="legacy v5 pair configSha256"
+    )
+    material = {key: item for key, item in value.items() if key != "configSha256"}
+    if (
+        value.get("schemaVersion") != PAIR_GENERATION_SCHEMA
+        or value.get("generationIndex") != 1
+        or sha256(canonical_json_bytes(material)) != config_sha
+    ):
+        raise TemporalQDNativeError("legacy v5 pair config is incompatible")
+    return value
+
+
+def _legacy_v5_validate_receipt(
+    receipt: object,
+    *,
+    runtime: Mapping[str, Any],
+    pair_config_sha256: str,
+    identity_ledger_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the compact receipt surface before granting migration authority.
+
+    The regular native G0 transaction re-verifies this receipt and every
+    public output before use.  This narrow preflight deliberately checks only
+    the immutable bindings necessary to re-open the legacy supervisor config.
+    """
+
+    expected = {
+        "schemaVersion",
+        "requestSha256",
+        "authoritySha256",
+        "executionAuthority",
+        "configSha256",
+        "generationIndex",
+        "constructionPoolSize",
+        "evaluationPopulationSize",
+        "operatorImplementationSha256",
+        "archivePolicyAuthoritySha256",
+        "journalInventorySha256",
+        "sourceHandoffSha256",
+        "globalIdentityLedger",
+        "identityLedgerBinding",
+        "g0Bootstrap",
+        "population",
+        "evaluationPopulation",
+        "generationJournal",
+        "pairGenerationResult",
+        "constructionPoolIdentitySha256",
+        "acceptedPoolSha256",
+        "selectionSha256",
+        "ledgerSha256",
+        "receiptSha256",
+    }
+    if not isinstance(receipt, Mapping) or set(receipt) != expected:
+        raise TemporalQDNativeError("legacy v5 native G0 receipt fields are not exact")
+    result = dict(receipt)
+    if result.get("schemaVersion") != G0_FUNNEL_RECEIPT_SCHEMA:
+        raise TemporalQDNativeError("legacy v5 native G0 receipt schema is incompatible")
+    receipt_sha = _validate_exact_sha256(
+        result.get("receiptSha256"), name="legacy v5 native G0 receiptSha256"
+    )
+    material = {key: item for key, item in result.items() if key != "receiptSha256"}
+    if sha256(canonical_json_bytes(material)) != receipt_sha:
+        raise TemporalQDNativeError("legacy v5 native G0 receipt identity mismatch")
+    execution_authority = _validate_g0_execution_authority(
+        result.get("executionAuthority")
+    )
+    if (
+        result.get("authoritySha256") != execution_authority["authoritySha256"]
+        or execution_authority["g0FinalizationRuntimeSha256"]
+        != runtime["runtimeSha256"]
+        or result.get("configSha256") != pair_config_sha256
+        or result.get("generationIndex") != 1
+        or result.get("identityLedgerBinding") != identity_ledger_binding
+    ):
+        raise TemporalQDNativeError("legacy v5 native G0 receipt binding drifted")
+    return result
+
+
+def _validate_legacy_v5_g0_runtime_migration(
+    value: object,
+    *,
+    supervisor_config: Mapping[str, Any],
+    run_root: Path,
+    pair_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "schemaVersion",
+        "supervisorConfigPath",
+        "supervisorConfigSha256",
+        "pairGenerationRuntimeSha256",
+        "derivedG0FinalizationRuntime",
+        "derivedG0FinalizationRuntimeSha256",
+        "proposalRoot",
+        "proposalConfigPath",
+        "proposalConfigSha256",
+        "identityLedgerPath",
+        "identityLedgerBinding",
+        "nativeReceiptPath",
+        "nativeReceiptSha256",
+        "nativeExecutionAuthority",
+        "nativeExecutionAuthoritySha256",
+        "migrationSha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("legacy v5 G0 migration fields are not exact")
+    result = dict(value)
+    if result.get("schemaVersion") != G0_LEGACY_V5_RUNTIME_MIGRATION_SCHEMA:
+        raise TemporalQDNativeError("legacy v5 G0 migration schema is incompatible")
+    migration_sha = _validate_exact_sha256(
+        result.get("migrationSha256"), name="legacy v5 G0 migrationSha256"
+    )
+    material = {key: item for key, item in result.items() if key != "migrationSha256"}
+    if sha256(canonical_json_bytes(material)) != migration_sha:
+        raise TemporalQDNativeError("legacy v5 G0 migration identity mismatch")
+    (
+        config_path,
+        proposal_root,
+        pair_config_path,
+        ledger_path,
+        receipt_path,
+    ) = _legacy_v5_expected_paths(run_root)
+    config_sha = _validate_exact_sha256(
+        supervisor_config.get("configSha256"), name="legacy v5 supervisor configSha256"
+    )
+    runtime = derive_legacy_v5_g0_finalization_runtime(
+        supervisor_config_sha256=config_sha,
+        pair_generation_runtime=pair_runtime,
+    )
+    pair_config = _legacy_v5_read_pair_config(pair_config_path)
+    _require_regular_file(ledger_path, name="legacy v5 identity ledger")
+    identity_binding = _legacy_v5_identity_ledger_binding(
+        supervisor_config=supervisor_config, ledger_path=ledger_path
+    )
+    expected_strings = {
+        "supervisorConfigPath": str(config_path.resolve()),
+        "supervisorConfigSha256": config_sha,
+        "pairGenerationRuntimeSha256": pair_runtime["runtimeSha256"],
+        "derivedG0FinalizationRuntimeSha256": runtime["runtimeSha256"],
+        "proposalRoot": str(proposal_root.resolve()),
+        "proposalConfigPath": str(pair_config_path.resolve()),
+        "proposalConfigSha256": pair_config["configSha256"],
+        "identityLedgerPath": str(ledger_path.resolve()),
+        "nativeReceiptPath": str(receipt_path.resolve()),
+    }
+    if (
+        any(result.get(key) != expected_value for key, expected_value in expected_strings.items())
+        or result.get("derivedG0FinalizationRuntime") != runtime
+        or result.get("identityLedgerBinding") != identity_binding
+    ):
+        raise TemporalQDNativeError("legacy v5 G0 migration authority drifted")
+    for key in (
+        "nativeReceiptSha256",
+        "nativeExecutionAuthoritySha256",
+    ):
+        _validate_exact_sha256(result.get(key), name=f"legacy v5 G0 migration {key}")
+    execution_authority = _validate_g0_execution_authority(
+        result.get("nativeExecutionAuthority")
+    )
+    if result["nativeExecutionAuthoritySha256"] != execution_authority["authoritySha256"]:
+        raise TemporalQDNativeError("legacy v5 G0 migration execution authority drifted")
+    receipt = _load_immutable_json_object(
+        receipt_path, name="legacy v5 native G0 receipt"
+    )
+    checked_receipt = _legacy_v5_validate_receipt(
+        receipt,
+        runtime=runtime,
+        pair_config_sha256=pair_config["configSha256"],
+        identity_ledger_binding=identity_binding,
+    )
+    if (
+        result["nativeReceiptSha256"] != checked_receipt["receiptSha256"]
+        or result["nativeExecutionAuthority"] != checked_receipt["executionAuthority"]
+        or result["nativeExecutionAuthoritySha256"]
+        != checked_receipt["authoritySha256"]
+    ):
+        raise TemporalQDNativeError("legacy v5 G0 migration receipt drifted")
+    return result
+
+
+def seal_legacy_v5_g0_runtime_migration(
+    *,
+    supervisor_config: Mapping[str, Any],
+    run_root: Path | str,
+) -> dict[str, Any]:
+    """Publish the singleton legacy reopen authority after a native seal.
+
+    The immutable migration receipt does not replace the native G0 receipt. It
+    binds that receipt to the exact old supervisor config, derived Rust runtime,
+    proposal config, and global ledger path so a later supervisor restart has
+    a narrow, auditable exception rather than a Python fallback.
+    """
+
+    root = _require_existing_real_directory_tree(
+        run_root, name="legacy v5 G0 migration run root"
+    )
+    config_path, proposal_root, pair_config_path, ledger_path, receipt_path = (
+        _legacy_v5_expected_paths(root)
+    )
+    persisted_config = _load_immutable_json_object(
+        config_path, name="legacy v5 supervisor config"
+    )
+    if persisted_config != dict(supervisor_config):
+        raise TemporalQDNativeError("legacy v5 supervisor config changed before migration")
+    config_sha = _validate_exact_sha256(
+        persisted_config.get("configSha256"), name="legacy v5 supervisor configSha256"
+    )
+    config_material = {
+        key: item for key, item in persisted_config.items() if key != "configSha256"
+    }
+    if sha256(canonical_json_bytes(config_material)) != config_sha:
+        raise TemporalQDNativeError("legacy v5 supervisor config identity mismatch")
+    if "g0FinalizationRuntime" in persisted_config:
+        raise TemporalQDNativeError(
+            "legacy v5 G0 migration is forbidden for a config with a frozen G0 runtime"
+        )
+    pair_runtime = validate_pair_generation_runtime_config(
+        persisted_config.get("pairGenerationRuntime")
+    )
+    runtime = derive_legacy_v5_g0_finalization_runtime(
+        supervisor_config_sha256=config_sha,
+        pair_generation_runtime=pair_runtime,
+    )
+    pair_config = _legacy_v5_read_pair_config(pair_config_path)
+    # The G0 receipt performs its own durable ledger reduction.  We only prove
+    # the frozen path is a real file here; no Python row scan is permitted.
+    _require_regular_file(ledger_path, name="legacy v5 identity ledger")
+    identity_binding = _legacy_v5_identity_ledger_binding(
+        supervisor_config=persisted_config, ledger_path=ledger_path
+    )
+    receipt = _load_immutable_json_object(
+        receipt_path, name="legacy v5 native G0 receipt"
+    )
+    receipt = _legacy_v5_validate_receipt(
+        receipt,
+        runtime=runtime,
+        pair_config_sha256=pair_config["configSha256"],
+        identity_ledger_binding=identity_binding,
+    )
+    migration: dict[str, Any] = {
+        "schemaVersion": G0_LEGACY_V5_RUNTIME_MIGRATION_SCHEMA,
+        "supervisorConfigPath": str(config_path.resolve()),
+        "supervisorConfigSha256": config_sha,
+        "pairGenerationRuntimeSha256": pair_runtime["runtimeSha256"],
+        "derivedG0FinalizationRuntime": runtime,
+        "derivedG0FinalizationRuntimeSha256": runtime["runtimeSha256"],
+        "proposalRoot": str(proposal_root.resolve()),
+        "proposalConfigPath": str(pair_config_path.resolve()),
+        "proposalConfigSha256": pair_config["configSha256"],
+        "identityLedgerPath": str(ledger_path.resolve()),
+        "identityLedgerBinding": identity_binding,
+        "nativeReceiptPath": str(receipt_path.resolve()),
+        "nativeReceiptSha256": receipt["receiptSha256"],
+        "nativeExecutionAuthority": receipt["executionAuthority"],
+        "nativeExecutionAuthoritySha256": receipt["authoritySha256"],
+    }
+    migration["migrationSha256"] = sha256(canonical_json_bytes(migration))
+    migration_path = proposal_root / G0_LEGACY_V5_RUNTIME_MIGRATION_PATH
+    _write_bytes_once(migration_path, canonical_json_bytes(migration) + b"\n")
+    persisted_migration = _load_immutable_json_object(
+        migration_path, name="legacy v5 G0 migration"
+    )
+    return _validate_legacy_v5_g0_runtime_migration(
+        persisted_migration,
+        supervisor_config=persisted_config,
+        run_root=root,
+        pair_runtime=pair_runtime,
+    )
+
+
+def load_legacy_v5_g0_finalization_runtime(
+    *, supervisor_config: Mapping[str, Any], run_root: Path | str
+) -> dict[str, Any]:
+    """Return the sealed legacy G0 runtime only after every compact binding.
+
+    This is intentionally unavailable to all new configs.  Its caller still
+    invokes the native G0 transaction on restart, which re-hashes public
+    output and performs the receipt's complete fail-closed adoption check.
+    """
+
+    root = _require_existing_real_directory_tree(
+        run_root, name="legacy v5 G0 migration run root"
+    )
+    config_sha = _validate_exact_sha256(
+        supervisor_config.get("configSha256"), name="legacy v5 supervisor configSha256"
+    )
+    if config_sha != G0_LEGACY_V5_PRE_CUTOVER_CONFIG_SHA256:
+        raise TemporalQDNativeError(
+            "legacy v5 G0 migration is not authorized for this frozen config"
+        )
+    if "g0FinalizationRuntime" in supervisor_config:
+        raise TemporalQDNativeError(
+            "legacy v5 G0 migration cannot shadow a frozen G0 runtime"
+        )
+    pair_runtime = validate_pair_generation_runtime_config(
+        supervisor_config.get("pairGenerationRuntime")
+    )
+    runtime = derive_legacy_v5_g0_finalization_runtime(
+        supervisor_config_sha256=config_sha,
+        pair_generation_runtime=pair_runtime,
+    )
+    _, proposal_root, _, _, _ = _legacy_v5_expected_paths(root)
+    migration_path = proposal_root / G0_LEGACY_V5_RUNTIME_MIGRATION_PATH
+    migration = _load_immutable_json_object(
+        migration_path, name="legacy v5 G0 migration"
+    )
+    checked = _validate_legacy_v5_g0_runtime_migration(
+        migration,
+        supervisor_config=supervisor_config,
+        run_root=root,
+        pair_runtime=pair_runtime,
+    )
+    if checked["derivedG0FinalizationRuntime"] != runtime:
+        raise TemporalQDNativeError("legacy v5 G0 migration runtime drifted")
+    return runtime
+
+
 def _load_json_object(path: Path, *, name: str) -> dict[str, Any]:
     try:
         _require_regular_file(path, name=name)
@@ -1764,12 +2987,244 @@ def run_native_generation(
     return file_result["pairGenerationResult"]
 
 
+def validate_g0_admission_thread_cap(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= G0_ADMISSION_THREAD_CAP_MAXIMUM
+    ):
+        raise TemporalQDNativeError(
+            "native G0 admission thread cap must be an integer within "
+            f"1..={G0_ADMISSION_THREAD_CAP_MAXIMUM}"
+        )
+    return value
+
+
+def _parse_native_g0_diagnostics(raw: bytes) -> dict[str, Any] | None:
+    """Decode the optional untrusted Rust timing line without affecting results.
+
+    The compact stdout result and sealed receipt remain the only semantic
+    authority.  This line exists solely for external release evidence, so a
+    malformed line fails the bridge rather than being silently misreported.
+    """
+
+    try:
+        lines = raw.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise TemporalQDNativeError("native G0 diagnostics are not UTF-8") from exc
+    payloads = [line.removeprefix(_G0_DIAGNOSTICS_PREFIX) for line in lines if line.startswith(_G0_DIAGNOSTICS_PREFIX)]
+    if not payloads:
+        return None
+    if len(payloads) != 1:
+        raise TemporalQDNativeError("native G0 emitted multiple diagnostics records")
+    try:
+        value = json.loads(payloads[0])
+    except json.JSONDecodeError as exc:
+        raise TemporalQDNativeError("native G0 diagnostics are not JSON") from exc
+    expected = {
+        "schemaVersion",
+        "mode",
+        "threadCap",
+        "totalElapsedMilliseconds",
+        "configurationBindingMilliseconds",
+        "journalAdmission",
+        "populationStreamingMilliseconds",
+        "reductionMilliseconds",
+        "publicationMilliseconds",
+        "sealingMilliseconds",
+        "outputArtifactBytes",
+        "outputBytesHashed",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise TemporalQDNativeError("native G0 diagnostics fields are not exact")
+    result = dict(value)
+    if result["schemaVersion"] != G0_DIAGNOSTICS_SCHEMA or result["mode"] not in {
+        "adopted",
+        "completed",
+        "construction_incomplete",
+    }:
+        raise TemporalQDNativeError("native G0 diagnostics are incompatible")
+    result["threadCap"] = validate_g0_admission_thread_cap(result["threadCap"])
+    for field in (
+        "totalElapsedMilliseconds",
+        "configurationBindingMilliseconds",
+        "populationStreamingMilliseconds",
+        "reductionMilliseconds",
+        "publicationMilliseconds",
+        "sealingMilliseconds",
+        "outputArtifactBytes",
+        "outputBytesHashed",
+    ):
+        if isinstance(result[field], bool) or not isinstance(result[field], int) or result[field] < 0:
+            raise TemporalQDNativeError(f"native G0 diagnostics {field} is invalid")
+    journal = result["journalAdmission"]
+    if journal is None:
+        return result
+    journal_expected = {
+        "entryCount",
+        "acceptedCount",
+        "sourceBytesRead",
+        "admissionSourceBytesRead",
+        "populationSourceBytesRead",
+        "workerCount",
+        "enumerationMilliseconds",
+        "admissionMilliseconds",
+        "mergeMilliseconds",
+    }
+    if not isinstance(journal, Mapping) or set(journal) != journal_expected:
+        raise TemporalQDNativeError("native G0 journal diagnostics fields are not exact")
+    normalized_journal = dict(journal)
+    for field, item in normalized_journal.items():
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise TemporalQDNativeError(f"native G0 journal diagnostics {field} is invalid")
+    if normalized_journal["workerCount"] > G0_ADMISSION_THREAD_CAP_MAXIMUM:
+        raise TemporalQDNativeError("native G0 journal diagnostics worker count is invalid")
+    result["journalAdmission"] = normalized_journal
+    return result
+
+
+def run_native_g0_funnel(
+    *,
+    output_root: Path | str,
+    g0_finalization_runtime: Mapping[str, Any],
+    generation_config: Mapping[str, Any],
+    evaluation_population_size: int,
+    publication_policy: Mapping[str, Any],
+    identity_ledger_binding: Mapping[str, Any] | None,
+    audit: bool = False,
+    admission_thread_cap: int = G0_ADMISSION_THREAD_CAP_DEFAULT,
+    on_process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    on_diagnostics: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run the single Rust-owned post-construction G0 transaction.
+
+    Unlike the older front-half bridge, this deliberately invokes native code
+    on every restart.  A cheap native adoption verifies the sealed receipt and
+    output binding without reading proposal-journal bytes; returning a cached
+    Python bridge result here would skip that fail-closed check.
+    """
+
+    root = _require_existing_real_directory_tree(
+        output_root, name="native G0 funnel output root"
+    )
+    runtime = validate_g0_finalization_runtime_config(g0_finalization_runtime)
+    if runtime["engine"] != G0_FINALIZATION_RUNTIME_RUST:
+        raise TemporalQDNativeError("native G0 funnel selected a non-Rust runtime")
+    admission_thread_cap = validate_g0_admission_thread_cap(admission_thread_cap)
+    # Resolve the actual executable authority *before* constructing the
+    # manifest.  A receipt is not reusable across an executable/source drift.
+    binary, authority = ensure_native_batch()
+    authority = validate_native_authority(authority)
+    if _sha256_file(binary) != authority["executableSha256"]:
+        raise TemporalQDNativeError(
+            "native Temporal QD executable changed after authority verification"
+        )
+    if native_source_sha256() != authority["sourceSha256"]:
+        raise TemporalQDNativeError(
+            "native Temporal QD source changed after authority verification"
+        )
+    manifest = build_g0_funnel_manifest(
+        g0_finalization_runtime=runtime,
+        output_root=root,
+        generation_config=generation_config,
+        evaluation_population_size=evaluation_population_size,
+        publication_policy=publication_policy,
+        native_batch_authority=authority,
+        identity_ledger_binding=identity_ledger_binding,
+        audit=audit,
+    )
+    native_base = _ensure_real_directory_tree(
+        root / "native-batch" / "g0-funnel", name="native G0 funnel invocation base"
+    )
+    if _sha256_file(binary) != authority["executableSha256"]:
+        raise TemporalQDNativeError(
+            "native Temporal QD executable changed after authority verification"
+        )
+    if native_source_sha256() != authority["sourceSha256"]:
+        raise TemporalQDNativeError(
+            "native Temporal QD source changed after authority verification"
+        )
+    native_root = _ensure_real_directory_tree(
+        native_base / manifest["manifestSha256"].removeprefix("sha256:"),
+        name="native G0 funnel invocation root",
+    )
+    authority_path = native_root / "authority.json"
+    manifest_path = native_root / "manifest.json"
+    _write_bytes_once(authority_path, canonical_json_bytes(authority) + b"\n")
+    _write_bytes_once(manifest_path, canonical_json_bytes(manifest) + b"\n")
+    completed = _run_checked(
+        (str(binary), "--manifest", str(manifest_path)),
+        cwd=_repo_root(),
+        timeout=float(runtime["executionTimeoutSeconds"]),
+        env={**os.environ, G0_ADMISSION_THREAD_CAP_ENV: str(admission_thread_cap)},
+        on_process_started=on_process_started,
+    )
+    diagnostics = _parse_native_g0_diagnostics(completed.stderr)
+    if diagnostics is not None:
+        if diagnostics["threadCap"] != admission_thread_cap:
+            raise TemporalQDNativeError("native G0 diagnostics thread cap drifted")
+        if on_diagnostics is not None:
+            on_diagnostics(diagnostics)
+    stdout_result = validate_g0_funnel_result(
+        _parse_canonical_json_line(
+            completed.stdout, name="native G0 funnel stdout result"
+        ),
+        manifest=manifest,
+    )
+    result_path = native_root / G0_FUNNEL_RESULT_FILENAME
+    existing_result = _existing_regular_file(
+        result_path, name="native G0 funnel result"
+    )
+    if stdout_result["status"] == "construction_incomplete":
+        if existing_result is not None:
+            raise TemporalQDNativeError(
+                "incomplete native G0 invocation found a sealed bridge result"
+            )
+        return stdout_result
+    if existing_result is None:
+        if stdout_result["status"] == "completed":
+            raise TemporalQDNativeError(
+                "completed native G0 transaction did not publish its immutable bridge result"
+            )
+        # The receipt, not the optional original bridge result, is the
+        # authoritative adoption checkpoint.  A preserved receipt can exist
+        # without this newer bridge-side convenience artifact.
+        return stdout_result
+    file_result = validate_g0_funnel_result(
+        _parse_canonical_json_line(
+            existing_result[0], name="native G0 funnel result"
+        ),
+        manifest=manifest,
+    )
+    if (
+        file_result.get("pairGenerationResult")
+        != stdout_result.get("pairGenerationResult")
+        or file_result.get("receipt") != stdout_result.get("receipt")
+    ):
+        raise TemporalQDNativeError(
+            "native G0 stdout/result artifact disagreement"
+        )
+    return stdout_result
+
+
 __all__ = [
     "NATIVE_AUTHORITY_SCHEMA",
     "NATIVE_BINARY_ENV",
     "NATIVE_CONTRACT_VERSION",
     "NATIVE_MANIFEST_SCHEMA",
     "NATIVE_RESULT_SCHEMA",
+    "G0_FINALIZATION_RUNTIME_DEFAULT",
+    "G0_FINALIZATION_RUNTIME_PYTHON_ORACLE",
+    "G0_FINALIZATION_RUNTIME_RUST",
+    "G0_FINALIZATION_RUNTIME_SCHEMA",
+    "G0_LEGACY_V5_PRE_CUTOVER_CONFIG_SHA256",
+    "G0_LEGACY_V5_RUNTIME_MIGRATION_PATH",
+    "G0_LEGACY_V5_RUNTIME_MIGRATION_SCHEMA",
+    "G0_FUNNEL_MANIFEST_SCHEMA",
+    "G0_FUNNEL_RECEIPT_SCHEMA",
+    "G0_FUNNEL_RESULT_SCHEMA",
+    "G0_ADMISSION_THREAD_CAP_DEFAULT",
+    "G0_ADMISSION_THREAD_CAP_MAXIMUM",
     "PAIR_GENERATION_RUNTIME_PYTHON",
     "PAIR_GENERATION_RUNTIME_RUST",
     "PAIR_GENERATION_RUNTIME_DEFAULT",
@@ -1777,7 +3232,10 @@ __all__ = [
     "TemporalQDNativeError",
     "build_generation_manifest",
     "build_generation_runtime_authority",
+    "build_g0_finalization_runtime_config",
+    "build_g0_funnel_manifest",
     "build_pair_generation_runtime_config",
+    "derive_legacy_v5_g0_finalization_runtime",
     "build_foundation_manifest",
     "build_native_authority",
     "ensure_native_batch",
@@ -1786,11 +3244,18 @@ __all__ = [
     "native_workspace_manifest",
     "resolve_native_batch_binary",
     "run_native_foundation",
+    "run_native_g0_funnel",
     "run_native_generation",
+    "seal_legacy_v5_g0_runtime_migration",
     "validate_foundation_manifest",
     "validate_foundation_result",
     "validate_generation_manifest",
     "validate_generation_result",
+    "validate_g0_finalization_runtime_config",
+    "validate_g0_admission_thread_cap",
+    "validate_g0_funnel_manifest",
+    "validate_g0_funnel_result",
     "validate_native_version",
     "validate_pair_generation_runtime_config",
+    "load_legacy_v5_g0_finalization_runtime",
 ]

@@ -204,7 +204,9 @@ def test_rotating_task_upper_bounds_include_parent_fairness_and_backfill() -> No
 def test_rotating_generation_transaction_g1_is_market_free_and_restart_stable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(supervisor, "_validate_frozen_sources", lambda _config: [])
+    monkeypatch.setattr(
+        supervisor, "_validate_frozen_sources", lambda _config, **_: []
+    )
     templates = {
         f"panel-{index}": {
             "path": str(tmp_path / f"panel-{index}.json"),
@@ -948,6 +950,64 @@ def test_pair_supervisor_freezes_rust_runtime_by_default(
         supervisor.PAIR_GENERATION_RUNTIME_RUST
     )
     assert config["pairGenerationRuntime"]["fallbackPolicy"] == "forbidden"
+
+
+def test_pair_g0_supervisor_freezes_distinct_rust_finalization_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    pair_config = {
+        "schemaVersion": "fixture_pair_run_config_v1",
+        "operatorImplementation": {"implementation": "fixture"},
+    }
+    monkeypatch.setattr(
+        supervisor, "load_pair_run_config", lambda value: pair_config
+    )
+
+    config, _warnings = supervisor._frozen_config(
+        initial_archive_path=inputs["initial_archive_path"],
+        source_preparation_path=None,
+        base_generator_root=None,
+        confirmed_entry_admission_root=None,
+        template_preparation_path=inputs["template_preparation_path"],
+        validator_command_file=None,
+        parameters=inputs["parameters"],
+        generation_count=1,
+        first_generation_index=1,
+        initial_immigrant_continuation_ordinal=0,
+        autoresearch_commit=inputs["autoresearch_commit"],
+        execution_engine_commit=inputs["execution_engine_commit"],
+        worker_contract_sha256=inputs["worker_contract_sha256"],
+        gateway_url=inputs["gateway_url"],
+        evaluation_timeout_seconds=60.0,
+        enqueue_batch_size=100,
+        broad_admission=False,
+        construction_catalog_path=inputs["construction_catalog_path"],
+        bidirectional_pair_config=pair_config,
+        pair_generation_engine=supervisor.PAIR_GENERATION_RUNTIME_PYTHON,
+    )
+
+    # v5 construction remains Python because it owns the live evolvable
+    # factory/compiler.  Its independent G0 post-construction authority is
+    # frozen to Rust with no fallback.
+    assert config["pairGenerationRuntime"]["engine"] == (
+        supervisor.PAIR_GENERATION_RUNTIME_PYTHON
+    )
+    assert config["g0FinalizationRuntime"]["engine"] == (
+        supervisor.G0_FINALIZATION_RUNTIME_RUST
+    )
+    assert config["g0FinalizationRuntime"]["fallbackPolicy"] == "forbidden"
+
+    # The separate post-construction authority is self-hashed inside the
+    # already self-hashed supervisor config.  Rehashing only the outer config
+    # must still reject a restart with a drifted G0 runtime.
+    drifted = copy.deepcopy(config)
+    drifted["g0FinalizationRuntime"]["executionTimeoutSeconds"] = 7200
+    drifted["configSha256"] = canonical_sha256(
+        {key: value for key, value in drifted.items() if key != "configSha256"}
+    )
+    with pytest.raises(TemporalDiscoveryContractError, match="identity mismatch"):
+        supervisor._validate_frozen_sources(drifted)
 
 
 def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(

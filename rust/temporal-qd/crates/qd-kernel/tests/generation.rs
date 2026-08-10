@@ -476,6 +476,7 @@ fn request(root: PathBuf, authority_sha256: String) -> GenerateGenerationRequest
             pair_policy: object([]),
             operator_implementation_identity: object([]),
             predeclared_evidence_context_sha256: None,
+            archive_policy_authority: None,
         },
         g0_evaluation_width: None,
         evidence_identity_context: None,

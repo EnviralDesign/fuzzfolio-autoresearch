@@ -4,6 +4,7 @@
 //! immutable result. Coarse pair generation composes the admitted kernel and
 //! runtime crates behind a second exact, self-hashed manifest.
 
+mod g0_funnel_contract;
 mod generation_contract;
 
 use std::env;
@@ -13,11 +14,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 use temporal_qd_contract::{
     CONTRACT_VERSION, FoundationResult, JsonNewline, NativeVersion, Value, canonical_json_line,
     canonical_sha256, parse_foundation_manifest, python_pretty_json_line,
 };
 use temporal_qd_kernel::{
+    g0_funnel::{
+        DEFAULT_G0_ADMISSION_THREAD_CAP, G0FunnelOutcome, G0FunnelRequest,
+        MAX_G0_ADMISSION_THREAD_CAP, finalize_g0,
+    },
     generation::{GenerateGenerationRequest, generate_generation},
     journal::FinalNewline,
     publication::PublicationPolicy,
@@ -29,6 +35,7 @@ use temporal_qd_runtime::{
     global_identity_ledger_from_public,
 };
 
+use crate::g0_funnel_contract::{G0_FUNNEL_MANIFEST_SCHEMA, parse_g0_funnel_manifest};
 use crate::generation_contract::{
     FRONT_GENERATION_PROGRESS_SCHEMA, GENERATION_MANIFEST_SCHEMA, assemble_runtime_manifest_owned,
     build_generation_result, parse_generation_manifest, validate_generation_result,
@@ -62,8 +69,125 @@ fn execute_manifest(manifest_path: &Path) -> Result<()> {
     let value: Value = serde_json::from_slice(&raw).context("parse manifest dispatch envelope")?;
     match value.get("schemaVersion").and_then(Value::as_str) {
         Some(GENERATION_MANIFEST_SCHEMA) => execute_generation(&manifest_path, &raw),
+        Some(G0_FUNNEL_MANIFEST_SCHEMA) => execute_g0_funnel(&manifest_path, &raw),
         _ => execute_foundation_bytes(&manifest_path, &raw),
     }
+}
+
+fn execute_g0_funnel(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
+    let manifest =
+        parse_g0_funnel_manifest(manifest_bytes).context("validate native G0 funnel manifest")?;
+    let parent = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("G0 funnel manifest has no parent directory"))?;
+    ensure_safe_existing_directory(parent, "G0 funnel manifest parent")?;
+    verify_g0_execution_authority(parent, &manifest.execution_authority)
+        .context("verify native G0 execution authority")?;
+    let output_root =
+        ensure_safe_directory_tree(Path::new(&manifest.output_root), "G0 funnel output root")?;
+    let final_newline = generation_final_newline(&manifest.final_newline);
+    let policy = parse_publication_policy(&manifest.publication_policy)
+        .context("parse G0 funnel publication policy")?;
+    let request = G0FunnelRequest {
+        output_root,
+        final_newline,
+        request_sha256: manifest.manifest_sha256,
+        authority_sha256: manifest.authority_sha256,
+        config: manifest.generation_config,
+        config_sha256: manifest.generation_config_sha256,
+        generation_index: manifest.generation_index,
+        construction_pool_size: manifest.construction_pool_size,
+        evaluation_population_size: manifest.evaluation_population_size,
+        max_proposal_attempts: manifest.max_proposal_attempts,
+        admission_thread_cap: g0_admission_thread_cap()?,
+        publication_policy: policy,
+        execution_authority: manifest.execution_authority,
+        identity_ledger: manifest.identity_ledger,
+        global_identity_ledger: None,
+        audit: manifest.audit,
+    };
+    let outcome = finalize_g0(&request).context("execute native G0 funnel")?;
+    let result_value = outcome.result_value();
+    let result_bytes = canonical_json_line(&result_value)
+        .map_err(|error| anyhow!("encode canonical G0 funnel result: {error}"))?;
+    // An incomplete construction is intentionally not an immutable result:
+    // Python may append more proposal entries and invoke this same manifest
+    // again.  Publishing it would make the later completed transaction appear
+    // to conflict with an unrelated stale result.  An adopted receipt also
+    // does not rewrite the original completed bridge result: its receipt is
+    // the authoritative restart artifact, while its status is transient.
+    if matches!(outcome, G0FunnelOutcome::Completed { .. }) {
+        publish_once(&parent.join(&manifest.result_path), &result_bytes)?;
+    }
+    write_stdout_bytes(&result_bytes)
+}
+
+/// Operational-only cap for bounded G0 journal admission.  It is intentionally
+/// not part of the sealed manifest: ordinal merge makes the output invariant,
+/// while the caller records the chosen cap in external performance evidence.
+fn g0_admission_thread_cap() -> Result<usize> {
+    let Some(raw) = env::var_os("TEMPORAL_QD_G0_ADMISSION_THREAD_CAP") else {
+        return Ok(DEFAULT_G0_ADMISSION_THREAD_CAP);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow!("G0 admission thread cap must be valid UTF-8"))?;
+    let cap = raw
+        .parse::<usize>()
+        .map_err(|_| anyhow!("G0 admission thread cap must be an integer"))?;
+    if !(1..=MAX_G0_ADMISSION_THREAD_CAP).contains(&cap) {
+        bail!("G0 admission thread cap must be within 1..={MAX_G0_ADMISSION_THREAD_CAP}")
+    }
+    Ok(cap)
+}
+
+fn sha256_file(path: &Path, label: &str) -> Result<String> {
+    let path = safe_existing_file(path, label)?;
+    let before = fs::metadata(&path).with_context(|| format!("stat {label}"))?;
+    let mut file = fs::File::open(&path).with_context(|| format!("open {label}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {label}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let after = fs::metadata(&path).with_context(|| format!("restat {label}"))?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        bail!("{label} changed while its authority hash was being read")
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn verify_g0_execution_authority(parent: &Path, authority: &Value) -> Result<()> {
+    let fields = authority
+        .as_object()
+        .ok_or_else(|| anyhow!("native G0 execution authority is invalid"))?;
+    let batch = fields
+        .get("nativeBatchAuthority")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("native G0 execution authority lacks batch authority"))?;
+    let expected_binary_sha = batch
+        .get("executableSha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native G0 execution authority lacks executable hash"))?;
+    let current = std::env::current_exe().context("discover current native batch executable")?;
+    if sha256_file(&current, "native G0 batch executable")? != expected_binary_sha {
+        bail!("native G0 batch executable authority drifted")
+    }
+    let authority_path = parent.join("authority.json");
+    let authority_path = safe_existing_file(&authority_path, "native G0 authority artifact")?;
+    let raw = read_stable_existing_file(&authority_path, "native G0 authority artifact")?;
+    let persisted: Value =
+        serde_json::from_slice(&raw).context("parse native G0 authority artifact")?;
+    if raw != canonical_json_line(&persisted)? || persisted != Value::Object(batch.clone()) {
+        bail!("native G0 authority artifact differs from manifest authority")
+    }
+    Ok(())
 }
 
 fn execute_foundation_bytes(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
@@ -346,6 +470,10 @@ fn parse_publication_policy(value: &Value) -> Result<PublicationPolicy> {
             .filter(|value| !value.is_null())
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        archive_policy_authority: fields
+            .get("archivePolicyAuthority")
+            .filter(|value| !value.is_null())
+            .cloned(),
     })
 }
 

@@ -52,13 +52,17 @@ from .temporal_qd_evaluation_population import (
     load_evaluation_population,
 )
 from .temporal_qd_native import (
+    G0_FINALIZATION_RUNTIME_PYTHON_ORACLE,
+    G0_FINALIZATION_RUNTIME_RUST,
     PAIR_GENERATION_RUNTIME_DEFAULT,
     PAIR_GENERATION_RUNTIME_PYTHON,
     PAIR_GENERATION_RUNTIME_RUST,
     TemporalQDNativeError,
+    build_g0_finalization_runtime_config,
     build_pair_generation_runtime_config,
     build_generation_runtime_authority,
     run_native_generation,
+    validate_g0_finalization_runtime_config,
     validate_pair_generation_runtime_config,
 )
 from .result_codec import fsync_directory
@@ -4399,6 +4403,7 @@ def generate_qd_generation(
     construction_catalog_path: Path | str | None = None,
     generation_funnel_enabled: bool = False,
     pair_generation_runtime: Mapping[str, Any] | None = None,
+    g0_finalization_runtime: Mapping[str, Any] | None = None,
     bidirectional_pair_run_config: Mapping[str, Any] | None = None,
     qd_publication_authority: Mapping[str, Any] | None = None,
     archive_policy_authority: Mapping[str, Any] | None = None,
@@ -4505,6 +4510,8 @@ def generate_qd_generation(
                 "native bidirectional QD generation requires its frozen pair run config"
             )
         from .temporal_qd_pair_generation import (
+            POPULATION_FINALIZER_PYTHON,
+            POPULATION_FINALIZER_RUST,
             _frozen_catalog_for_predeclared_scope,
             build_pair_generation_config,
             generate_pair_population,
@@ -4530,6 +4537,32 @@ def generate_qd_generation(
         ):
             raise TemporalDiscoveryContractError("G0 requires an empty generation-1 archive and must bind the normal evaluation width")
         construction_width = int(initial_construction_pool_size) if is_g0 else requested_width
+        g0_runtime: dict[str, Any] | None = None
+        if is_g0 and native_pair_generation:
+            if g0_finalization_runtime is not None:
+                raise TemporalDiscoveryContractError(
+                    "G0 finalization runtime is only valid with Python-owned v5 construction"
+                )
+        elif is_g0:
+            try:
+                g0_runtime = (
+                    validate_g0_finalization_runtime_config(g0_finalization_runtime)
+                    if g0_finalization_runtime is not None
+                    else build_g0_finalization_runtime_config()
+                )
+            except TemporalQDNativeError as exc:
+                raise TemporalDiscoveryContractError(str(exc)) from exc
+            if g0_runtime["engine"] not in {
+                G0_FINALIZATION_RUNTIME_RUST,
+                G0_FINALIZATION_RUNTIME_PYTHON_ORACLE,
+            }:
+                raise TemporalDiscoveryContractError(
+                    "G0 finalization runtime selected an unknown engine"
+                )
+        elif g0_finalization_runtime is not None:
+            raise TemporalDiscoveryContractError(
+                "G0 finalization runtime is only valid for generation-1 G0"
+            )
         pair_run_config = {
             "parentArchiveSha256": archive_sha,
             "archivePolicyAuthority": (
@@ -4711,6 +4744,13 @@ def generate_qd_generation(
             ),
             max_new_proposals=max_new_proposals,
             g0_evaluation_width=(requested_width if is_g0 else None),
+            g0_finalization_runtime=g0_runtime,
+            population_finalizer=(
+                POPULATION_FINALIZER_PYTHON
+                if g0_runtime is not None
+                and g0_runtime["engine"] == G0_FINALIZATION_RUNTIME_PYTHON_ORACLE
+                else POPULATION_FINALIZER_RUST
+            ),
             archive_policy_authority=(
                 archive_policy_authority
                 if archive_policy_authority is not None

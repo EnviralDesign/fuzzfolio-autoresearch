@@ -833,6 +833,15 @@ pub fn generate_generation(
             construction_references: runtime.accepted_references.clone(),
             g0_evaluation_width: request.g0_evaluation_width,
             global_identity_ledger,
+            reproduction_allocation: request.pair_config.get("reproductionAllocation").cloned(),
+            // The native front-half keeps its allocation counters in the
+            // compact proposal state.  Historical callers that do not yet
+            // expose a byte-identical accounting facade leave this absent;
+            // the dedicated v5 G0 funnel supplies the exact reduction.
+            reproduction_allocation_accounting: None,
+            unique_pair_genome_count: Some(
+                runtime.proposal_state.local_executable_semantics.len() as u64
+            ),
             policy: request.publication_policy.clone(),
         },
     )?;

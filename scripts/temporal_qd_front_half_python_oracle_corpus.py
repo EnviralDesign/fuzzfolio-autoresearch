@@ -28,6 +28,10 @@ from autoresearch.temporal_bidirectional_genome import (
     canonical_sha256,
 )
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+from autoresearch.temporal_qd_native import (
+    G0_FINALIZATION_RUNTIME_PYTHON_ORACLE,
+    build_g0_finalization_runtime_config,
+)
 from autoresearch.temporal_qd_pair_generation import generate_pair_population
 
 from scripts import temporal_qd_front_half_oracle as semantic_oracle
@@ -448,7 +452,15 @@ def _arguments(
         "implementation": "optimized",
         "population_finalizer": "python",
         **(
-            {"g0_evaluation_width": g0_evaluation_width}
+            {
+                "g0_evaluation_width": g0_evaluation_width,
+                # The Python G0 path is an oracle only.  Make that authority
+                # explicit so corpus generation cannot accidentally exercise
+                # the production Rust-only default.
+                "g0_finalization_runtime": build_g0_finalization_runtime_config(
+                    engine=G0_FINALIZATION_RUNTIME_PYTHON_ORACLE
+                ),
+            }
             if g0_evaluation_width is not None
             else {}
         ),

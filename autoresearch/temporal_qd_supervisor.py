@@ -59,13 +59,17 @@ from .temporal_qd_evolution import (
 )
 from .temporal_qd_funnel_adapter import build_qd_generation_funnel
 from .temporal_qd_native import (
+    G0_FINALIZATION_RUNTIME_RUST,
     PAIR_GENERATION_RUNTIME_DEFAULT,
     PAIR_GENERATION_RUNTIME_PYTHON,
     PAIR_GENERATION_RUNTIME_RUST,
     TemporalQDNativeError,
+    build_g0_finalization_runtime_config,
     build_pair_generation_runtime_config,
+    load_legacy_v5_g0_finalization_runtime,
     validate_generation_manifest,
     validate_generation_result,
+    validate_g0_finalization_runtime_config,
     validate_pair_generation_runtime_config,
 )
 from .temporal_qd_evidence_ladder import (
@@ -5045,7 +5049,108 @@ def _continuation_binding(
     }
 
 
-def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
+def _resolve_g0_finalization_runtime_for_reopen(
+    *,
+    config: Mapping[str, Any],
+    pair_runtime: Mapping[str, Any] | None,
+    run_root: Path | None,
+) -> dict[str, Any] | None:
+    """Resolve only an explicit runtime or the singleton pre-cutover receipt.
+
+    New configs must continue to carry ``g0FinalizationRuntime``.  The one
+    preserved v5 checkpoint predates that field, so it can reopen only through
+    the immutable migration receipt produced after native G0 sealing.
+    """
+
+    g0_bootstrap = config.get("g0Bootstrap")
+    runtime_raw = config.get("g0FinalizationRuntime")
+    if runtime_raw is not None:
+        try:
+            return validate_g0_finalization_runtime_config(runtime_raw)
+        except TemporalQDNativeError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+    if not (
+        isinstance(g0_bootstrap, Mapping)
+        and pair_runtime is not None
+        and pair_runtime.get("engine") == PAIR_GENERATION_RUNTIME_PYTHON
+    ):
+        return None
+    if run_root is None:
+        raise TemporalDiscoveryContractError(
+            "Python-owned G0 construction lacks its frozen Rust finalization runtime"
+        )
+    try:
+        return load_legacy_v5_g0_finalization_runtime(
+            supervisor_config=config, run_root=run_root
+        )
+    except TemporalQDNativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+
+
+def _open_legacy_v5_g0_reopen_authority(
+    *, root: Path
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Open the one receipt-authorized config that predates G0 runtime freezing.
+
+    This runs before ``_frozen_config`` on restart.  Reconstructing the newer
+    config would add ``g0FinalizationRuntime`` and make byte-exact write-once
+    comparison reject the preserved checkpoint before its migration receipt
+    can be examined.  The old config itself remains the immutable authority;
+    the Rust runtime is an effective, separately verified value.
+    """
+
+    config_path = root / "config.json"
+    if not config_path.exists():
+        return None
+    if not config_path.is_file():
+        raise TemporalDiscoveryContractError(
+            "QD supervisor frozen config is not a regular file"
+        )
+    config = _read(config_path, name="QD supervisor frozen config")
+    if "g0FinalizationRuntime" in config:
+        return None
+    g0_bootstrap = config.get("g0Bootstrap")
+    if not isinstance(g0_bootstrap, Mapping):
+        return None
+    if config.get("bidirectionalPairGeneration") is None:
+        raise TemporalDiscoveryContractError(
+            "legacy G0 runtime migration requires frozen bidirectional pair authority"
+        )
+    try:
+        pair_runtime = validate_pair_generation_runtime_config(
+            config.get("pairGenerationRuntime")
+        )
+    except TemporalQDNativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    if pair_runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON:
+        raise TemporalDiscoveryContractError(
+            "legacy G0 runtime migration requires the frozen Python construction runtime"
+        )
+    expected_config_sha = _sha256(
+        config.get("configSha256"), name="legacy QD supervisor config"
+    )
+    material = _clone(config, name="legacy QD supervisor config")
+    material.pop("configSha256", None)
+    if canonical_sha256(material) != expected_config_sha:
+        raise TemporalDiscoveryContractError(
+            "legacy QD supervisor frozen config identity mismatch"
+        )
+    try:
+        runtime = load_legacy_v5_g0_finalization_runtime(
+            supervisor_config=config, run_root=root
+        )
+    except TemporalQDNativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    if runtime["engine"] != G0_FINALIZATION_RUNTIME_RUST:
+        raise TemporalDiscoveryContractError(
+            "legacy G0 migration did not resolve the Rust finalization runtime"
+        )
+    return _clone(config, name="legacy QD supervisor frozen config"), runtime
+
+
+def _validate_frozen_sources(
+    config: Mapping[str, Any], *, run_root: Path | None = None
+) -> list[str]:
     """Reopen every path-backed source before each phase can consume it."""
 
     expected_config_sha = _sha256(config.get("configSha256"), name="supervisor config")
@@ -5077,6 +5182,28 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
         pair_runtime is not None
         and pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST
     )
+    g0_bootstrap = config.get("g0Bootstrap")
+    g0_runtime = _resolve_g0_finalization_runtime_for_reopen(
+        config=config, pair_runtime=pair_runtime, run_root=run_root
+    )
+    if g0_runtime is not None:
+        if (
+            not isinstance(g0_bootstrap, Mapping)
+            or pair_runtime is None
+            or pair_runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON
+            or g0_runtime["engine"] != G0_FINALIZATION_RUNTIME_RUST
+        ):
+            raise TemporalDiscoveryContractError(
+                "G0 finalization runtime must be the Rust-only post-construction authority"
+            )
+    elif (
+        isinstance(g0_bootstrap, Mapping)
+        and pair_runtime is not None
+        and pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_PYTHON
+    ):
+        raise TemporalDiscoveryContractError(
+            "Python-owned G0 construction lacks its frozen Rust finalization runtime"
+        )
     if native_pair_generation:
         archive_path = Path(str(archive_binding.get("path") or ""))
         if (
@@ -5523,6 +5650,19 @@ def _frozen_config(
         raise TemporalDiscoveryContractError("G0 construction/evaluation sizes are invalid or drift from the frozen normal width")
     if g0_enabled and int(normalized_parameters["maxProposalAttempts"]) < int(initial_construction_pool_size):
         raise TemporalDiscoveryContractError("G0 construction pool exceeds the frozen generation-1 proposal ceiling")
+    try:
+        g0_finalization_runtime = (
+            build_g0_finalization_runtime_config(
+                engine=G0_FINALIZATION_RUNTIME_RUST,
+                execution_timeout_seconds=pair_generation_timeout_seconds,
+            )
+            if g0_enabled
+            and pair_generation_runtime is not None
+            and pair_generation_runtime["engine"] == PAIR_GENERATION_RUNTIME_PYTHON
+            else None
+        )
+    except TemporalQDNativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
     generation_plan = {
         "firstGenerationIndex": first_generation_index,
         "generationCount": generation_count,
@@ -5734,6 +5874,11 @@ def _frozen_config(
         **({"evidenceLadderExecution": ladder_execution} if ladder_execution is not None else {}),
         "generationPlan": generation_plan,
         **({"g0Bootstrap": g0_bootstrap} if g0_bootstrap is not None else {}),
+        **(
+            {"g0FinalizationRuntime": g0_finalization_runtime}
+            if g0_finalization_runtime is not None
+            else {}
+        ),
         "frozenSearchPolicy": normalized_parameters,
         "operationalTripwires": [
             "determinism_drift",
@@ -5792,6 +5937,7 @@ def _campaign_window_evidence(
 def _run_rotating_cohort_campaign(
     *,
     root: Path,
+    supervisor_root: Path,
     candidates: list[dict[str, Any]],
     generation_index: int,
     panel_id: str,
@@ -5803,7 +5949,7 @@ def _run_rotating_cohort_campaign(
     # A parent/backfill campaign can begin hours after the proposal campaign.
     # Reopen all path-backed authorities immediately before freezing another
     # task matrix so one generation cannot mix catalog/template semantics.
-    _validate_frozen_sources(config)
+    _validate_frozen_sources(config, run_root=supervisor_root)
     cohort = build_rotating_cohort_population(
         candidates=candidates,
         generation_index=generation_index,
@@ -6005,7 +6151,7 @@ def _run_rotating_generation_transaction(
         if native_finalizer_binary is not None
         else None
     )
-    _validate_frozen_sources(config)
+    _validate_frozen_sources(config, run_root=root)
     contract = validate_rotating_evidence_contract(config["rotatingEvidence"])
     panel = panel_for_generation(contract, generation_index)
     evidence_root = generation_root / "evidence"
@@ -6386,6 +6532,7 @@ def _run_rotating_generation_transaction(
         template = contract["panelTemplates"][panel["panelId"]]
         result, population_path, parent_campaign_root = _run_rotating_cohort_campaign(
             root=evidence_root / "current-parents",
+            supervisor_root=root,
             candidates=list(parent_candidates.values()),
             generation_index=generation_index,
             panel_id=str(panel["panelId"]),
@@ -6567,6 +6714,7 @@ def _run_rotating_generation_transaction(
         template = contract["panelTemplates"][backfill_panel_id]
         result, population_path, backfill_campaign_root = _run_rotating_cohort_campaign(
             root=evidence_root / "backfill" / backfill_panel_id,
+            supervisor_root=root,
             candidates=[rich_candidates[candidate_id] for candidate_id in missing],
             generation_index=generation_index,
             panel_id=backfill_panel_id,
@@ -6935,44 +7083,79 @@ def run_qd_supervisor(
         root=root,
         generation_finalization_engine=generation_finalization_engine,
     )
-    initial_archive_file = Path(initial_archive_path)
-    # Pair mode never constructs a v2 continuation.  These placeholders are
-    # deliberately not persisted or opened in that mode.
-    source_preparation_file = Path(source_preparation_path) if source_preparation_path is not None else root / ".pair-mode-unused-source.json"
-    base_generator_dir = Path(base_generator_root) if base_generator_root is not None else root / ".pair-mode-unused-generator"
-    confirmed_entry_dir = Path(confirmed_entry_admission_root) if confirmed_entry_admission_root is not None else root / ".pair-mode-unused-admission"
-    template_preparation_file = Path(template_preparation_path)
-    validator_file = Path(validator_command_file) if validator_command_file is not None else None
-    config, validator_command = _frozen_config(
-        initial_archive_path=initial_archive_file,
-        source_preparation_path=source_preparation_file,
-        base_generator_root=base_generator_dir,
-        confirmed_entry_admission_root=confirmed_entry_dir,
-        template_preparation_path=template_preparation_file,
-        validator_command_file=validator_file,
-        parameters=parameters,
-        generation_count=generation_count,
-        first_generation_index=first_generation_index,
-        initial_immigrant_continuation_ordinal=initial_immigrant_continuation_ordinal,
-        autoresearch_commit=autoresearch_commit,
-        execution_engine_commit=execution_engine_commit,
-        worker_contract_sha256=worker_contract_sha256,
-        gateway_url=gateway_url,
-        evaluation_timeout_seconds=evaluation_timeout_seconds,
-        enqueue_batch_size=enqueue_batch_size,
-        broad_admission=broad_admission,
-        generation_funnel_enabled=generation_funnel_enabled,
-        construction_catalog_path=construction_catalog_path,
-        bidirectional_pair_config=bidirectional_pair_config,
-        pair_generation_engine=pair_generation_engine,
-        pair_generation_timeout_seconds=pair_generation_timeout_seconds,
-        evidence_ladder_config=evidence_ladder_config,
-        rotating_evidence_config=rotating_evidence_config,
-        continuation_from=continuation_from,
-        initial_construction_pool_size=initial_construction_pool_size,
-        evaluation_population_size=evaluation_population_size,
-        evolvable_module_authority_config=evolvable_module_authority_config,
-    )
+    config_path = root / "config.json"
+    legacy_reopen = _open_legacy_v5_g0_reopen_authority(root=root)
+    effective_g0_finalization_runtime: dict[str, Any] | None = None
+    if legacy_reopen is not None:
+        # This old singleton is already sealed by its config, native receipt,
+        # and migration receipt.  Do not reconstruct or rewrite it: the
+        # missing field is part of its historical public bytes.
+        config, effective_g0_finalization_runtime = legacy_reopen
+        archive_binding = config.get("initialArchive")
+        evaluation_binding = config.get("evaluation")
+        generation_plan = config.get("generationPlan")
+        if (
+            not isinstance(archive_binding, Mapping)
+            or not isinstance(evaluation_binding, Mapping)
+            or not isinstance(generation_plan, Mapping)
+            or not isinstance(generation_plan.get("firstGenerationIndex"), int)
+            or isinstance(generation_plan.get("firstGenerationIndex"), bool)
+            or int(generation_plan["firstGenerationIndex"]) < 1
+        ):
+            raise TemporalDiscoveryContractError(
+                "legacy G0 migration lacks its frozen supervisor restart bindings"
+            )
+        initial_archive_file = Path(str(archive_binding.get("path") or ""))
+        template_preparation_file = Path(
+            str(evaluation_binding.get("templatePreparationPath") or "")
+        )
+        # This singleton is pair-owned, so legacy source/validator arguments
+        # cannot influence a reopened phase.  They remain inert placeholders.
+        source_preparation_file = root / ".pair-mode-unused-source.json"
+        base_generator_dir = root / ".pair-mode-unused-generator"
+        confirmed_entry_dir = root / ".pair-mode-unused-admission"
+        first_generation_index = int(generation_plan["firstGenerationIndex"])
+        initial_immigrant_continuation_ordinal = 0
+        validator_command: list[str] = []
+    else:
+        initial_archive_file = Path(initial_archive_path)
+        # Pair mode never constructs a v2 continuation.  These placeholders are
+        # deliberately not persisted or opened in that mode.
+        source_preparation_file = Path(source_preparation_path) if source_preparation_path is not None else root / ".pair-mode-unused-source.json"
+        base_generator_dir = Path(base_generator_root) if base_generator_root is not None else root / ".pair-mode-unused-generator"
+        confirmed_entry_dir = Path(confirmed_entry_admission_root) if confirmed_entry_admission_root is not None else root / ".pair-mode-unused-admission"
+        template_preparation_file = Path(template_preparation_path)
+        validator_file = Path(validator_command_file) if validator_command_file is not None else None
+        config, validator_command = _frozen_config(
+            initial_archive_path=initial_archive_file,
+            source_preparation_path=source_preparation_file,
+            base_generator_root=base_generator_dir,
+            confirmed_entry_admission_root=confirmed_entry_dir,
+            template_preparation_path=template_preparation_file,
+            validator_command_file=validator_file,
+            parameters=parameters,
+            generation_count=generation_count,
+            first_generation_index=first_generation_index,
+            initial_immigrant_continuation_ordinal=initial_immigrant_continuation_ordinal,
+            autoresearch_commit=autoresearch_commit,
+            execution_engine_commit=execution_engine_commit,
+            worker_contract_sha256=worker_contract_sha256,
+            gateway_url=gateway_url,
+            evaluation_timeout_seconds=evaluation_timeout_seconds,
+            enqueue_batch_size=enqueue_batch_size,
+            broad_admission=broad_admission,
+            generation_funnel_enabled=generation_funnel_enabled,
+            construction_catalog_path=construction_catalog_path,
+            bidirectional_pair_config=bidirectional_pair_config,
+            pair_generation_engine=pair_generation_engine,
+            pair_generation_timeout_seconds=pair_generation_timeout_seconds,
+            evidence_ladder_config=evidence_ladder_config,
+            rotating_evidence_config=rotating_evidence_config,
+            continuation_from=continuation_from,
+            initial_construction_pool_size=initial_construction_pool_size,
+            evaluation_population_size=evaluation_population_size,
+            evolvable_module_authority_config=evolvable_module_authority_config,
+        )
     if (
         tail_result_mode == TAIL_RESULT_MODE_INDEXED
         and config.get("rotatingEvidence") is None
@@ -6987,13 +7170,13 @@ def run_qd_supervisor(
         raise TemporalDiscoveryContractError(
             "Rust generation finalization requires indexed tail authority"
         )
-    config_path = root / "config.json"
     state_path = root / "state.json"
-    _write_once(config_path, config)
-    if config.get("evidenceLadder") is not None:
-        _write_once(root / "evidence-ladder.json", config["evidenceLadder"])
-    if config.get("rotatingEvidence") is not None:
-        _write_once(root / "rotating-evidence.json", config["rotatingEvidence"])
+    if legacy_reopen is None:
+        _write_once(config_path, config)
+        if config.get("evidenceLadder") is not None:
+            _write_once(root / "evidence-ladder.json", config["evidenceLadder"])
+        if config.get("rotatingEvidence") is not None:
+            _write_once(root / "rotating-evidence.json", config["rotatingEvidence"])
     # Retain indexes only for the active supervisor transaction.  They are
     # source-verified once at admission and then reused by member, provenance,
     # funnel, and artifact reducers without reopening raw result blobs.
@@ -7047,7 +7230,7 @@ def run_qd_supervisor(
     # This is deliberately before both the completed fast path and gateway
     # construction.  A restart must never treat a stale source, or a merely
     # self-claimed completed state, as permission to skip immutable work.
-    validator_command = _validate_frozen_sources(config)
+    validator_command = _validate_frozen_sources(config, run_root=root)
     if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
         assert native_finalizer_binary is not None
         completed_by_index = _admit_completed_generations_native(
@@ -7199,7 +7382,7 @@ def run_qd_supervisor(
                 )
             # Do not let a file-backed source change while an earlier
             # generation is running and then silently feed a later phase.
-            validator_command = _validate_frozen_sources(config)
+            validator_command = _validate_frozen_sources(config, run_root=root)
             generation_kwargs = dict(
                 parent_archive_path=parent_archive_path,
                 parent_archive_sha256=parent_archive_sha256,
@@ -7278,6 +7461,34 @@ def run_qd_supervisor(
                                 "archivePolicyAuthority"
                             ]
                         g0 = config.get("g0Bootstrap")
+                        g0_runtime = None
+                        if isinstance(g0, Mapping) and generation_index == 1:
+                            reopened_g0_runtime = _resolve_g0_finalization_runtime_for_reopen(
+                                config=config,
+                                pair_runtime=pair_runtime,
+                                run_root=root,
+                            )
+                            if (
+                                effective_g0_finalization_runtime is not None
+                                and reopened_g0_runtime
+                                != effective_g0_finalization_runtime
+                            ):
+                                raise TemporalDiscoveryContractError(
+                                    "legacy G0 effective runtime drifted after restart preflight"
+                                )
+                            g0_runtime = (
+                                effective_g0_finalization_runtime
+                                if effective_g0_finalization_runtime is not None
+                                else reopened_g0_runtime
+                            )
+                            if (
+                                g0_runtime is None
+                                or g0_runtime["engine"]
+                                != G0_FINALIZATION_RUNTIME_RUST
+                            ):
+                                raise TemporalDiscoveryContractError(
+                                    "production G0 cannot select the Python finalization oracle"
+                                )
                         generation_result = generate_qd_generation(
                             **generation_kwargs,
                             pair_generation_runtime=pair_runtime,
@@ -7304,6 +7515,7 @@ def run_qd_supervisor(
                             ),
                             initial_construction_pool_size=(int(g0["initialConstructionPoolSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
                             evaluation_population_size=(int(g0["evaluationPopulationSize"]) if isinstance(g0, Mapping) and generation_index == 1 else None),
+                            g0_finalization_runtime=g0_runtime,
                         )
                 elif pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST:
                     g0 = config.get("g0Bootstrap")
@@ -7346,7 +7558,7 @@ def run_qd_supervisor(
 
             state["stage"] = "freezing_evaluation"
             _save_state(state_path, state)
-            validator_command = _validate_frozen_sources(config)
+            validator_command = _validate_frozen_sources(config, run_root=root)
             campaign_result = freeze_qd_screening_campaign(
                 population_path=proposal_root / "population.json",
                 template_preparation_path=generation_template_file,

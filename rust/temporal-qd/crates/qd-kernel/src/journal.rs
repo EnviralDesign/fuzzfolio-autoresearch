@@ -4,9 +4,12 @@
 //! separate.  A segment is the durable receipt; mutable in-memory indexes may
 //! advance only after its file is sealed and verified.
 
+#[cfg(debug_assertions)]
+use std::cell::RefCell;
+
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Read, Seek, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -25,6 +28,14 @@ pub enum FinalNewline {
     Lf,
     Crlf,
 }
+
+/// Private-temporary streaming writer that may patch a fixed-width region
+/// before the normal write-once publication step.  No implementation may use
+/// it to mutate an installed artifact: callers receive only the disposable
+/// temporary inode created by `ProposalJournal`.
+pub trait RewritableTemporaryWrite: Write + Seek {}
+
+impl<T: Write + Seek + ?Sized> RewritableTemporaryWrite for T {}
 
 impl FinalNewline {
     pub const fn bytes(self) -> &'static [u8] {
@@ -49,6 +60,29 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 
 fn contract(message: impl Into<String>) -> JournalError {
     JournalError::Contract(message.into())
+}
+
+// A thread-local debug seam lets the integration suite simulate process loss
+// after a write-once artifact is durable.  It is unavailable to release
+// builds, and thread locality prevents one test's injected loss from leaking
+// into another concurrent transaction.
+#[cfg(debug_assertions)]
+thread_local! {
+    static G0_TEST_CRASH_AFTER_ARTIFACT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_g0_test_crash_after_artifact(relative: Option<&str>) {
+    G0_TEST_CRASH_AFTER_ARTIFACT.with(|target| {
+        *target.borrow_mut() = relative.map(ToOwned::to_owned);
+    });
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn g0_test_should_crash_after_artifact(relative: &Path) -> bool {
+    G0_TEST_CRASH_AFTER_ARTIFACT
+        .with(|target| target.borrow().as_deref() == Some(relative.to_string_lossy().as_ref()))
 }
 
 fn object(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -325,27 +359,34 @@ pub struct WrittenArtifact {
 #[derive(Debug)]
 pub struct ProposalJournal {
     root: PathBuf,
+    canonical_root: PathBuf,
     public_newline: FinalNewline,
 }
 
 impl ProposalJournal {
     pub fn open(root: impl AsRef<Path>, newline: FinalNewline) -> Result<Self> {
-        let root = root.as_ref();
-        fs::create_dir_all(root)?;
-        reject_symlink(root, "generation root")?;
-        let root = fs::canonicalize(root)?;
+        // Do not let `create_dir_all` silently follow a caller-controlled
+        // link/junction on the way to the generation root.  The batch binary
+        // already validates its manifest path, but the kernel is also used
+        // directly by tests and library callers, so the write authority must
+        // be self-contained here.
+        let root = absolute_path(root.as_ref())?;
+        let root = ensure_safe_directory_tree(&root, "generation root")?;
+        let canonical_root = fs::canonicalize(&root).map_err(|error| {
+            contract(format!("canonicalize safe generation root failed: {error}"))
+        })?;
+        ensure_safe_existing_directory(&root, "generation root")?;
         for relative in [
             Path::new("proposal-journal"),
             Path::new("internal"),
             Path::new("internal/segments"),
             Path::new("internal/checkpoints"),
         ] {
-            let path = root.join(relative);
-            fs::create_dir_all(&path)?;
-            reject_symlink(&path, "proposal journal directory")?;
+            ensure_safe_relative_directory(&root, relative, "proposal journal directory")?;
         }
         Ok(Self {
             root,
+            canonical_root,
             public_newline: newline,
         })
     }
@@ -393,37 +434,47 @@ impl ProposalJournal {
     }
 
     pub fn read_public_entry(&self, ordinal: u64) -> Result<Value> {
-        let value = read_canonical_document(
-            &self
-                .root
-                .join("proposal-journal")
-                .join(format!("{ordinal:08}.json")),
-            self.public_newline,
-        )?;
+        Ok(self.read_public_entry_with_bytes(ordinal)?.0)
+    }
+
+    /// Read and authenticate one sealed proposal row, returning the exact
+    /// source bytes consumed alongside its decoded value.  The G0 funnel uses
+    /// this for untrusted performance diagnostics; the byte count is never
+    /// admitted into a semantic artifact or receipt.
+    pub fn read_public_entry_with_bytes(&self, ordinal: u64) -> Result<(Value, u64)> {
+        let relative = PathBuf::from("proposal-journal").join(format!("{ordinal:08}.json"));
+        let path = self.existing_artifact_path(&relative)?;
+        let bytes = fs::read(path)?;
+        let byte_len = bytes.len() as u64;
+        let value = read_canonical_document_bytes(&bytes, self.public_newline)?;
         verify_self_hash(
             &value,
             "entrySha256",
             crate::proposal::PROPOSAL_ENTRY_SCHEMA,
             "proposal entry",
         )?;
-        Ok(value)
+        Ok((value, byte_len))
     }
 
     pub fn read_artifact(&self, relative: &Path) -> Result<Value> {
-        validate_relative(relative)?;
-        read_canonical_document(&self.root.join(relative), self.public_newline)
+        read_canonical_document(&self.existing_artifact_path(relative)?, self.public_newline)
     }
 
     pub fn artifact_file_sha256(&self, relative: &Path) -> Result<String> {
-        validate_relative(relative)?;
-        file_sha256(&self.root.join(relative))
+        file_sha256(&self.existing_artifact_path(relative)?)
+    }
+
+    /// Read metadata for a sealed artifact without reopening its contents.
+    /// Diagnostic callers use this only after the normal write-once or
+    /// receipt verification path has already authenticated the artifact.
+    pub fn artifact_encoded_bytes(&self, relative: &Path) -> Result<u64> {
+        Ok(fs::metadata(self.existing_artifact_path(relative)?)?.len())
     }
 
     pub fn load_segment(&self, proposal_ordinal: u64) -> Result<Value> {
-        let path = self
-            .root
-            .join("internal/segments")
-            .join(format!("{proposal_ordinal:08}.json"));
+        let path = self.existing_artifact_path(
+            &PathBuf::from("internal/segments").join(format!("{proposal_ordinal:08}.json")),
+        )?;
         let value = read_canonical_document(&path, FinalNewline::Lf)?;
         verify_self_hash(&value, "segmentSha256", SEGMENT_SCHEMA, "proposal segment")?;
         Ok(value)
@@ -461,6 +512,23 @@ impl ProposalJournal {
         self.write_once_with_newline(relative, newline, write)
     }
 
+    /// Atomically publish a canonical streaming document that needs one
+    /// fixed-width placeholder patched in its private temporary file before
+    /// hashing, fsync, and write-once installation.  The final component never
+    /// observes the placeholder: this reuses the ordinary exact-existing and
+    /// reparse-safe publisher after the caller has sealed the final bytes.
+    pub fn write_canonical_once_streaming_rewritable<F>(
+        &self,
+        relative: &Path,
+        newline: FinalNewline,
+        write: F,
+    ) -> Result<WrittenArtifact>
+    where
+        F: FnOnce(&mut dyn RewritableTemporaryWrite) -> Result<()>,
+    {
+        self.write_once_with_newline_rewritable(relative, newline, write)
+    }
+
     fn write_once_with_newline<F>(
         &self,
         relative: &Path,
@@ -470,14 +538,57 @@ impl ProposalJournal {
     where
         F: FnOnce(&mut dyn Write) -> Result<()>,
     {
-        validate_relative(relative)?;
-        let destination = self.root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-            reject_symlink(parent, "artifact parent")?;
-        }
+        let destination = self.artifact_path(relative, true)?;
         let temporary = temporary_path(&destination);
         let (encoded_bytes, temporary_sha) = write_streaming_file(&temporary, newline, write)?;
+        self.publish_temporary_once(
+            relative,
+            destination,
+            temporary,
+            encoded_bytes,
+            temporary_sha,
+        )
+    }
+
+    fn write_once_with_newline_rewritable<F>(
+        &self,
+        relative: &Path,
+        newline: FinalNewline,
+        write: F,
+    ) -> Result<WrittenArtifact>
+    where
+        F: FnOnce(&mut dyn RewritableTemporaryWrite) -> Result<()>,
+    {
+        let destination = self.artifact_path(relative, true)?;
+        let temporary = temporary_path(&destination);
+        let (encoded_bytes, temporary_sha) =
+            write_rewritable_streaming_file(&temporary, newline, write)?;
+        self.publish_temporary_once(
+            relative,
+            destination,
+            temporary,
+            encoded_bytes,
+            temporary_sha,
+        )
+    }
+
+    fn publish_temporary_once(
+        &self,
+        relative: &Path,
+        destination: PathBuf,
+        temporary: PathBuf,
+        encoded_bytes: u64,
+        temporary_sha: String,
+    ) -> Result<WrittenArtifact> {
+        let parent = destination
+            .parent()
+            .expect("validated artifact path has a parent");
+        // Recheck every enclosing component after the stream has been sealed
+        // and immediately before its inode gains the public name.  This
+        // closes the normal link/junction alias case and turns a concurrent
+        // path substitution into a fail-closed transaction.
+        self.ensure_artifact_parent(parent, "artifact parent")?;
+        reject_link_or_non_regular_file(&destination, "write-once artifact")?;
         let installed = match fs::hard_link(&temporary, &destination) {
             Ok(()) => {
                 // The temporary inode is sealed before it gains its public
@@ -487,6 +598,8 @@ impl ProposalJournal {
                 false
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.ensure_artifact_parent(parent, "artifact parent")?;
+                reject_link_or_non_regular_file(&destination, "write-once artifact")?;
                 let matches = files_equal(&temporary, &destination)?;
                 fs::remove_file(&temporary)?;
                 if !matches {
@@ -502,6 +615,8 @@ impl ProposalJournal {
                 return Err(error.into());
             }
         };
+        self.ensure_artifact_parent(parent, "artifact parent")?;
+        ensure_safe_existing_regular_file(&destination, "write-once artifact")?;
         let metadata = fs::metadata(&destination)?;
         if metadata.len() != encoded_bytes {
             return Err(contract(
@@ -514,7 +629,19 @@ impl ProposalJournal {
                 "write-once artifact hash drifted after publication",
             ));
         }
-        sync_parent_directory(destination.parent().expect("artifact path has a parent"))?;
+        sync_parent_directory(parent)?;
+        // This narrowly-scoped debug failpoint models a process loss after a
+        // public artifact has reached durable storage but before its caller
+        // can publish the next artifact/receipt.  It is deliberately absent
+        // from release builds and only exists to prove that G0 can resume an
+        // exact write-once prefix without trusting it.
+        #[cfg(debug_assertions)]
+        if g0_test_should_crash_after_artifact(relative) {
+            return Err(contract(format!(
+                "injected G0 crash after durable artifact: {}",
+                relative.display()
+            )));
+        }
         Ok(WrittenArtifact {
             path: destination,
             file_sha256: destination_sha,
@@ -528,25 +655,22 @@ impl ProposalJournal {
     /// replacement primitive is for checkpointed campaign identity state.
     pub fn write_public_identity_ledger(&self, value: &Value) -> Result<WrittenArtifact> {
         let relative = Path::new("identity-ledger.json");
-        let destination = self.root.join(relative);
+        let destination = self.artifact_path(relative, true)?;
         let parent = destination
             .parent()
             .ok_or_else(|| contract("mutable artifact path lacks a parent"))?;
-        fs::create_dir_all(parent)?;
-        reject_symlink(parent, "artifact parent")?;
-        if let Ok(metadata) = fs::symlink_metadata(&destination) {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(contract("mutable artifact must be a non-symlink file"));
-            }
-        }
         let temporary = temporary_path(&destination);
         let (encoded_bytes, expected_sha) = write_python_pretty_file(&temporary, value)?;
-        let existed = destination.exists();
+        self.ensure_artifact_parent(parent, "mutable artifact parent")?;
+        reject_link_or_non_regular_file(&destination, "mutable artifact")?;
+        let existed = fs::symlink_metadata(&destination).is_ok();
         let installed = replace_file_atomically(&temporary, &destination);
         if let Err(error) = installed {
             let _ = fs::remove_file(&temporary);
             return Err(error.into());
         }
+        self.ensure_artifact_parent(parent, "mutable artifact parent")?;
+        ensure_safe_existing_regular_file(&destination, "mutable artifact")?;
         let metadata = fs::metadata(&destination)?;
         if metadata.len() != encoded_bytes || file_sha256(&destination)? != expected_sha {
             return Err(contract("mutable artifact bytes drifted after replacement"));
@@ -561,14 +685,15 @@ impl ProposalJournal {
     }
 
     pub fn read_public_identity_ledger(&self) -> Result<Value> {
-        read_python_pretty_document(&self.root.join("identity-ledger.json"))
+        read_python_pretty_document(
+            &self.existing_artifact_path(Path::new("identity-ledger.json"))?,
+        )
     }
 
     pub fn load_checkpoint(&self, next_ordinal: u64) -> Result<Value> {
-        let path = self
-            .root
-            .join("internal/checkpoints")
-            .join(format!("{next_ordinal:08}.json"));
+        let path = self.existing_artifact_path(
+            &PathBuf::from("internal/checkpoints").join(format!("{next_ordinal:08}.json")),
+        )?;
         let value = read_canonical_document(&path, FinalNewline::Lf)?;
         verify_self_hash(&value, "checkpointSha256", CHECKPOINT_SCHEMA, "checkpoint")?;
         Ok(value)
@@ -589,7 +714,13 @@ impl ProposalJournal {
     }
 
     pub fn load_generation_head(&self) -> Result<Option<Value>> {
-        let path = self.root.join("internal/generation-head.json");
+        let path = match self.existing_artifact_path(Path::new("internal/generation-head.json")) {
+            Ok(path) => path,
+            Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         match read_canonical_document(&path, FinalNewline::Lf) {
             Ok(value) => {
                 verify_self_hash(
@@ -603,6 +734,74 @@ impl ProposalJournal {
             Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Resolve a sealed artifact only after checking every component below the
+    /// journal root.  `None` represents an absent artifact, not an alias.
+    pub fn safe_existing_artifact(&self, relative: &Path) -> Result<Option<PathBuf>> {
+        match self.existing_artifact_path(relative) {
+            Ok(path) => Ok(Some(path)),
+            Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Resolve an existing journal directory without following a symlink or a
+    /// Windows junction/reparse point in any component below the root.
+    pub fn safe_existing_directory(&self, relative: &Path) -> Result<PathBuf> {
+        validate_relative(relative)?;
+        self.ensure_artifact_parent(&self.root, "generation root")?;
+        let path = self.root.join(relative);
+        ensure_safe_existing_directory(&path, "journal directory")?;
+        self.ensure_artifact_parent(&path, "journal directory")?;
+        Ok(path)
+    }
+
+    fn existing_artifact_path(&self, relative: &Path) -> Result<PathBuf> {
+        let destination = self.artifact_path(relative, false)?;
+        ensure_safe_existing_regular_file(&destination, "artifact")?;
+        Ok(destination)
+    }
+
+    fn artifact_path(&self, relative: &Path, create_parent: bool) -> Result<PathBuf> {
+        validate_relative(relative)?;
+        let parent_relative = relative
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty());
+        let parent = match parent_relative {
+            Some(parent_relative) if create_parent => {
+                ensure_safe_relative_directory(&self.root, parent_relative, "artifact parent")?
+            }
+            Some(parent_relative) => ensure_safe_existing_relative_directory(
+                &self.root,
+                parent_relative,
+                "artifact parent",
+            )?,
+            None => self.root.clone(),
+        };
+        self.ensure_artifact_parent(&parent, "artifact parent")?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| contract("artifact path lacks a final file component"))?;
+        let destination = parent.join(name);
+        reject_link_or_non_regular_file(&destination, "artifact")?;
+        Ok(destination)
+    }
+
+    fn ensure_artifact_parent(&self, parent: &Path, label: &str) -> Result<()> {
+        ensure_safe_existing_directory(&self.root, "generation root")?;
+        ensure_safe_existing_directory(parent, label)?;
+        let canonical_root = fs::canonicalize(&self.root)?;
+        if canonical_root != self.canonical_root {
+            return Err(contract("generation root canonical identity drifted"));
+        }
+        let canonical_parent = fs::canonicalize(parent)?;
+        if !canonical_parent.starts_with(&self.canonical_root) {
+            return Err(contract(format!(
+                "{label} escapes generation root through a link or reparse alias"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -779,7 +978,10 @@ fn validate_relative(relative: &Path) -> Result<()> {
         || relative.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
             )
         })
     {
@@ -788,12 +990,205 @@ fn validate_relative(relative: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reject_symlink(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(contract(format!("{label} must be a non-symlink directory")));
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if absolute
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(contract(
+            "generation root path contains an unsafe component",
+        ));
+    }
+    Ok(absolute)
+}
+
+/// Component-wise root construction based on the qd-batch executable's
+/// authority-path checker.  `create_dir_all` is deliberately avoided because
+/// it follows a pre-existing symlink/junction before the caller can inspect
+/// it.
+fn ensure_safe_directory_tree(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(contract(format!("{label} path must be absolute")));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(contract(format!(
+                    "{label} path contains an unsafe component"
+                )));
+            }
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure_real_directory(&metadata, label, &current)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let metadata = fs::symlink_metadata(&current)?;
+                ensure_real_directory(&metadata, label, &current)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn ensure_safe_relative_directory(root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
+    validate_relative(relative)?;
+    ensure_safe_existing_directory(root, "generation root")?;
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(contract(format!(
+                "{label} path contains an unsafe component"
+            )));
+        };
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure_real_directory(&metadata, label, &path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let metadata = fs::symlink_metadata(&path)?;
+                ensure_real_directory(&metadata, label, &path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    ensure_relative_containment(root, &path, label)?;
+    Ok(path)
+}
+
+fn ensure_safe_existing_relative_directory(
+    root: &Path,
+    relative: &Path,
+    label: &str,
+) -> Result<PathBuf> {
+    validate_relative(relative)?;
+    let path = root.join(relative);
+    ensure_safe_existing_directory(&path, label)?;
+    ensure_relative_containment(root, &path, label)?;
+    Ok(path)
+}
+
+fn ensure_safe_existing_directory(path: &Path, label: &str) -> Result<()> {
+    ensure_safe_existing_components(path, label, true)
+}
+
+fn ensure_safe_existing_regular_file(path: &Path, label: &str) -> Result<()> {
+    ensure_safe_existing_components(path, label, false)
+}
+
+fn ensure_safe_existing_components(
+    path: &Path,
+    label: &str,
+    final_is_directory: bool,
+) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(contract(format!("{label} path must be absolute")));
+    }
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty() {
+        return Err(contract(format!("{label} path is empty")));
+    }
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(contract(format!(
+                    "{label} path contains an unsafe component"
+                )));
+            }
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if is_link_or_reparse(&metadata) {
+            return Err(contract(format!(
+                "{label} contains a symlink or Windows reparse point: {}",
+                current.display()
+            )));
+        }
+        let is_final = index + 1 == components.len();
+        if (!is_final || final_is_directory) && !metadata.is_dir() {
+            return Err(contract(format!(
+                "{label} parent is not a real directory: {}",
+                current.display()
+            )));
+        }
+        if is_final && !final_is_directory && !metadata.is_file() {
+            return Err(contract(format!(
+                "{label} is not a regular file: {}",
+                current.display()
+            )));
+        }
     }
     Ok(())
+}
+
+fn ensure_real_directory(metadata: &fs::Metadata, label: &str, path: &Path) -> Result<()> {
+    if is_link_or_reparse(metadata) || !metadata.is_dir() {
+        return Err(contract(format!(
+            "{label} contains a non-directory or symlink/reparse point: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_relative_containment(root: &Path, path: &Path, label: &str) -> Result<()> {
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_path = fs::canonicalize(path)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(contract(format!(
+            "{label} escapes generation root through a link or reparse alias"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an existing final component that could cause an otherwise
+/// byte-exact write-once comparison to follow an alias.  A missing final
+/// component is the only non-file state permitted to a publisher.
+fn reject_link_or_non_regular_file(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse(&metadata) || !metadata.is_file() => Err(contract(
+            format!("{label} must be a non-symlink, non-reparse regular file"),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -826,6 +1221,55 @@ where
     Ok((bytes, file_sha256(path)?))
 }
 
+fn write_rewritable_streaming_file<F>(
+    path: &Path,
+    newline: FinalNewline,
+    write: F,
+) -> Result<(u64, String)>
+where
+    F: FnOnce(&mut dyn RewritableTemporaryWrite) -> Result<()>,
+{
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut writer = RewritableBufferedWriter {
+        inner: io::BufWriter::with_capacity(1024 * 1024, file),
+    };
+    write(&mut writer)?;
+    writer.write_all(newline.bytes())?;
+    let bytes = writer.seal()?;
+    drop(writer);
+    Ok((bytes, file_sha256(path)?))
+}
+
+struct RewritableBufferedWriter {
+    inner: io::BufWriter<File>,
+}
+
+impl RewritableBufferedWriter {
+    fn seal(&mut self) -> io::Result<u64> {
+        self.inner.flush()?;
+        let bytes = self.inner.get_ref().metadata()?.len();
+        self.inner.get_ref().sync_all()?;
+        Ok(bytes)
+    }
+}
+
+impl Write for RewritableBufferedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for RewritableBufferedWriter {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.inner.flush()?;
+        self.inner.seek(position)
+    }
+}
+
 fn write_python_pretty_file(path: &Path, value: &Value) -> Result<(u64, String)> {
     let encoded = python_pretty_json_line(value, JsonNewline::Lf)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -836,6 +1280,10 @@ fn write_python_pretty_file(path: &Path, value: &Value) -> Result<(u64, String)>
 
 fn read_canonical_document(path: &Path, newline: FinalNewline) -> Result<Value> {
     let bytes = fs::read(path)?;
+    read_canonical_document_bytes(&bytes, newline)
+}
+
+fn read_canonical_document_bytes(bytes: &[u8], newline: FinalNewline) -> Result<Value> {
     if !bytes.ends_with(newline.bytes()) {
         return Err(contract("artifact newline convention is incompatible"));
     }

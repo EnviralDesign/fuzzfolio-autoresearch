@@ -394,6 +394,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
+ "sha2",
  "temporal-qd-contract",
  "temporal-qd-kernel",
  "temporal-qd-runtime",
@@ -450,8 +451,11 @@ dependencies = [
 name = "temporal-qd-kernel"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "flate2",
  "serde",
  "serde_json",
+ "sha2",
  "temporal-qd-contract",
  "thiserror",
 ]
