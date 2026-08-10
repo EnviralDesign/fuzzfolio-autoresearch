@@ -33,6 +33,7 @@ from .evolvable_module_genome import (
     ResourceUse,
     Zone,
     decode_program,
+    evolvable_resource_fingerprint,
 )
 from .evolvable_module_resource_operators import (
     GenomeResourceOperatorLayer,
@@ -295,13 +296,7 @@ def _indicator_id(row: Mapping[str, Any]) -> str:
 
 
 def _fingerprint(genome: EvolvableModuleGenomeV1) -> str:
-    return canonical_sha256({
-        "indicators": [((row.get("meta") or {}).get("id"), (row.get("config") or {}).get("timeframe")) for row in genome.resources.canonical()["indicators"]],
-        "groups": [row.get("indicatorInstanceIds") for row in genome.resources.canonical()["evidenceGroups"]],
-        "events": [row.get("indicatorInstanceId") for row in genome.resources.canonical()["events"]],
-        "management": [edge.effect.value for edge in genome.edges if edge.effect in {EffectKind.BREAK_EVEN, EffectKind.TIGHTEN_STOP, EffectKind.ACTIVATE_TRAILING, EffectKind.DEACTIVATE_TRAILING, EffectKind.SET_TARGET, EffectKind.CANCEL_TARGET}],
-        "exits": sum(1 for edge in genome.edges if edge.effect is EffectKind.EXIT),
-    })
+    return evolvable_resource_fingerprint(genome)
 
 
 def _admission_rejection_reason(exc: Exception) -> str:

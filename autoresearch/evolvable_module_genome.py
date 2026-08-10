@@ -845,6 +845,43 @@ def compile_program(*, program_kind: str, codec: str, payload: Mapping[str, Any]
     return (compiler or EvolvableModuleCompilerV1()).compile(genome, candidate_id=candidate_id, native_validator=native_validator)
 
 
+def evolvable_resource_fingerprint(genome: EvolvableModuleGenomeV1) -> str:
+    """Canonical strategy-resource projection used by factory admission audits."""
+
+    resources = genome.resources.canonical()
+    management_effects = {
+        EffectKind.BREAK_EVEN,
+        EffectKind.TIGHTEN_STOP,
+        EffectKind.ACTIVATE_TRAILING,
+        EffectKind.DEACTIVATE_TRAILING,
+        EffectKind.SET_TARGET,
+        EffectKind.CANCEL_TARGET,
+    }
+    return canonical_sha256({
+        "indicators": [
+            (
+                (row.get("meta") or {}).get("id"),
+                (row.get("config") or {}).get("timeframe"),
+            )
+            for row in resources["indicators"]
+        ],
+        "groups": [
+            row.get("indicatorInstanceIds")
+            for row in resources["evidenceGroups"]
+        ],
+        "events": [
+            row.get("indicatorInstanceId")
+            for row in resources["events"]
+        ],
+        "management": [
+            edge.effect.value
+            for edge in genome.edges
+            if edge.effect in management_effects
+        ],
+        "exits": sum(1 for edge in genome.edges if edge.effect is EffectKind.EXIT),
+    })
+
+
 def _guard_shape(value: Mapping[str, Any]) -> Any:
     kind = str(value.get("kind") or "")
     if kind in {"all", "any"}:
@@ -859,5 +896,5 @@ __all__ = [
     "EvolvableGenomeError", "EvolvableModuleCompilerV1", "EvolvableModuleGenomeCodecV1",
     "EvolvableModuleGenomeV1", "GENOME_CODEC", "GENOME_SCHEMA", "GenomeEdgeV1", "GenomeNodeV1",
     "NativeModuleValidator", "PROGRAM_KIND", "ResourceKind", "ResourcePoolV1", "ResourceUse", "Zone",
-    "compile_program", "decode_program",
+    "compile_program", "decode_program", "evolvable_resource_fingerprint",
 ]

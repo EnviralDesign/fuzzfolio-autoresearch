@@ -19,9 +19,11 @@ from autoresearch.temporal_bidirectional_genome import (
 )
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_qd_pair_generation import (
+    materialize_pair_candidate,
     propose_pair,
     replay_pair_proposal,
 )
+from autoresearch.temporal_qd_g0_bootstrap import _verify_accepted_entry
 from autoresearch.temporal_qd_initial_protection import default_initial_protection_policy
 
 
@@ -149,6 +151,88 @@ def test_opt_in_factory_compiles_symmetric_catalog_bound_modules_then_existing_v
     assert audit["sides"]["long"]["semanticTopologySha256"]
     assert audit["sides"]["short"]["resourceFingerprintSha256"]
     assert all(item["codec"] == "evolvable_module_genome_json_v1" for item in pair.side_targeted_lineage)
+
+
+def _evolvable_g0_entry(authority, *, audit_mutator=None) -> dict:
+    pair, proposal = propose_pair(
+        proposal_seed="evolvable-g0-audit-fixture",
+        parent=None,
+        pair_factory=authority.factory,
+        module_authority=authority.operator,
+        native_validator=authority.bundle.validator,
+        pair_compiler=authority.bundle.compiler,
+    )
+    assert pair is not None
+    if audit_mutator is not None:
+        audit_mutator(proposal["factoryConstructionAudit"])
+        proposal["factoryConstructionAudit"]["auditSha256"] = canonical_sha256({
+            key: value
+            for key, value in proposal["factoryConstructionAudit"].items()
+            if key != "auditSha256"
+        })
+        proposal["proposalSha256"] = canonical_sha256({
+            key: value for key, value in proposal.items() if key != "proposalSha256"
+        })
+    pair_policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": pair.pair_compiler.canonical_payload(),
+    }
+    candidate = materialize_pair_candidate(
+        pair=pair,
+        proposal=proposal,
+        pair_policy=pair_policy,
+        generation_index=0,
+        birth_ordinal=0,
+        proposal_ordinal=0,
+    )
+    entry = {
+        "schemaVersion": "temporal_qd_proposal_entry_v3",
+        "configSha256": canonical_sha256({"config": "evolvable-g0-fixture"}),
+        "generationIndex": 0,
+        "proposalOrdinal": 0,
+        "originKind": "random_immigrant",
+        "proposal": proposal,
+        "operatorImplementationSha256": canonical_sha256({"operator": "evolvable-g0-fixture"}),
+        "disposition": "accepted",
+        "candidate": candidate,
+    }
+    entry["entrySha256"] = canonical_sha256(entry)
+    return entry
+
+
+def test_g0_accepts_and_binds_evolvable_factory_audit(authority) -> None:
+    entry = _evolvable_g0_entry(authority)
+    candidate, pair = _verify_accepted_entry(entry)
+    assert candidate["candidateId"].startswith("qd_")
+    assert pair.identity_sha256 == entry["proposal"]["pairIdentitySha256"]
+
+
+@pytest.mark.parametrize(
+    ("audit_mutator", "message"),
+    [
+        (
+            lambda audit: audit.update({"authoritySha256": "sha256:" + "0" * 64}),
+            "authority or side lineage drift",
+        ),
+        (
+            lambda audit: audit["sides"]["long"].update(
+                {"resourceFingerprintSha256": "sha256:" + "1" * 64}
+            ),
+            "diverged from frozen module program",
+        ),
+        (
+            lambda audit: audit.update({"unexpected": True}),
+            "unexpected schema",
+        ),
+    ],
+)
+def test_g0_rejects_rehashed_evolvable_factory_audit_drift(
+    authority, audit_mutator, message
+) -> None:
+    entry = _evolvable_g0_entry(authority, audit_mutator=audit_mutator)
+    with pytest.raises(TemporalDiscoveryContractError, match=message):
+        _verify_accepted_entry(entry)
 
 
 def test_resource_topology_replay_stale_plan_and_cross_side_drift_fail_closed(authority) -> None:

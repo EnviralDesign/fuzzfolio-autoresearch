@@ -141,6 +141,31 @@ and the full 8,192-pair no-market capacity admission above was rerun against the
 repaired policy. No candidate evaluation or market-data task occurred in the
 failed preflight.
 
+The next live attempt constructed all 4,000 G0 immigrants and then stopped
+before selection or worker enqueue because the bootstrap projection recognized
+only the legacy rich-immigrant audit schema. The bootstrap now has separate,
+closed validation branches for the legacy audit and
+`temporal_qd_evolvable_module_factory_audit_v1`. The evolvable branch decodes
+both frozen genomes, recomputes genome, topology, and resource-fingerprint
+identities, binds the pair identity and exact long/short seed lineage, and
+rejects rehashed authority, resource, side, or schema drift. The legacy branch
+is unchanged. Focused G0, authority, supervisor, evolution, and bidirectional
+tests pass.
+
+That failed run also froze a mistyped, nonexistent AutoResearch provenance SHA
+(`9d363f25087f9f29ea5ef345c19b27e1c20b610d`) rather than the actual source
+commit (`9d363f2b22babbd78559655ee4fc2857b3c1531a`). Its 4,000 proposal journals are
+preserved as forensic evidence but are not eligible for a canonical restart.
+The admitted checkpoint must start from a fresh run root after this validator
+correction is committed, with the exact new commit frozen.
+
+During the failed G0 projection, Python working-set memory temporarily reached
+approximately 33 GB while rehydrating the 4,000 large journal entries. It
+released after the tripwire, so it did not contaminate evidence, but it is a
+recorded performance defect. A future optimization must retain the Python
+oracle while replacing all-at-once rehydration/reduction with a bounded-memory
+streaming or native path.
+
 Launch-ready immutable inputs are committed beside this record:
 
 - `TEMPORAL_QD_EVOLVABLE_CAPACITY_ADMISSION_2026-08-09.json` — the semantic

@@ -17,6 +17,11 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .evolvable_module_genome import (
+    EvolvableGenomeError,
+    decode_program,
+    evolvable_resource_fingerprint,
+)
 from .temporal_bidirectional_genome import BidirectionalGenomeError, FrozenModule, FrozenPair
 from .temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
 from .temporal_search_policy_v2 import inspect_management_reachability
@@ -122,6 +127,7 @@ _CANDIDATE_IDENTITY_FIELDS = {
 }
 MAX_CANONICAL_GRAPH_STATES = 32
 MAX_CANONICAL_GRAPH_TRANSITIONS = 128
+EVOLVABLE_FACTORY_AUDIT_SCHEMA = "temporal_qd_evolvable_module_factory_audit_v1"
 
 
 def _closed_keys(value: Any, *, required: set[str], optional: set[str], label: str) -> Mapping[str, Any]:
@@ -165,6 +171,138 @@ def _validate_g0_accepted_entry_schema(entry: Mapping[str, Any]) -> None:
     scope = _closed_keys(candidate.get("constructionEvidenceScope"), required={"schemaVersion", "evidencePlanRotationRequired", "lakeScopeRegenerationRequired", "reasons", "timeframeMutationTraceSha256s", "evidenceScopeSha256"}, optional=set(), label="G0 construction evidence scope")
     if scope.get("schemaVersion") != "temporal_qd_construction_evidence_scope_v1" or scope.get("evidencePlanRotationRequired") is not False or scope.get("lakeScopeRegenerationRequired") is not False or scope.get("reasons") != [] or scope.get("timeframeMutationTraceSha256s") != [] or scope.get("evidenceScopeSha256") != canonical_sha256({key: value for key, value in scope.items() if key != "evidenceScopeSha256"}):
         raise TemporalDiscoveryContractError("G0 construction evidence scope is invalid")
+
+
+def _verify_evolvable_factory_audit(
+    *, audit: Mapping[str, Any], pair: FrozenPair, proposal_seed: str
+) -> None:
+    audit = _closed_keys(
+        audit,
+        required={
+            "schemaVersion",
+            "authoritySha256",
+            "pairIdentitySha256",
+            "sides",
+            "auditSha256",
+        },
+        optional=set(),
+        label="G0 evolvable factory construction audit",
+    )
+    authority_sha256 = _sha(
+        audit.get("authoritySha256"), name="evolvable factory authoritySha256"
+    )
+    if (
+        audit.get("schemaVersion") != EVOLVABLE_FACTORY_AUDIT_SCHEMA
+        or audit.get("pairIdentitySha256") != pair.identity_sha256
+        or audit.get("auditSha256")
+        != canonical_sha256(
+            {key: value for key, value in audit.items() if key != "auditSha256"}
+        )
+    ):
+        raise TemporalDiscoveryContractError(
+            "G0 evolvable factory construction audit identity drift"
+        )
+
+    sides = _closed_keys(
+        audit.get("sides"),
+        required={"long", "short"},
+        optional=set(),
+        label="G0 evolvable factory audit sides",
+    )
+    lineage_rows = pair.canonical_payload().get("sideTargetedLineage")
+    if (
+        not isinstance(lineage_rows, Sequence)
+        or isinstance(lineage_rows, (str, bytes))
+        or len(lineage_rows) != 2
+    ):
+        raise TemporalDiscoveryContractError(
+            "G0 evolvable factory audit lacks exact side-targeted seed lineage"
+        )
+    lineage_by_side: dict[str, Mapping[str, Any]] = {}
+    lineage_fields = {
+        "authoritySha256",
+        "codec",
+        "compilerPolicySha256",
+        "genomeSha256",
+        "operation",
+        "programKind",
+        "proposalSeed",
+        "side",
+    }
+    for raw_lineage in lineage_rows:
+        lineage = _closed_keys(
+            raw_lineage,
+            required=lineage_fields,
+            optional=set(),
+            label="G0 evolvable factory side-targeted lineage",
+        )
+        side = lineage.get("side")
+        if (
+            side not in {"long", "short"}
+            or side in lineage_by_side
+            or lineage.get("operation") != "evolvable_module_pair_seed"
+            or lineage.get("authoritySha256") != authority_sha256
+            or lineage.get("proposalSeed") != proposal_seed
+        ):
+            raise TemporalDiscoveryContractError(
+                "G0 evolvable factory audit authority or side lineage drift"
+            )
+        _sha(lineage.get("compilerPolicySha256"), name="compilerPolicySha256")
+        _sha(lineage.get("genomeSha256"), name="lineage genomeSha256")
+        lineage_by_side[str(side)] = lineage
+
+    expected_sides: dict[str, dict[str, Any]] = {}
+    for module in (pair.long, pair.short):
+        program = module.canonical_payload().get("program")
+        if not isinstance(program, Mapping):
+            raise TemporalDiscoveryContractError(
+                "G0 evolvable factory module program is invalid"
+            )
+        try:
+            genome = decode_program(
+                program_kind=str(program.get("programKind") or ""),
+                codec=str(program.get("codec") or ""),
+                payload=program,
+            )
+            genome.validate()
+        except (EvolvableGenomeError, TypeError, ValueError) as exc:
+            raise TemporalDiscoveryContractError(
+                "G0 evolvable factory module program is invalid"
+            ) from exc
+        if genome.direction != module.direction:
+            raise TemporalDiscoveryContractError(
+                "G0 evolvable factory module direction drift"
+            )
+        expected = {
+            "programKind": genome.program_kind,
+            "codec": genome.codec,
+            "genomeSha256": genome.identity_sha256,
+            "semanticTopologySha256": genome.semantic_topology_signature(),
+            "resourceFingerprintSha256": evolvable_resource_fingerprint(genome),
+        }
+        side_audit = _closed_keys(
+            sides.get(module.direction),
+            required=set(expected),
+            optional=set(),
+            label=f"G0 evolvable factory {module.direction} audit",
+        )
+        if side_audit != expected:
+            raise TemporalDiscoveryContractError(
+                "G0 evolvable factory audit diverged from frozen module program"
+            )
+        lineage = lineage_by_side.get(module.direction)
+        if lineage is None or any(
+            lineage.get(key) != expected[key]
+            for key in ("programKind", "codec", "genomeSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "G0 evolvable factory audit diverged from frozen pair lineage"
+            )
+        expected_sides[module.direction] = expected
+    if sides != expected_sides:
+        raise TemporalDiscoveryContractError(
+            "G0 evolvable factory audit side closure drift"
+        )
 
 
 def _verify_accepted_entry(entry: Mapping[str, Any]) -> tuple[Mapping[str, Any], FrozenPair]:
@@ -219,17 +357,28 @@ def _verify_accepted_entry(entry: Mapping[str, Any]) -> tuple[Mapping[str, Any],
         raise TemporalDiscoveryContractError("accepted candidate identity does not bind pair proposal")
     audit = proposal.get("factoryConstructionAudit")
     if audit is not None:
-        audit = _closed_keys(audit, required={"schemaVersion", "pairIdentitySha256", "sides", "auditSha256"}, optional=set(), label="G0 factory construction audit")
-        if audit.get("schemaVersion") != "temporal_qd_rich_immigrant_pair_construction_v1" or audit.get("pairIdentitySha256") != pair.identity_sha256 or audit.get("auditSha256") != canonical_sha256({key: value for key, value in audit.items() if key != "auditSha256"}):
-            raise TemporalDiscoveryContractError("G0 factory construction audit identity drift")
-        expected_sides = {}
-        for module in (pair.long, pair.short):
-            construction = next((item.get("audit") for item in reversed(module.lineage) if item.get("operation") == "rich_immigrant_construction"), None)
-            if not isinstance(construction, Mapping):
-                raise TemporalDiscoveryContractError("G0 factory construction audit lacks frozen lineage authority")
-            expected_sides[module.direction] = _plain(construction)
-        if audit.get("sides") != expected_sides:
-            raise TemporalDiscoveryContractError("G0 factory construction audit diverged from frozen lineage")
+        if not isinstance(audit, Mapping):
+            raise TemporalDiscoveryContractError(
+                "G0 factory construction audit has an unexpected schema"
+            )
+        if audit.get("schemaVersion") == EVOLVABLE_FACTORY_AUDIT_SCHEMA:
+            _verify_evolvable_factory_audit(
+                audit=audit,
+                pair=pair,
+                proposal_seed=str(proposal["proposalSeed"]),
+            )
+        else:
+            audit = _closed_keys(audit, required={"schemaVersion", "pairIdentitySha256", "sides", "auditSha256"}, optional=set(), label="G0 factory construction audit")
+            if audit.get("schemaVersion") != "temporal_qd_rich_immigrant_pair_construction_v1" or audit.get("pairIdentitySha256") != pair.identity_sha256 or audit.get("auditSha256") != canonical_sha256({key: value for key, value in audit.items() if key != "auditSha256"}):
+                raise TemporalDiscoveryContractError("G0 factory construction audit identity drift")
+            expected_sides = {}
+            for module in (pair.long, pair.short):
+                construction = next((item.get("audit") for item in reversed(module.lineage) if item.get("operation") == "rich_immigrant_construction"), None)
+                if not isinstance(construction, Mapping):
+                    raise TemporalDiscoveryContractError("G0 factory construction audit lacks frozen lineage authority")
+                expected_sides[module.direction] = _plain(construction)
+            if audit.get("sides") != expected_sides:
+                raise TemporalDiscoveryContractError("G0 factory construction audit diverged from frozen lineage")
     funnel = entry.get("funnelCandidate")
     if funnel is not None:
         funnel = _closed_keys(funnel, required={"schemaVersion", "candidateId", "rawSourceProfileSha256", "staticReachability", "nativeValidation", "admission"}, optional=set(), label="G0 funnel candidate")
