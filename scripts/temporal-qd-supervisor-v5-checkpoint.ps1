@@ -37,7 +37,7 @@ $arguments = @(
     "--rotating-evidence-config", (Join-Path $campaignRoot "authority\rotating-evidence\rotating-evidence-config.json"),
     "--pair-generation-engine", "python_optimized_v1",
     "--pair-generation-timeout-seconds", "14400",
-    "--tail-result-mode", "indexed",
+    "--tail-result-mode", "legacy",
     "--generation-funnel-enabled"
 )
 
