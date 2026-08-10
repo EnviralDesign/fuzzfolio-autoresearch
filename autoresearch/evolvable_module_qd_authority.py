@@ -343,6 +343,15 @@ class EvolvableModulePairFactory:
             "seedPolicy": "independent_symmetric_sides_catalog_bound_v1",
             "programKind": authority.config["programKind"],
             "codec": authority.config["codec"],
+            # The live pair-population generator applies this fail-closed
+            # acceptance tripwire to every immigrant factory.  Keep it inside
+            # the authority-bound construction policy so the capacity receipt,
+            # generation config, journal, and restart identity all agree on the
+            # exact collapse threshold used at runtime.
+            "collisionTripwire": {
+                "minimumImmigrantAttempts": 512,
+                "minimumAcceptedRatio": 0.25,
+            },
         }
 
     def _build_side(self, side: str, proposal_seed: str) -> tuple[EvolvableModuleGenomeV1, dict[str, Any]]:

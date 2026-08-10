@@ -138,6 +138,10 @@ def authority():
 
 
 def test_opt_in_factory_compiles_symmetric_catalog_bound_modules_then_existing_v3_pair(authority) -> None:
+    assert authority.factory.construction_policy["collisionTripwire"] == {
+        "minimumImmigrantAttempts": 512,
+        "minimumAcceptedRatio": 0.25,
+    }
     pair = authority.factory.create_pair(proposal_seed="evolvable-fixture-seed")
     assert pair.profile["version"] == "v3"
     assert pair.long.canonical_payload()["program"]["programKind"] == "evolvable_module_genome_v1"

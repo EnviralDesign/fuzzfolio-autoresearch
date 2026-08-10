@@ -20,8 +20,16 @@
           "tradeFrequency",
           "medianHolding"
         ],
-        "graphNodeBounds": [40, 55, 70],
-        "lineageFamilyFields": ["operatorId", "operation", "kind"],
+        "graphNodeBounds": [
+          40,
+          55,
+          70
+        ],
+        "lineageFamilyFields": [
+          "operatorId",
+          "operation",
+          "kind"
+        ],
         "managementActionKinds": [
           "activate_trailing_stop_next_open",
           "cancel_target_next_open",
@@ -30,7 +38,10 @@
           "set_target_next_open",
           "tighten_stop_next_open"
         ],
-        "rootConstructionOperations": ["rich_immigrant_construction", "typed_seed"],
+        "rootConstructionOperations": [
+          "rich_immigrant_construction",
+          "typed_seed"
+        ],
         "schemaVersion": "temporal_qd_descriptor_policy_v2"
       },
       "directionSelection": {
@@ -40,7 +51,10 @@
           "short_specialist": "supported_nonnegative_short_with_inactive_or_unsupported_long"
         },
         "fallback": "remaining_direction_eligible_quality_pareto_then_crowding",
-        "ineligibleLanes": ["harmful_opposite_side", "inactive_or_unsupported"],
+        "ineligibleLanes": [
+          "harmful_opposite_side",
+          "inactive_or_unsupported"
+        ],
         "memberBinding": "aggregate.realizedBehavior_then_direction_selection_v1",
         "perCellBreedingQuotas": {
           "balanced_bidirectional": 2,
@@ -58,9 +72,18 @@
         "selectionPolicySha256": "sha256:2567175ff6ae6063baa485484c0faa0d742507af6814a593076020a68aef3ed1"
       },
       "economicObjectives": [
-        {"direction": "max", "name": "worstWindowConservativeNetR"},
-        {"direction": "min", "name": "maximumDrawdownR"},
-        {"direction": "min", "name": "structuralComplexity"}
+        {
+          "direction": "max",
+          "name": "worstWindowConservativeNetR"
+        },
+        {
+          "direction": "min",
+          "name": "maximumDrawdownR"
+        },
+        {
+          "direction": "min",
+          "name": "structuralComplexity"
+        }
       ],
       "identity": {
         "candidateIdentity": "reject_exact_repeat",
@@ -77,12 +100,30 @@
       "resolvedExecutionDeduplication": {
         "identity": "aggregate.resolvedProgramSha256",
         "representativeOrdering": [
-          {"direction": "max", "field": "finiteDataValidity.validForQuality"},
-          {"direction": "max", "field": "objectives.worstWindowConservativeNetR"},
-          {"direction": "max", "field": "cappedTradeSupport"},
-          {"direction": "min", "field": "objectives.maximumDrawdownR"},
-          {"direction": "min", "field": "objectives.structuralComplexity"},
-          {"direction": "min", "field": "candidateId"}
+          {
+            "direction": "max",
+            "field": "finiteDataValidity.validForQuality"
+          },
+          {
+            "direction": "max",
+            "field": "objectives.worstWindowConservativeNetR"
+          },
+          {
+            "direction": "max",
+            "field": "cappedTradeSupport"
+          },
+          {
+            "direction": "min",
+            "field": "objectives.maximumDrawdownR"
+          },
+          {
+            "direction": "min",
+            "field": "objectives.structuralComplexity"
+          },
+          {
+            "direction": "min",
+            "field": "candidateId"
+          }
         ],
         "required": true,
         "stage": "before_archive_reduction"
@@ -130,7 +171,10 @@
     "minimumUniqueResourceFingerprintsPerSide": 64,
     "minimumUniqueTopologiesPerSide": 8,
     "previewStreamSize": 8192,
-    "requiredDirections": ["long", "short"],
+    "requiredDirections": [
+      "long",
+      "short"
+    ],
     "schemaVersion": "temporal_qd_evolvable_module_capacity_contract_v1"
   },
   "capacityReceipt": {
@@ -142,14 +186,17 @@
       "minimumUniqueResourceFingerprintsPerSide": 64,
       "minimumUniqueTopologiesPerSide": 8,
       "previewStreamSize": 8192,
-      "requiredDirections": ["long", "short"],
+      "requiredDirections": [
+        "long",
+        "short"
+      ],
       "schemaVersion": "temporal_qd_evolvable_module_capacity_contract_v1"
     },
     "catalogSha256": "sha256:e870e59811079ac4be601380a6f507b7be0c34bccf9ce3699eded4e65e6bae3b",
     "codec": "evolvable_module_genome_json_v1",
     "compiledAdmittedCandidateCount": 8192,
     "compilerPolicySha256": "sha256:677d0d764b2877040b8f7d14b0d53acb22594dcb41ccf042b9eb244067cd56f4",
-    "factoryPolicySha256": "sha256:8a4091aa23a3c7224f17681806fb58def4033d696a901f83ba71f1e0119a579c",
+    "factoryPolicySha256": "sha256:8ea743f247b9aaf1377b7b9179550451d94cb796c4615e09cae7dc3f897c4ad9",
     "nativeOrCompilerRejectionCounts": {},
     "noMarket": true,
     "operatorRegistrySha256": "sha256:4eb3c2e7f76e2e679fc40d68308f1b3553dafdb0c109222121b1c4b4c35465a5",
@@ -157,7 +204,10 @@
     "passed": true,
     "perSide": {
       "long": {
-        "exitPresenceCounts": {"False": 4149, "True": 4043},
+        "exitPresenceCounts": {
+          "False": 4149,
+          "True": 4043
+        },
         "managementEffectCounts": {
           "None": 2020,
           "activate_trailing_stop_next_open": 2048,
@@ -168,7 +218,10 @@
         "uniqueSemanticTopologyCount": 32
       },
       "short": {
-        "exitPresenceCounts": {"False": 4094, "True": 4098},
+        "exitPresenceCounts": {
+          "False": 4094,
+          "True": 4098
+        },
         "managementEffectCounts": {
           "None": 2098,
           "activate_trailing_stop_next_open": 2009,
@@ -183,13 +236,19 @@
     "programKind": "evolvable_module_genome_v1",
     "rawPreview": {
       "perSide": {
-        "long": {"uniqueResourceFingerprintCount": 288, "uniqueSemanticTopologyCount": 32},
-        "short": {"uniqueResourceFingerprintCount": 288, "uniqueSemanticTopologyCount": 32}
+        "long": {
+          "uniqueResourceFingerprintCount": 288,
+          "uniqueSemanticTopologyCount": 32
+        },
+        "short": {
+          "uniqueResourceFingerprintCount": 288,
+          "uniqueSemanticTopologyCount": 32
+        }
       },
       "uniqueSemanticPairCount": 8192
     },
     "schemaVersion": "temporal_qd_evolvable_module_capacity_receipt_v1",
-    "semanticReceiptSha256": "sha256:3c403c9c68f2796ec6fe79bc601ab2891ef0fdfa0bfe7cf1affdc143169ed594",
+    "semanticReceiptSha256": "sha256:1a783f103fed96401aa8959a637347808f44475aeb8d069b8bbb119a1913b84f",
     "uniqueCompiledV3ProfileCount": 8192,
     "uniqueSemanticPairCount": 8192
   },
@@ -210,7 +269,11 @@
   "compilerPolicySha256": "sha256:677d0d764b2877040b8f7d14b0d53acb22594dcb41ccf042b9eb244067cd56f4",
   "operatorRegistry": {
     "crossover": "evolvable_module_compatible_motif_crossover_v1",
-    "crossoverPorts": ["entry_setup", "management_hub", "exit_hub"],
+    "crossoverPorts": [
+      "entry_setup",
+      "management_hub",
+      "exit_hub"
+    ],
     "crossoverResourceTransfer": "recipient_closed_only_no_implicit_import_v1",
     "replay": "content_bound_plan_then_native_compile_v1",
     "resourceOperators": "evolvable_module_resource_operators_v1",

@@ -126,11 +126,20 @@ Evolvable factory capacity:     8,192 previewed
 ```
 
 The authoritative no-market capacity receipt is
-`sha256:3c403c9c68f2796ec6fe79bc601ab2891ef0fdfa0bfe7cf1affdc143169ed594`
+`sha256:1a783f103fed96401aa8959a637347808f44475aeb8d069b8bbb119a1913b84f`
 under evolvable authority
 `sha256:7fbf45787ea91ef707f58c71a04c00fc275d8df0791ed190b1182d553130f164`.
 It exceeds the frozen five-generation construction requirement of 8,096 by 96
 fully admitted unique semantic pairs.
+
+The first live two-generation checkpoint preflight then exposed one focused
+admission defect before candidate construction: the evolvable factory policy
+did not carry the collision-collapse tripwire required by the optimized pair
+population generator. The policy now binds the existing 512-attempt / 25%
+minimum acceptance threshold, focused authority/supervisor/generator tests pass,
+and the full 8,192-pair no-market capacity admission above was rerun against the
+repaired policy. No candidate evaluation or market-data task occurred in the
+failed preflight.
 
 Launch-ready immutable inputs are committed beside this record:
 

@@ -17,7 +17,7 @@
   "codec": "evolvable_module_genome_json_v1",
   "compiledAdmittedCandidateCount": 8192,
   "compilerPolicySha256": "sha256:677d0d764b2877040b8f7d14b0d53acb22594dcb41ccf042b9eb244067cd56f4",
-  "factoryPolicySha256": "sha256:8a4091aa23a3c7224f17681806fb58def4033d696a901f83ba71f1e0119a579c",
+  "factoryPolicySha256": "sha256:8ea743f247b9aaf1377b7b9179550451d94cb796c4615e09cae7dc3f897c4ad9",
   "nativeOrCompilerRejectionCounts": {},
   "noMarket": true,
   "operatorRegistrySha256": "sha256:4eb3c2e7f76e2e679fc40d68308f1b3553dafdb0c109222121b1c4b4c35465a5",
@@ -69,7 +69,7 @@
     "uniqueSemanticPairCount": 8192
   },
   "schemaVersion": "temporal_qd_evolvable_module_capacity_receipt_v1",
-  "semanticReceiptSha256": "sha256:3c403c9c68f2796ec6fe79bc601ab2891ef0fdfa0bfe7cf1affdc143169ed594",
+  "semanticReceiptSha256": "sha256:1a783f103fed96401aa8959a637347808f44475aeb8d069b8bbb119a1913b84f",
   "uniqueCompiledV3ProfileCount": 8192,
   "uniqueSemanticPairCount": 8192
 }
