@@ -307,7 +307,6 @@ fn build_task(
         ("candidate_id", candidate_id),
         ("window_id", window_id),
         ("authority_id", authority_id),
-        ("raw_source_profile_sha256", source_sha),
         ("lake_window_semantic_sha256", semantic),
         ("shared_observation_stream_id", &shared),
         ("user_id", "temporal-search"),
@@ -4934,12 +4933,7 @@ mod tests {
                 .ok_or_else(|| anyhow!("task payload missing"))?,
             "task payload",
         )?;
-        assert_eq!(
-            payload
-                .get("raw_source_profile_sha256")
-                .and_then(Value::as_str),
-            Some(profile_sha.as_str())
-        );
+        assert!(!payload.contains_key("raw_source_profile_sha256"));
         assert!(!payload.contains_key("temporal_source_profile_sha256"));
         Ok(())
     }
