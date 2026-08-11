@@ -41,6 +41,7 @@ fn compact_fixture(root: &Path, sizes: [u64; 8]) -> PathBuf {
         "contractVersion": CONTRACT_VERSION,
         "operation": OPERATION,
         "runtimeAuthoritySha256": HASH_B,
+        "semanticAuthoritySha256": HASH_A,
         "sourcePath": root.join("absent-source.json").to_string_lossy(),
         "sourceSha256": HASH_A,
         "resultPath": COMMIT_PATH,
@@ -55,6 +56,7 @@ fn compact_fixture(root: &Path, sizes: [u64; 8]) -> PathBuf {
         "sourceSha256": HASH_A,
         "manifestSha256": manifest["manifestSha256"],
         "runtimeAuthoritySha256": HASH_B,
+        "semanticAuthoritySha256": HASH_A,
         "generationIndex": 1,
         "auxiliaryPlanSha256": HASH_B,
     });
@@ -72,6 +74,7 @@ fn compact_fixture(root: &Path, sizes: [u64; 8]) -> PathBuf {
     .zip(sizes)
     {
         let output = root.join(output_path);
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
         if size == 3 {
             fs::write(&output, b"{}\n").unwrap();
         } else {

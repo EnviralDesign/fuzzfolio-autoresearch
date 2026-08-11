@@ -95,6 +95,7 @@ def window(row: dict, index: int, net: float, trades: int) -> dict:
         "resolvedProgramSha256": resolved_program,
         "resolvedProfileSnapshotSha256": digest(row["candidateId"] + ":resolved-profile"),
         "sourceProfileSnapshotSha256": row["profileSnapshotSha256"],
+        "observationStreamSha256": digest(row["candidateId"] + f":stream:{index}"),
         "trades": trades,
         "observations": 1000 + index,
         "conservativeNetR": net,
@@ -211,7 +212,7 @@ def projection(record: dict) -> dict:
     }
 
 
-def entry(task_id: str, record: dict) -> dict:
+def entry(task_id: str, record: dict, *, directional: bool = False) -> dict:
     task = {
         "taskId": task_id,
         "candidateId": record["candidateId"],
@@ -221,7 +222,10 @@ def entry(task_id: str, record: dict) -> dict:
         "taskPayloadSha256": digest(task_id + ":payload"),
     }
     raw = {
-        "schemaVersion": "temporal_qd_tail_result_index_entry_v3",
+        "schemaVersion": (
+            "temporal_qd_tail_result_index_entry_v4"
+            if directional else "temporal_qd_tail_result_index_entry_v3"
+        ),
         "task": task,
         "rawResultRef": {
             "schemaVersion": "temporal_qd_tail_raw_result_ref_v1",
@@ -239,6 +243,16 @@ def entry(task_id: str, record: dict) -> dict:
     if record.get("evaluationRejected"):
         raw["rejection"] = record["rejection"]
     else:
+        if directional:
+            behavior = record["realizedBehavior"]
+            raw["rawRotatingProvenance"] = {
+                "schemaVersion": "temporal_qd_v5_raw_rotating_provenance_v1",
+                "taskId": task_id,
+                "resultSha256": raw["rawResultRef"]["resultSha256"],
+                "observationStreamSha256": record["observationStreamSha256"],
+                "conservativeReplayStreamSha256": record["observationStreamSha256"],
+                "realizedBehaviorSha256": semantic_sha256(behavior),
+            }
         raw["stageProjection"] = projection(record)
         raw["rotatingEvidenceMetrics"] = {
             "conservativeNetR": record["conservativeNetR"],
@@ -319,6 +333,18 @@ def main() -> None:
     (out / "evaluation-population.json").write_bytes(canonical_json_bytes(evaluation))
     (out / "tail-result-index-v3.json").write_bytes(canonical_json_bytes(index))
 
+    v4_entries = []
+    for candidate_id in sorted(grouped):
+        for window_index, record in enumerate(grouped[candidate_id]):
+            v4_entries.append(entry(f"task-{candidate_id}-{window_index}", record, directional=True))
+    v4_entries.sort(key=lambda value: value["task"]["taskId"])
+    v4 = dict(index)
+    v4["schemaVersion"] = "temporal_qd_tail_result_index_v4"
+    v4["entries"] = v4_entries
+    v4.pop("tailResultIndexSha256")
+    v4["tailResultIndexSha256"] = semantic_sha256(v4)
+    (out / "tail-result-index-v4.json").write_bytes(canonical_json_bytes(v4))
+
     members = []
     rejected = []
     for row in sorted(rows, key=lambda value: value["candidateId"]):
@@ -343,6 +369,7 @@ def main() -> None:
             continue
         aggregate = _aggregate_candidate(row, windows)
         members.append({
+            "schemaVersion": "temporal_qd_evaluated_member_v1",
             "candidateId": candidate_id,
             "generationIndex": 7,
             "candidate": row,
@@ -390,6 +417,12 @@ def main() -> None:
     }
     manifest["manifestSha256"] = semantic_sha256(manifest)
     (out / "manifest.json").write_bytes(canonical_json_bytes(manifest) + b"\n")
+    manifest_v4 = dict(manifest)
+    manifest_v4["tailResultIndexPath"] = str((out / "tail-result-index-v4.json").resolve())
+    manifest_v4["tailResultIndexSha256"] = v4["tailResultIndexSha256"]
+    manifest_v4.pop("manifestSha256")
+    manifest_v4["manifestSha256"] = semantic_sha256(manifest_v4)
+    (out / "manifest-v4.json").write_bytes(canonical_json_bytes(manifest_v4) + b"\n")
 
 
 if __name__ == "__main__":

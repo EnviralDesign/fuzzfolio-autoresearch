@@ -31,7 +31,9 @@ from autoresearch.temporal_qd_native import (
     load_legacy_v5_g0_finalization_runtime,
     validate_pair_generation_runtime_config,
 )
-from autoresearch.temporal_qd_pair_generation import generate_pair_population
+from autoresearch.temporal_qd_pair_generation import (
+    generate_v5_pair_population_python_oracle,
+)
 from scripts.admit_temporal_qd_g0_release import run_release_admission
 from scripts.temporal_qd_front_half_python_oracle_corpus import (
     UniqueFixtureFactory,
@@ -84,7 +86,9 @@ def _materialize_existing_v5_proposal_root(
     arguments["identity_ledger_path"] = run_root / "identity-ledger.json"
     arguments["evidence_identity_context"] = qd_predeclared_evidence_context({})
     arguments["archive_policy_authority"] = archive_authority
-    oracle_result = generate_pair_population(output_root=proposal_root, **arguments)
+    oracle_result = generate_v5_pair_population_python_oracle(
+        output_root=proposal_root, **arguments
+    )
     assert oracle_result["completed"] is True
     pair_config = json.loads((proposal_root / "pair-config.json").read_text())
     config: dict[str, object] = {
@@ -488,10 +492,13 @@ def test_supervisor_reopens_legacy_v5_config_before_rebuilding_or_writing(
             parameters={},
             generation_count=99,
             autoresearch_commit="0" * 40,
-            execution_engine_commit="1" * 40,
-            worker_contract_sha256="sha256:" + "0" * 64,
-            gateway_url="http://127.0.0.1:1",
-        )
+                execution_engine_commit="1" * 40,
+                worker_contract_sha256="sha256:" + "0" * 64,
+                gateway_url="http://127.0.0.1:1",
+                # This is a pre-cutover artifact intentionally reopened only
+                # for historical receipt validation, not fresh construction.
+                generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
+            )
 
     assert validated == [config]
     assert config_path.read_bytes() == frozen_config_bytes

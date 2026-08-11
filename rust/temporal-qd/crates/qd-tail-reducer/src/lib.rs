@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use flate2::read::GzDecoder;
 use serde_json::{Map, Number, Value, json};
@@ -26,15 +26,22 @@ use temporal_qd_contract::{
 
 pub const MANIFEST_SCHEMA: &str = "temporal_qd_native_tail_reduction_manifest_v1";
 pub const RESULT_SCHEMA: &str = "temporal_qd_native_tail_reduction_result_v1";
+pub const TAIL_AUTHORITY_SCHEMA: &str = "temporal_qd_tail_authority_receipt_v1";
 pub const OPERATION: &str = "reduce_evaluated_members_and_provisional";
 pub const RESULT_PATH: &str = "tail-reduction-result.json";
 pub const MEMBERS_PATH: &str = "evaluated-members.jsonl";
+pub const TAIL_AUTHORITY_PATH: &str = "tail-authority.json";
 
 const EVALUATION_POPULATION_SCHEMA: &str = "temporal_qd_evaluation_population_v1";
+const ROTATING_COHORT_POPULATION_SCHEMA: &str = "temporal_qd_rotating_cohort_population_v1";
 const INDEX_SCHEMA: &str = "temporal_qd_tail_result_index_v3";
 const ENTRY_SCHEMA: &str = "temporal_qd_tail_result_index_entry_v3";
+const DIRECTIONAL_INDEX_SCHEMA: &str = "temporal_qd_tail_result_index_v4";
+const DIRECTIONAL_ENTRY_SCHEMA: &str = "temporal_qd_tail_result_index_entry_v4";
+const RAW_ROTATING_PROVENANCE_SCHEMA: &str = "temporal_qd_v5_raw_rotating_provenance_v1";
 const PROJECTION_SCHEMA: &str = "temporal_qd_tail_stage_projection_v1";
 const EVALUATED_SCHEMA: &str = "temporal_qd_evaluated_members_v1";
+const EVALUATED_MEMBER_SCHEMA: &str = "temporal_qd_evaluated_member_v1";
 const PROVISIONAL_SCHEMA: &str = "temporal_qd_native_provisional_survivors_v1";
 
 #[derive(Clone, Debug)]
@@ -69,6 +76,16 @@ struct ReductionState {
     provisional: Vec<Value>,
     members_sha256: String,
     members_bytes: u64,
+}
+
+/// The reducer admits two deliberately distinct population ABIs.  The legacy
+/// evaluation population remains proposal-only.  The rotating cohort
+/// population is the freezer-authenticated per-campaign population and may
+/// therefore contain retained-parent or prior-panel-backfill candidates.
+struct ReductionPopulation {
+    population_sha256: String,
+    manifest_bound_sha256: String,
+    candidates: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,9 +201,13 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     ensure_real_directory(output_dir, "tail reduction output directory")?;
     let result_path = output_dir.join(RESULT_PATH);
     let members_path = output_dir.join(MEMBERS_PATH);
+    let authority_path = output_dir.join(TAIL_AUTHORITY_PATH);
 
     if result_path.exists() {
         let result = reopen_result(&result_path, &members_path, &manifest)?;
+        if manifest.runtime_authority_sha256.is_some() && !authority_path.exists() {
+            publish_tail_authority(&authority_path, &result_path, &members_path, &result)?;
+        }
         profile.mark("restart_reopen_validate");
         profile.finish();
         return Ok(result);
@@ -215,6 +236,12 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     publish_once(&temporary_result, &result_path, None)?;
     sync_directory(output_dir)?;
     profile.mark("result_build_publish");
+    // The compact authority is receipt-last: archive reduction can reopen the
+    // durable tail result/member artifacts without accepting any candidate-
+    // bearing path or identity from a Python-authored manifest.
+    if manifest.runtime_authority_sha256.is_some() {
+        publish_tail_authority(&authority_path, &result_path, &members_path, &result)?;
+    }
     // The exact bytes and member digest were validated before publication.
     // Reopening both freshly-created artifacts here repeated canonical parsing
     // and hashing without adding evidence. Restart still takes the full
@@ -222,6 +249,71 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     profile.mark("fresh_commit_complete");
     profile.finish();
     Ok(result)
+}
+
+fn publish_tail_authority(
+    authority_path: &Path,
+    result_path: &Path,
+    members_path: &Path,
+    result: &Value,
+) -> Result<()> {
+    let result_map = object(result, "tail reduction result")?;
+    let runtime_authority_sha256 = sha_field(
+        result_map,
+        "runtimeAuthoritySha256",
+        "tail reduction result",
+    )?;
+    let evaluated = object(
+        field(result_map, "evaluatedMembers", "tail reduction result")?,
+        "tail evaluated members",
+    )?;
+    let members = object(
+        field(evaluated, "membersFile", "tail evaluated members")?,
+        "tail members descriptor",
+    )?;
+    let tail_result_raw_sha256 = sha256_prefixed(&fs::read(result_path)?);
+    let tail_result_size_bytes =
+        fs::metadata(existing_regular_file(result_path, "tail reduction result")?)?.len();
+    let members_raw_sha256 = sha_field(members, "rawSha256", "tail members descriptor")?;
+    let members_size_bytes = integer(members, "sizeBytes", "tail members descriptor")?;
+    ensure!(
+        fs::metadata(existing_regular_file(members_path, "evaluated members")?)?.len()
+            == members_size_bytes,
+        "evaluated member descriptor size drifted before authority publication"
+    );
+    ensure!(
+        sha256_prefixed(&fs::read(members_path)?) == members_raw_sha256,
+        "evaluated member descriptor digest drifted before authority publication"
+    );
+    let mut authority = json!({
+        "schemaVersion": TAIL_AUTHORITY_SCHEMA,
+        "generationIndex": integer(result_map, "generationIndex", "tail reduction result")?,
+        "tailReductionManifestSha256": sha_field(result_map, "manifestSha256", "tail reduction result")?,
+        "evaluationPopulationSha256": sha_field(result_map, "evaluationPopulationSha256", "tail reduction result")?,
+        "populationSha256": sha_field(result_map, "populationSha256", "tail reduction result")?,
+        "tailResultIndexSha256": sha_field(result_map, "tailResultIndexSha256", "tail reduction result")?,
+        "taskMatrixSha256": sha_field(result_map, "taskMatrixSha256", "tail reduction result")?,
+        "resultSetSha256": sha_field(result_map, "resultSetSha256", "tail reduction result")?,
+        "runtimeAuthoritySha256": runtime_authority_sha256,
+        "tailReductionResult": {"path": RESULT_PATH, "rawSha256": tail_result_raw_sha256, "sizeBytes": tail_result_size_bytes, "resultSha256": sha_field(result_map, "resultSha256", "tail reduction result")?},
+        "evaluatedMembers": {"path": MEMBERS_PATH, "rawSha256": members_raw_sha256, "sizeBytes": members_size_bytes, "recordCount": integer(members, "recordCount", "tail members descriptor")?},
+    });
+    let authority_sha256 = canonical_sha256(&authority)?;
+    authority
+        .as_object_mut()
+        .expect("tail authority object")
+        .insert(
+            "tailAuthoritySha256".into(),
+            Value::String(authority_sha256),
+        );
+    let bytes = canonical_json_line(&authority)?;
+    let temporary = temporary_path(
+        authority_path.parent().expect("tail authority parent"),
+        TAIL_AUTHORITY_PATH,
+    );
+    write_new_synced(&temporary, &bytes)?;
+    publish_once(&temporary, authority_path, None)?;
+    sync_directory(authority_path.parent().expect("tail authority parent"))
 }
 
 pub fn parse_manifest(raw: &[u8]) -> Result<TailReductionManifest> {
@@ -324,21 +416,11 @@ pub fn parse_manifest(raw: &[u8]) -> Result<TailReductionManifest> {
     })
 }
 
-fn reduce_to_members_file(
+fn validate_legacy_evaluation_population(
+    evaluation: &mut Value,
     manifest: &TailReductionManifest,
-    output: &Path,
-    profile: &mut StageProfile,
-) -> Result<ReductionState> {
-    let evaluation_path = existing_regular_file(
-        &manifest.evaluation_population_path,
-        "evaluation population",
-    )?;
-    let index_path = existing_regular_file(&manifest.tail_result_index_path, "tail result index")?;
-    let mut evaluation: Value =
-        serde_json::from_reader(BufReader::new(File::open(&evaluation_path)?))
-            .context("parse evaluation population")?;
-    profile.mark("evaluation_read_parse");
-    let evaluation_fields = object(&evaluation, "evaluation population")?;
+) -> Result<ReductionPopulation> {
+    let evaluation_fields = object(evaluation, "evaluation population")?;
     let mut expected_evaluation_fields = vec![
         "schemaVersion",
         "generationIndex",
@@ -369,13 +451,6 @@ fn reduce_to_members_file(
         &expected_evaluation_fields,
         "evaluation population",
     )?;
-    ensure!(
-        evaluation_fields
-            .get("schemaVersion")
-            .and_then(Value::as_str)
-            == Some(EVALUATION_POPULATION_SCHEMA),
-        "evaluation population schema is incompatible"
-    );
     let supplied_evaluation = sha_field(
         evaluation_fields,
         "evaluationPopulationSha256",
@@ -386,7 +461,7 @@ fn reduce_to_members_file(
         "evaluation population manifest binding mismatch"
     );
     ensure!(
-        canonical_sha256_without_object_field(&evaluation, "evaluationPopulationSha256")?
+        canonical_sha256_without_object_field(evaluation, "evaluationPopulationSha256")?
             == supplied_evaluation,
         "evaluation population identity mismatch"
     );
@@ -436,27 +511,143 @@ fn reduce_to_members_file(
             .is_some_and(|rows| rows.len() == proposal_attempts),
         "evaluation population proposal accounting mismatch"
     );
-    profile.mark("evaluation_root_validate");
-    let expected_candidates = usize::try_from(integer(
-        evaluation_fields,
-        "candidateCount",
+    extract_population_candidates(
+        evaluation,
         "evaluation population",
-    )?)?;
-    let candidates_value = evaluation
+        population_sha256,
+        supplied_evaluation,
+    )
+}
+
+fn validate_rotating_cohort_population(
+    cohort: &mut Value,
+    manifest: &TailReductionManifest,
+) -> Result<ReductionPopulation> {
+    let fields = object(cohort, "rotating cohort population")?;
+    exact_keys(
+        fields,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "panelId",
+            "cohortRole",
+            "rotatingEvidenceSha256",
+            "candidateCount",
+            "candidates",
+            "proposalPopulation",
+            "populationSha256",
+        ],
+        "rotating cohort population",
+    )?;
+    let population_sha256 = sha_field(fields, "populationSha256", "rotating cohort population")?;
+    ensure!(
+        population_sha256 == manifest.evaluation_population_sha256,
+        "rotating cohort population manifest binding mismatch"
+    );
+    ensure!(
+        canonical_sha256_without_object_field(cohort, "populationSha256")? == population_sha256,
+        "rotating cohort population identity mismatch"
+    );
+    ensure!(
+        integer(fields, "generationIndex", "rotating cohort population")?
+            == manifest.generation_index,
+        "rotating cohort population generation binding mismatch"
+    );
+    let panel_id = string(fields, "panelId", "rotating cohort population")?;
+    ensure!(
+        !panel_id.trim().is_empty(),
+        "rotating cohort population panel ID is invalid"
+    );
+    let cohort_role = string(fields, "cohortRole", "rotating cohort population")?;
+    let proposal_population = fields
+        .get("proposalPopulation")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("rotating cohort population proposalPopulation must be boolean"))?;
+    let is_proposal = match cohort_role.as_str() {
+        "proposal_current_panel" => true,
+        "retained_parent_current_panel" | "prior_panel_backfill" => false,
+        _ => bail!("rotating cohort population cohort role is invalid"),
+    };
+    ensure!(
+        proposal_population == is_proposal,
+        "rotating cohort population proposal role binding mismatch"
+    );
+    sha_field(
+        fields,
+        "rotatingEvidenceSha256",
+        "rotating cohort population",
+    )?;
+    extract_population_candidates(
+        cohort,
+        "rotating cohort population",
+        population_sha256.clone(),
+        population_sha256,
+    )
+}
+
+fn extract_population_candidates(
+    population: &mut Value,
+    label: &str,
+    population_sha256: String,
+    manifest_bound_sha256: String,
+) -> Result<ReductionPopulation> {
+    let fields = object(population, label)?;
+    let expected_candidates = usize::try_from(integer(fields, "candidateCount", label)?)?;
+    let candidates_value = population
         .as_object_mut()
         .expect("object checked")
         .remove("candidates")
-        .ok_or_else(|| anyhow!("evaluation population lacks candidates"))?;
+        .ok_or_else(|| anyhow!("{label} lacks candidates"))?;
     let candidates = candidates_value
         .as_array()
-        .ok_or_else(|| anyhow!("evaluation population candidates must be an array"))?;
+        .ok_or_else(|| anyhow!("{label} candidates must be an array"))?
+        .clone();
     ensure!(
         candidates.len() == expected_candidates,
-        "evaluation population candidate count mismatch"
+        "{label} candidate count mismatch"
     );
+    for candidate in &candidates {
+        validate_candidate(candidate)?;
+    }
+    Ok(ReductionPopulation {
+        population_sha256,
+        manifest_bound_sha256,
+        candidates,
+    })
+}
+
+fn reduce_to_members_file(
+    manifest: &TailReductionManifest,
+    output: &Path,
+    profile: &mut StageProfile,
+) -> Result<ReductionState> {
+    let evaluation_path = existing_regular_file(
+        &manifest.evaluation_population_path,
+        "evaluation population",
+    )?;
+    let index_path = existing_regular_file(&manifest.tail_result_index_path, "tail result index")?;
+    let mut evaluation: Value =
+        serde_json::from_reader(BufReader::new(File::open(&evaluation_path)?))
+            .context("parse evaluation population")?;
+    profile.mark("evaluation_read_parse");
+    let evaluation_fields = object(&evaluation, "evaluation population")?;
+    let population = match evaluation_fields
+        .get("schemaVersion")
+        .and_then(Value::as_str)
+    {
+        Some(EVALUATION_POPULATION_SCHEMA) => {
+            validate_legacy_evaluation_population(&mut evaluation, manifest)?
+        }
+        Some(ROTATING_COHORT_POPULATION_SCHEMA) => {
+            validate_rotating_cohort_population(&mut evaluation, manifest)?
+        }
+        _ => bail!("evaluation population schema is incompatible"),
+    };
+    let population_sha256 = population.population_sha256;
+    let supplied_evaluation = population.manifest_bound_sha256;
+    let candidates = population.candidates;
     let mut candidate_map = BTreeMap::new();
-    for candidate in candidates.iter().cloned() {
-        validate_candidate(&candidate)?;
+    for candidate in candidates {
         let candidate_id = candidate
             .get("candidateId")
             .and_then(Value::as_str)
@@ -491,10 +682,11 @@ fn reduce_to_members_file(
         ],
         "tail result index",
     )?;
-    ensure!(
-        index_fields.get("schemaVersion").and_then(Value::as_str) == Some(INDEX_SCHEMA),
-        "tail result index schema is incompatible"
-    );
+    let directional = match index_fields.get("schemaVersion").and_then(Value::as_str) {
+        Some(INDEX_SCHEMA) => false,
+        Some(DIRECTIONAL_INDEX_SCHEMA) => true,
+        _ => bail!("tail result index schema is incompatible"),
+    };
     let supplied_index = sha_field(index_fields, "tailResultIndexSha256", "tail result index")?;
     ensure!(
         supplied_index == manifest.tail_result_index_sha256,
@@ -529,7 +721,7 @@ fn reduce_to_members_file(
         entries.len() == expected_entries,
         "tail result index task count mismatch"
     );
-    let decoded_entries = decode_entries_parallel(entries, include_funnel)?;
+    let decoded_entries = decode_entries_parallel(entries, include_funnel, directional)?;
     let mut last_task_id: Option<String> = None;
     let mut source_bytes = 0u64;
     let mut windows_by_candidate: HashMap<String, CandidateWindows> = HashMap::new();
@@ -688,6 +880,7 @@ fn reduce_candidate(
     let validity = finite_data_validity(&aggregate, manifest)?;
     let total_trades = i64_at(&aggregate, "totalTrades")?;
     let member = json!({
+        "schemaVersion": EVALUATED_MEMBER_SCHEMA,
         "candidateId": candidate_id,
         "generationIndex": manifest.generation_index,
         "candidate": candidate,
@@ -827,12 +1020,16 @@ fn runtime_threads(work_items: usize) -> Result<usize> {
     Ok(requested.min(work_items.max(1)))
 }
 
-fn decode_entries_parallel(entries: &[Value], include_funnel: bool) -> Result<Vec<DecodedEntry>> {
+fn decode_entries_parallel(
+    entries: &[Value],
+    include_funnel: bool,
+    directional: bool,
+) -> Result<Vec<DecodedEntry>> {
     let worker_count = runtime_threads(entries.len())?;
     if worker_count == 1 || entries.len() < 2 {
         return entries
             .iter()
-            .map(|entry| decode_entry(entry, include_funnel))
+            .map(|entry| decode_entry(entry, include_funnel, directional))
             .collect();
     }
 
@@ -853,7 +1050,7 @@ fn decode_entries_parallel(entries: &[Value], include_funnel: bool) -> Result<Ve
                         if index >= entries.len() {
                             break;
                         }
-                        let decoded = decode_entry(&entries[index], include_funnel);
+                        let decoded = decode_entry(&entries[index], include_funnel, directional);
                         *outputs[index]
                             .lock()
                             .expect("tail entry decoder output mutex poisoned") = Some(decoded);
@@ -883,10 +1080,19 @@ fn decode_entries_parallel(entries: &[Value], include_funnel: bool) -> Result<Ve
         .collect()
 }
 
-fn decode_entry(entry: &Value, include_funnel: bool) -> Result<(String, String, u64, Value)> {
+fn decode_entry(
+    entry: &Value,
+    include_funnel: bool,
+    directional: bool,
+) -> Result<(String, String, u64, Value)> {
     let fields = object(entry, "tail result index entry")?;
     ensure!(
-        fields.get("schemaVersion").and_then(Value::as_str) == Some(ENTRY_SCHEMA),
+        fields.get("schemaVersion").and_then(Value::as_str)
+            == Some(if directional {
+                DIRECTIONAL_ENTRY_SCHEMA
+            } else {
+                ENTRY_SCHEMA
+            }),
         "tail result index entry schema is incompatible"
     );
     let supplied = sha_field(fields, "entrySha256", "tail result index entry")?;
@@ -987,6 +1193,9 @@ fn decode_entry(entry: &Value, include_funnel: bool) -> Result<(String, String, 
     };
     if include_funnel && !rejected {
         expected_fields.push("funnelProjection");
+    }
+    if directional && !rejected {
+        expected_fields.push("rawRotatingProvenance");
     }
     exact_keys(fields, &expected_fields, "tail result index entry")?;
     let window = if let Some(rejection) = fields.get("rejection") {
@@ -1099,6 +1308,14 @@ fn decode_entry(entry: &Value, include_funnel: bool) -> Result<(String, String, 
                 "tail stage projection drifted from rotating metrics for {metric}"
             );
         }
+        if directional {
+            validate_raw_rotating_provenance(
+                field(fields, "rawRotatingProvenance", "tail result index entry")?,
+                &task_id,
+                raw_ref,
+                &record,
+            )?;
+        }
         record
     };
     ensure!(
@@ -1114,6 +1331,61 @@ fn decode_entry(entry: &Value, include_funnel: bool) -> Result<(String, String, 
         integer(raw_ref, "blobSizeBytes", "tail raw result reference")?,
         window,
     ))
+}
+
+fn validate_raw_rotating_provenance(
+    value: &Value,
+    task_id: &str,
+    raw_ref: &Map<String, Value>,
+    record: &Value,
+) -> Result<()> {
+    let provenance = object(value, "raw rotating provenance")?;
+    exact_keys(
+        provenance,
+        &[
+            "schemaVersion",
+            "taskId",
+            "resultSha256",
+            "observationStreamSha256",
+            "conservativeReplayStreamSha256",
+            "realizedBehaviorSha256",
+        ],
+        "raw rotating provenance",
+    )?;
+    ensure!(
+        provenance.get("schemaVersion").and_then(Value::as_str)
+            == Some(RAW_ROTATING_PROVENANCE_SCHEMA),
+        "raw rotating provenance schema is incompatible"
+    );
+    ensure!(
+        provenance.get("taskId").and_then(Value::as_str) == Some(task_id)
+            && provenance.get("resultSha256") == raw_ref.get("resultSha256"),
+        "raw rotating provenance task/result binding drifted"
+    );
+    for field_name in [
+        "resultSha256",
+        "observationStreamSha256",
+        "conservativeReplayStreamSha256",
+        "realizedBehaviorSha256",
+    ] {
+        sha_field(provenance, field_name, "raw rotating provenance")?;
+    }
+    ensure!(
+        provenance.get("observationStreamSha256") == record.get("observationStreamSha256"),
+        "raw rotating provenance observation-stream binding drifted"
+    );
+    let behavior = record
+        .get("realizedBehavior")
+        .ok_or_else(|| anyhow!("directional stage record lacks realized behavior"))?;
+    ensure!(
+        canonical_sha256(behavior)?
+            == provenance
+                .get("realizedBehaviorSha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        "raw rotating provenance realized-behavior binding drifted"
+    );
+    Ok(())
 }
 
 fn candidate_rejection(

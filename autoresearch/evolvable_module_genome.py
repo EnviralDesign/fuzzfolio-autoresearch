@@ -21,6 +21,9 @@ GENOME_SCHEMA = "evolvable_module_genome_v1"
 PROGRAM_KIND = "evolvable_module_genome_v1"
 GENOME_CODEC = "evolvable_module_genome_json_v1"
 COMPILER_POLICY_SCHEMA = "evolvable_module_compiler_policy_v1"
+# This schema has always promised an ID- and representation-independent graph
+# signature.  Source/authority commits bind implementation fixes; do not bump
+# the semantic schema merely to preserve an insertion-order bug in old lineage.
 TOPOLOGY_SCHEMA = "evolvable_module_semantic_topology_v1"
 
 
@@ -424,7 +427,22 @@ class EvolvableModuleGenomeV1:
         """ID-independent topology identity; resource IDs and numeric knobs are omitted."""
 
         nodes = {node.node_id: node for node in self.nodes}
-        labels = {identifier: canonical_sha256(node.canonical(include_id=False) | {"guard": _guard_shape(node.guard), "resources": [item.kind.value for item in node.resources], "timeoutBars": node.timeout_bars is not None}) for identifier, node in nodes.items()}
+        labels = {
+            identifier: canonical_sha256(
+                node.canonical(include_id=False)
+                | {
+                    "guard": _guard_shape(node.guard),
+                    # Resource IDs are intentionally omitted, but resource-kind
+                    # multiplicity is topology.  Canonicalize the kinds just as
+                    # ``GenomeNodeV1.canonical`` canonicalizes ResourceUse rows;
+                    # otherwise an in-memory genome and its own codec round trip
+                    # can acquire different topology identities.
+                    "resources": sorted(item.kind.value for item in node.resources),
+                    "timeoutBars": node.timeout_bars is not None,
+                }
+            )
+            for identifier, node in nodes.items()
+        }
         # Weisfeiler-Lehman style refinement makes ordinary ID renames irrelevant
         # while retaining directed topology and edge semantics.
         for _ in range(max(1, len(nodes))):

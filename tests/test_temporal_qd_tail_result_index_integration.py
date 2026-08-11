@@ -641,7 +641,9 @@ def test_rotating_transaction_legacy_to_indexed_resume_is_exact_and_worker_free(
         fixture,
     ) = _rotating_transaction_fixture(tmp_path)
     candidate = fixture["candidate"]
-    monkeypatch.setattr(supervisor, "_validate_frozen_sources", lambda _config: [])
+    monkeypatch.setattr(
+        supervisor, "_validate_frozen_sources", lambda _config, **_kwargs: []
+    )
     monkeypatch.setattr(
         supervisor,
         "load_evaluation_population",
@@ -898,7 +900,9 @@ def test_post_save_validation_receives_the_live_indexed_tail_cache(
         )
 
     monkeypatch.setattr(supervisor, "_frozen_config", lambda **_kwargs: (config, []))
-    monkeypatch.setattr(supervisor, "_validate_frozen_sources", lambda _config: [])
+    monkeypatch.setattr(
+        supervisor, "_validate_frozen_sources", lambda _config, **_kwargs: []
+    )
     monkeypatch.setattr(
         supervisor, "_validate_completed_generations", fake_validate_completed
     )
@@ -938,6 +942,7 @@ def test_post_save_validation_receives_the_live_indexed_tail_cache(
         worker_contract_sha256=worker_contract,
         gateway_url="http://127.0.0.1:8799",
         tail_result_mode="indexed",
+        generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
     )
     assert result["status"] == "completed"
     assert raw_reads == len(source_manifest["tasks"])
@@ -1206,6 +1211,7 @@ def test_indexed_post_save_validation_avoids_historical_raw_reopens(
         "worker_contract_sha256": worker_contract,
         "gateway_url": "http://127.0.0.1:8799",
         "tail_result_mode": "indexed",
+        "generation_finalization_engine": supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
     }
     first = supervisor.run_qd_supervisor(run_root=root, **run_kwargs)
     assert first["status"] == "completed"

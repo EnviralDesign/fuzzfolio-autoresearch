@@ -12,13 +12,13 @@ use temporal_qd_runtime::{DashboardPort, RuntimeManifest, RuntimePairAuthority};
 
 const FIXTURE_ROOT: &str = "../../../../tests/fixtures/temporal_qd_runtime_oracle";
 const ORACLE_FIXTURE_FILE_SHA256: &str =
-    "30089a3c445fbcf731ec78b46e763304276b1ab94b9131358755bec3a2bcf1fb";
+    "27f28515b8c1db55125eb5b10c7bd357c5cb56d43025745925d2ae780aff11a8";
 const ORACLE_MANIFEST_FILE_SHA256: &str =
-    "3d8ac2b15886c2cb99db1cf9672f5949ff9f23d2058169e0e1e889169072e0fd";
+    "57af8529b5024340e691c25a7538c80375d4814250a110165c62d4861bbe6c99";
 const ORACLE_TRANSCRIPT_FILE_SHA256: &str =
-    "0aa60feceb6154fa6eb0e31082f91ea4a3f3538425f55c9efcf447e82a521ac8";
+    "d9ccc1df5e1314b715167c30e35d065ebdca44451ee61305859d4a29d64f3124";
 const ORACLE_GENERATOR_SOURCE_SHA256: &str =
-    "sha256:acba6296a83136c88889a65e24b3bd60d1dc49cd57bd68b63b48d7e911360082";
+    "sha256:9154451f361c9440d2f11a81db36fddf81f24e65259876a7234ae2f00dcbab1b";
 
 fn fixture_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT)
@@ -444,32 +444,44 @@ fn runtime_replays_real_python_oracle_transcript_in_exact_order() {
     );
     assert_rich_immigrant_factory_construction_audit(&rich);
     let root = parent(&rich, "rich");
+    let depth2_expected = &fixture["cases"]["sequentialMutationDepth2"];
     let depth2 = authority
         .execute(
             &ProposalIntent::StructuralMutation {
-                proposal_seed: "runtime-oracle-depth:14:3".into(),
+                proposal_seed: depth2_expected["operation"]["proposalSeed"]
+                    .as_str()
+                    .expect("depth-2 oracle proposal seed")
+                    .into(),
                 parent: root.clone(),
                 mutation_depth: 2,
             },
             &context,
         )
         .unwrap();
-    assert_materialized(&depth2, &fixture["cases"]["sequentialMutationDepth2"]);
+    assert_materialized(&depth2, depth2_expected);
+    let depth3_expected = &fixture["cases"]["sequentialMutationDepth3"];
     let depth3 = authority
         .execute(
             &ProposalIntent::StructuralMutation {
-                proposal_seed: "runtime-oracle-depth:19:62".into(),
+                proposal_seed: depth3_expected["operation"]["proposalSeed"]
+                    .as_str()
+                    .expect("depth-3 oracle proposal seed")
+                    .into(),
                 parent: root,
                 mutation_depth: 3,
             },
             &context,
         )
         .unwrap();
-    assert_materialized(&depth3, &fixture["cases"]["sequentialMutationDepth3"]);
+    assert_materialized(&depth3, depth3_expected);
+    let crossover_expected = &fixture["cases"]["sameSideCrossoverMaterialized"];
     let crossover = authority
         .execute(
             &ProposalIntent::SameSideCrossover {
-                proposal_seed: "runtime-oracle-crossover-materialized:1".into(),
+                proposal_seed: crossover_expected["operation"]["proposalSeed"]
+                    .as_str()
+                    .expect("materialized crossover oracle proposal seed")
+                    .into(),
                 side: Side::Long,
                 parent: parent(&depth2, "depth2"),
                 mate: parent(&depth3, "depth3"),
@@ -478,10 +490,7 @@ fn runtime_replays_real_python_oracle_transcript_in_exact_order() {
             &context,
         )
         .unwrap();
-    assert_materialized(
-        &crossover,
-        &fixture["cases"]["sameSideCrossoverMaterialized"],
-    );
+    assert_materialized(&crossover, crossover_expected);
     let mut foreign_mate = FrozenPair::from_payload(&rich.proposal["factoryPair"])
         .expect("rich pair payload must be restart-safe");
     foreign_mate.long.native_authority = IdentitySnapshot::create(
@@ -493,7 +502,11 @@ fn runtime_replays_real_python_oracle_transcript_in_exact_order() {
     let rejected = authority
         .execute(
             &ProposalIntent::SameSideCrossover {
-                proposal_seed: "runtime-oracle-crossover-rejected:0".into(),
+                proposal_seed:
+                    fixture["cases"]["sameSideCrossoverRejected"]["operation"]["proposalSeed"]
+                        .as_str()
+                        .expect("rejected crossover oracle proposal seed")
+                        .into(),
                 side: Side::Long,
                 parent: parent(&rich, "rich"),
                 mate: parent_from_pair(&foreign_mate, "foreign"),

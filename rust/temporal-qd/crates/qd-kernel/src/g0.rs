@@ -130,6 +130,67 @@ struct DescriptorPair<'a> {
     native_validation_report_sha256: &'a str,
 }
 
+/// The descriptor needs only these two public identity facts from an admitted
+/// candidate.  Keeping this separate from `AcceptedEntrySurface` lets the v5
+/// compact path enter G0 without fabricating or expanding a legacy rich-entry
+/// journal row.
+struct DescriptorProjectionSurface<'a> {
+    candidate_id: &'a str,
+    candidate_identity_sha256: &'a str,
+}
+
+/// Narrow, typed transient handoff from the v5 Rust reconstructor to the G0
+/// selector.  This is never a journal schema: its profile/catalog values are
+/// derived afresh from a sealed authority and compact delta, consumed once to
+/// make a descriptor, then dropped.  No caller can use it to route all 4,000
+/// candidates through a legacy rich entry.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactV5DescriptorModuleInput {
+    pub(crate) direction: String,
+    pub(crate) profile: Value,
+    pub(crate) catalog_payload: Value,
+    pub(crate) catalog_snapshot_sha256: String,
+    pub(crate) grammar_context_snapshot_sha256: String,
+    pub(crate) policy_snapshot_sha256: String,
+    pub(crate) native_authority_snapshot_sha256: String,
+    /// Evolvable genome program identity.  This is the identity used by the
+    /// frozen-module surface and seed-derived module candidate ID.
+    pub(crate) genome_program_sha256: String,
+    /// Native/Dashboard normalized executable program identity.  Validation
+    /// reports and the compiled v3 pair bind this separately from the genome.
+    pub(crate) native_program_sha256: String,
+    pub(crate) raw_profile_sha256: String,
+    pub(crate) profile_snapshot_sha256: String,
+    pub(crate) validation_report_sha256: String,
+    pub(crate) module_identity_sha256: String,
+    /// Full `temporal_bidirectional_module_snapshot_v1` identity material,
+    /// reconstructed by v5 rather than accepted from a compact record.
+    pub(crate) module_identity_envelope: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompactV5DescriptorInput {
+    pub(crate) candidate_id: String,
+    pub(crate) candidate_identity_sha256: String,
+    pub(crate) candidate_identity_material: Value,
+    pub(crate) proposal_seed: String,
+    pub(crate) pair_identity_sha256: String,
+    pub(crate) pair_identity_envelope: Value,
+    pub(crate) pair_profile: Value,
+    pub(crate) pair_raw_profile_sha256: String,
+    pub(crate) pair_profile_snapshot_sha256: String,
+    pub(crate) pair_program_sha256: String,
+    pub(crate) pair_validation_report_sha256: String,
+    pub(crate) pair_compiler_authority_sha256: String,
+    pub(crate) pair_policy_sha256: String,
+    pub(crate) qd_engine_version: String,
+    pub(crate) proposal_sha256: String,
+    pub(crate) side_targeted_lineage: Value,
+    pub(crate) executable_semantic_sha256: String,
+    pub(crate) long: CompactV5DescriptorModuleInput,
+    pub(crate) short: CompactV5DescriptorModuleInput,
+}
+
 fn contract(message: impl Into<String>) -> G0Error {
     G0Error::Contract(message.into())
 }
@@ -185,7 +246,15 @@ fn sha(value: &Value, label: &str) -> Result<String> {
     let hex = value
         .strip_prefix("sha256:")
         .ok_or_else(|| contract(format!("{label} must be a SHA-256 identity")))?;
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    // Persisted SHA identities are canonical lowercase hexadecimal.  Do not
+    // accept uppercase (or a broad ASCII-hex spelling) at the compact/native
+    // seam: otherwise two textual spellings could authenticate the same
+    // object while producing distinct downstream reference bytes.
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err(contract(format!("{label} must be a SHA-256 identity")));
     }
     Ok(value)
@@ -4407,11 +4476,15 @@ fn derive_descriptor_projection_from_verified(
         pair_identity_sha256: frozen(pair.identity_sha256())?,
         native_validation_report_sha256: &pair.native_validation_report_sha256,
     };
-    derive_descriptor_projection_from_descriptor_pair(surface, &descriptor_pair)
+    let descriptor_surface = DescriptorProjectionSurface {
+        candidate_id: &surface.candidate_id,
+        candidate_identity_sha256: &surface.candidate_identity_sha256,
+    };
+    derive_descriptor_projection_from_descriptor_pair(&descriptor_surface, &descriptor_pair)
 }
 
 fn derive_descriptor_projection_from_descriptor_pair(
-    surface: &AcceptedEntrySurface,
+    surface: &DescriptorProjectionSurface<'_>,
     pair: &DescriptorPair<'_>,
 ) -> Result<Value> {
     let report = static_reachability(pair.profile)?;
@@ -4429,10 +4502,10 @@ fn derive_descriptor_projection_from_descriptor_pair(
     let descriptor_vector = pair_descriptor(pair, &liveness)?;
     let mut projection = object([
         ("schemaVersion", Value::from(DESCRIPTOR_PROJECTION_SCHEMA)),
-        ("candidateId", Value::from(surface.candidate_id.clone())),
+        ("candidateId", Value::from(surface.candidate_id)),
         (
             "candidateIdentitySha256",
-            Value::from(surface.candidate_identity_sha256.clone()),
+            Value::from(surface.candidate_identity_sha256),
         ),
         (
             "pairIdentitySha256",
@@ -4457,6 +4530,648 @@ fn derive_descriptor_projection_from_descriptor_pair(
         .expect("projection object")
         .insert("descriptorProjectionSha256".to_owned(), Value::from(hash));
     Ok(projection)
+}
+
+fn v5_snapshot_payload<'a>(
+    snapshot: &'a Value,
+    expected_kind: &str,
+    expected_sha256: &str,
+    label: &str,
+) -> Result<&'a Value> {
+    let fields = object_ref(snapshot, label)?;
+    exact_keys(
+        fields,
+        &["kind", "schemaVersion", "payload", "sha256"],
+        &[],
+        label,
+    )?;
+    if fields.get("kind").and_then(Value::as_str) != Some(expected_kind) {
+        return Err(contract(format!("{label} kind is incompatible")));
+    }
+    let payload = required(fields, "payload", label)?;
+    if !payload.is_object() {
+        return Err(contract(format!("{label} payload must be an object")));
+    }
+    let supplied = sha(
+        required(fields, "sha256", label)?,
+        &format!("{label} SHA-256"),
+    )?;
+    if supplied != expected_sha256 || supplied != canonical_sha256(payload)? {
+        return Err(contract(format!("{label} identity drift")));
+    }
+    Ok(payload)
+}
+
+fn v5_id_from_identity(prefix: &str, identity_sha256: &str, label: &str) -> Result<String> {
+    let identity = sha(&Value::String(identity_sha256.to_owned()), label)?;
+    let suffix = identity
+        .get(7..35)
+        .ok_or_else(|| contract(format!("{label} has no identifier suffix")))?;
+    Ok(format!("{prefix}{suffix}"))
+}
+
+fn v5_module_candidate_id(
+    proposal_seed: &str,
+    direction: &str,
+    program_sha256: &str,
+) -> Result<String> {
+    if direction != "long" && direction != "short" {
+        return Err(contract("compact v5 module direction is invalid"));
+    }
+    let identity = canonical_sha256(&object([
+        ("seed", Value::from(proposal_seed.to_owned())),
+        ("side", Value::from(direction.to_owned())),
+        ("genome", Value::from(program_sha256.to_owned())),
+    ]))?;
+    v5_id_from_identity(
+        "qd_evolvable_module_",
+        &identity,
+        "v5 module candidate identity",
+    )
+}
+
+fn v5_pair_candidate_id(proposal_seed: &str) -> Result<String> {
+    let identity = canonical_sha256(&object([("seed", Value::from(proposal_seed.to_owned()))]))?;
+    v5_id_from_identity(
+        "qd_evolvable_pair_",
+        &identity,
+        "v5 pair candidate identity",
+    )
+}
+
+fn v5_profile_validation(
+    profile: &Value,
+    candidate_id: &str,
+    raw_profile_sha256: &str,
+    profile_snapshot_sha256: &str,
+    program_sha256: &str,
+    validation_report_sha256: &str,
+    label: &str,
+) -> Result<()> {
+    let validation = crate::v5::validate_native_profile(profile, candidate_id)
+        .map_err(|error| contract(format!("{label} native validation failed: {error}")))?;
+    if validation.raw_profile_sha256 != raw_profile_sha256
+        || validation.profile_snapshot_sha256 != profile_snapshot_sha256
+        || validation.program_sha256 != program_sha256
+        || validation.validation_report_sha256 != validation_report_sha256
+    {
+        return Err(contract(format!(
+            "{label} profile/program/report identity drift"
+        )));
+    }
+    Ok(())
+}
+
+fn v5_module_identity_material_without_schema(value: &Value) -> Result<Value> {
+    let fields = object_ref(value, "compact v5 module identity envelope")?;
+    exact_keys(
+        fields,
+        &[
+            "schemaVersion",
+            "direction",
+            "programSha256",
+            "profileSha256",
+            "grammarContext",
+            "catalog",
+            "policy",
+            "nativeAuthority",
+            "nativeSnapshotSha256",
+            "nativeProgramSha256",
+            "nativeValidationReportSha256",
+            "lineage",
+        ],
+        &[],
+        "compact v5 module identity envelope",
+    )?;
+    if fields.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_bidirectional_module_snapshot_v1")
+    {
+        return Err(contract(
+            "compact v5 module identity envelope schema is invalid",
+        ));
+    }
+    let mut material = fields.clone();
+    material.remove("schemaVersion");
+    Ok(Value::Object(material))
+}
+
+fn validate_compact_v5_module(
+    input: &CompactV5DescriptorModuleInput,
+    proposal_seed: &str,
+    expected_direction: &str,
+) -> Result<Value> {
+    if input.direction != expected_direction {
+        return Err(contract("compact v5 module direction is in the wrong slot"));
+    }
+    let module_candidate_id = v5_module_candidate_id(
+        proposal_seed,
+        expected_direction,
+        &input.genome_program_sha256,
+    )?;
+    v5_profile_validation(
+        &input.profile,
+        &module_candidate_id,
+        &input.raw_profile_sha256,
+        &input.profile_snapshot_sha256,
+        &input.native_program_sha256,
+        &input.validation_report_sha256,
+        &format!("compact v5 {expected_direction} module"),
+    )?;
+    let fields = object_ref(
+        &input.module_identity_envelope,
+        "compact v5 module identity envelope",
+    )?;
+    let direction = text(
+        required(fields, "direction", "compact v5 module identity envelope")?,
+        "compact v5 module identity direction",
+    )?;
+    if direction != expected_direction
+        || sha(
+            required(
+                fields,
+                "programSha256",
+                "compact v5 module identity envelope",
+            )?,
+            "compact v5 module identity program SHA-256",
+        )? != input.genome_program_sha256
+        || sha(
+            required(
+                fields,
+                "profileSha256",
+                "compact v5 module identity envelope",
+            )?,
+            "compact v5 module identity profile SHA-256",
+        )? != input.raw_profile_sha256
+        || sha(
+            required(
+                fields,
+                "nativeSnapshotSha256",
+                "compact v5 module identity envelope",
+            )?,
+            "compact v5 module identity snapshot SHA-256",
+        )? != input.profile_snapshot_sha256
+        || sha(
+            required(
+                fields,
+                "nativeProgramSha256",
+                "compact v5 module identity envelope",
+            )?,
+            "compact v5 module identity native program SHA-256",
+        )? != input.native_program_sha256
+        || sha(
+            required(
+                fields,
+                "nativeValidationReportSha256",
+                "compact v5 module identity envelope",
+            )?,
+            "compact v5 module identity validation SHA-256",
+        )? != input.validation_report_sha256
+    {
+        return Err(contract(
+            "compact v5 module identity facts do not match rebuilt profile",
+        ));
+    }
+    let grammar_payload = v5_snapshot_payload(
+        required(
+            fields,
+            "grammarContext",
+            "compact v5 module identity envelope",
+        )?,
+        "grammarContext",
+        &input.grammar_context_snapshot_sha256,
+        "compact v5 grammar context snapshot",
+    )?;
+    let catalog_payload = v5_snapshot_payload(
+        required(fields, "catalog", "compact v5 module identity envelope")?,
+        "catalog",
+        &input.catalog_snapshot_sha256,
+        "compact v5 catalog snapshot",
+    )?;
+    let _policy_payload = v5_snapshot_payload(
+        required(fields, "policy", "compact v5 module identity envelope")?,
+        "policy",
+        &input.policy_snapshot_sha256,
+        "compact v5 policy snapshot",
+    )?;
+    let _native_payload = v5_snapshot_payload(
+        required(
+            fields,
+            "nativeAuthority",
+            "compact v5 module identity envelope",
+        )?,
+        "nativeAuthority",
+        &input.native_authority_snapshot_sha256,
+        "compact v5 native authority snapshot",
+    )?;
+    if catalog_payload != &input.catalog_payload
+        || !grammar_payload.is_object()
+        || input.catalog_payload.get("side").and_then(Value::as_str) != Some(expected_direction)
+    {
+        return Err(contract(
+            "compact v5 module static snapshot binding drifted",
+        ));
+    }
+    if canonical_sha256(&input.module_identity_envelope)? != input.module_identity_sha256 {
+        return Err(contract("compact v5 module identity SHA-256 drifted"));
+    }
+    v5_module_identity_material_without_schema(&input.module_identity_envelope)
+}
+
+/// Direct compact v5 *G0 immigrant* admission into the existing Rust
+/// descriptor selector.  Every profile/report/snapshot/identity used below
+/// is rechecked from typed reconstructed facts.  Keep this wrapper pinned to
+/// `random_immigrant`: later-generation structural offspring have their own
+/// sealed wrapper below and must never enter G0 under a substituted identity.
+pub(crate) fn derive_descriptor_projection_from_compact_v5(
+    input: &CompactV5DescriptorInput,
+) -> Result<Value> {
+    derive_descriptor_projection_from_compact_v5_for_origin(input, "random_immigrant")
+}
+
+/// Direct compact v5 admission for a sealed later-generation structural
+/// offspring.  It shares the compact descriptor computation with G0, but the
+/// candidate identity is required to bind `structural_offspring`; this keeps
+/// a random-immigrant candidate envelope from being replayed as a mutation or
+/// crossover child (and vice versa).
+pub(crate) fn derive_descriptor_projection_from_evolved_compact_v5(
+    input: &CompactV5DescriptorInput,
+) -> Result<Value> {
+    derive_descriptor_projection_from_compact_v5_for_origin(input, "structural_offspring")
+}
+
+/// Shared sealed compact descriptor derivation.  The only varying admission
+/// fact is the closed candidate origin selected by the caller-specific
+/// wrapper; all compiled profile, static snapshot, pair, and candidate
+/// identity checks below stay identical.
+fn derive_descriptor_projection_from_compact_v5_for_origin(
+    input: &CompactV5DescriptorInput,
+    expected_origin_kind: &str,
+) -> Result<Value> {
+    let proposal_seed = sha(
+        &Value::String(input.proposal_seed.clone()),
+        "compact v5 proposal seed",
+    )?;
+    let long_material = validate_compact_v5_module(&input.long, &proposal_seed, "long")?;
+    let short_material = validate_compact_v5_module(&input.short, &proposal_seed, "short")?;
+    let pair_candidate_id = v5_pair_candidate_id(&proposal_seed)?;
+    v5_profile_validation(
+        &input.pair_profile,
+        &pair_candidate_id,
+        &input.pair_raw_profile_sha256,
+        &input.pair_profile_snapshot_sha256,
+        &input.pair_program_sha256,
+        &input.pair_validation_report_sha256,
+        "compact v5 compiled pair",
+    )?;
+    let pair_fields = object_ref(
+        &input.pair_identity_envelope,
+        "compact v5 pair identity envelope",
+    )?;
+    exact_keys(
+        pair_fields,
+        &[
+            "schemaVersion",
+            "longModule",
+            "shortModule",
+            "pairCompiler",
+            "compiledV3",
+            "sideTargetedLineage",
+        ],
+        &[],
+        "compact v5 pair identity envelope",
+    )?;
+    if pair_fields.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_bidirectional_pair_snapshot_v1")
+        || required(
+            pair_fields,
+            "longModule",
+            "compact v5 pair identity envelope",
+        )? != &long_material
+        || required(
+            pair_fields,
+            "shortModule",
+            "compact v5 pair identity envelope",
+        )? != &short_material
+        || required(
+            pair_fields,
+            "sideTargetedLineage",
+            "compact v5 pair identity envelope",
+        )? != &input.side_targeted_lineage
+        || canonical_sha256(&input.pair_identity_envelope)? != input.pair_identity_sha256
+    {
+        return Err(contract("compact v5 pair identity binding drifted"));
+    }
+    let pair_compiler = required(
+        pair_fields,
+        "pairCompiler",
+        "compact v5 pair identity envelope",
+    )?;
+    let pair_compiler_fields = object_ref(pair_compiler, "compact v5 pair compiler snapshot")?;
+    if sha(
+        required(
+            pair_compiler_fields,
+            "sha256",
+            "compact v5 pair compiler snapshot",
+        )?,
+        "compact v5 pair compiler SHA-256",
+    )? != input.pair_compiler_authority_sha256
+    {
+        return Err(contract("compact v5 pair compiler identity drifted"));
+    }
+    let compiled = object_ref(
+        required(
+            pair_fields,
+            "compiledV3",
+            "compact v5 pair identity envelope",
+        )?,
+        "compact v5 compiled pair identity facts",
+    )?;
+    exact_keys(
+        compiled,
+        &[
+            "rawPairSha256",
+            "profileSha256",
+            "programSha256",
+            "validationReportSha256",
+        ],
+        &[],
+        "compact v5 compiled pair identity facts",
+    )?;
+    if sha(
+        required(
+            compiled,
+            "rawPairSha256",
+            "compact v5 compiled pair identity facts",
+        )?,
+        "compact v5 raw pair SHA-256",
+    )? != input.pair_raw_profile_sha256
+        || sha(
+            required(
+                compiled,
+                "profileSha256",
+                "compact v5 compiled pair identity facts",
+            )?,
+            "compact v5 pair profile SHA-256",
+        )? != input.pair_profile_snapshot_sha256
+        || sha(
+            required(
+                compiled,
+                "programSha256",
+                "compact v5 compiled pair identity facts",
+            )?,
+            "compact v5 pair program SHA-256",
+        )? != input.pair_program_sha256
+        || sha(
+            required(
+                compiled,
+                "validationReportSha256",
+                "compact v5 compiled pair identity facts",
+            )?,
+            "compact v5 pair validation SHA-256",
+        )? != input.pair_validation_report_sha256
+    {
+        return Err(contract("compact v5 compiled pair identity facts drifted"));
+    }
+    let candidate_fields = object_ref(
+        &input.candidate_identity_material,
+        "compact v5 candidate identity material",
+    )?;
+    let candidate_keys = [
+        "schemaVersion",
+        "qdEngineVersion",
+        "originKind",
+        "bidirectionalGenomeIdentitySha256",
+        "pairPolicySha256",
+        "longModuleIdentitySha256",
+        "shortModuleIdentitySha256",
+        "longGrammarContextSha256",
+        "shortGrammarContextSha256",
+        "longCatalogSha256",
+        "shortCatalogSha256",
+        "longPolicySha256",
+        "shortPolicySha256",
+        "longNativeAuthoritySha256",
+        "shortNativeAuthoritySha256",
+        "pairCompilerAuthoritySha256",
+        "compiledRawPairSha256",
+        "compiledProfileSha256",
+        "compiledProgramSha256",
+        "compiledValidationReportSha256",
+        "orderedSideLineage",
+        "materializedPairProposalSha256",
+    ];
+    exact_keys(
+        candidate_fields,
+        &candidate_keys,
+        &[],
+        "compact v5 candidate identity material",
+    )?;
+    if candidate_fields
+        .get("schemaVersion")
+        .and_then(Value::as_str)
+        != Some("temporal_qd_bidirectional_candidate_identity_v1")
+        || candidate_fields
+            .get("qdEngineVersion")
+            .and_then(Value::as_str)
+            != Some(input.qd_engine_version.as_str())
+        || candidate_fields.get("originKind").and_then(Value::as_str) != Some(expected_origin_kind)
+        || sha(
+            required(
+                candidate_fields,
+                "bidirectionalGenomeIdentitySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 pair identity SHA-256",
+        )? != input.pair_identity_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "pairPolicySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 pair policy SHA-256",
+        )? != input.pair_policy_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "longModuleIdentitySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 long module identity SHA-256",
+        )? != input.long.module_identity_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "shortModuleIdentitySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 short module identity SHA-256",
+        )? != input.short.module_identity_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "longGrammarContextSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 long grammar SHA-256",
+        )? != input.long.grammar_context_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "shortGrammarContextSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 short grammar SHA-256",
+        )? != input.short.grammar_context_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "longCatalogSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 long catalog SHA-256",
+        )? != input.long.catalog_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "shortCatalogSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 short catalog SHA-256",
+        )? != input.short.catalog_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "longPolicySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 long policy SHA-256",
+        )? != input.long.policy_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "shortPolicySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 short policy SHA-256",
+        )? != input.short.policy_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "longNativeAuthoritySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 long native SHA-256",
+        )? != input.long.native_authority_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "shortNativeAuthoritySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 short native SHA-256",
+        )? != input.short.native_authority_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "pairCompilerAuthoritySha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 pair compiler SHA-256",
+        )? != input.pair_compiler_authority_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "compiledRawPairSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 compiled raw pair SHA-256",
+        )? != input.pair_raw_profile_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "compiledProfileSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 compiled profile SHA-256",
+        )? != input.pair_profile_snapshot_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "compiledProgramSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 compiled program SHA-256",
+        )? != input.pair_program_sha256
+        || sha(
+            required(
+                candidate_fields,
+                "compiledValidationReportSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 compiled validation SHA-256",
+        )? != input.pair_validation_report_sha256
+        || required(
+            candidate_fields,
+            "orderedSideLineage",
+            "compact v5 candidate identity material",
+        )? != &input.side_targeted_lineage
+        || sha(
+            required(
+                candidate_fields,
+                "materializedPairProposalSha256",
+                "compact v5 candidate identity material",
+            )?,
+            "compact v5 proposal SHA-256",
+        )? != input.proposal_sha256
+        || canonical_sha256(&input.candidate_identity_material)? != input.candidate_identity_sha256
+        || v5_id_from_identity(
+            "qd_",
+            &input.candidate_identity_sha256,
+            "compact v5 candidate identity",
+        )? != input.candidate_id
+    {
+        return Err(contract("compact v5 candidate identity binding drifted"));
+    }
+    let executable_semantic = canonical_sha256(&object([
+        (
+            "schemaVersion",
+            Value::from("temporal_qd_pair_genome_semantics_v1"),
+        ),
+        (
+            "longProfileSha256",
+            Value::from(input.long.raw_profile_sha256.clone()),
+        ),
+        (
+            "shortProfileSha256",
+            Value::from(input.short.raw_profile_sha256.clone()),
+        ),
+    ]))?;
+    if executable_semantic != input.executable_semantic_sha256 {
+        return Err(contract("compact v5 executable semantic identity drifted"));
+    }
+    let descriptor_pair = DescriptorPair {
+        profile: &input.pair_profile,
+        long: DescriptorModule {
+            profile: &input.long.profile,
+            catalog_payload: &input.long.catalog_payload,
+            catalog_sha256: &input.long.catalog_snapshot_sha256,
+        },
+        short: DescriptorModule {
+            profile: &input.short.profile,
+            catalog_payload: &input.short.catalog_payload,
+            catalog_sha256: &input.short.catalog_snapshot_sha256,
+        },
+        pair_identity_sha256: input.pair_identity_sha256.clone(),
+        native_validation_report_sha256: &input.pair_validation_report_sha256,
+    };
+    derive_descriptor_projection_from_descriptor_pair(
+        &DescriptorProjectionSurface {
+            candidate_id: &input.candidate_id,
+            candidate_identity_sha256: &input.candidate_identity_sha256,
+        },
+        &descriptor_pair,
+    )
 }
 
 /// Rehydrate one rich G0 entry exactly once, prove its native/static
@@ -4486,8 +5201,13 @@ fn admit_accepted_pair_entry_with_operator(
             pair_identity_sha256: facts.pair_identity_sha256,
             native_validation_report_sha256: &facts.adapter.native_validation_report_sha256,
         };
-        let descriptor_projection =
-            derive_descriptor_projection_from_descriptor_pair(&surface, &descriptor_pair)?;
+        let descriptor_projection = derive_descriptor_projection_from_descriptor_pair(
+            &DescriptorProjectionSurface {
+                candidate_id: &surface.candidate_id,
+                candidate_identity_sha256: &surface.candidate_identity_sha256,
+            },
+            &descriptor_pair,
+        )?;
         let executable_semantic_sha256 = canonical_sha256(&object([
             (
                 "schemaVersion",

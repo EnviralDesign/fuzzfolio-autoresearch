@@ -1,15 +1,15 @@
 """Hermetic fresh-v5 supervisor authority/restart coverage.
 
-This deliberately exercises the production ``PairAuthorityBundle`` reopen
-path.  The tiny Dashboard-shaped source tree is made under ``tmp_path``; it
-has no market, network, or C:\\fuzzfolio-research dependency.  We do not run
-candidate evaluation here--the point is to make the supervisor's frozen
-authority boundary executable before it can schedule any worker work.
+The source fixture intentionally resembles the old Dashboard-shaped pair
+authority, but fresh v5 must never open it.  The production boundary derives
+only pure sealed projections before it gives the one-shot Rust transaction
+ownership of construction.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 import sys
@@ -152,6 +152,20 @@ def _fresh_v5_fixture(tmp_path: Path) -> tuple[dict, dict]:
         tmp_path / "fresh-v5-initial-archive.json",
         qd.canonical_empty_directional_bidirectional_archive_template(),
     )
+    archive_bytes = archive_path.read_bytes()
+    initial_archive_transport_descriptor = {
+        "schemaVersion": "temporal_qd_archive_transport_descriptor_v1",
+        "absolutePath": str(archive_path.resolve()),
+        "documentSchemaVersion": "temporal_qd_archive_v3",
+        "archiveSha256": qd.canonical_empty_directional_bidirectional_archive_template()[
+            "archiveSha256"
+        ],
+        "fileSha256": "sha256:" + hashlib.sha256(archive_bytes).hexdigest(),
+        "sizeBytes": len(archive_bytes),
+    }
+    initial_archive_transport_descriptor["descriptorSha256"] = canonical_sha256(
+        initial_archive_transport_descriptor
+    )
     inputs = {
         "initial_archive_path": archive_path,
         "source_preparation_path": tmp_path / "pair-mode-unused-source.json",
@@ -183,9 +197,10 @@ def _fresh_v5_fixture(tmp_path: Path) -> tuple[dict, dict]:
         "enqueue_batch_size": 1,
         "broad_admission": False,
         "bidirectional_pair_config": pair_config,
-        "pair_generation_engine": supervisor.PAIR_GENERATION_RUNTIME_PYTHON,
+        "pair_generation_engine": supervisor.PAIR_GENERATION_RUNTIME_RUST,
         "rotating_evidence_config": rotating_input,
         "evolvable_module_authority_config": evolvable,
+        "initial_archive_transport_descriptor": initial_archive_transport_descriptor,
     }
     return inputs, {"pair": pair_config, "evolvable": evolvable, "validator": validator}
 
@@ -205,9 +220,16 @@ def _rehash_authority(authority: dict) -> dict:
 
 
 def test_fresh_v5_supervisor_reopens_exact_hermetic_authorities_at_phase_and_restart(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs, fixture = _fresh_v5_fixture(tmp_path)
+    monkeypatch.setattr(
+        supervisor,
+        "PairAuthorityBundle",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fresh v5 must not open a Python pair authority"
+        ),
+    )
     config, warnings = supervisor._frozen_config(**inputs)
     assert warnings == []
     assert config["initialArchive"]["archiveSha256"] == qd.canonical_empty_directional_bidirectional_archive_template()["archiveSha256"]
@@ -216,9 +238,11 @@ def test_fresh_v5_supervisor_reopens_exact_hermetic_authorities_at_phase_and_res
     assert config["bidirectionalPairGeneration"]["behaviorAttributionRequirement"] == fixture["evolvable"]["behaviorAttributionRequirement"]
     assert config["bidirectionalPairGeneration"]["operatorImplementation"]["authoritySha256"] == fixture["evolvable"]["authoritySha256"]
     assert config["evaluation"]["behaviorAttributionRequirement"] == fixture["evolvable"]["behaviorAttributionRequirement"]
+    assert config["pairGenerationRuntime"]["engine"] == supervisor.PAIR_GENERATION_RUNTIME_RUST
+    assert config["nativeV5ProposalRuntime"]["engine"] == supervisor.NATIVE_V5_PROPOSAL_ENGINE
 
-    # A phase boundary and a process restart must reopen the same source
-    # authority--not reuse an in-memory authority object.
+    # A phase boundary and a process restart rebuild the same sealed native
+    # control plane, without opening a Python authority object.
     assert supervisor._validate_frozen_sources(config) == []
     restarted = json.loads(json.dumps(config))
     assert supervisor._validate_frozen_sources(restarted) == []
@@ -227,7 +251,7 @@ def test_fresh_v5_supervisor_reopens_exact_hermetic_authorities_at_phase_and_res
     mutated_operator["bidirectionalPairGeneration"]["operatorImplementation"] = {
         "schemaVersion": "forged_operator_v1"
     }
-    with pytest.raises(TemporalDiscoveryContractError, match="operatorImplementation drifted"):
+    with pytest.raises(TemporalDiscoveryContractError, match="generation bindings drifted"):
         supervisor._validate_frozen_sources(_rehash_config(mutated_operator))
 
     mutated_archive = _rehash_config(config)
@@ -235,7 +259,7 @@ def test_fresh_v5_supervisor_reopens_exact_hermetic_authorities_at_phase_and_res
     mutated_archive["evolvableModuleAuthority"] = _rehash_authority(
         mutated_archive["evolvableModuleAuthority"]
     )
-    with pytest.raises(TemporalDiscoveryContractError, match="exact v5 direction-aware archive policy"):
+    with pytest.raises(TemporalDiscoveryContractError, match="archive policy is invalid"):
         supervisor._validate_frozen_sources(_rehash_config(mutated_archive))
 
     mutated_behavior = _rehash_config(config)
@@ -243,7 +267,7 @@ def test_fresh_v5_supervisor_reopens_exact_hermetic_authorities_at_phase_and_res
     mutated_behavior["evolvableModuleAuthority"] = _rehash_authority(
         mutated_behavior["evolvableModuleAuthority"]
     )
-    with pytest.raises(TemporalDiscoveryContractError, match="identity or policy drifted"):
+    with pytest.raises(TemporalDiscoveryContractError, match="proposal runtime authority drifted"):
         supervisor._validate_frozen_sources(_rehash_config(mutated_behavior))
 
     # The requirement has two consumers: generation materialization and the
@@ -254,8 +278,46 @@ def test_fresh_v5_supervisor_reopens_exact_hermetic_authorities_at_phase_and_res
     with pytest.raises(TemporalDiscoveryContractError, match="behavior attribution requirement drifted"):
         supervisor._validate_frozen_sources(_rehash_config(mutated_evaluation_requirement))
 
-    # The source tree is part of the sealed authority, not a permissive test
-    # double.  Its mutation is detected before a later phase can consume it.
-    fixture["validator"].write_text("# source drift\n", encoding="utf-8")
-    with pytest.raises(TemporalDiscoveryContractError, match="authority content drifted"):
-        supervisor._validate_frozen_sources(config)
+    mutated_runtime = _rehash_config(config)
+    mutated_runtime["nativeV5ProposalRuntime"]["threadCap"] = 1
+    with pytest.raises(TemporalDiscoveryContractError, match="runtime identity drifted"):
+        supervisor._validate_frozen_sources(_rehash_config(mutated_runtime))
+
+
+@pytest.mark.skipif(
+    supervisor.os.name != "nt", reason="Windows extended-path archive transport ABI"
+)
+def test_fresh_v5_supervisor_preserves_rust_extended_initial_archive_transport(
+    tmp_path: Path,
+) -> None:
+    """A self-hashed ``\\\\?\\`` descriptor survives freeze and restart unchanged."""
+
+    inputs, _fixture = _fresh_v5_fixture(tmp_path)
+    transport = dict(inputs["initial_archive_transport_descriptor"])
+    normal_path = transport["absolutePath"]
+    transport["absolutePath"] = "\\\\?\\" + normal_path
+    transport["descriptorSha256"] = canonical_sha256(
+        {key: value for key, value in transport.items() if key != "descriptorSha256"}
+    )
+    inputs["initial_archive_transport_descriptor"] = transport
+
+    config, warnings = supervisor._frozen_config(**inputs)
+    assert warnings == []
+    assert config["initialArchive"]["transportDescriptor"] == transport
+    assert supervisor._validate_frozen_sources(config) == []
+    assert supervisor._validate_frozen_sources(json.loads(json.dumps(config))) == []
+
+    foreign_inputs = copy.deepcopy(inputs)
+    foreign = dict(transport)
+    foreign["absolutePath"] = "\\\\?\\" + str(
+        (tmp_path / "foreign-initial-archive.json").resolve()
+    )
+    foreign["descriptorSha256"] = canonical_sha256(
+        {key: value for key, value in foreign.items() if key != "descriptorSha256"}
+    )
+    foreign_inputs["initial_archive_transport_descriptor"] = foreign
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="initial archive transport descriptor binding drifted",
+    ):
+        supervisor._frozen_config(**foreign_inputs)

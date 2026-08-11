@@ -109,6 +109,7 @@ QD_JOURNAL_SCHEMA = "temporal_qd_generation_journal_v3"
 QD_MANIFEST_SCHEMA = "temporal_qd_generation_manifest_v3"
 QD_IDENTITY_LEDGER_SCHEMA = "temporal_qd_identity_ledger_v3"
 BIDIRECTIONAL_QD_POLICY_SCHEMA = "temporal_qd_bidirectional_pair_policy_v1"
+_V5_PYTHON_ORACLE_TOKEN = object()
 
 LEGACY_QD_POLICY_NAME = "stage5e7_v3_robust_quality_archive"
 LEGACY_QD_POLICY = {
@@ -4382,7 +4383,7 @@ def _proposal_accounting(
     }
 
 
-def generate_qd_generation(
+def _generate_qd_generation_impl(
     *,
     parent_archive_path: Path | str,
     parent_archive_sha256: str | None = None,
@@ -4415,7 +4416,17 @@ def generate_qd_generation(
     bidirectional_operator_implementation_identity: Mapping[str, Any] | None = None,
     initial_construction_pool_size: int | None = None,
     evaluation_population_size: int | None = None,
+    _v5_python_oracle_token: object | None = None,
 ) -> dict[str, Any]:
+    """Generate a legacy/v4 QD proposal population.
+
+    Fresh direction-aware v5 construction is deliberately *not* a compatibility
+    mode of this function.  Its production entry point is the one-shot native
+    v5 transaction owned by the supervisor.  The private switch is used only
+    by :func:`generate_v5_qd_generation_python_oracle`, which keeps the old
+    implementation available for differential-oracle and fixture work without
+    leaving a production-shaped Python fallback behind.
+    """
     if generation_index < 1:
         raise TemporalDiscoveryContractError("evolved QD generations begin at index 1")
     if immigrant_continuation_start < 0:
@@ -4436,6 +4447,29 @@ def generate_qd_generation(
     except TemporalQDNativeError as exc:
         raise TemporalDiscoveryContractError(str(exc)) from exc
     native_pair_generation = runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST
+    authority_is_v5 = False
+    if archive_policy_authority is not None:
+        try:
+            _policy_name, _policy_sha, _policy, authority_is_v5 = (
+                _resolve_archive_policy_authority(archive_policy_authority)
+            )
+        except TemporalDiscoveryContractError:
+            # Preserve the historical authority error below rather than
+            # obscuring it with a v5 routing message.
+            authority_is_v5 = False
+        if (
+            authority_is_v5
+            and _v5_python_oracle_token is not _V5_PYTHON_ORACLE_TOKEN
+        ):
+            raise TemporalDiscoveryContractError(
+                "fresh v5 construction must use the native v5 proposal transaction; "
+                "the Python implementation is available only through the explicit oracle helper"
+            )
+        if authority_is_v5 and native_pair_generation:
+            raise TemporalDiscoveryContractError(
+                "fresh v5 construction cannot use the legacy native pair-generation bridge; "
+                "use the native v5 proposal transaction"
+            )
     if native_pair_generation:
         if bidirectional_pair_policy is None:
             raise TemporalDiscoveryContractError(
@@ -4481,6 +4515,15 @@ def generate_qd_generation(
             raise TemporalDiscoveryContractError(
                 "QD generation archive policy authority differs from its parent archive"
             )
+        if (
+            archive_policy_kind == "directional"
+            and _v5_python_oracle_token is not _V5_PYTHON_ORACLE_TOKEN
+        ):
+            raise TemporalDiscoveryContractError(
+                "fresh v5 construction must use the native v5 proposal transaction; "
+                "the Python implementation is available only through the explicit oracle helper"
+            )
+        authority_is_v5 = archive_policy_kind == "directional"
     supplied_pair_policy = (
         _bidirectional_pair_policy({"bidirectionalPairPolicy": bidirectional_pair_policy})
         if bidirectional_pair_policy is not None
@@ -4515,6 +4558,7 @@ def generate_qd_generation(
             _frozen_catalog_for_predeclared_scope,
             build_pair_generation_config,
             generate_pair_population,
+            generate_v5_pair_population_python_oracle,
         )
 
         pair_ledger_file = (
@@ -4720,7 +4764,12 @@ def generate_qd_generation(
                     parents.append(
                         FrozenPair.from_payload(candidate["bidirectionalGenome"])
                     )
-        return generate_pair_population(
+        pair_population_generator = (
+            generate_v5_pair_population_python_oracle
+            if authority_is_v5
+            else generate_pair_population
+        )
+        return pair_population_generator(
             output_root=root,
             generation_index=generation_index,
             target_unique_candidates=construction_width,
@@ -5321,6 +5370,34 @@ def generate_qd_generation(
     }
 
 
+def generate_qd_generation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Generate legacy/v4 proposals; fresh v5 is never a compatibility mode."""
+
+    if "_v5_python_oracle_token" in kwargs:
+        raise TemporalDiscoveryContractError(
+            "v5 Python oracle routing is controlled by the explicit helper"
+        )
+    return _generate_qd_generation_impl(*args, **kwargs)
+
+
+def generate_v5_qd_generation_python_oracle(**kwargs: Any) -> dict[str, Any]:
+    """Run the retired v5 Python constructor only for oracle/test comparison.
+
+    This is intentionally named as an oracle rather than a runtime option.
+    Production config, the CLI, and the supervisor route fresh v5 construction
+    through one receipt-authenticated Rust transaction and cannot opt back into
+    this path.
+    """
+
+    if "_v5_python_oracle_token" in kwargs:
+        raise TemporalDiscoveryContractError(
+            "v5 Python oracle routing is controlled by the explicit helper"
+        )
+    return _generate_qd_generation_impl(
+        **kwargs, _v5_python_oracle_token=_V5_PYTHON_ORACLE_TOKEN
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -5397,6 +5474,12 @@ def main() -> None:
                 validator_command=command,
             )
         else:
+            parent_archive, _parent_archive_sha = _load_archive(args.parent_archive)
+            if _archive_policy_kind(parent_archive) == "directional":
+                parser.error(
+                    "fresh v5 construction is available only through the Rust-native "
+                    "supervisor transaction; this legacy CLI has no Python fallback"
+                )
             from .temporal_qd_pair_factory import PairAuthorityBundle, load_pair_run_config, pair_policy_from_config
             frozen = load_pair_run_config(_read(args.bidirectional_pair_config, name="bidirectional pair run config"))
             with PairAuthorityBundle(frozen) as authority:
@@ -5439,6 +5522,7 @@ __all__ = [
     "initialize_empty_directional_bidirectional_archive",
     "build_rotating_qd_parent_archive",
     "generate_qd_generation",
+    "generate_v5_qd_generation_python_oracle",
     "load_qd_evaluated_members",
     "qd_behavior_descriptor",
     "qd_canonical_evidence_identity",

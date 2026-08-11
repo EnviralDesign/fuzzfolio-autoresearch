@@ -1,0 +1,24 @@
+[package]
+name = "temporal-qd-campaign-freeze"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "temporal-qd-campaign-freeze"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-rotating-prefinalizer = { path = "../qd-rotating-prefinalizer" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

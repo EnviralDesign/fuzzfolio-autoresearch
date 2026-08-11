@@ -413,6 +413,33 @@ def test_native_checked_command_forwards_explicit_environment(tmp_path: Path) ->
     assert completed.stdout == expected
 
 
+@pytest.mark.parametrize(
+    ("stream", "limit_name"),
+    (("stdout", "stdout"), ("stderr", "stderr")),
+)
+def test_native_checked_command_rejects_oversized_pipe_output(
+    tmp_path: Path, stream: str, limit_name: str
+) -> None:
+    """The reusable drainer must keep consuming but never retain unlimited bytes."""
+
+    program = (
+        "import sys; "
+        f"sys.{stream}.buffer.write(b'x' * 4097); "
+        f"sys.{stream}.flush()"
+    )
+    with pytest.raises(
+        native.TemporalQDNativeError,
+        match=rf"{limit_name} exceeded its 4096 byte capture limit",
+    ):
+        native._run_checked(
+            (sys.executable, "-c", program),
+            cwd=tmp_path,
+            timeout=5,
+            stdout_limit_bytes=4096,
+            stderr_limit_bytes=4096,
+        )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object ordering only")
 def test_windows_fast_child_is_assigned_before_it_is_resumed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

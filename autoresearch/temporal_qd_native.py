@@ -304,6 +304,7 @@ class _BoundedPipeCapture:
         self._stream = stream
         self._limit_bytes = limit_bytes
         self._buffer = bytearray()
+        self._overflowed = False
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._drain, daemon=True)
 
@@ -316,6 +317,8 @@ class _BoundedPipeCapture:
                 remaining = self._limit_bytes - len(self._buffer)
                 if remaining > 0:
                     self._buffer.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    self._overflowed = True
         except BaseException as exc:
             self._error = exc
         finally:
@@ -326,6 +329,12 @@ class _BoundedPipeCapture:
         if self._error is not None:
             raise TemporalQDNativeError("could not drain native Temporal QD command output") from self._error
         return bytes(self._buffer)
+
+    @property
+    def overflowed(self) -> bool:
+        """Whether the child wrote beyond the bounded retained capture."""
+
+        return self._overflowed
 
 
 class _WindowsKillOnCloseJob:
@@ -555,6 +564,8 @@ def _run_checked(
     env: Mapping[str, str] | None = None,
     raise_on_nonzero: bool = True,
     on_process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    stdout_limit_bytes: int = _NATIVE_CAPTURE_LIMIT_BYTES,
+    stderr_limit_bytes: int = _NATIVE_CAPTURE_LIMIT_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one native command with complete child-tree ownership.
 
@@ -563,6 +574,15 @@ def _run_checked(
     are terminated before the exception escapes.
     """
 
+    if (
+        isinstance(stdout_limit_bytes, bool)
+        or not isinstance(stdout_limit_bytes, int)
+        or stdout_limit_bytes < 1
+        or isinstance(stderr_limit_bytes, bool)
+        or not isinstance(stderr_limit_bytes, int)
+        or stderr_limit_bytes < 1
+    ):
+        raise TemporalQDNativeError("native command capture limits must be positive integers")
     command_strings = [str(part) for part in command]
     popen_options: dict[str, Any] = {
         "cwd": cwd,
@@ -596,10 +616,10 @@ def _run_checked(
                 ) from exc
         assert process.stdout is not None and process.stderr is not None
         stdout_capture = _BoundedPipeCapture(
-            process.stdout, limit_bytes=_NATIVE_CAPTURE_LIMIT_BYTES
+            process.stdout, limit_bytes=stdout_limit_bytes
         )
         stderr_capture = _BoundedPipeCapture(
-            process.stderr, limit_bytes=_NATIVE_CAPTURE_LIMIT_BYTES
+            process.stderr, limit_bytes=stderr_limit_bytes
         )
         stdout_capture.start()
         stderr_capture.start()
@@ -641,6 +661,16 @@ def _run_checked(
             _terminate_process_group(process)
         stdout = stdout_capture.finish()
         stderr = stderr_capture.finish()
+        if stdout_capture.overflowed:
+            raise TemporalQDNativeError(
+                "native Temporal QD command stdout exceeded its "
+                f"{stdout_limit_bytes} byte capture limit"
+            )
+        if stderr_capture.overflowed:
+            raise TemporalQDNativeError(
+                "native Temporal QD command stderr exceeded its "
+                f"{stderr_limit_bytes} byte capture limit"
+            )
         completed = subprocess.CompletedProcess(
             command_strings, returncode, stdout=stdout, stderr=stderr
         )
@@ -886,6 +916,43 @@ def ensure_native_batch() -> tuple[Path, dict[str, str]]:
     if executable_after != executable_before:
         raise TemporalQDNativeError(
             "native Temporal QD executable changed during the version handshake"
+        )
+    return binary, build_native_authority(
+        binary=binary,
+        version=version,
+        source_sha256=source_after,
+        executable_sha256=executable_after,
+    )
+
+
+def require_native_batch() -> tuple[Path, dict[str, str]]:
+    """Resolve an already-built batch binary without compiling one.
+
+    Fresh v5 production transactions are not allowed to turn a missing Rust
+    authority into a hidden Cargo build.  That would make the executable used
+    for a receipt depend on ambient source state at launch time and would
+    defeat the caller's fail-closed runtime-authority gate.  Historical v4
+    callers retain :func:`ensure_native_batch`; the v5 bridge uses this
+    resolver exclusively.
+    """
+
+    source_before = native_source_sha256()
+    binary = resolve_native_batch_binary()
+    if binary is None:
+        binary = native_batch_binary_path()
+        _require_regular_file(binary, name="native Temporal QD batch binary")
+    binary = binary.absolute()
+    executable_before = _sha256_file(binary)
+    version = _native_version(binary)
+    executable_after = _sha256_file(binary)
+    if executable_after != executable_before:
+        raise TemporalQDNativeError(
+            "native Temporal QD executable changed during the version handshake"
+        )
+    source_after = native_source_sha256()
+    if source_after != source_before:
+        raise TemporalQDNativeError(
+            "native Temporal QD source changed during the version handshake"
         )
     return binary, build_native_authority(
         binary=binary,
@@ -1998,6 +2065,7 @@ def _existing_regular_file(
     *,
     name: str,
     parent_status: os.stat_result | None = None,
+    maximum_bytes: int | None = None,
 ) -> tuple[bytes, os.stat_result] | None:
     if parent_status is not None:
         _require_directory_identity(path.parent, parent_status, name=f"{name} parent")
@@ -2009,11 +2077,23 @@ def _existing_regular_file(
         raise TemporalQDNativeError(f"could not inspect {name}: {path}") from exc
     if _is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
         raise TemporalQDNativeError(f"{name} is not a regular file: {path}")
+    if maximum_bytes is not None and (
+        isinstance(maximum_bytes, bool)
+        or not isinstance(maximum_bytes, int)
+        or maximum_bytes < 1
+    ):
+        raise TemporalQDNativeError(f"{name} maximum byte limit is invalid")
+    if maximum_bytes is not None and before.st_size > maximum_bytes:
+        raise TemporalQDNativeError(
+            f"{name} exceeded its {maximum_bytes} byte compact-document limit"
+        )
     try:
         with path.open("rb") as handle:
             opened = os.fstat(handle.fileno())
             _require_same_identity(opened, before, name=name, path=path)
-            payload = handle.read()
+            payload = handle.read(
+                maximum_bytes + 1 if maximum_bytes is not None else -1
+            )
     except OSError as exc:
         raise TemporalQDNativeError(f"could not read {name}: {path}") from exc
     if parent_status is not None:
@@ -2025,6 +2105,10 @@ def _existing_regular_file(
     if _is_link_or_reparse(after) or not stat.S_ISREG(after.st_mode):
         raise TemporalQDNativeError(f"{name} is not a regular file: {path}")
     _require_same_identity(after, opened, name=name, path=path)
+    if maximum_bytes is not None and len(payload) > maximum_bytes:
+        raise TemporalQDNativeError(
+            f"{name} exceeded its {maximum_bytes} byte compact-document limit"
+        )
     return payload, opened
 
 
@@ -2862,6 +2946,79 @@ def run_native_foundation(*, output_root: Path | str) -> dict[str, str]:
     return file_result
 
 
+def _is_directional_v5_policy_material(value: object) -> bool:
+    """Recognize a v5 policy marker without accepting a generic bridge route."""
+
+    if not isinstance(value, Mapping):
+        return False
+    # Kept local and lazy so this legacy bridge does not gain an import-time
+    # dependency on the evolution implementation it must no longer serve.
+    from .temporal_qd_evolution import (
+        DIRECTIONAL_QD_POLICY_NAME,
+        DIRECTIONAL_QD_POLICY_SHA256,
+    )
+
+    frozen = value.get("frozenPolicy")
+    return (
+        value.get("policyName") == DIRECTIONAL_QD_POLICY_NAME
+        or value.get("policySha256") == DIRECTIONAL_QD_POLICY_SHA256
+        or (
+            isinstance(frozen, Mapping)
+            and (
+                frozen.get("policyName") == DIRECTIONAL_QD_POLICY_NAME
+                or "directionSelection" in frozen
+            )
+        )
+    )
+
+
+def _reject_directional_v5_legacy_native_generation(
+    *,
+    runtime_authority: Mapping[str, Any],
+    generation_config: Mapping[str, Any],
+    qd_version: str,
+    policy_name: str,
+    policy_sha256: str,
+    frozen_policy: Mapping[str, Any],
+) -> None:
+    """Keep the generic v4 native bridge from becoming a v5 side entrance."""
+
+    bindings: list[object] = [
+        {
+            "qdVersion": qd_version,
+            "policyName": policy_name,
+            "policySha256": policy_sha256,
+            "frozenPolicy": frozen_policy,
+        },
+        generation_config,
+        runtime_authority,
+    ]
+    binding_index = 0
+    seen_binding_ids: set[int] = set()
+    while binding_index < len(bindings):
+        binding = bindings[binding_index]
+        binding_index += 1
+        if isinstance(binding, Mapping):
+            binding_id = id(binding)
+            if binding_id in seen_binding_ids:
+                continue
+            seen_binding_ids.add(binding_id)
+            bindings.extend(
+                binding.get(key)
+                for key in (
+                    "archivePolicyAuthority",
+                    "evolvableModuleAuthority",
+                    "runConfig",
+                    "pairRunConfig",
+                )
+            )
+    if any(_is_directional_v5_policy_material(binding) for binding in bindings):
+        raise TemporalQDNativeError(
+            "directional/v5 construction is unavailable through "
+            "run_native_generation; use run_native_v5_generation_construction"
+        )
+
+
 def run_native_generation(
     *,
     output_root: Path | str,
@@ -2882,6 +3039,14 @@ def run_native_generation(
 ) -> dict[str, Any]:
     """Execute the selected native generation once; errors never fall back."""
 
+    _reject_directional_v5_legacy_native_generation(
+        runtime_authority=runtime_authority,
+        generation_config=generation_config,
+        qd_version=qd_version,
+        policy_name=policy_name,
+        policy_sha256=policy_sha256,
+        frozen_policy=frozen_policy,
+    )
     root = _ensure_real_directory_tree(output_root, name="native generation output root")
     native_base = _ensure_real_directory_tree(
         root / "native-batch", name="native generation invocation base"
@@ -3239,6 +3404,7 @@ __all__ = [
     "build_foundation_manifest",
     "build_native_authority",
     "ensure_native_batch",
+    "require_native_batch",
     "native_batch_binary_path",
     "native_source_sha256",
     "native_workspace_manifest",

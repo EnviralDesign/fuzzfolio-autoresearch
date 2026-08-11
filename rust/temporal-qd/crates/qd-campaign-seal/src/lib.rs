@@ -8,9 +8,9 @@
 
 #![recursion_limit = "256"]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,22 +25,84 @@ use temporal_qd_contract::{
 };
 
 pub const SOURCE_SCHEMA: &str = "temporal_qd_campaign_seal_source_v1";
+pub const SOURCE_BUILD_MANIFEST_SCHEMA: &str = "temporal_qd_campaign_seal_source_build_manifest_v1";
+pub const SOURCE_BUILD_RECEIPT_SCHEMA: &str = "temporal_qd_campaign_seal_source_build_receipt_v1";
+pub const SOURCE_BUILD_RESULT_SCHEMA: &str = "temporal_qd_campaign_seal_source_build_result_v1";
 pub const MANIFEST_SCHEMA: &str = "temporal_qd_campaign_seal_manifest_v1";
 pub const CAMPAIGN_SEAL_SCHEMA: &str = "temporal_qd_campaign_seal_v1";
 pub const TRANSACTION_SCHEMA: &str = "temporal_qd_generation_tail_transaction_v1";
 pub const EXECUTION_SCHEMA: &str = "temporal_qd_campaign_seal_execution_v1";
+pub const EXECUTION_V2_SCHEMA: &str = "temporal_qd_campaign_seal_execution_v2";
+pub const EXECUTION_RECEIPT_SCHEMA: &str = "temporal_qd_campaign_seal_execution_receipt_v2";
 pub const OPERATION: &str = "seal_completed_task_matrix_and_reduce_tail";
 pub const INDEX_PATH: &str = "tail-result-index-v3.json";
+pub const DIRECTIONAL_INDEX_PATH: &str = "tail-result-index-v4.json";
 pub const INVENTORY_PATH: &str = "raw-result-inventory.jsonl";
 pub const CAMPAIGN_SEAL_PATH: &str = "campaign-seal-result.json";
 pub const TAIL_MANIFEST_PATH: &str = "tail-reduction-manifest.json";
 pub const TRANSACTION_PATH: &str = "generation-tail-transaction-result.json";
+pub const EXECUTION_RECEIPT_PATH: &str = "campaign-seal-execution-receipt.json";
 
 const ENTRY_SCHEMA: &str = "temporal_qd_tail_result_index_entry_v3";
 const INDEX_SCHEMA: &str = "temporal_qd_tail_result_index_v3";
+const DIRECTIONAL_ENTRY_SCHEMA: &str = "temporal_qd_tail_result_index_entry_v4";
+const DIRECTIONAL_INDEX_SCHEMA: &str = "temporal_qd_tail_result_index_v4";
+const DIRECTIONAL_TAIL_AUTHORITY_SCHEMA: &str = "temporal_qd_v5_directional_tail_authority_v1";
+const RAW_ROTATING_PROVENANCE_SCHEMA: &str = "temporal_qd_v5_raw_rotating_provenance_v1";
 const STAGE_SCHEMA: &str = "temporal_qd_tail_stage_projection_v1";
 const ADMITTED_SCHEMA: &str = "temporal_graph_candidate_window_result_v1";
 const REJECTED_SCHEMA: &str = "temporal_graph_candidate_window_rejected_result_v1";
+const GATEWAY_EXECUTION_RECEIPT_SCHEMA_V2: &str = "temporal_qd_native_gateway_execution_receipt_v2";
+const GATEWAY_RESULT_INVENTORY_ENTRY_SCHEMA_V2: &str =
+    "temporal_qd_native_gateway_result_inventory_entry_v2";
+const GATEWAY_RESULT_INVENTORY_ROOT_SCHEMA_V2: &str =
+    "temporal_qd_native_gateway_result_inventory_root_v2";
+
+/// Terminal disposition after the exact candidate-window raw-result admission
+/// that the campaign seal uses before it makes a task result restartable.
+///
+/// This is intentionally a small public seam for bounded gateway dispatchers:
+/// callers supply one immutable task-manifest row and one worker material. It
+/// does not construct a projection, accept an envelope, or relax any of the
+/// campaign-seal evidence checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateWindowResultAdmission {
+    Admitted,
+    Rejected,
+}
+
+/// Admit one terminal candidate-window material against its immutable task
+/// manifest row.
+///
+/// The source task/binding is reconstructed exactly from the native freezer's
+/// task row, then passed through the same binding, v3 evidence, worker
+/// artifact, and warmup-rejection validators used by `build_index_and_inventory`.
+/// This lets an online dispatcher durably admit an individual result without
+/// accumulating a whole raw-result collection in memory.
+pub fn admit_candidate_window_task_result(
+    task_manifest_row: &Value,
+    material: &Value,
+) -> Result<CandidateWindowResultAdmission> {
+    let source_task = source_task_from_manifest_row(task_manifest_row)?;
+    let material_map = object(material, "candidate-window task material")?;
+    verify_result_binding(material, &source_task)?;
+    match text(material_map, "schema_version")?.as_str() {
+        ADMITTED_SCHEMA => {
+            validate_v3_candidate_window_result(
+                material,
+                Some(&source_task.task),
+                Some(&source_task.task_payload),
+            )?;
+            validate_worker_material_identity(material)?;
+            Ok(CandidateWindowResultAdmission::Admitted)
+        }
+        REJECTED_SCHEMA => {
+            validate_warmup_rejected_candidate_window_result(material, &source_task)?;
+            Ok(CandidateWindowResultAdmission::Rejected)
+        }
+        schema => bail!("candidate-window material schema is not admitted: {schema}"),
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Manifest {
@@ -54,6 +116,7 @@ struct Manifest {
     minimum_trades_per_window: i64,
     cap_trades: i64,
     provisional_limit: usize,
+    directional_tail_authority: Option<Value>,
     manifest_sha256: String,
 }
 
@@ -94,13 +157,44 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
         .ok_or_else(|| anyhow!("manifest has no parent"))?;
     ensure_real_directory(output_dir, "campaign seal output directory")?;
     let has_committed_seal = output_dir.join(CAMPAIGN_SEAL_PATH).exists();
+    let has_committed_receipt = output_dir.join(EXECUTION_RECEIPT_PATH).exists();
     let manifest_raw = fs::read(&manifest_path)?;
     let manifest = parse_manifest(&manifest_raw, has_committed_seal)?;
+
+    // The v2 runtime receipt is the recovery boundary.  It authenticates only
+    // fixed durable siblings, so a restart no longer needs the candidate-
+    // bearing source, immutable task manifest, or raw worker results.
+    if has_committed_receipt {
+        ensure!(
+            manifest.runtime_authority_sha256.is_some(),
+            "historical campaign cannot have a current runtime receipt"
+        );
+        let receipt = reopen_execution_receipt(output_dir, &manifest)?;
+        return execution_v2_response(
+            output_dir,
+            receipt,
+            true,
+            0,
+            ReadMetrics::default(),
+            started,
+        );
+    }
     let source = load_source(&manifest, !has_committed_seal)?;
 
     let transaction_path = output_dir.join(TRANSACTION_PATH);
     if transaction_path.exists() {
         let transaction = reopen_transaction(output_dir, &manifest, &source)?;
+        if manifest.runtime_authority_sha256.is_some() {
+            let receipt = publish_execution_receipt(output_dir, &manifest, &transaction)?;
+            return execution_v2_response(
+                output_dir,
+                receipt,
+                true,
+                0,
+                ReadMetrics::default(),
+                started,
+            );
+        }
         return Ok(execution_response(
             transaction,
             true,
@@ -119,12 +213,12 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
         )
     } else {
         let raw_started = Instant::now();
-        let (index, inventory, metrics) = build_index_and_inventory(&source)?;
+        let (index, inventory, metrics) = build_index_and_inventory(&source, &manifest)?;
         // Match the Python oracle's immutable index bytes exactly (canonical
         // JSON, no trailing newline). Native control/commit records use LF.
         let index_bytes = canonical_json_bytes(&index)?;
         let inventory_sha = sha_bytes(&inventory);
-        publish_bytes_once(output_dir, INDEX_PATH, &index_bytes)?;
+        publish_bytes_once(output_dir, manifest.index_path(), &index_bytes)?;
         publish_bytes_once(output_dir, INVENTORY_PATH, &inventory)?;
         let seal = build_campaign_seal(
             &manifest,
@@ -144,6 +238,17 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
         TRANSACTION_PATH,
         &canonical_json_line(&transaction)?,
     )?;
+    if manifest.runtime_authority_sha256.is_some() {
+        let receipt = publish_execution_receipt(output_dir, &manifest, &transaction)?;
+        return execution_v2_response(
+            output_dir,
+            receipt,
+            has_committed_seal,
+            raw_scan_millis,
+            metrics,
+            started,
+        );
+    }
     Ok(execution_response(
         transaction,
         has_committed_seal,
@@ -151,6 +256,699 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
         metrics,
         started,
     ))
+}
+
+/// Build the existing seal source directly from the freezer's immutable task
+/// matrix and the v2 gateway's receipt-last sidecar. Historical v1 gateway
+/// receipts embed an O(T) inventory and are intentionally rejected by this
+/// current-runtime handoff.
+pub fn build_source_manifest(manifest_path: &Path) -> Result<Value> {
+    let manifest_path = existing_file(manifest_path, "campaign seal source-build manifest")?;
+    let builder_root = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("source-build manifest has no parent"))?
+        .to_path_buf();
+    let raw = fs::read(&manifest_path)?;
+    let value: Value = serde_json::from_slice(&raw).context("parse source-build manifest")?;
+    ensure!(
+        canonical_json_line(&value)? == raw,
+        "source-build manifest must be canonical JSON plus LF"
+    );
+    let map = object(&value, "source-build manifest")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "taskManifestPath",
+            "freezerReceiptPath",
+            "gatewayOutputRoot",
+            "gatewayReceiptPath",
+            "sourcePath",
+            "funnelProjectionIncluded",
+            "manifestSha256",
+        ],
+        "source-build manifest",
+    )?;
+    ensure!(
+        text(map, "schemaVersion")? == SOURCE_BUILD_MANIFEST_SCHEMA,
+        "source-build manifest schema is incompatible"
+    );
+    let manifest_sha = sha_field(map, "manifestSha256")?;
+    ensure!(
+        canonical_sha256_without_object_field(&value, "manifestSha256")? == manifest_sha,
+        "source-build manifest identity drifted"
+    );
+    let task_manifest_path = PathBuf::from(text(map, "taskManifestPath")?);
+    let freezer_receipt_path = PathBuf::from(text(map, "freezerReceiptPath")?);
+    let gateway_root = PathBuf::from(text(map, "gatewayOutputRoot")?);
+    let gateway_receipt_path = PathBuf::from(text(map, "gatewayReceiptPath")?);
+    let source_path = PathBuf::from(text(map, "sourcePath")?);
+    ensure!(
+        source_path.is_absolute()
+            && source_path.parent().is_some_and(
+                |parent| parent.canonicalize().ok().as_deref() == Some(builder_root.as_path())
+            ),
+        "source path must be an absolute direct child of the source-build manifest directory"
+    );
+    let source_parent = source_path
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent"))?;
+    fs::create_dir_all(source_parent)?;
+    ensure_real_directory(source_parent, "source output directory")?;
+    if source_path.exists() {
+        existing_file(&source_path, "source output")?;
+    }
+    let receipt_path = source_parent.join("source-build-receipt.json");
+    if receipt_path.exists() {
+        return reopen_source_build_receipt(&receipt_path, &source_path, &manifest_sha);
+    }
+
+    let task_manifest_path = existing_file(&task_manifest_path, "freezer task manifest")?;
+    let freezer_receipt_path = existing_file(&freezer_receipt_path, "freezer receipt")?;
+    ensure_real_directory(&gateway_root, "gateway output root")?;
+    let gateway_receipt_path = existing_file(&gateway_receipt_path, "gateway receipt")?;
+    ensure!(
+        gateway_receipt_path
+            == gateway_root
+                .join(".native-gateway-dispatch")
+                .join("execution-receipt.json")
+                .canonicalize()?,
+        "gateway receipt path is not the fixed dispatch receipt"
+    );
+
+    let freezer = read_canonical_value(&freezer_receipt_path, "freezer receipt")?;
+    let freezer_map = object(&freezer, "freezer receipt")?;
+    exact_keys(
+        freezer_map,
+        &[
+            "schemaVersion",
+            "manifestSha256",
+            "nativeRuntimeAuthoritySha256",
+            "transactionSha256",
+            "campaignSha256",
+            "authorityId",
+            "evaluationIdentitySha256",
+            "taskMatrixSha256",
+            "taskCount",
+            "outputInventory",
+            "semanticReceiptSha256",
+            "receiptSha256",
+        ],
+        "freezer receipt",
+    )?;
+    ensure!(
+        text(freezer_map, "schemaVersion")? == "temporal_qd_v5_native_campaign_freeze_receipt_v1"
+            && canonical_sha256_without_object_field(&freezer, "receiptSha256")?
+                == sha_field(freezer_map, "receiptSha256")?,
+        "freezer receipt identity drifted"
+    );
+    let freezer_root = freezer_receipt_path
+        .parent()
+        .ok_or_else(|| anyhow!("freezer receipt has no parent"))?;
+    ensure!(
+        task_manifest_path
+            == freezer_root
+                .join("screening-run")
+                .join("task-manifest.json")
+                .canonicalize()?,
+        "freezer task manifest path is not the fixed receipt output"
+    );
+    let freezer_inventory = field(freezer_map, "outputInventory")?
+        .as_array()
+        .ok_or_else(|| anyhow!("freezer receipt inventory must be an array"))?;
+    let freezer_task_inventory = freezer_inventory
+        .iter()
+        .find_map(|row| {
+            row.as_object().filter(|row| {
+                row.get("relativePath").and_then(Value::as_str)
+                    == Some("screening-run/task-manifest.json")
+            })
+        })
+        .ok_or_else(|| anyhow!("freezer receipt lacks task-manifest inventory"))?;
+    ensure!(
+        sha_field(freezer_task_inventory, "rawSha256")? == sha_file(&task_manifest_path)?,
+        "freezer receipt task-manifest inventory binding drifted"
+    );
+
+    let gateway = read_canonical_value(&gateway_receipt_path, "gateway execution receipt")?;
+    let gateway_map = object(&gateway, "gateway execution receipt")?;
+    exact_keys(
+        gateway_map,
+        &[
+            "schemaVersion",
+            "runtimeRoleSha256",
+            "authorityId",
+            "taskMatrixSha256",
+            "sourceTaskManifestSha256",
+            "taskIndexRootSha256",
+            "completionJournalSemanticSha256",
+            "checkpointSemanticSha256",
+            "completionJournalSha256",
+            "checkpointSha256",
+            "taskCount",
+            "completedTaskCount",
+            "resultInventoryRootSha256",
+            "resultInventorySha256",
+            "resultInventorySizeBytes",
+            "resultInventoryCount",
+            "semanticReceiptSha256",
+            "receiptSha256",
+        ],
+        "gateway execution receipt",
+    )?;
+    ensure!(
+        text(gateway_map, "schemaVersion")? == GATEWAY_EXECUTION_RECEIPT_SCHEMA_V2
+            && canonical_sha256_without_object_field(&gateway, "receiptSha256")?
+                == sha_field(gateway_map, "receiptSha256")?,
+        "gateway execution receipt identity drifted"
+    );
+
+    let task_manifest = read_pretty_value(&task_manifest_path, "freezer task manifest")?;
+    let task_manifest_map = object(&task_manifest, "freezer task manifest")?;
+    exact_keys(
+        task_manifest_map,
+        &[
+            "authorityId",
+            "schemaVersion",
+            "taskCount",
+            "taskMatrixSha256",
+            "tasks",
+        ],
+        "freezer task manifest",
+    )?;
+    ensure!(
+        text(task_manifest_map, "schemaVersion")? == "temporal_graph_candidate_window_manifest_v1",
+        "freezer task manifest schema is incompatible"
+    );
+    let task_manifest_raw_sha = sha_file(&task_manifest_path)?;
+    ensure!(
+        task_manifest_raw_sha == sha_field(gateway_map, "sourceTaskManifestSha256")?,
+        "gateway receipt task-manifest raw binding drifted"
+    );
+    ensure!(
+        field(task_manifest_map, "authorityId")? == field(freezer_map, "authorityId")?
+            && field(task_manifest_map, "taskMatrixSha256")?
+                == field(freezer_map, "taskMatrixSha256")?
+            && unsigned(task_manifest_map, "taskCount")? == unsigned(freezer_map, "taskCount")?,
+        "freezer receipt task-matrix binding drifted"
+    );
+    ensure!(
+        field(task_manifest_map, "authorityId")? == field(gateway_map, "authorityId")?
+            && field(task_manifest_map, "taskMatrixSha256")?
+                == field(gateway_map, "taskMatrixSha256")?
+            && unsigned(task_manifest_map, "taskCount")? == unsigned(gateway_map, "taskCount")?
+            && unsigned(gateway_map, "completedTaskCount")? == unsigned(gateway_map, "taskCount")?,
+        "gateway receipt task-matrix/completion binding drifted"
+    );
+
+    let sidecar = gateway_root.join(".native-gateway-dispatch");
+    let index_path = sidecar.join("task-index.jsonl");
+    let journal_path = sidecar.join("completion-journal.jsonl");
+    let checkpoint_path = gateway_root.join("checkpoint.json");
+    ensure!(
+        sha_file(&journal_path)? == sha_field(gateway_map, "completionJournalSha256")?
+            && sha_file(&checkpoint_path)? == sha_field(gateway_map, "checkpointSha256")?,
+        "gateway journal/checkpoint receipt binding drifted"
+    );
+    let inventory = load_gateway_result_inventory(&sidecar, gateway_map)?;
+    let journal = load_gateway_journal(&journal_path, &gateway_root, &inventory)?;
+    let rows = field(task_manifest_map, "tasks")?
+        .as_array()
+        .ok_or_else(|| anyhow!("freezer task manifest tasks must be an array"))?;
+    ensure!(
+        rows.len() as u64 == unsigned(task_manifest_map, "taskCount")?,
+        "freezer task count drifted"
+    );
+    ensure!(
+        canonical_sha256(&Value::Array(rows.clone()))?
+            == sha_field(task_manifest_map, "taskMatrixSha256")?,
+        "freezer task matrix identity drifted"
+    );
+    let index = load_gateway_index(&index_path)?;
+    ensure!(
+        index.len() == rows.len() && journal.len() == rows.len(),
+        "gateway task/journal count drifted"
+    );
+
+    let mut source_tasks = Vec::with_capacity(rows.len());
+    let mut seen = BTreeSet::new();
+    for task in rows {
+        let task_map = object(task, "freezer task row")?;
+        let task_id = safe_task_id(&text(task_map, "task_id")?)?;
+        ensure!(
+            seen.insert(task_id.clone()),
+            "freezer task manifest has duplicate task ids"
+        );
+        let index_task_sha = index
+            .get(&task_id)
+            .ok_or_else(|| anyhow!("freezer task is absent from gateway index"))?;
+        ensure!(
+            canonical_sha256(task)? == *index_task_sha,
+            "gateway task index task identity drifted"
+        );
+        let task_object = read_canonical_value(
+            &sidecar.join("tasks").join(format!("{task_id}.json")),
+            "gateway task object",
+        )?;
+        let object_map = object(&task_object, "gateway task object")?;
+        exact_keys(
+            object_map,
+            &["schemaVersion", "task", "taskSha256", "taskObjectSha256"],
+            "gateway task object",
+        )?;
+        ensure!(
+            field(object_map, "task")? == task
+                && sha_field(object_map, "taskSha256")? == *index_task_sha
+                && canonical_sha256_without_object_field(&task_object, "taskObjectSha256")?
+                    == sha_field(object_map, "taskObjectSha256")?,
+            "gateway task object binding drifted"
+        );
+        let record = journal
+            .get(&task_id)
+            .ok_or_else(|| anyhow!("freezer task lacks gateway terminal record"))?;
+        let payload = object(field(task_map, "payload")?, "freezer task payload")?;
+        let task_payload_sha = canonical_sha256(&Value::Object(payload.clone()))?;
+        let result_path = gateway_root
+            .join("results")
+            .join(format!("{task_id}.json.gz"));
+        ensure!(
+            sha_file(&result_path)?
+                == sha_field(
+                    object(record, "gateway completion record")?,
+                    "resultBlobSha256"
+                )?,
+            "gateway result blob binding drifted"
+        );
+        let raw_ref = json!({"schemaVersion":"temporal_qd_tail_raw_result_ref_v1","relativePath":format!("results/{task_id}.json.gz"),"resultSha256":record.get("resultSha256").cloned().ok_or_else(|| anyhow!("gateway record lacks result sha"))?,"codec":"gzip-json-v1","semanticSizeBytes":record.get("resultSemanticSizeBytes").cloned().ok_or_else(|| anyhow!("gateway record lacks semantic size"))?,"uncompressedSha256":record.get("resultUncompressedSha256").cloned().ok_or_else(|| anyhow!("gateway record lacks uncompressed sha"))?,"uncompressedSizeBytes":record.get("resultUncompressedSizeBytes").cloned().ok_or_else(|| anyhow!("gateway record lacks uncompressed size"))?,"blobSha256":record.get("resultBlobSha256").cloned().ok_or_else(|| anyhow!("gateway record lacks blob sha"))?,"blobSizeBytes":record.get("resultBlobSizeBytes").cloned().ok_or_else(|| anyhow!("gateway record lacks blob size"))?});
+        let evidence = object(
+            field(payload, "evidence_plan")?,
+            "freezer task evidence plan",
+        )?;
+        source_tasks.push(json!({"task":{"taskId":task_id,"candidateId":field(payload,"candidate_id")?,"analysisWindowStart":field(payload,"analysis_window_start")?,"analysisWindowEnd":field(payload,"analysis_window_end")?,"evidencePlanSemanticSha256":field(evidence,"plan_id")?,"taskPayloadSha256":task_payload_sha},"taskPayloadBinding":{"taskPayloadSha256":task_payload_sha,"barLimit":field(payload,"bar_limit")?},"rawResultPath":result_path.to_string_lossy(),"rawResultRef":raw_ref,"resultBinding":{"taskKind":field(task_map,"task_kind")?,"jobId":field(payload,"job_id")?,"authorityId":field(payload,"authority_id")?,"candidateId":field(payload,"candidate_id")?,"evidencePlanId":field(evidence,"plan_id")?,"lakeWindowSemanticSha256":field(payload,"lake_window_semantic_sha256")?,"sharedObservationStreamId":field(payload,"shared_observation_stream_id")?}}));
+    }
+    source_tasks.sort_by_key(|row| row["task"]["taskId"].as_str().unwrap_or("").to_owned());
+    let mut source = json!({"schemaVersion":SOURCE_SCHEMA,"authorityId":field(task_manifest_map,"authorityId")?,"authoritySha256":field(task_manifest_map,"authorityId")?,"taskMatrixSha256":field(task_manifest_map,"taskMatrixSha256")?,"taskManifestSha256":canonical_sha256(&task_manifest)?,"taskManifestPath":task_manifest_path.to_string_lossy(),"checkpointSha256":sha_field(gateway_map,"checkpointSha256")?,"taskCount":source_tasks.len(),"funnelProjectionIncluded":field(map,"funnelProjectionIncluded")?,"tasks":source_tasks});
+    let source_sha = canonical_sha256(&source)?;
+    source["sourceSha256"] = Value::String(source_sha.clone());
+    publish_bytes_once(
+        source_parent,
+        source_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| anyhow!("source file name is invalid"))?,
+        &canonical_json_line(&source)?,
+    )?;
+    let mut receipt = json!({"schemaVersion":SOURCE_BUILD_RECEIPT_SCHEMA,"manifestSha256":manifest_sha,"freezerReceiptSha256":sha_field(freezer_map,"receiptSha256")?,"gatewayReceiptSha256":sha_field(gateway_map,"receiptSha256")?,"sourceSha256":source_sha,"authorityId":field(task_manifest_map,"authorityId")?,"taskMatrixSha256":field(task_manifest_map,"taskMatrixSha256")?,"taskCount":rows.len(),"sourcePath":source_path.to_string_lossy()});
+    let receipt_sha = canonical_sha256(&receipt)?;
+    receipt["receiptSha256"] = Value::String(receipt_sha.clone());
+    publish_bytes_once(
+        source_parent,
+        "source-build-receipt.json",
+        &canonical_json_line(&receipt)?,
+    )?;
+    Ok(json!({
+        "schemaVersion": SOURCE_BUILD_RESULT_SCHEMA,
+        "sourcePath": source_path.to_string_lossy(),
+        "sourceSha256": source_sha,
+        "receiptPath": receipt_path.to_string_lossy(),
+        "receiptSha256": receipt_sha,
+        "authorityId": field(task_manifest_map,"authorityId")?,
+        "taskMatrixSha256": field(task_manifest_map,"taskMatrixSha256")?,
+        "taskCount": rows.len(),
+    }))
+}
+
+fn reopen_source_build_receipt(
+    receipt_path: &Path,
+    source_path: &Path,
+    manifest_sha: &str,
+) -> Result<Value> {
+    let receipt = read_canonical_value(receipt_path, "source-build receipt")?;
+    let map = object(&receipt, "source-build receipt")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "manifestSha256",
+            "freezerReceiptSha256",
+            "gatewayReceiptSha256",
+            "sourceSha256",
+            "authorityId",
+            "taskMatrixSha256",
+            "taskCount",
+            "sourcePath",
+            "receiptSha256",
+        ],
+        "source-build receipt",
+    )?;
+    ensure!(
+        text(map, "schemaVersion")? == SOURCE_BUILD_RECEIPT_SCHEMA
+            && text(map, "manifestSha256")? == manifest_sha
+            && canonical_sha256_without_object_field(&receipt, "receiptSha256")?
+                == sha_field(map, "receiptSha256")?,
+        "source-build receipt identity drifted"
+    );
+    ensure!(
+        text(map, "sourcePath")? == source_path.to_string_lossy(),
+        "source-build receipt source path drifted"
+    );
+    // The receipt is deliberately sufficient for restart/hand-off. Do not
+    // reopen or hash the O(T) source here; `load_source` validates it at the
+    // only consumer that actually needs to decode it.
+    Ok(
+        json!({"schemaVersion":SOURCE_BUILD_RESULT_SCHEMA,"sourcePath":source_path.to_string_lossy(),"sourceSha256":sha_field(map,"sourceSha256")?,"receiptPath":receipt_path.to_string_lossy(),"receiptSha256":sha_field(map,"receiptSha256")?,"authorityId":sha_field(map,"authorityId")?,"taskMatrixSha256":sha_field(map,"taskMatrixSha256")?,"taskCount":unsigned(map,"taskCount")?}),
+    )
+}
+
+/// Public bounded validation seam for the Python handoff. It validates the
+/// self-hashed receipt and the exact source path without opening the source.
+pub fn validate_source_build_receipt(
+    receipt_path: &Path,
+    source_path: &Path,
+    source_sha256: &str,
+) -> Result<()> {
+    let receipt = read_canonical_value(receipt_path, "source-build receipt")?;
+    let map = object(&receipt, "source-build receipt")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "manifestSha256",
+            "freezerReceiptSha256",
+            "gatewayReceiptSha256",
+            "sourceSha256",
+            "authorityId",
+            "taskMatrixSha256",
+            "taskCount",
+            "sourcePath",
+            "receiptSha256",
+        ],
+        "source-build receipt",
+    )?;
+    ensure!(
+        text(map, "schemaVersion")? == SOURCE_BUILD_RECEIPT_SCHEMA
+            && canonical_sha256_without_object_field(&receipt, "receiptSha256")?
+                == sha_field(map, "receiptSha256")?
+            && text(map, "sourcePath")? == source_path.to_string_lossy()
+            && sha_field(map, "sourceSha256")? == source_sha256,
+        "source-build public receipt binding drifted"
+    );
+    Ok(())
+}
+
+fn read_canonical_value(path: &Path, label: &str) -> Result<Value> {
+    let path = existing_file(path, label)?;
+    let raw = fs::read(path)?;
+    let value: Value = serde_json::from_slice(&raw).with_context(|| format!("parse {label}"))?;
+    ensure!(
+        canonical_json_line(&value)? == raw,
+        "{label} must be canonical JSON plus LF"
+    );
+    Ok(value)
+}
+
+fn read_pretty_value(path: &Path, label: &str) -> Result<Value> {
+    let path = existing_file(path, label)?;
+    let raw = fs::read(path)?;
+    let value: Value = serde_json::from_slice(&raw).with_context(|| format!("parse {label}"))?;
+    ensure!(
+        temporal_qd_contract::python_pretty_json_line(
+            &value,
+            temporal_qd_contract::JsonNewline::Lf
+        )? == raw,
+        "{label} must be deterministic pretty JSON plus LF"
+    );
+    Ok(value)
+}
+
+fn sha_file(path: &Path) -> Result<String> {
+    let path = existing_file(path, "receipt-bound file")?;
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+fn safe_task_id(value: &str) -> Result<String> {
+    ensure!(
+        value.len() <= 160
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'.' | b'_' | b':' | b'-')),
+        "gateway task id is unsafe"
+    );
+    Ok(value.to_owned())
+}
+
+/// Stream and validate the v2 gateway inventory. The execution receipt is
+/// bounded; all task-scale claims live in this independently self-hashed JSONL
+/// sidecar and are checked before source construction.
+fn load_gateway_result_inventory(
+    sidecar: &Path,
+    receipt: &Map<String, Value>,
+) -> Result<BTreeMap<String, Value>> {
+    let root_path = sidecar.join("result-inventory.json");
+    let root = read_canonical_value(&root_path, "gateway result inventory root")?;
+    let root_map = object(&root, "gateway result inventory root")?;
+    exact_keys(
+        root_map,
+        &[
+            "schemaVersion",
+            "inventoryRelativePath",
+            "inventorySha256",
+            "inventorySizeBytes",
+            "inventoryCount",
+            "resultInventoryRootSha256",
+        ],
+        "gateway result inventory root",
+    )?;
+    ensure!(
+        text(root_map, "schemaVersion")? == GATEWAY_RESULT_INVENTORY_ROOT_SCHEMA_V2
+            && text(root_map, "inventoryRelativePath")? == "result-inventory.jsonl"
+            && canonical_sha256_without_object_field(&root, "resultInventoryRootSha256")?
+                == sha_field(root_map, "resultInventoryRootSha256")?
+            && sha_field(root_map, "resultInventoryRootSha256")?
+                == sha_field(receipt, "resultInventoryRootSha256")?
+            && sha_field(root_map, "inventorySha256")?
+                == sha_field(receipt, "resultInventorySha256")?
+            && unsigned(root_map, "inventorySizeBytes")?
+                == unsigned(receipt, "resultInventorySizeBytes")?
+            && unsigned(root_map, "inventoryCount")? == unsigned(receipt, "resultInventoryCount")?,
+        "gateway result inventory root receipt binding drifted"
+    );
+    let inventory_path = existing_file(
+        &sidecar.join(text(root_map, "inventoryRelativePath")?),
+        "gateway result inventory",
+    )?;
+    ensure!(
+        sha_file(&inventory_path)? == sha_field(root_map, "inventorySha256")?
+            && fs::metadata(&inventory_path)?.len() == unsigned(root_map, "inventorySizeBytes")?,
+        "gateway result inventory bytes drifted"
+    );
+    let mut out = BTreeMap::new();
+    let mut ordinal = 0_u64;
+    for line in BufReader::new(File::open(inventory_path)?).lines() {
+        let line = line?;
+        ensure!(!line.is_empty(), "gateway result inventory has empty line");
+        let row: Value = serde_json::from_str(&line)?;
+        ensure!(
+            canonical_json_bytes(&row)? == line.as_bytes(),
+            "gateway result inventory line is not canonical"
+        );
+        let map = object(&row, "gateway receipt inventory row")?;
+        exact_keys(
+            map,
+            &[
+                "schemaVersion",
+                "ordinal",
+                "taskId",
+                "taskSha256",
+                "completionSha256",
+                "resultBlobSha256",
+                "resultSemanticSha256",
+                "outcome",
+                "entrySha256",
+            ],
+            "gateway receipt inventory row",
+        )?;
+        ensure!(
+            text(map, "schemaVersion")? == GATEWAY_RESULT_INVENTORY_ENTRY_SCHEMA_V2
+                && unsigned(map, "ordinal")? == ordinal
+                && canonical_sha256_without_object_field(&row, "entrySha256")?
+                    == sha_field(map, "entrySha256")?,
+            "gateway receipt inventory row identity drifted"
+        );
+        let task_id = safe_task_id(&text(map, "taskId")?)?;
+        for field_name in [
+            "taskSha256",
+            "completionSha256",
+            "resultBlobSha256",
+            "resultSemanticSha256",
+        ] {
+            sha_field(map, field_name)?;
+        }
+        ensure!(
+            matches!(text(map, "outcome")?.as_str(), "admitted" | "rejected"),
+            "gateway receipt inventory outcome is invalid"
+        );
+        ensure!(
+            out.insert(task_id, row.clone()).is_none(),
+            "gateway receipt inventory has duplicate task ids"
+        );
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("gateway result inventory ordinal overflow"))?;
+    }
+    ensure!(
+        out.len() as u64 == unsigned(receipt, "taskCount")?
+            && out.len() as u64 == unsigned(receipt, "resultInventoryCount")?,
+        "gateway receipt inventory count drifted"
+    );
+    Ok(out)
+}
+
+fn load_gateway_index(path: &Path) -> Result<BTreeMap<String, String>> {
+    let path = existing_file(path, "gateway task index")?;
+    let reader = BufReader::new(File::open(path)?);
+    let mut out = BTreeMap::new();
+    for line in reader.lines() {
+        let line = line?;
+        ensure!(!line.is_empty(), "gateway task index has empty line");
+        let value: Value = serde_json::from_str(&line)?;
+        ensure!(
+            canonical_json_bytes(&value)? == line.as_bytes(),
+            "gateway task index line is not canonical"
+        );
+        let map = object(&value, "gateway task index entry")?;
+        exact_keys(
+            map,
+            &[
+                "schemaVersion",
+                "ordinal",
+                "taskId",
+                "taskSha256",
+                "taskObjectSha256",
+                "relativePath",
+                "entrySha256",
+            ],
+            "gateway task index entry",
+        )?;
+        ensure!(
+            text(map, "schemaVersion")? == "temporal_qd_native_gateway_task_index_entry_v1"
+                && canonical_sha256_without_object_field(&value, "entrySha256")?
+                    == sha_field(map, "entrySha256")?,
+            "gateway task index entry identity drifted"
+        );
+        let id = safe_task_id(&text(map, "taskId")?)?;
+        ensure!(
+            text(map, "relativePath")? == format!("tasks/{id}.json"),
+            "gateway task index path is unsafe"
+        );
+        ensure!(
+            out.insert(id, sha_field(map, "taskSha256")?).is_none(),
+            "gateway task index has duplicate task ids"
+        );
+    }
+    Ok(out)
+}
+
+fn load_gateway_journal(
+    path: &Path,
+    gateway_root: &Path,
+    inventory: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>> {
+    let path = existing_file(path, "gateway completion journal")?;
+    let reader = BufReader::new(File::open(path)?);
+    let mut out = BTreeMap::new();
+    let mut ordinal = 0_u64;
+    for line in reader.lines() {
+        let line = line?;
+        ensure!(
+            !line.is_empty(),
+            "gateway completion journal has empty line"
+        );
+        let value: Value = serde_json::from_str(&line)?;
+        ensure!(
+            canonical_json_bytes(&value)? == line.as_bytes(),
+            "gateway completion journal line is not canonical"
+        );
+        let map = object(&value, "gateway completion journal entry")?;
+        exact_keys(
+            map,
+            &[
+                "schemaVersion",
+                "ordinal",
+                "taskId",
+                "taskSha256",
+                "completionSha256",
+                "record",
+                "entrySha256",
+            ],
+            "gateway completion journal entry",
+        )?;
+        ensure!(
+            text(map, "schemaVersion")? == "temporal_qd_native_gateway_completion_journal_entry_v1"
+                && unsigned(map, "ordinal")? == ordinal
+                && canonical_sha256_without_object_field(&value, "entrySha256")?
+                    == sha_field(map, "entrySha256")?,
+            "gateway completion journal identity drifted"
+        );
+        let id = safe_task_id(&text(map, "taskId")?)?;
+        let record = object(field(map, "record")?, "gateway completion record")?;
+        let inventory_row = inventory
+            .get(&id)
+            .ok_or_else(|| anyhow!("gateway completion is absent from receipt inventory"))?;
+        let inventory_map = object(inventory_row, "gateway receipt inventory row")?;
+        ensure!(
+            sha_field(map, "taskSha256")? == sha_field(inventory_map, "taskSha256")?
+                && sha_field(map, "completionSha256")?
+                    == sha_field(inventory_map, "completionSha256")?
+                && sha_field(record, "resultBlobSha256")?
+                    == sha_field(inventory_map, "resultBlobSha256")?
+                && sha_field(record, "resultSemanticSha256")?
+                    == sha_field(inventory_map, "resultSemanticSha256")?,
+            "gateway journal/receipt inventory binding drifted"
+        );
+        ensure!(
+            record
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("admitted")
+                == text(inventory_map, "outcome")?,
+            "gateway journal terminal disposition drifted"
+        );
+        ensure!(
+            text(record, "resultPath")?
+                == gateway_root
+                    .join("results")
+                    .join(format!("{id}.json.gz"))
+                    .to_string_lossy(),
+            "gateway completion result path is unsafe"
+        );
+        ensure!(
+            out.insert(id, Value::Object(record.clone())).is_none(),
+            "gateway completion journal has duplicate task ids"
+        );
+        ordinal += 1;
+    }
+    ensure!(
+        out.len() == inventory.len(),
+        "gateway completion journal inventory coverage drifted"
+    );
+    Ok(out)
 }
 
 fn parse_manifest(raw: &[u8], allow_legacy_committed_manifest: bool) -> Result<Manifest> {
@@ -185,6 +983,21 @@ fn parse_manifest(raw: &[u8], allow_legacy_committed_manifest: bool) -> Result<M
         }
         None => bail!("campaign seal manifest lacks runtime authority"),
     };
+    let directional_tail_authority = match map.get("directionalTailAuthority") {
+        Some(value) => {
+            manifest_keys.push("directionalTailAuthority");
+            Some(validate_directional_tail_authority(
+                value,
+                runtime_authority_sha256.as_deref(),
+                unsigned(map, "generationIndex")?,
+            )?)
+        }
+        None => None,
+    };
+    ensure!(
+        runtime_authority_sha256.is_none() || directional_tail_authority.is_some(),
+        "current runtime campaign requires directional tail authority"
+    );
     exact_keys(map, &manifest_keys, "campaign seal manifest")?;
     ensure!(
         text(map, "schemaVersion")? == MANIFEST_SCHEMA,
@@ -218,9 +1031,86 @@ fn parse_manifest(raw: &[u8], allow_legacy_committed_manifest: bool) -> Result<M
         minimum_trades_per_window: nonnegative(map, "minimumTradesPerWindow")?,
         cap_trades: nonnegative(map, "capTrades")?,
         provisional_limit: usize::try_from(unsigned(map, "provisionalLimit")?)?,
+        directional_tail_authority,
         manifest_sha256,
     }
     .validated()
+}
+
+/// The v3 index predates the exact direction-attributable replay projection.
+/// A v5 campaign must opt into this self-authenticating authority rather than
+/// treating a historic v3 projection as direction-safe by convention.
+fn validate_directional_tail_authority(
+    value: &Value,
+    runtime_authority_sha256: Option<&str>,
+    generation_index: u64,
+) -> Result<Value> {
+    let map = object(value, "directional tail authority")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "runtimeAuthoritySha256",
+            "tailResultIndexSchema",
+            "tailResultEntrySchema",
+            "rawRotatingProvenanceSchema",
+            "tailAuthoritySha256",
+        ],
+        "directional tail authority",
+    )?;
+    ensure!(
+        text(map, "schemaVersion")? == DIRECTIONAL_TAIL_AUTHORITY_SCHEMA,
+        "directional tail authority schema is incompatible"
+    );
+    ensure!(
+        unsigned(map, "generationIndex")? == generation_index,
+        "directional tail authority generation binding drifted"
+    );
+    let runtime = runtime_authority_sha256
+        .ok_or_else(|| anyhow!("directional tail authority requires runtime authority"))?;
+    ensure!(
+        sha_field(map, "runtimeAuthoritySha256")? == runtime,
+        "directional tail authority runtime binding drifted"
+    );
+    ensure!(
+        text(map, "tailResultIndexSchema")? == DIRECTIONAL_INDEX_SCHEMA
+            && text(map, "tailResultEntrySchema")? == DIRECTIONAL_ENTRY_SCHEMA
+            && text(map, "rawRotatingProvenanceSchema")? == RAW_ROTATING_PROVENANCE_SCHEMA,
+        "directional tail authority contract is incompatible"
+    );
+    let supplied = sha_field(map, "tailAuthoritySha256")?;
+    ensure!(
+        canonical_sha256_without_object_field(value, "tailAuthoritySha256")? == supplied,
+        "directional tail authority identity mismatch"
+    );
+    Ok(value.clone())
+}
+
+impl Manifest {
+    fn index_path(&self) -> &'static str {
+        if self.directional_tail_authority.is_some() {
+            DIRECTIONAL_INDEX_PATH
+        } else {
+            INDEX_PATH
+        }
+    }
+
+    fn index_schema(&self) -> &'static str {
+        if self.directional_tail_authority.is_some() {
+            DIRECTIONAL_INDEX_SCHEMA
+        } else {
+            INDEX_SCHEMA
+        }
+    }
+
+    fn entry_schema(&self) -> &'static str {
+        if self.directional_tail_authority.is_some() {
+            DIRECTIONAL_ENTRY_SCHEMA
+        } else {
+            ENTRY_SCHEMA
+        }
+    }
 }
 
 impl Manifest {
@@ -231,6 +1121,96 @@ impl Manifest {
         );
         Ok(self)
     }
+}
+
+/// Reconstruct the compact `SourceTask` projection used by the campaign seal
+/// from exactly one row emitted by the native task-matrix freezer.  Keeping
+/// this private prevents a dispatcher from manufacturing alternate bindings;
+/// the public admission function above is the only supported entry point.
+fn source_task_from_manifest_row(task_manifest_row: &Value) -> Result<SourceTask> {
+    let row = object(task_manifest_row, "immutable task manifest row")?;
+    exact_keys(
+        row,
+        &[
+            "task_id",
+            "lane_id",
+            "attempt_id",
+            "task_kind",
+            "payload",
+            "required_worker_capabilities",
+            "deadline_seconds",
+            "max_attempts",
+        ],
+        "immutable task manifest row",
+    )?;
+    let task_id = safe_identifier(field(row, "task_id")?, "task manifest task_id")?;
+    ensure!(
+        field(row, "attempt_id")? == &Value::String(task_id.clone()),
+        "task manifest attempt_id must equal task_id"
+    );
+    ensure!(
+        field(row, "task_kind")? == &Value::String("temporal_graph_candidate_window".into()),
+        "task manifest task_kind is incompatible"
+    );
+    safe_identifier(field(row, "lane_id")?, "task manifest lane_id")?;
+    nonnegative_integral_number(row, "deadline_seconds")?;
+    unsigned(row, "max_attempts")?;
+    ensure!(
+        field(row, "required_worker_capabilities")?.is_array(),
+        "task manifest required_worker_capabilities must be an array"
+    );
+
+    let payload = field(row, "payload")?.clone();
+    let payload_map = object(&payload, "immutable task manifest payload")?;
+    ensure!(
+        field(payload_map, "job_id")? == &Value::String(task_id.clone()),
+        "task manifest payload job_id must equal task_id"
+    );
+    safe_identifier(field(payload_map, "job_id")?, "task manifest job_id")?;
+    let candidate_id = text(payload_map, "candidate_id")?;
+    let authority_id = text(payload_map, "authority_id")?;
+    let lake_window_semantic_sha256 = text(payload_map, "lake_window_semantic_sha256")?;
+    let shared_observation_stream_id = text(payload_map, "shared_observation_stream_id")?;
+    let analysis_window_start = text(payload_map, "analysis_window_start")?;
+    let analysis_window_end = text(payload_map, "analysis_window_end")?;
+    let evidence_plan = object(
+        field(payload_map, "evidence_plan")?,
+        "immutable task manifest evidence plan",
+    )?;
+    let evidence_plan_id = sha_field(evidence_plan, "plan_id")?;
+    nonnegative_value(
+        field(payload_map, "bar_limit")?,
+        "task manifest bar_limit",
+        1,
+    )?;
+
+    let task_payload_sha256 = canonical_sha256(&payload)?;
+    let task = json!({
+        "taskId": task_id,
+        "candidateId": candidate_id,
+        "analysisWindowStart": analysis_window_start,
+        "analysisWindowEnd": analysis_window_end,
+        "evidencePlanSemanticSha256": evidence_plan_id,
+        "taskPayloadSha256": task_payload_sha256,
+    });
+    let binding = json!({
+        "taskKind": "temporal_graph_candidate_window",
+        "jobId": payload_map.get("job_id").cloned().expect("checked job_id"),
+        "authorityId": authority_id,
+        "candidateId": payload_map.get("candidate_id").cloned().expect("checked candidate_id"),
+        "evidencePlanId": evidence_plan.get("plan_id").cloned().expect("checked plan_id"),
+        "lakeWindowSemanticSha256": lake_window_semantic_sha256,
+        "sharedObservationStreamId": shared_observation_stream_id,
+    });
+    Ok(SourceTask {
+        task,
+        task_payload: payload,
+        // The online dispatcher does not have (or need) a raw gzip path/ref at
+        // this admission point.  Those are created after material admission.
+        raw_result_path: PathBuf::new(),
+        raw_ref: Value::Null,
+        binding,
+    })
 }
 
 fn load_source(manifest: &Manifest, verify_raw_paths: bool) -> Result<Source> {
@@ -514,7 +1494,10 @@ fn load_source(manifest: &Manifest, verify_raw_paths: bool) -> Result<Source> {
     })
 }
 
-fn build_index_and_inventory(source: &Source) -> Result<(Value, Vec<u8>, ReadMetrics)> {
+fn build_index_and_inventory(
+    source: &Source,
+    manifest: &Manifest,
+) -> Result<(Value, Vec<u8>, ReadMetrics)> {
     let mut entries = Vec::with_capacity(source.tasks.len());
     let mut inventory = Vec::new();
     let mut metrics = ReadMetrics::default();
@@ -560,7 +1543,13 @@ fn build_index_and_inventory(source: &Source) -> Result<(Value, Vec<u8>, ReadMet
         } else if text(object(&result, "raw result")?, "schema_version")? == REJECTED_SCHEMA {
             validate_warmup_rejected_candidate_window_result(&result, source_task)?;
         }
-        let entry = build_entry(&result, source_task, source.include_funnel)?;
+        let entry = build_entry(
+            &result,
+            source_task,
+            source.include_funnel,
+            manifest.directional_tail_authority.is_some(),
+            manifest.entry_schema(),
+        )?;
         let inventory_row = json!({
             "schemaVersion": "temporal_qd_raw_result_inventory_entry_v1",
             "taskId": text(object(&source_task.task, "source task")?, "taskId")?,
@@ -570,7 +1559,7 @@ fn build_index_and_inventory(source: &Source) -> Result<(Value, Vec<u8>, ReadMet
         entries.push(entry);
     }
     let mut index = json!({
-        "schemaVersion": INDEX_SCHEMA,
+        "schemaVersion": manifest.index_schema(),
         "authorityId": source.authority_id,
         "authoritySha256": source.authority_sha256,
         "taskMatrixSha256": source.task_matrix_sha256,
@@ -1791,7 +2780,13 @@ fn cost_view_path_sha256(replay: &Map<String, Value>, name: &str) -> Result<Stri
     )?)
 }
 
-fn build_entry(result: &Value, source_task: &SourceTask, include_funnel: bool) -> Result<Value> {
+fn build_entry(
+    result: &Value,
+    source_task: &SourceTask,
+    include_funnel: bool,
+    direction_aware: bool,
+    entry_schema: &str,
+) -> Result<Value> {
     let result_map = object(result, "raw result")?;
     let task = object(&source_task.task, "source task")?;
     let schema = text(result_map, "schema_version")?;
@@ -1816,15 +2811,31 @@ fn build_entry(result: &Value, source_task: &SourceTask, include_funnel: bool) -
     let task_id = field(task, "taskId")?.clone();
     let result_sha = field(raw_ref, "resultSha256")?.clone();
     let mut entry = json!({
-        "schemaVersion": ENTRY_SCHEMA,
+        "schemaVersion": entry_schema,
         "task": source_task.task,
         "rawResultRef": source_task.raw_ref,
-        "rawTaskProvenance": { "taskId": task_id, "resultSha256": result_sha },
+        "rawTaskProvenance": { "taskId": task_id.clone(), "resultSha256": result_sha.clone() },
     });
     let entry_map = entry.as_object_mut().expect("entry is object");
     if record.get("evaluationRejected") == Some(&Value::Bool(true)) {
         entry_map.insert("rejection".into(), field(&record, "rejection")?.clone());
     } else {
+        if direction_aware {
+            let behavior = record
+                .get("realizedBehavior")
+                .ok_or_else(|| anyhow!("directional tail record lacks realized behavior"))?;
+            entry_map.insert(
+                "rawRotatingProvenance".into(),
+                json!({
+                    "schemaVersion": RAW_ROTATING_PROVENANCE_SCHEMA,
+                    "taskId": task_id,
+                    "resultSha256": result_sha,
+                    "observationStreamSha256": field(&record, "observationStreamSha256")?,
+                    "conservativeReplayStreamSha256": conservative_replay_stream_sha256(result)?,
+                    "realizedBehaviorSha256": canonical_sha256(behavior)?,
+                }),
+            );
+        }
         entry_map.insert(
             "stageProjection".into(),
             stage_projection(&Value::Object(record.clone()))?,
@@ -2105,7 +3116,367 @@ fn window_record(result: &Value) -> Result<Map<String, Value>> {
     put!("averageMfeR", number(average(&mfe)));
     put!("averageMaeR", number(average(&mae)));
     put!("equityCurveR", economic_curve);
+    // This exact raw replay projection is intentionally built inside the
+    // native raw-read boundary.  It is never supplied by Python as a rich
+    // result projection: the later reducer consumes only the authenticated
+    // compact stage record.
+    put!(
+        "realizedBehavior",
+        build_window_realized_behavior(
+            conservative_replay,
+            conservative,
+            &format!(
+                "{}/{}",
+                python_string(root.get("analysis_window_start")),
+                python_string(root.get("analysis_window_end")),
+            ),
+        )?
+    );
     Ok(record)
+}
+
+fn conservative_replay_stream_sha256(result: &Value) -> Result<Value> {
+    let root = object(result, "raw result")?;
+    let cost_views = object(field(root, "cost_view_results")?, "cost view results")?;
+    Ok(field(replay(cost_views, "research_conservative")?, "streamSha256")?.clone())
+}
+
+#[derive(Default)]
+struct WindowBehaviorSide {
+    closed_trades: i64,
+    wins: i64,
+    losses: i64,
+    flat_trades: i64,
+    gross_r: f64,
+    net_r: f64,
+    cost_r: f64,
+    holding_bars: i64,
+    holding_hours: f64,
+    close_reason_counts: BTreeMap<String, i64>,
+    action_counts: BTreeMap<String, i64>,
+    transition_counts: BTreeMap<String, i64>,
+    trade_sequence: Vec<Value>,
+    terminal_status_counts: BTreeMap<String, i64>,
+    terminal_direction_count: i64,
+    conflict_abstentions: i64,
+}
+
+fn build_window_realized_behavior(
+    replay_value: &Map<String, Value>,
+    metrics: &Map<String, Value>,
+    window_id: &str,
+) -> Result<Value> {
+    let trades = replay_value
+        .get("trades")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("conservative replay trades must be an array"))?;
+    let reported = nonnegative_i64_value(
+        metrics.get("tradesClosed").unwrap_or(&Value::from(0)),
+        "metrics tradesClosed",
+    )?;
+    let observations = nonnegative_i64_value(
+        metrics
+            .get("observationsProcessed")
+            .unwrap_or(&Value::from(0)),
+        "metrics observationsProcessed",
+    )?;
+    let mut sides = BTreeMap::from([
+        ("long", WindowBehaviorSide::default()),
+        ("short", WindowBehaviorSide::default()),
+    ]);
+    let mut trade_sides = BTreeMap::<String, String>::new();
+    let mut position_sides = BTreeMap::<String, String>::new();
+    let mut complete_economics = !trades.is_empty() && trades.len() as i64 == reported;
+    for (index, raw) in trades.iter().enumerate() {
+        let raw = object(raw, &format!("replay trades[{index}]"))?;
+        let direction = raw
+            .get("direction")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "long" | "short"))
+            .ok_or_else(|| anyhow!("replay trades[{index}] direction must be long or short"))?;
+        let side = sides.get_mut(direction).expect("fixed directions");
+        if let Some(value) = raw.get("tradeId").filter(|v| !v.is_null()) {
+            trade_sides.insert(python_string(Some(value)), direction.to_owned());
+        }
+        if let Some(value) = raw.get("positionId").filter(|v| !v.is_null()) {
+            position_sides.insert(python_string(Some(value)), direction.to_owned());
+        }
+        let gross_present = raw.contains_key("grossR");
+        let net_present = raw.contains_key("netR");
+        ensure!(
+            gross_present == net_present,
+            "replay trades[{index}] grossR/netR must be paired"
+        );
+        let (gross_r, net_r) = if gross_present {
+            (
+                finite_required(
+                    field(raw, "grossR")?,
+                    &format!("replay trades[{index}] grossR"),
+                )?,
+                finite_required(field(raw, "netR")?, &format!("replay trades[{index}] netR"))?,
+            )
+        } else {
+            complete_economics = false;
+            (0.0, 0.0)
+        };
+        let holding = nonnegative_i64_value(
+            raw.get("holdingBars").unwrap_or(&Value::from(0)),
+            &format!("replay trades[{index}] holdingBars"),
+        )?;
+        let hours = finite_required(
+            raw.get("holdingHours").unwrap_or(&Value::from(0.0)),
+            &format!("replay trades[{index}] holdingHours"),
+        )?;
+        ensure!(
+            hours >= 0.0,
+            "replay trades[{index}] holdingHours must be nonnegative"
+        );
+        side.closed_trades += 1;
+        side.gross_r += gross_r;
+        side.net_r += net_r;
+        // Preserve Python's per-trade operation order. Computing this only
+        // from accumulated totals changes IEEE-754 output bytes on real tails.
+        side.cost_r += gross_r - net_r;
+        side.holding_bars += holding;
+        side.holding_hours += hours;
+        if net_r > 0.0 {
+            side.wins += 1;
+        } else if net_r < 0.0 {
+            side.losses += 1;
+        } else {
+            side.flat_trades += 1;
+        }
+        increment_behavior_count(
+            &mut side.close_reason_counts,
+            python_or_unknown(raw.get("closeReason")),
+        )?;
+        side.trade_sequence.push(json!({
+            "entryClockIndex": nonnegative_i64_value(raw.get("entryClockIndex").unwrap_or(&Value::from(0)), &format!("replay trades[{index}] entryClockIndex"))?,
+            "exitClockIndex": nonnegative_i64_value(raw.get("exitClockIndex").unwrap_or(&Value::from(0)), &format!("replay trades[{index}] exitClockIndex"))?,
+            "entryTime": raw.get("entryTime").cloned().unwrap_or(Value::Null),
+            "exitTime": raw.get("exitTime").cloned().unwrap_or(Value::Null),
+            "holdingBars": holding, "holdingHours": hours,
+            "closeReason": python_or_unknown(raw.get("closeReason")),
+            "grossR": gross_r, "netR": net_r,
+        }));
+    }
+
+    let mut conflict_abstentions = 0i64;
+    let mut unattributed_conflicts = 0i64;
+    for (key, label, target_is_action) in [
+        ("executionTraces", "actionKind", true),
+        ("graphTraces", "transitionId", false),
+    ] {
+        let traces = replay_value
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("conservative replay {key} must be an array"))?;
+        for (index, trace) in traces.iter().enumerate() {
+            let trace = object(trace, &format!("conservative replay {key}[{index}]"))?;
+            let side_name = trace_side(trace, &trade_sides, &position_sides)?;
+            if let (Some(side_name), Some(value)) = (side_name.as_deref(), trace.get(label)) {
+                if !value.is_null() {
+                    let target = sides.get_mut(side_name).expect("fixed direction");
+                    if target_is_action {
+                        increment_behavior_count(
+                            &mut target.action_counts,
+                            python_or_unknown(Some(value)),
+                        )?;
+                    } else {
+                        increment_behavior_count(
+                            &mut target.transition_counts,
+                            python_or_unknown(Some(value)),
+                        )?;
+                    }
+                }
+            }
+            if trace_is_conflict_abstention(trace) {
+                conflict_abstentions += 1;
+                if let Some(side_name) = side_name {
+                    sides
+                        .get_mut(side_name.as_str())
+                        .expect("fixed direction")
+                        .conflict_abstentions += 1;
+                } else {
+                    unattributed_conflicts += 1;
+                }
+            }
+        }
+    }
+
+    let mut terminal = json!({"positionStatus": "unavailable", "direction": null});
+    if let Some(value) = metrics
+        .get("terminalValuation")
+        .filter(|value| !value.is_null())
+    {
+        let terminal_map = object(value, "metrics terminalValuation")?;
+        let status = python_or_unknown(terminal_map.get("positionStatus"));
+        let direction = terminal_map
+            .get("direction")
+            .cloned()
+            .unwrap_or(Value::Null);
+        terminal = json!({"positionStatus": status, "direction": direction});
+        if !direction.is_null() {
+            let direction = direction
+                .as_str()
+                .filter(|value| matches!(*value, "long" | "short"))
+                .ok_or_else(|| anyhow!("terminal direction must be long or short"))?;
+            let side = sides.get_mut(direction).expect("fixed direction");
+            side.terminal_direction_count += 1;
+            increment_behavior_count(&mut side.terminal_status_counts, status)?;
+            side.gross_r += finite_required(
+                terminal_map.get("grossR").unwrap_or(&Value::Null),
+                "terminal grossR",
+            )?;
+            side.net_r += finite_required(
+                terminal_map.get("netR").unwrap_or(&Value::Null),
+                "terminal netR",
+            )?;
+            side.cost_r += finite_required(
+                terminal_map.get("grossR").unwrap_or(&Value::Null),
+                "terminal grossR",
+            )? - finite_required(
+                terminal_map.get("netR").unwrap_or(&Value::Null),
+                "terminal netR",
+            )?;
+        } else {
+            ensure!(
+                matches!(status.as_str(), "no_open_position" | "none" | "unknown"),
+                "terminal position status requires a direction"
+            );
+        }
+    }
+    if complete_economics {
+        let expected_gross = finite_required(
+            metrics.get("totalGrossR").unwrap_or(&Value::Null),
+            "metrics totalGrossR",
+        )?;
+        let expected_net = finite_required(
+            metrics.get("totalNetR").unwrap_or(&Value::Null),
+            "metrics totalNetR",
+        )?;
+        let terminal_direction = terminal.get("direction").and_then(Value::as_str);
+        let terminal_map = metrics.get("terminalValuation").and_then(Value::as_object);
+        let terminal_gross = if terminal_direction.is_some() {
+            finite_required(
+                terminal_map
+                    .and_then(|map| map.get("grossR"))
+                    .unwrap_or(&Value::Null),
+                "terminal grossR",
+            )?
+        } else {
+            0.0
+        };
+        let terminal_net = if terminal_direction.is_some() {
+            finite_required(
+                terminal_map
+                    .and_then(|map| map.get("netR"))
+                    .unwrap_or(&Value::Null),
+                "terminal netR",
+            )?
+        } else {
+            0.0
+        };
+        let gross: f64 = sides.values().map(|side| side.gross_r).sum();
+        let net: f64 = sides.values().map(|side| side.net_r).sum();
+        ensure!(
+            (gross - terminal_gross - expected_gross).abs() <= 1e-9
+                && (net - terminal_net - expected_net).abs() <= 1e-9,
+            "replay trade economics do not reconcile with metrics"
+        );
+    }
+    let mut rendered_sides = Map::new();
+    for name in ["long", "short"] {
+        let side = sides.get(name).expect("fixed direction");
+        rendered_sides.insert(name.to_owned(), json!({
+            "closedTrades": side.closed_trades, "wins": side.wins, "losses": side.losses, "flatTrades": side.flat_trades,
+            "grossR": side.gross_r, "netR": side.net_r, "costR": side.cost_r, "holdingBars": side.holding_bars, "holdingHours": side.holding_hours,
+            "closeReasonCounts": side.close_reason_counts, "actionCounts": side.action_counts, "transitionCounts": side.transition_counts,
+            "tradeSequence": side.trade_sequence, "terminalStatusCounts": side.terminal_status_counts,
+            "terminalDirectionCount": side.terminal_direction_count, "conflictAbstentions": side.conflict_abstentions,
+            "active": side.closed_trades != 0 || side.terminal_direction_count != 0,
+            "exposureProxy": if observations == 0 { 0.0 } else { side.holding_bars as f64 / observations as f64 },
+            "averageHoldingBars": if side.closed_trades == 0 { 0.0 } else { side.holding_bars as f64 / side.closed_trades as f64 },
+            "closeReasonDistribution": behavior_distribution(&side.close_reason_counts),
+            "actionDistribution": behavior_distribution(&side.action_counts),
+            "transitionDistribution": behavior_distribution(&side.transition_counts),
+        }));
+    }
+    Ok(json!({
+        "schemaVersion": "temporal_realized_behavior_v1", "windowId": window_id,
+        "reportedClosedTrades": reported, "materializedClosedTrades": trades.len(), "unattributedClosedTrades": 0,
+        "observations": observations, "terminal": terminal, "conflictAbstentions": conflict_abstentions,
+        "unattributedConflictAbstentions": unattributed_conflicts, "sides": rendered_sides,
+    }))
+}
+
+fn nonnegative_i64_value(value: &Value, label: &str) -> Result<i64> {
+    value
+        .as_i64()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| anyhow!("{label} must be nonnegative"))
+}
+fn finite_required(value: &Value, label: &str) -> Result<f64> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow!("{label} must be finite"))
+}
+fn increment_behavior_count(counts: &mut BTreeMap<String, i64>, key: String) -> Result<()> {
+    let value = counts.entry(key).or_default();
+    *value = value
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("realized behavior count overflow"))?;
+    Ok(())
+}
+fn python_or_unknown(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "unknown".to_owned(),
+        Some(Value::String(value)) if value.is_empty() => "unknown".to_owned(),
+        Some(value) => python_string(Some(value)),
+    }
+}
+fn behavior_distribution(counts: &BTreeMap<String, i64>) -> Value {
+    let total: i64 = counts.values().sum();
+    if total <= 0 {
+        return json!({});
+    }
+    Value::Object(
+        counts
+            .iter()
+            .map(|(key, count)| (key.clone(), number(*count as f64 / total as f64)))
+            .collect(),
+    )
+}
+fn trace_side(
+    trace: &Map<String, Value>,
+    trades: &BTreeMap<String, String>,
+    positions: &BTreeMap<String, String>,
+) -> Result<Option<String>> {
+    if let Some(direction) = trace.get("direction").filter(|value| !value.is_null()) {
+        return direction
+            .as_str()
+            .filter(|value| matches!(*value, "long" | "short"))
+            .map(ToOwned::to_owned)
+            .map(Some)
+            .ok_or_else(|| anyhow!("replay trace direction must be long or short"));
+    }
+    for (key, lookup) in [("tradeId", trades), ("positionId", positions)] {
+        if let Some(value) = trace.get(key).filter(|value| !value.is_null()) {
+            if let Some(direction) = lookup.get(&python_string(Some(value))) {
+                return Ok(Some(direction.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+fn trace_is_conflict_abstention(trace: &Map<String, Value>) -> bool {
+    let values = ["transitionId", "reasonCode", "actionKind", "status"]
+        .into_iter()
+        .map(|key| python_string(trace.get(key)).to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    values.contains("conflict") && (values.contains("abstain") || values.contains("reject"))
 }
 
 fn replay<'a>(cost_views: &'a Map<String, Value>, key: &str) -> Result<&'a Map<String, Value>> {
@@ -2260,7 +3631,7 @@ fn build_campaign_seal(
         "sourceResultBlobBytes": metrics.blob_bytes,
         "sourceResultUncompressedBytes": metrics.uncompressed_bytes,
         "sourceResultSemanticBytes": metrics.semantic_bytes,
-        "tailResultIndex": { "path": INDEX_PATH, "sha256": index_sha },
+        "tailResultIndex": { "path": manifest.index_path(), "sha256": index_sha },
         "rawResultInventory": { "path": INVENTORY_PATH, "sha256": inventory_sha256, "bytes": inventory_bytes },
     });
     if let Some(runtime_authority_sha256) = &manifest.runtime_authority_sha256 {
@@ -2342,7 +3713,7 @@ fn reopen_campaign_seal(output_dir: &Path, manifest: &Manifest, source: &Source)
         "raw result inventory",
     )?;
     let index_raw = fs::read(existing_file(
-        &output_dir.join(INDEX_PATH),
+        &output_dir.join(manifest.index_path()),
         "tail result index",
     )?)?;
     let index: Value = serde_json::from_slice(&index_raw)?;
@@ -2379,7 +3750,7 @@ fn run_tail_transaction(
         "operation": temporal_qd_tail_reducer::OPERATION,
         "evaluationPopulationPath": absolute_string(&manifest.evaluation_path)?,
         "evaluationPopulationSha256": manifest.evaluation_sha256,
-        "tailResultIndexPath": absolute_string(&output_dir.join(INDEX_PATH))?,
+        "tailResultIndexPath": absolute_string(&output_dir.join(manifest.index_path()))?,
         "tailResultIndexSha256": index_sha,
         "generationIndex": manifest.generation_index,
         "minimumTotalTrades": manifest.minimum_total_trades,
@@ -2560,6 +3931,521 @@ fn execution_response(
             "sourceResultSemanticBytes": metrics.semantic_bytes,
         }
     })
+}
+
+fn execution_v2_response(
+    output_dir: &Path,
+    receipt: Value,
+    restarted: bool,
+    raw_scan_millis: u64,
+    metrics: ReadMetrics,
+    started: Instant,
+) -> Result<Value> {
+    Ok(json!({
+        "schemaVersion": EXECUTION_V2_SCHEMA,
+        "restartedFromCommittedReceipt": restarted,
+        "receipt": {
+            "receiptPath": absolute_string(&output_dir.join(EXECUTION_RECEIPT_PATH))?,
+            "receiptSha256": sha_field(object(&receipt, "campaign execution receipt")?, "receiptSha256")?,
+        },
+        "runtimeMetrics": {
+            "elapsedMilliseconds": started.elapsed().as_millis() as u64,
+            "rawScanMilliseconds": raw_scan_millis,
+            "rawResultReadCount": metrics.raw_reads,
+            "sourceResultBlobBytes": metrics.blob_bytes,
+            "sourceResultUncompressedBytes": metrics.uncompressed_bytes,
+            "sourceResultSemanticBytes": metrics.semantic_bytes,
+        }
+    }))
+}
+
+fn publish_execution_receipt(
+    output_dir: &Path,
+    manifest: &Manifest,
+    transaction: &Value,
+) -> Result<Value> {
+    let runtime = manifest
+        .runtime_authority_sha256
+        .as_deref()
+        .ok_or_else(|| anyhow!("campaign execution v2 requires runtime authority"))?;
+    ensure!(
+        manifest.directional_tail_authority.is_some(),
+        "campaign execution v2 requires the v4 directional tail authority"
+    );
+    let seal = read_canonical_line_value(&output_dir.join(CAMPAIGN_SEAL_PATH), "campaign seal")?;
+    let index = read_canonical_value_no_lf(
+        &output_dir.join(DIRECTIONAL_INDEX_PATH),
+        "v4 tail result index",
+    )?;
+    let tail_authority = read_canonical_line_value(
+        &output_dir.join(temporal_qd_tail_reducer::TAIL_AUTHORITY_PATH),
+        "tail authority receipt",
+    )?;
+    validate_current_execution_chain(
+        output_dir,
+        manifest,
+        &seal,
+        transaction,
+        &index,
+        &tail_authority,
+    )?;
+    let mut receipt = json!({
+        "schemaVersion": EXECUTION_RECEIPT_SCHEMA,
+        "contractVersion": CONTRACT_VERSION,
+        "manifestSha256": manifest.manifest_sha256,
+        "runtimeAuthoritySha256": runtime,
+        "sourceSha256": manifest.source_sha256,
+        "campaignSeal": fixed_artifact_descriptor(
+            output_dir,
+            CAMPAIGN_SEAL_PATH,
+            "campaignSealSha256",
+            &seal,
+        )?,
+        "generationTailTransaction": fixed_artifact_descriptor(
+            output_dir,
+            TRANSACTION_PATH,
+            "transactionSha256",
+            transaction,
+        )?,
+        "tailResultIndex": fixed_artifact_descriptor(
+            output_dir,
+            DIRECTIONAL_INDEX_PATH,
+            "tailResultIndexSha256",
+            &index,
+        )?,
+        "tailAuthority": {
+            "receiptPath": temporal_qd_tail_reducer::TAIL_AUTHORITY_PATH,
+            "receiptSha256": sha_field(object(&tail_authority, "tail authority receipt")?, "tailAuthoritySha256")?,
+        },
+    });
+    add_identity(&mut receipt, "receiptSha256")?;
+    publish_bytes_once(
+        output_dir,
+        EXECUTION_RECEIPT_PATH,
+        &canonical_json_line(&receipt)?,
+    )?;
+    Ok(receipt)
+}
+
+fn reopen_execution_receipt(output_dir: &Path, manifest: &Manifest) -> Result<Value> {
+    let receipt = read_canonical_line_value(
+        &output_dir.join(EXECUTION_RECEIPT_PATH),
+        "campaign execution receipt",
+    )?;
+    let map = object(&receipt, "campaign execution receipt")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "manifestSha256",
+            "runtimeAuthoritySha256",
+            "sourceSha256",
+            "campaignSeal",
+            "generationTailTransaction",
+            "tailResultIndex",
+            "tailAuthority",
+            "receiptSha256",
+        ],
+        "campaign execution receipt",
+    )?;
+    ensure!(
+        text(map, "schemaVersion")? == EXECUTION_RECEIPT_SCHEMA
+            && text(map, "contractVersion")? == CONTRACT_VERSION,
+        "campaign execution receipt schema/version drifted"
+    );
+    ensure!(
+        field(map, "manifestSha256")? == &Value::String(manifest.manifest_sha256.clone())
+            && field(map, "sourceSha256")? == &Value::String(manifest.source_sha256.clone())
+            && field(map, "runtimeAuthoritySha256")?
+                == &Value::String(
+                    manifest
+                        .runtime_authority_sha256
+                        .clone()
+                        .context("current receipt requires runtime authority")?,
+                ),
+        "campaign execution receipt manifest/runtime/source binding drifted"
+    );
+    ensure!(
+        canonical_sha256_without_object_field(&receipt, "receiptSha256")?
+            == sha_field(map, "receiptSha256")?,
+        "campaign execution receipt identity drifted"
+    );
+
+    let seal = reopen_fixed_artifact(
+        output_dir,
+        field(map, "campaignSeal")?,
+        CAMPAIGN_SEAL_PATH,
+        "campaignSealSha256",
+        true,
+    )?;
+    let transaction = reopen_fixed_artifact(
+        output_dir,
+        field(map, "generationTailTransaction")?,
+        TRANSACTION_PATH,
+        "transactionSha256",
+        true,
+    )?;
+    let index = reopen_fixed_artifact(
+        output_dir,
+        field(map, "tailResultIndex")?,
+        DIRECTIONAL_INDEX_PATH,
+        "tailResultIndexSha256",
+        false,
+    )?;
+    let authority_ref = object(field(map, "tailAuthority")?, "tail authority reference")?;
+    exact_keys(
+        authority_ref,
+        &["receiptPath", "receiptSha256"],
+        "tail authority reference",
+    )?;
+    ensure!(
+        text(authority_ref, "receiptPath")? == temporal_qd_tail_reducer::TAIL_AUTHORITY_PATH,
+        "tail authority receipt path drifted"
+    );
+    let tail_authority = read_canonical_line_value(
+        &output_dir.join(temporal_qd_tail_reducer::TAIL_AUTHORITY_PATH),
+        "tail authority receipt",
+    )?;
+    ensure!(
+        sha_field(
+            object(&tail_authority, "tail authority receipt")?,
+            "tailAuthoritySha256"
+        )? == sha_field(authority_ref, "receiptSha256")?,
+        "tail authority receipt reference drifted"
+    );
+    validate_current_execution_chain(
+        output_dir,
+        manifest,
+        &seal,
+        &transaction,
+        &index,
+        &tail_authority,
+    )?;
+    Ok(receipt)
+}
+
+fn fixed_artifact_descriptor(
+    output_dir: &Path,
+    leaf: &str,
+    semantic_field: &str,
+    value: &Value,
+) -> Result<Value> {
+    let path = existing_file(&output_dir.join(leaf), leaf)?;
+    let raw = fs::read(&path)?;
+    let mut descriptor = json!({
+        "path": leaf,
+        "rawSha256": sha_bytes(&raw),
+        "sizeBytes": raw.len(),
+    });
+    descriptor
+        .as_object_mut()
+        .expect("descriptor object")
+        .insert(
+            semantic_field.to_owned(),
+            Value::String(sha_field(object(value, leaf)?, semantic_field)?),
+        );
+    Ok(descriptor)
+}
+
+fn reopen_fixed_artifact(
+    output_dir: &Path,
+    descriptor: &Value,
+    leaf: &str,
+    semantic_field: &str,
+    canonical_lf: bool,
+) -> Result<Value> {
+    let map = object(descriptor, "campaign execution artifact descriptor")?;
+    exact_keys(
+        map,
+        &["path", "rawSha256", "sizeBytes", semantic_field],
+        "campaign execution artifact descriptor",
+    )?;
+    ensure!(
+        text(map, "path")? == leaf,
+        "campaign execution artifact path drifted"
+    );
+    let path = existing_file(&output_dir.join(leaf), leaf)?;
+    let raw = fs::read(&path)?;
+    ensure!(
+        unsigned(map, "sizeBytes")? == raw.len() as u64
+            && sha_field(map, "rawSha256")? == sha_bytes(&raw),
+        "campaign execution artifact raw binding drifted"
+    );
+    let value: Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("parse campaign execution artifact {leaf}"))?;
+    if canonical_lf {
+        ensure!(
+            canonical_json_line(&value)? == raw,
+            "campaign execution artifact {leaf} is not canonical JSON plus LF"
+        );
+    } else {
+        ensure!(
+            canonical_json_bytes(&value)? == raw,
+            "campaign execution artifact {leaf} is not canonical JSON without LF"
+        );
+    }
+    let semantic = sha_field(object(&value, leaf)?, semantic_field)?;
+    ensure!(
+        semantic == sha_field(map, semantic_field)?
+            && canonical_sha256_without_object_field(&value, semantic_field)? == semantic,
+        "campaign execution artifact semantic binding drifted"
+    );
+    Ok(value)
+}
+
+fn read_canonical_line_value(path: &Path, label: &str) -> Result<Value> {
+    let raw = fs::read(existing_file(path, label)?)?;
+    let value: Value = serde_json::from_slice(&raw).with_context(|| format!("parse {label}"))?;
+    ensure!(
+        canonical_json_line(&value)? == raw,
+        "{label} is not canonical JSON plus LF"
+    );
+    Ok(value)
+}
+
+fn read_canonical_value_no_lf(path: &Path, label: &str) -> Result<Value> {
+    let raw = fs::read(existing_file(path, label)?)?;
+    let value: Value = serde_json::from_slice(&raw).with_context(|| format!("parse {label}"))?;
+    ensure!(
+        canonical_json_bytes(&value)? == raw,
+        "{label} is not canonical JSON without LF"
+    );
+    Ok(value)
+}
+
+fn validate_current_execution_chain(
+    output_dir: &Path,
+    manifest: &Manifest,
+    seal: &Value,
+    transaction: &Value,
+    index: &Value,
+    authority: &Value,
+) -> Result<()> {
+    let runtime = manifest
+        .runtime_authority_sha256
+        .as_deref()
+        .context("current execution chain lacks runtime authority")?;
+    let seal_map = object(seal, "campaign seal")?;
+    exact_keys(
+        seal_map,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "manifestSha256",
+            "runtimeAuthoritySha256",
+            "sourceSha256",
+            "authorityId",
+            "authoritySha256",
+            "taskMatrixSha256",
+            "taskManifestSha256",
+            "checkpointSha256",
+            "taskCount",
+            "rawResultReadCount",
+            "sourceResultBlobBytes",
+            "sourceResultUncompressedBytes",
+            "sourceResultSemanticBytes",
+            "tailResultIndex",
+            "rawResultInventory",
+            "campaignSealSha256",
+        ],
+        "current campaign seal",
+    )?;
+    ensure!(
+        text(seal_map, "schemaVersion")? == CAMPAIGN_SEAL_SCHEMA
+            && text(seal_map, "contractVersion")? == CONTRACT_VERSION
+            && sha_field(seal_map, "manifestSha256")? == manifest.manifest_sha256
+            && sha_field(seal_map, "runtimeAuthoritySha256")? == runtime
+            && sha_field(seal_map, "sourceSha256")? == manifest.source_sha256
+            && canonical_sha256_without_object_field(seal, "campaignSealSha256")?
+                == sha_field(seal_map, "campaignSealSha256")?,
+        "current campaign seal manifest/runtime/source identity drifted"
+    );
+    let seal_index = object(field(seal_map, "tailResultIndex")?, "campaign seal index")?;
+    exact_keys(seal_index, &["path", "sha256"], "campaign seal index")?;
+    ensure!(
+        text(seal_index, "path")? == DIRECTIONAL_INDEX_PATH,
+        "current campaign seal does not bind the fixed v4 index"
+    );
+
+    let index_map = object(index, "v4 tail result index")?;
+    exact_keys(
+        index_map,
+        &[
+            "schemaVersion",
+            "authorityId",
+            "authoritySha256",
+            "taskMatrixSha256",
+            "taskManifestSha256",
+            "checkpointSha256",
+            "taskCount",
+            "funnelProjectionIncluded",
+            "sourceResultBlobBytes",
+            "entries",
+            "tailResultIndexSha256",
+        ],
+        "v4 tail result index",
+    )?;
+    let index_sha = sha_field(index_map, "tailResultIndexSha256")?;
+    ensure!(
+        text(index_map, "schemaVersion")? == DIRECTIONAL_INDEX_SCHEMA
+            && canonical_sha256_without_object_field(index, "tailResultIndexSha256")? == index_sha
+            && sha_field(seal_index, "sha256")? == index_sha
+            && field(index_map, "authorityId")? == field(seal_map, "authorityId")?
+            && field(index_map, "authoritySha256")? == field(seal_map, "authoritySha256")?
+            && field(index_map, "taskMatrixSha256")? == field(seal_map, "taskMatrixSha256")?
+            && field(index_map, "taskManifestSha256")? == field(seal_map, "taskManifestSha256")?
+            && field(index_map, "checkpointSha256")? == field(seal_map, "checkpointSha256")?,
+        "current campaign seal/v4 index chain drifted"
+    );
+
+    let transaction_map = object(transaction, "generation tail transaction")?;
+    exact_keys(
+        transaction_map,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "manifestSha256",
+            "runtimeAuthoritySha256",
+            "sourceSha256",
+            "campaignSealSha256",
+            "tailResultIndexSha256",
+            "tailReductionManifestSha256",
+            "tailReductionResultSha256",
+            "evaluatedMembers",
+            "provisional",
+            "transactionSha256",
+        ],
+        "current generation tail transaction",
+    )?;
+    ensure!(
+        text(transaction_map, "schemaVersion")? == TRANSACTION_SCHEMA
+            && text(transaction_map, "contractVersion")? == CONTRACT_VERSION
+            && sha_field(transaction_map, "manifestSha256")? == manifest.manifest_sha256
+            && sha_field(transaction_map, "runtimeAuthoritySha256")? == runtime
+            && sha_field(transaction_map, "sourceSha256")? == manifest.source_sha256
+            && sha_field(transaction_map, "campaignSealSha256")?
+                == sha_field(seal_map, "campaignSealSha256")?
+            && sha_field(transaction_map, "tailResultIndexSha256")? == index_sha
+            && canonical_sha256_without_object_field(transaction, "transactionSha256")?
+                == sha_field(transaction_map, "transactionSha256")?,
+        "current generation tail transaction chain drifted"
+    );
+
+    let authority_map = object(authority, "tail authority receipt")?;
+    exact_keys(
+        authority_map,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "tailReductionManifestSha256",
+            "evaluationPopulationSha256",
+            "populationSha256",
+            "tailResultIndexSha256",
+            "taskMatrixSha256",
+            "resultSetSha256",
+            "runtimeAuthoritySha256",
+            "tailReductionResult",
+            "evaluatedMembers",
+            "tailAuthoritySha256",
+        ],
+        "tail authority receipt",
+    )?;
+    ensure!(
+        text(authority_map, "schemaVersion")? == temporal_qd_tail_reducer::TAIL_AUTHORITY_SCHEMA
+            && unsigned(authority_map, "generationIndex")? == manifest.generation_index
+            && sha_field(authority_map, "runtimeAuthoritySha256")? == runtime
+            && sha_field(authority_map, "tailResultIndexSha256")? == index_sha
+            && field(authority_map, "taskMatrixSha256")? == field(index_map, "taskMatrixSha256")?
+            && sha_field(authority_map, "tailReductionManifestSha256")?
+                == sha_field(transaction_map, "tailReductionManifestSha256")?
+            && canonical_sha256_without_object_field(authority, "tailAuthoritySha256")?
+                == sha_field(authority_map, "tailAuthoritySha256")?,
+        "tail authority receipt chain drifted"
+    );
+
+    let tail_descriptor = object(
+        field(authority_map, "tailReductionResult")?,
+        "tail reduction result descriptor",
+    )?;
+    exact_keys(
+        tail_descriptor,
+        &["path", "rawSha256", "sizeBytes", "resultSha256"],
+        "tail reduction result descriptor",
+    )?;
+    ensure!(
+        text(tail_descriptor, "path")? == temporal_qd_tail_reducer::RESULT_PATH,
+        "tail reduction result path is not fixed"
+    );
+    let tail_result = read_canonical_line_value(
+        &output_dir.join(temporal_qd_tail_reducer::RESULT_PATH),
+        "tail reduction result",
+    )?;
+    let tail_raw = fs::read(existing_file(
+        &output_dir.join(temporal_qd_tail_reducer::RESULT_PATH),
+        "tail reduction result",
+    )?)?;
+    ensure!(
+        sha_bytes(&tail_raw) == sha_field(tail_descriptor, "rawSha256")?
+            && tail_raw.len() as u64 == unsigned(tail_descriptor, "sizeBytes")?,
+        "tail reduction result raw binding drifted"
+    );
+    let tail_map = object(&tail_result, "tail reduction result")?;
+    ensure!(
+        text(tail_map, "schemaVersion")? == temporal_qd_tail_reducer::RESULT_SCHEMA
+            && canonical_sha256_without_object_field(&tail_result, "resultSha256")?
+                == sha_field(tail_map, "resultSha256")?
+            && sha_field(tail_map, "resultSha256")? == sha_field(tail_descriptor, "resultSha256")?
+            && sha_field(tail_map, "resultSha256")?
+                == sha_field(transaction_map, "tailReductionResultSha256")?
+            && sha_field(tail_map, "manifestSha256")?
+                == sha_field(authority_map, "tailReductionManifestSha256")?
+            && sha_field(tail_map, "runtimeAuthoritySha256")? == runtime
+            && sha_field(tail_map, "tailResultIndexSha256")? == index_sha,
+        "tail reduction result semantic chain drifted"
+    );
+
+    let members_descriptor = object(
+        field(authority_map, "evaluatedMembers")?,
+        "evaluated members descriptor",
+    )?;
+    exact_keys(
+        members_descriptor,
+        &["path", "rawSha256", "sizeBytes", "recordCount"],
+        "evaluated members descriptor",
+    )?;
+    ensure!(
+        text(members_descriptor, "path")? == temporal_qd_tail_reducer::MEMBERS_PATH,
+        "evaluated members path is not fixed"
+    );
+    let members_path = existing_file(
+        &output_dir.join(temporal_qd_tail_reducer::MEMBERS_PATH),
+        "evaluated members",
+    )?;
+    ensure!(
+        fs::metadata(&members_path)?.len() == unsigned(members_descriptor, "sizeBytes")?
+            && sha_file(&members_path)? == sha_field(members_descriptor, "rawSha256")?,
+        "evaluated members raw binding drifted"
+    );
+    ensure!(
+        field(transaction_map, "evaluatedMembers")? == field(tail_map, "evaluatedMembers")?,
+        "transaction/tail evaluated-member descriptor drifted"
+    );
+    let tail_evaluated = object(
+        field(tail_map, "evaluatedMembers")?,
+        "tail evaluated members",
+    )?;
+    let tail_members = object(
+        field(tail_evaluated, "membersFile")?,
+        "tail evaluated members file",
+    )?;
+    ensure!(
+        field(tail_members, "rawSha256")? == field(members_descriptor, "rawSha256")?
+            && field(tail_members, "sizeBytes")? == field(members_descriptor, "sizeBytes")?
+            && field(tail_members, "recordCount")? == field(members_descriptor, "recordCount")?,
+        "tail authority/evaluated-member descriptor drifted"
+    );
+    Ok(())
 }
 
 fn validate_file_descriptor(output_dir: &Path, descriptor: &Value, label: &str) -> Result<()> {
@@ -2846,6 +4732,21 @@ fn unsigned(map: &Map<String, Value>, key: &str) -> Result<u64> {
         .as_u64()
         .ok_or_else(|| anyhow!("{key} must be a nonnegative integer"))
 }
+fn nonnegative_integral_number(map: &Map<String, Value>, key: &str) -> Result<()> {
+    let value = field(map, key)?;
+    if value.as_u64().is_some() {
+        return Ok(());
+    }
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+        .ok_or_else(|| anyhow!("{key} must be a nonnegative integral number"))?;
+    ensure!(
+        number <= u64::MAX as f64,
+        "{key} must be a nonnegative integral number"
+    );
+    Ok(())
+}
 fn nonnegative(map: &Map<String, Value>, key: &str) -> Result<i64> {
     field(map, key)?
         .as_i64()
@@ -2969,6 +4870,62 @@ mod tests {
             }
             value["artifact_size_bytes"] = json!(bytes);
         }
+    }
+
+    fn manifest_task_row() -> Value {
+        json!({
+            "task_id":"fixture-task",
+            "lane_id":"fixture",
+            "attempt_id":"fixture-task",
+            "task_kind":"temporal_graph_candidate_window",
+            "payload":{
+                "job_id":"fixture-task",
+                "candidate_id":"fixture",
+                "authority_id":"fixture-authority",
+                "evidence_plan":{"plan_id":SHA_A},
+                "lake_window_semantic_sha256":SHA_B,
+                "shared_observation_stream_id":"fixture-stream",
+                "analysis_window_start":"2024-01-01T00:00:00Z",
+                "analysis_window_end":"2024-02-01T00:00:00Z",
+                "bar_limit":100
+            },
+            "required_worker_capabilities":[],
+            "deadline_seconds":30.0,
+            "max_attempts":1
+        })
+    }
+
+    fn bind_worker_material(mut material: Value) -> Value {
+        material["task_kind"] = json!("temporal_graph_candidate_window");
+        material["job_id"] = json!("fixture-task");
+        material["authority_id"] = json!("fixture-authority");
+        material["evidence_plan_id"] = json!(SHA_A);
+        material["lake_window_semantic_sha256"] = json!(SHA_B);
+        material["shared_observation_stream_id"] = json!("fixture-stream");
+        material
+    }
+
+    #[test]
+    fn public_task_row_admission_reuses_campaign_seal_validators() -> Result<()> {
+        let task = manifest_task_row();
+        let admitted = freeze_worker_artifact(bind_worker_material(valid_v3_result()));
+        assert_eq!(
+            admit_candidate_window_task_result(&task, &admitted)?,
+            CandidateWindowResultAdmission::Admitted
+        );
+
+        let mut rejected = valid_rejection(false);
+        rejected["job_id"] = json!("fixture-task");
+        let rejected = freeze_rejected_artifact(rejected);
+        assert_eq!(
+            admit_candidate_window_task_result(&task, &rejected)?,
+            CandidateWindowResultAdmission::Rejected
+        );
+
+        let mut tampered = admitted;
+        tampered["job_id"] = json!("other-task");
+        assert!(admit_candidate_window_task_result(&task, &tampered).is_err());
+        Ok(())
     }
 
     #[test]
@@ -3134,6 +5091,344 @@ mod tests {
         let mut tampered = raw.to_vec();
         tampered[0] ^= 1;
         assert!(verify_raw_blob(&sha_bytes(&tampered), tampered.len() as u64, &reference).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn source_builder_reconstructs_source_and_restarts_without_freezer_reopen() -> Result<()> {
+        fn self_hash(value: &mut Value, field: &str) -> Result<()> {
+            value[field] = Value::String(canonical_sha256(value)?);
+            Ok(())
+        }
+        fn write_canonical(path: &Path, value: &Value) -> Result<()> {
+            fs::write(path, canonical_json_line(value)?)?;
+            Ok(())
+        }
+        let directory = tempfile::TempDir::new()?;
+        let root = directory.path();
+        let gateway_root = root.join("gateway");
+        let sidecar = gateway_root.join(".native-gateway-dispatch");
+        fs::create_dir_all(sidecar.join("tasks"))?;
+        fs::create_dir_all(gateway_root.join("results"))?;
+        let payload = json!({"job_id":"fixture-task","candidate_id":"fixture","authority_id":SHA_A,"evidence_plan":{"plan_id":SHA_B},"lake_window_semantic_sha256":SHA_C,"shared_observation_stream_id":"fixture-stream","analysis_window_start":"2024-01-01T00:00:00Z","analysis_window_end":"2024-02-01T00:00:00Z","bar_limit":100});
+        let task = json!({"task_id":"fixture-task","task_kind":"temporal_graph_candidate_window","payload":payload});
+        let matrix = canonical_sha256(&Value::Array(vec![task.clone()]))?;
+        let task_manifest = json!({"authorityId":SHA_A,"schemaVersion":"temporal_graph_candidate_window_manifest_v1","taskCount":1,"taskMatrixSha256":matrix,"tasks":[task.clone()]});
+        fs::create_dir_all(root.join("screening-run"))?;
+        let task_manifest_path = root.join("screening-run").join("task-manifest.json");
+        fs::write(
+            &task_manifest_path,
+            temporal_qd_contract::python_pretty_json_line(
+                &task_manifest,
+                temporal_qd_contract::JsonNewline::Lf,
+            )?,
+        )?;
+        let mut freezer = json!({"schemaVersion":"temporal_qd_v5_native_campaign_freeze_receipt_v1","manifestSha256":SHA_A,"nativeRuntimeAuthoritySha256":SHA_B,"transactionSha256":SHA_C,"campaignSha256":SHA_A,"authorityId":SHA_A,"evaluationIdentitySha256":SHA_B,"taskMatrixSha256":matrix,"taskCount":1,"outputInventory":[{"relativePath":"screening-run/task-manifest.json","rawSha256":sha_file(&task_manifest_path)?}],"semanticReceiptSha256":SHA_C});
+        self_hash(&mut freezer, "receiptSha256")?;
+        let freezer_path = root.join("native-freeze-receipt.json");
+        write_canonical(&freezer_path, &freezer)?;
+        let task_sha = canonical_sha256(&task)?;
+        let mut task_object = json!({"schemaVersion":"temporal_qd_native_gateway_task_object_v1","task":task,"taskSha256":task_sha});
+        self_hash(&mut task_object, "taskObjectSha256")?;
+        write_canonical(
+            &sidecar.join("tasks").join("fixture-task.json"),
+            &task_object,
+        )?;
+        let mut index = json!({"schemaVersion":"temporal_qd_native_gateway_task_index_entry_v1","ordinal":0,"taskId":"fixture-task","taskSha256":task_sha,"taskObjectSha256":task_object["taskObjectSha256"],"relativePath":"tasks/fixture-task.json"});
+        self_hash(&mut index, "entrySha256")?;
+        fs::write(
+            sidecar.join("task-index.jsonl"),
+            canonical_json_line(&index)?,
+        )?;
+        let blob = b"fixture-result";
+        let blob_sha = sha_bytes(blob);
+        fs::write(
+            gateway_root.join("results").join("fixture-task.json.gz"),
+            blob,
+        )?;
+        // A deterministic gateway rejection is terminal evidence too; the
+        // builder must preserve its one-task/one-result routing exactly.
+        let record = json!({"resultSha256":SHA_A,"resultCodec":"gzip-json-v1","resultSemanticSha256":SHA_B,"resultSemanticSizeBytes":1,"resultUncompressedSha256":SHA_C,"resultUncompressedSizeBytes":1,"resultBlobSha256":blob_sha,"resultBlobSizeBytes":blob.len(),"resultPath":gateway_root.join("results").join("fixture-task.json.gz").to_string_lossy(),"candidateId":"fixture","outcome":"rejected","rejectionCode":"aligned_scoring_warmup_insufficient"});
+        let completion_sha = canonical_sha256(&record)?;
+        let mut journal = json!({"schemaVersion":"temporal_qd_native_gateway_completion_journal_entry_v1","ordinal":0,"taskId":"fixture-task","taskSha256":task_sha,"completionSha256":completion_sha,"record":record});
+        self_hash(&mut journal, "entrySha256")?;
+        fs::write(
+            sidecar.join("completion-journal.jsonl"),
+            canonical_json_line(&journal)?,
+        )?;
+        fs::write(gateway_root.join("checkpoint.json"), b"{}")?;
+        let mut inventory = json!({"schemaVersion":GATEWAY_RESULT_INVENTORY_ENTRY_SCHEMA_V2,"ordinal":0,"taskId":"fixture-task","taskSha256":task_sha,"completionSha256":completion_sha,"resultBlobSha256":blob_sha,"resultSemanticSha256":SHA_B,"outcome":"rejected"});
+        self_hash(&mut inventory, "entrySha256")?;
+        let inventory_path = sidecar.join("result-inventory.jsonl");
+        fs::write(&inventory_path, canonical_json_line(&inventory)?)?;
+        let mut inventory_root = json!({"schemaVersion":GATEWAY_RESULT_INVENTORY_ROOT_SCHEMA_V2,"inventoryRelativePath":"result-inventory.jsonl","inventorySha256":sha_file(&inventory_path)?,"inventorySizeBytes":fs::metadata(&inventory_path)?.len(),"inventoryCount":1});
+        self_hash(&mut inventory_root, "resultInventoryRootSha256")?;
+        write_canonical(&sidecar.join("result-inventory.json"), &inventory_root)?;
+        let mut gateway = json!({"schemaVersion":GATEWAY_EXECUTION_RECEIPT_SCHEMA_V2,"runtimeRoleSha256":SHA_A,"authorityId":SHA_A,"taskMatrixSha256":matrix,"sourceTaskManifestSha256":sha_file(&task_manifest_path)?,"taskIndexRootSha256":SHA_B,"completionJournalSemanticSha256":SHA_C,"checkpointSemanticSha256":SHA_A,"completionJournalSha256":sha_file(&sidecar.join("completion-journal.jsonl"))?,"checkpointSha256":sha_file(&gateway_root.join("checkpoint.json"))?,"taskCount":1,"completedTaskCount":1,"resultInventoryRootSha256":inventory_root["resultInventoryRootSha256"],"resultInventorySha256":inventory_root["inventorySha256"],"resultInventorySizeBytes":inventory_root["inventorySizeBytes"],"resultInventoryCount":1,"semanticReceiptSha256":SHA_B});
+        self_hash(&mut gateway, "receiptSha256")?;
+        let gateway_receipt_path = sidecar.join("execution-receipt.json");
+        write_canonical(&gateway_receipt_path, &gateway)?;
+        let source_path = root.join("source.json");
+        let mut manifest = json!({"schemaVersion":SOURCE_BUILD_MANIFEST_SCHEMA,"taskManifestPath":task_manifest_path,"freezerReceiptPath":freezer_path,"gatewayOutputRoot":gateway_root,"gatewayReceiptPath":gateway_receipt_path,"sourcePath":source_path,"funnelProjectionIncluded":false});
+        self_hash(&mut manifest, "manifestSha256")?;
+        let manifest_path = root.join("source-build-manifest.json");
+        write_canonical(&manifest_path, &manifest)?;
+        let built = build_source_manifest(&manifest_path)?;
+        assert_eq!(built["schemaVersion"], SOURCE_BUILD_RESULT_SCHEMA);
+        let source = read_canonical_value(&source_path, "source")?;
+        assert_eq!(source["taskCount"], 1);
+        let source_receipt = root.join("source-build-receipt.json");
+        let reject_tamper = |path: &Path, replacement: Vec<u8>| -> Result<()> {
+            let original = fs::read(path)?;
+            if source_receipt.exists() {
+                fs::remove_file(&source_receipt)?;
+            }
+            fs::write(path, replacement)?;
+            assert!(
+                build_source_manifest(&manifest_path).is_err(),
+                "tamper at {} was accepted",
+                path.display()
+            );
+            fs::write(path, original)?;
+            Ok(())
+        };
+        // Exact task/object/index coverage: payload/hash changes, duplicate
+        // and extra index rows, and missing task objects all fail before a
+        // source receipt can be committed.
+        reject_tamper(
+            &sidecar.join("tasks").join("fixture-task.json"),
+            b"{}\n".to_vec(),
+        )?;
+        let index_bytes = fs::read(sidecar.join("task-index.jsonl"))?;
+        reject_tamper(
+            &sidecar.join("task-index.jsonl"),
+            [index_bytes.clone(), index_bytes.clone()].concat(),
+        )?;
+        let task_object_path = sidecar.join("tasks").join("fixture-task.json");
+        let task_object_bytes = fs::read(&task_object_path)?;
+        fs::remove_file(&task_object_path)?;
+        assert!(build_source_manifest(&manifest_path).is_err());
+        fs::write(&task_object_path, task_object_bytes)?;
+        // Completion journal, checkpoint, gzip blob, and receipt inventory
+        // are independently receipt-bound; arbitrary edits cannot be adopted.
+        reject_tamper(&sidecar.join("completion-journal.jsonl"), b"{}\n".to_vec())?;
+        reject_tamper(
+            &gateway_root.join("checkpoint.json"),
+            b"{\"tampered\":true}".to_vec(),
+        )?;
+        reject_tamper(
+            &gateway_root.join("results").join("fixture-task.json.gz"),
+            b"tampered-result".to_vec(),
+        )?;
+        reject_tamper(&inventory_path, b"{}\n".to_vec())?;
+        reject_tamper(&sidecar.join("result-inventory.json"), b"{}\n".to_vec())?;
+        reject_tamper(&gateway_receipt_path, b"{}\n".to_vec())?;
+        reject_tamper(&freezer_path, b"{}\n".to_vec())?;
+        // The receipt itself also protects the published source.  If absent,
+        // write-once publication rejects a divergent source body.
+        let source_bytes = fs::read(&source_path)?;
+        fs::write(&source_path, b"{}\n")?;
+        assert!(build_source_manifest(&manifest_path).is_err());
+        fs::write(&source_path, source_bytes)?;
+        let mut traversal = manifest.clone();
+        traversal["sourcePath"] = json!(root.join("..").join("escape.json").to_string_lossy());
+        self_hash(&mut traversal, "manifestSha256")?;
+        let traversal_path = root.join("traversal.json");
+        write_canonical(&traversal_path, &traversal)?;
+        assert!(build_source_manifest(&traversal_path).is_err());
+        let mut alias = manifest.clone();
+        alias["sourcePath"] = json!("source.json");
+        self_hash(&mut alias, "manifestSha256")?;
+        let alias_path = root.join("alias.json");
+        write_canonical(&alias_path, &alias)?;
+        assert!(build_source_manifest(&alias_path).is_err());
+        #[cfg(windows)]
+        {
+            let linked = root.join("linked-source.json");
+            std::os::windows::fs::symlink_file(&source_path, &linked)?;
+            let mut symlink = manifest.clone();
+            symlink["sourcePath"] = json!(linked.to_string_lossy());
+            self_hash(&mut symlink, "manifestSha256")?;
+            let symlink_manifest = root.join("symlink.json");
+            write_canonical(&symlink_manifest, &symlink)?;
+            assert!(build_source_manifest(&symlink_manifest).is_err());
+        }
+        // A committed builder receipt is sufficient for source restart; it
+        // permits the sealed task manifest to have been retired.
+        build_source_manifest(&manifest_path)?;
+        fs::remove_file(&task_manifest_path)?;
+        assert_eq!(
+            build_source_manifest(&manifest_path)?["sourceSha256"],
+            built["sourceSha256"]
+        );
+        Ok(())
+    }
+
+    fn current_receipt_fixture(root: &Path) -> Result<(Manifest, Value)> {
+        let runtime = SHA_A.to_owned();
+        let mut directional = json!({
+            "schemaVersion": DIRECTIONAL_TAIL_AUTHORITY_SCHEMA,
+            "generationIndex": 1,
+            "runtimeAuthoritySha256": runtime,
+            "tailResultIndexSchema": DIRECTIONAL_INDEX_SCHEMA,
+            "tailResultEntrySchema": DIRECTIONAL_ENTRY_SCHEMA,
+            "rawRotatingProvenanceSchema": RAW_ROTATING_PROVENANCE_SCHEMA,
+        });
+        add_identity(&mut directional, "tailAuthoritySha256")?;
+        let manifest = Manifest {
+            runtime_authority_sha256: Some(runtime.clone()),
+            source_path: root.join("retired-source.json"),
+            source_sha256: SHA_B.to_owned(),
+            evaluation_path: root.join("retired-population.json"),
+            evaluation_sha256: SHA_C.to_owned(),
+            generation_index: 1,
+            minimum_total_trades: 0,
+            minimum_trades_per_window: 0,
+            cap_trades: 0,
+            provisional_limit: 1,
+            directional_tail_authority: Some(directional),
+            manifest_sha256: sha_bytes(b"manifest"),
+        };
+        let mut index = json!({
+            "schemaVersion": DIRECTIONAL_INDEX_SCHEMA, "authorityId": SHA_A,
+            "authoritySha256": SHA_B, "taskMatrixSha256": SHA_C,
+            "taskManifestSha256": SHA_A, "checkpointSha256": SHA_B,
+            "taskCount": 0, "funnelProjectionIncluded": false,
+            "sourceResultBlobBytes": 0, "entries": [],
+        });
+        add_identity(&mut index, "tailResultIndexSha256")?;
+        fs::write(
+            root.join(DIRECTIONAL_INDEX_PATH),
+            canonical_json_bytes(&index)?,
+        )?;
+        let mut seal = json!({
+            "schemaVersion": CAMPAIGN_SEAL_SCHEMA, "contractVersion": CONTRACT_VERSION,
+            "manifestSha256": manifest.manifest_sha256,
+            "runtimeAuthoritySha256": runtime, "sourceSha256": manifest.source_sha256,
+            "authorityId": SHA_A, "authoritySha256": SHA_B, "taskMatrixSha256": SHA_C,
+            "taskManifestSha256": SHA_A, "checkpointSha256": SHA_B, "taskCount": 0,
+            "rawResultReadCount": 0, "sourceResultBlobBytes": 0,
+            "sourceResultUncompressedBytes": 0, "sourceResultSemanticBytes": 0,
+            "tailResultIndex": {"path": DIRECTIONAL_INDEX_PATH, "sha256": index["tailResultIndexSha256"]},
+            "rawResultInventory": {"path": INVENTORY_PATH, "sha256": SHA_A, "bytes": 0},
+        });
+        add_identity(&mut seal, "campaignSealSha256")?;
+        fs::write(root.join(CAMPAIGN_SEAL_PATH), canonical_json_line(&seal)?)?;
+        let member_bytes = canonical_json_line(&json!({"candidate":{"candidateId":"fixture"}}))?;
+        fs::write(
+            root.join(temporal_qd_tail_reducer::MEMBERS_PATH),
+            &member_bytes,
+        )?;
+        let evaluated = json!({
+            "schemaVersion": "temporal_qd_evaluated_members_v1", "memberCount": 1,
+            "evaluationRejectionCount": 0, "evaluationRejectedCandidates": [],
+            "membersFile": {"path": temporal_qd_tail_reducer::MEMBERS_PATH,
+                "rawSha256": sha_bytes(&member_bytes), "sizeBytes": member_bytes.len(), "recordCount": 1},
+        });
+        let tail_manifest_sha = sha_bytes(b"tail-manifest");
+        let mut tail_result = json!({
+            "schemaVersion": temporal_qd_tail_reducer::RESULT_SCHEMA, "generationIndex": 1,
+            "manifestSha256": tail_manifest_sha, "evaluationPopulationSha256": SHA_A,
+            "populationSha256": SHA_B, "tailResultIndexSha256": index["tailResultIndexSha256"],
+            "taskMatrixSha256": SHA_C, "resultSetSha256": SHA_A,
+            "runtimeAuthoritySha256": runtime, "evaluatedMembers": evaluated,
+            "provisional": {"schemaVersion":"fixture","candidates":[]},
+        });
+        add_identity(&mut tail_result, "resultSha256")?;
+        let tail_raw = canonical_json_line(&tail_result)?;
+        fs::write(root.join(temporal_qd_tail_reducer::RESULT_PATH), &tail_raw)?;
+        let mut transaction = json!({
+            "schemaVersion": TRANSACTION_SCHEMA, "contractVersion": CONTRACT_VERSION,
+            "manifestSha256": manifest.manifest_sha256, "runtimeAuthoritySha256": runtime,
+            "sourceSha256": manifest.source_sha256, "campaignSealSha256": seal["campaignSealSha256"],
+            "tailResultIndexSha256": index["tailResultIndexSha256"],
+            "tailReductionManifestSha256": tail_manifest_sha,
+            "tailReductionResultSha256": tail_result["resultSha256"],
+            "evaluatedMembers": evaluated, "provisional": tail_result["provisional"],
+        });
+        add_identity(&mut transaction, "transactionSha256")?;
+        fs::write(
+            root.join(TRANSACTION_PATH),
+            canonical_json_line(&transaction)?,
+        )?;
+        let mut authority = json!({
+            "schemaVersion": temporal_qd_tail_reducer::TAIL_AUTHORITY_SCHEMA, "generationIndex": 1,
+            "tailReductionManifestSha256": tail_manifest_sha, "evaluationPopulationSha256": SHA_A,
+            "populationSha256": SHA_B, "tailResultIndexSha256": index["tailResultIndexSha256"],
+            "taskMatrixSha256": SHA_C, "resultSetSha256": SHA_A,
+            "runtimeAuthoritySha256": runtime,
+            "tailReductionResult": {"path": temporal_qd_tail_reducer::RESULT_PATH,
+                "rawSha256": sha_bytes(&tail_raw), "sizeBytes": tail_raw.len(),
+                "resultSha256": tail_result["resultSha256"]},
+            "evaluatedMembers": evaluated["membersFile"],
+        });
+        add_identity(&mut authority, "tailAuthoritySha256")?;
+        fs::write(
+            root.join(temporal_qd_tail_reducer::TAIL_AUTHORITY_PATH),
+            canonical_json_line(&authority)?,
+        )?;
+        Ok((manifest, transaction))
+    }
+
+    #[test]
+    fn current_receipt_is_compact_restartable_and_rejects_rehashed_substitution() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let (manifest, transaction) = current_receipt_fixture(root)?;
+        let historical = execution_response(
+            transaction.clone(),
+            false,
+            0,
+            ReadMetrics::default(),
+            Instant::now(),
+        );
+        let members_path = root.join(temporal_qd_tail_reducer::MEMBERS_PATH);
+        let members_bytes = fs::read(&members_path)?;
+        fs::remove_file(&members_path)?;
+        assert!(publish_execution_receipt(root, &manifest, &transaction).is_err());
+        fs::write(&members_path, members_bytes)?;
+        let receipt = publish_execution_receipt(root, &manifest, &transaction)?;
+        assert_eq!(
+            historical["transaction"]["transactionSha256"],
+            receipt["generationTailTransaction"]["transactionSha256"]
+        );
+        assert!(receipt.get("transaction").is_none());
+        assert!(receipt.get("evaluatedMembers").is_none());
+        assert!(receipt.get("provisional").is_none());
+        assert_eq!(reopen_execution_receipt(root, &manifest)?, receipt);
+        assert!(!manifest.source_path.exists());
+
+        let receipt_path = root.join(EXECUTION_RECEIPT_PATH);
+        let mut traversal = receipt.clone();
+        traversal["campaignSeal"]["path"] = json!("../campaign-seal-result.json");
+        traversal.as_object_mut().unwrap().remove("receiptSha256");
+        add_identity(&mut traversal, "receiptSha256")?;
+        fs::write(&receipt_path, canonical_json_line(&traversal)?)?;
+        assert!(reopen_execution_receipt(root, &manifest).is_err());
+        fs::write(&receipt_path, canonical_json_line(&receipt)?)?;
+
+        let mut substituted = transaction;
+        substituted["campaignSealSha256"] = json!(SHA_C);
+        substituted
+            .as_object_mut()
+            .unwrap()
+            .remove("transactionSha256");
+        add_identity(&mut substituted, "transactionSha256")?;
+        let substituted_raw = canonical_json_line(&substituted)?;
+        fs::write(root.join(TRANSACTION_PATH), &substituted_raw)?;
+        let mut rehashed_receipt = receipt;
+        rehashed_receipt["generationTailTransaction"]["rawSha256"] =
+            json!(sha_bytes(&substituted_raw));
+        rehashed_receipt["generationTailTransaction"]["sizeBytes"] = json!(substituted_raw.len());
+        rehashed_receipt["generationTailTransaction"]["transactionSha256"] =
+            substituted["transactionSha256"].clone();
+        rehashed_receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("receiptSha256");
+        add_identity(&mut rehashed_receipt, "receiptSha256")?;
+        fs::write(&receipt_path, canonical_json_line(&rehashed_receipt)?)?;
+        assert!(reopen_execution_receipt(root, &manifest).is_err());
         Ok(())
     }
 

@@ -579,7 +579,10 @@ fn materialize_g0(
     })
 }
 
-fn population_template(
+/// Shared public-schema envelope builder.  The historical file-backed
+/// publisher streams rich candidates from a journal; the v5 transaction uses
+/// the same envelope with a selected-only compact reconstruction stream.
+pub(crate) fn population_template(
     request: &PublicationRequest,
     selected: &[AcceptedReference],
     g0_binding: Option<&BTreeMap<String, String>>,

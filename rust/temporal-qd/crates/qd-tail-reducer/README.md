@@ -19,6 +19,12 @@ population coverage, and stable execution identities. It deliberately does
 not read raw replay blobs, re-run worker validation, or infer strategy metrics.
 Those remain on the Python side of the seam.
 
+V5 uses the separately versioned `temporal_qd_tail_result_index_v4` contract.
+Its admitted entries additionally bind `rawRotatingProvenance` to the raw
+result identity and the conservative replay's `realizedBehavior` identity.
+The reducer accepts v4 only when those compact bindings validate; it never
+downgrades a v4 request to v3 or opens a raw result on restart.
+
 The explicit operation is
 `reduce_evaluated_members_and_provisional`, carried by
 `temporal_qd_native_tail_reduction_manifest_v1`. Manifests are canonical JSON

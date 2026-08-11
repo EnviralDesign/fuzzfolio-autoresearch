@@ -285,6 +285,30 @@ impl ProposalState {
         )
     }
 
+    /// Advance the common proposal scheduler from a compact native attempt.
+    ///
+    /// The v5 transaction never fabricates a legacy rich proposal entry just
+    /// to update scheduling counters.  It still uses the exact same state
+    /// transition as the rich path: this compact attempt identity occupies
+    /// the historical `entry_sha256` bookkeeping slot solely as the durable
+    /// per-ordinal receipt identity.
+    pub fn observe_compact_attempt(
+        &mut self,
+        proposal_ordinal: u64,
+        origin_kind: &str,
+        disposition: &str,
+        attempt_sha256: &str,
+        accepted: Option<&AcceptedProposal>,
+    ) -> Result<()> {
+        self.observe_fields(
+            proposal_ordinal,
+            origin_kind,
+            disposition,
+            attempt_sha256,
+            accepted,
+        )
+    }
+
     /// Advance from the compact facts retained in a verified durable segment.
     /// Recovery must not retain the segment's rich candidate solely to rebuild
     /// bookkeeping that never reads it.

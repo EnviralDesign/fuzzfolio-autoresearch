@@ -1412,7 +1412,11 @@ fn construction_pool_identity(request: &G0FunnelRequest) -> Result<String> {
     .map_err(Into::into)
 }
 
-fn validate_reproduction_allocation(allocation: &Value) -> Result<()> {
+/// Validate the sealed allocation object used by both the historical G0
+/// funnel and the write-neutral v5 publication stream.  Keeping this one
+/// reducer crate-visible prevents the v5 path from growing a subtly different
+/// allocation schema.
+pub(crate) fn validate_reproduction_allocation(allocation: &Value) -> Result<()> {
     let fields = allocation
         .as_object()
         .ok_or_else(|| contract("reproduction allocation must be an object"))?;
@@ -1452,7 +1456,11 @@ fn validate_reproduction_allocation(allocation: &Value) -> Result<()> {
     Ok(())
 }
 
-fn reproduction_allocation_accounting(
+/// Deterministically reduce compact proposal dispositions into the exact
+/// public allocation-accounting value.  File-backed callers live in
+/// `g0_funnel`; the v5 transaction reuses this pure reducer without opening a
+/// journal or writing a path.
+pub(crate) fn reproduction_allocation_accounting(
     allocation: &Value,
     origins: &BTreeMap<String, u64>,
     accepted_origins: &BTreeMap<String, u64>,

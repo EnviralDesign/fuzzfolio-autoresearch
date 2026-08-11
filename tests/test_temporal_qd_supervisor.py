@@ -453,6 +453,10 @@ def _inputs(tmp_path: Path) -> dict:
         "gateway_url": "http://127.0.0.1:8799",
         "gateway_token": "fixture",
         "construction_catalog_path": catalog_path,
+        # These fixture campaigns cover the legacy Python materializer; make
+        # that historical/oracle choice explicit now that Rust is the public
+        # default.
+        "generation_finalization_engine": supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
     }
 
 
@@ -1883,6 +1887,7 @@ def test_pair_g0_64_to_32_rotating_supervisor_restart_never_reschedules_construc
             "bidirectional_pair_config": pair_config,
             "pair_generation_engine": supervisor.PAIR_GENERATION_RUNTIME_PYTHON,
             "rotating_evidence_config": rotating_input,
+            "generation_finalization_engine": supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
         "initial_construction_pool_size": 64,
         "evaluation_population_size": 32,
         "generation_funnel_enabled": True,

@@ -151,6 +151,7 @@ def oracle(out: Path) -> None:
         _require_candidate_execution_binding(candidate, windows)
         aggregate = _aggregate_candidate(candidate, windows)
         members.append({
+            "schemaVersion": "temporal_qd_evaluated_member_v1",
             "candidateId": candidate_id,
             "generationIndex": evaluation["generationIndex"],
             "candidate": candidate,

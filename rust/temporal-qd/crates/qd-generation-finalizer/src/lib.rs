@@ -25,23 +25,27 @@ use temporal_qd_contract::{
     CONTRACT_VERSION, canonical_json_line, canonical_sha256, canonical_sha256_without_object_field,
 };
 
-pub const SOURCE_SCHEMA: &str = "temporal_qd_generation_finalization_source_v1";
-pub const MANIFEST_SCHEMA: &str = "temporal_qd_generation_finalization_manifest_v1";
+pub const SOURCE_SCHEMA: &str = "temporal_qd_generation_finalization_source_v2";
+const PREVIOUS_PARENT_SUMMARY_SCHEMA: &str = "temporal_qd_previous_parent_archive_summary_v1";
+pub const MANIFEST_SCHEMA: &str = "temporal_qd_generation_finalization_manifest_v2";
 pub const PLAN_SCHEMA: &str = "temporal_qd_auxiliary_evidence_plan_v1";
 pub const RECEIPT_SCHEMA: &str = "temporal_qd_auxiliary_campaign_receipt_v1";
 pub const COMMIT_SCHEMA: &str = "temporal_qd_generation_commit_v1";
 pub const EXECUTION_SCHEMA: &str = "temporal_qd_generation_finalization_execution_v1";
 pub const OPERATION: &str = "finalize_rotating_generation";
 pub const PLAN_PATH: &str = "auxiliary-evidence-plan.json";
-pub const CUMULATIVE_PATH: &str = "cumulative-archive.json";
+pub const CUMULATIVE_PATH: &str = "evidence/cumulative-archive.json";
 pub const ARCHIVE_PATH: &str = "archive.json";
-pub const CHECKPOINT_PATH: &str = "checkpoint.json";
-pub const LEDGER_PATH: &str = "generation-ledger.json";
+pub const CHECKPOINT_PATH: &str = "evidence/checkpoint.json";
+pub const LEDGER_PATH: &str = "evidence/generation-ledger.json";
 pub const RECORD_PATH: &str = "generation-record.json";
 pub const STATE_PATCH_PATH: &str = "generation-state-patch.json";
+pub const STATE_APPLICATION_SIDECAR_PATH: &str = "generation-state-application-sidecar.json";
 pub const FUNNEL_PATH: &str = "generation-funnel.json";
 pub const FUNNEL_SNAPSHOT_PATH: &str = "generation-funnel-snapshot.json";
 pub const COMMIT_PATH: &str = "generation-commit.json";
+pub const STATE_APPLICATION_SIDECAR_SCHEMA: &str =
+    "temporal_qd_v5_generation_state_application_sidecar_v1";
 
 const ROTATING_SCHEMA: &str = "temporal_qd_rotating_evidence_v1";
 const COHORT_SCHEMA: &str = "temporal_qd_current_panel_evaluation_cohort_v1";
@@ -65,10 +69,12 @@ const CAMPAIGN_SEAL_SCHEMA: &str = "temporal_qd_campaign_seal_v1";
 const TAIL_TRANSACTION_SCHEMA: &str = "temporal_qd_generation_tail_transaction_v1";
 const TAIL_REDUCTION_SCHEMA: &str = "temporal_qd_native_tail_reduction_result_v1";
 const AUXILIARY_BUNDLE_ARTIFACT_SCHEMA: &str = "temporal_qd_auxiliary_panel_bundles_v1";
+const ROTATING_CAMPAIGN_RECEIPT_SCHEMA: &str = "temporal_qd_v5_rotating_campaign_receipt_v2";
 
 #[derive(Clone, Debug)]
 struct Manifest {
-    runtime_authority_sha256: Option<String>,
+    runtime_authority_sha256: String,
+    semantic_authority_sha256: String,
     source_path: PathBuf,
     source_sha256: String,
     manifest_sha256: String,
@@ -94,11 +100,12 @@ struct Source {
     current_member_count: u64,
     cell_capacity: usize,
     campaigns: Vec<Value>,
-    artifact_ledger_base: Value,
-    publication_paths: Value,
     funnel_source: Value,
-    generation_record_base: Value,
-    state_transition_base: Value,
+    state_basis: Value,
+    semantic_authority_sha256: String,
+    runtime_authority_sha256: String,
+    completed_generation_records: Vec<Value>,
+    proposal_state_authority: Value,
     expected_plan: Option<Value>,
     source_sha256: String,
 }
@@ -117,7 +124,7 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     let manifest_path = existing_file(manifest_path, "generation finalization manifest")?;
     let output_dir = manifest_path.parent().context("manifest has no parent")?;
     let commit_path = output_dir.join(COMMIT_PATH);
-    let manifest = parse_manifest(&fs::read(&manifest_path)?, commit_path.exists())?;
+    let manifest = parse_manifest(&fs::read(&manifest_path)?, output_dir)?;
     if commit_path.exists() {
         let commit = read_self_hashed(&commit_path, "commitSha256", COMMIT_SCHEMA)?;
         ensure!(
@@ -128,17 +135,20 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
             sha(&commit, "sourceSha256")? == manifest.source_sha256,
             "committed source binding drifted"
         );
-        if let Some(runtime_authority_sha256) = &manifest.runtime_authority_sha256 {
-            ensure!(
-                sha(&commit, "runtimeAuthoritySha256")? == runtime_authority_sha256.clone(),
-                "committed runtime authority binding drifted"
-            );
-        }
+        ensure!(
+            sha(&commit, "runtimeAuthoritySha256")? == manifest.runtime_authority_sha256,
+            "committed runtime authority binding drifted"
+        );
+        ensure!(
+            sha(&commit, "semanticAuthoritySha256")? == manifest.semantic_authority_sha256,
+            "committed semantic authority binding drifted"
+        );
         validate_commit_outputs(output_dir, &commit)?;
+        validate_state_application_sidecar(output_dir, &manifest, &commit)?;
         return Ok(restart_execution(&manifest, commit, started));
     }
-    let source = load_source(&manifest)?;
-    let plan = build_auxiliary_plan(&source)?;
+    let source = load_source(&manifest).context("load generation finalization source")?;
+    let plan = build_auxiliary_plan(&source).context("build generation finalization plan")?;
 
     if let Some(expected) = &source.expected_plan {
         ensure!(
@@ -212,42 +222,40 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
         "restartValidation": "compact_commit_and_output_hashes",
         "rawResultReads": 0,
     });
-    if let Some(runtime_authority_sha256) = &manifest.runtime_authority_sha256 {
-        object_mut(&mut commit, "generation commit")?.insert(
-            "runtimeAuthoritySha256".into(),
-            json!(runtime_authority_sha256),
-        );
-    }
+    object_mut(&mut commit, "generation commit")?.insert(
+        "runtimeAuthoritySha256".into(),
+        json!(manifest.runtime_authority_sha256),
+    );
+    object_mut(&mut commit, "generation commit")?.insert(
+        "semanticAuthoritySha256".into(),
+        json!(manifest.semantic_authority_sha256),
+    );
     add_self_hash(&mut commit, "commitSha256")?;
     publish_value_once(output_dir, COMMIT_PATH, &commit)?;
+    let sidecar =
+        build_state_application_sidecar(&source, &manifest, &commit, &record, &state_patch)?;
+    publish_value_once(output_dir, STATE_APPLICATION_SIDECAR_PATH, &sidecar)?;
     Ok(execution(&source, &manifest, &plan, commit, false, started))
 }
 
-fn parse_manifest(raw: &[u8], allow_legacy_committed_manifest: bool) -> Result<Manifest> {
+fn parse_manifest(raw: &[u8], output_dir: &Path) -> Result<Manifest> {
     let value: Value = serde_json::from_slice(raw).context("parse finalization manifest")?;
     ensure!(
         canonical_json_line(&value)? == raw,
         "manifest must be canonical JSON plus LF"
     );
     let map = object(&value, "manifest")?;
-    let mut manifest_keys = vec![
+    let manifest_keys = [
         "schemaVersion",
         "contractVersion",
         "operation",
         "runtimeAuthoritySha256",
+        "semanticAuthoritySha256",
         "sourcePath",
         "sourceSha256",
         "resultPath",
         "manifestSha256",
     ];
-    let runtime_authority_sha256 = match map.get("runtimeAuthoritySha256") {
-        Some(_) => Some(sha(&value, "runtimeAuthoritySha256")?),
-        None if allow_legacy_committed_manifest => {
-            manifest_keys.retain(|key| *key != "runtimeAuthoritySha256");
-            None
-        }
-        None => return Err(anyhow!("manifest lacks runtime authority")),
-    };
     exact_keys(map, &manifest_keys, "manifest")?;
     ensure!(
         text(&value, "schemaVersion")? == MANIFEST_SCHEMA,
@@ -270,16 +278,37 @@ fn parse_manifest(raw: &[u8], allow_legacy_committed_manifest: bool) -> Result<M
         canonical_sha256_without_object_field(&value, "manifestSha256")? == hash,
         "manifest identity mismatch"
     );
+    let source_path = PathBuf::from(text(&value, "sourcePath")?);
+    ensure!(
+        source_path.is_absolute(),
+        "finalization source execution path must be absolute"
+    );
+    ensure!(
+        source_path
+            .parent()
+            .context("finalization source has no parent")?
+            .canonicalize()?
+            == output_dir.canonicalize()?,
+        "finalization source escapes finalization root"
+    );
     Ok(Manifest {
-        runtime_authority_sha256,
-        source_path: PathBuf::from(text(&value, "sourcePath")?),
+        runtime_authority_sha256: sha(&value, "runtimeAuthoritySha256")?,
+        semantic_authority_sha256: sha(&value, "semanticAuthoritySha256")?,
+        source_path,
         source_sha256: sha(&value, "sourceSha256")?,
         manifest_sha256: hash,
     })
 }
 
 fn load_source(manifest: &Manifest) -> Result<Source> {
-    let path = existing_file(&manifest.source_path, "finalization source")?;
+    let path = existing_file_under(
+        &manifest.source_path,
+        manifest
+            .source_path
+            .parent()
+            .context("source has no parent")?,
+        "finalization source",
+    )?;
     let raw = fs::read(path)?;
     let value: Value = serde_json::from_slice(&raw).context("parse finalization source")?;
     ensure!(
@@ -294,6 +323,32 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         text(&value, "contractVersion")? == CONTRACT_VERSION,
         "source contract version mismatch"
     );
+    exact_keys(
+        object(&value, "finalization source")?,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "generationIndex",
+            "semanticAuthoritySha256",
+            "runtimeAuthoritySha256",
+            "stateBasis",
+            "completedGenerationRecords",
+            "proposalStateAuthority",
+            "rotatingEvidence",
+            "cohort",
+            "provisional",
+            "panelCoverage",
+            "selectedRichMembers",
+            "baselineCandidatePanelBundles",
+            "previousCumulativeArchive",
+            "previousParentArchiveSummary",
+            "archivePolicy",
+            "admittedCampaignLedger",
+            "funnelReductionSource",
+            "sourceSha256",
+        ],
+        "finalization source",
+    )?;
     let source_sha = sha(&value, "sourceSha256")?;
     ensure!(
         source_sha == manifest.source_sha256,
@@ -302,6 +357,16 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
     ensure!(
         canonical_sha256_without_object_field(&value, "sourceSha256")? == source_sha,
         "source identity mismatch"
+    );
+    let semantic_authority_sha256 = sha(&value, "semanticAuthoritySha256")?;
+    let runtime_authority_sha256 = sha(&value, "runtimeAuthoritySha256")?;
+    ensure!(
+        semantic_authority_sha256 == manifest.semantic_authority_sha256,
+        "source semantic authority binding mismatch"
+    );
+    ensure!(
+        runtime_authority_sha256 == manifest.runtime_authority_sha256,
+        "source runtime authority binding mismatch"
     );
     let generation_index = unsigned(&value, "generationIndex")?;
     ensure!(generation_index > 0, "generation index must be positive");
@@ -350,16 +415,17 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         "provisional binding mismatch"
     );
     let baseline_bundles = array(&value, "baselineCandidatePanelBundles")?.to_vec();
-    let complete_bundle_snapshot = member(&value, "completeBundleSnapshot")?
-        .as_bool()
-        .ok_or_else(|| anyhow!("completeBundleSnapshot must be boolean"))?;
-    let receipts = array(&value, "auxiliaryCampaignReceipts")?.to_vec();
+    // V2 is emitted only after the rotating prefinalizer has admitted an
+    // exact full snapshot.  The finalizer never accepts externally supplied
+    // receipts or an unchecked partial/auxiliary plan.
+    let complete_bundle_snapshot = true;
+    let receipts = Vec::new();
     let prior_cumulative = nullable_member(&value, "previousCumulativeArchive")?.cloned();
     if let Some(previous) = &prior_cumulative {
         verify_self_hash(previous, "archiveSha256", "previous cumulative archive")?;
     }
     let previous_parent = member(&value, "previousParentArchiveSummary")?.clone();
-    verify_self_hash(&previous_parent, "summarySha256", "previous parent summary")?;
+    validate_previous_parent_summary(&previous_parent)?;
     let archive_policy = member(&value, "archivePolicy")?.clone();
     verify_self_hash(
         &archive_policy,
@@ -367,18 +433,11 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         "archive policy binding",
     )?;
     validate_corrected_archive_policy(&archive_policy)?;
-    let rich_members = array(&value, "richMembers")?.to_vec();
-    let current_member_count = unsigned(&value, "currentMemberCount")?;
-    ensure!(
-        current_member_count >= rich_members.len() as u64,
-        "rich member count exceeds current member count"
-    );
-    let cell_capacity = unsigned(&value, "cellCapacity")? as usize;
-    ensure!(cell_capacity > 0, "cell capacity must be positive");
-    let expected_plan = nullable_member(&value, "auxiliaryPlan")?.cloned();
-    if let Some(plan) = &expected_plan {
-        verify_self_hash(plan, "planSha256", "auxiliary plan")?;
-    }
+    let rich_members =
+        validate_selected_rich_members(&value, generation_index, &cohort, &provisional)?;
+    let current_member_count = array(&cohort, "candidates")?.len() as u64;
+    let cell_capacity = derive_cell_capacity(&archive_policy)?;
+    let expected_plan = None;
     let funnel_source = member(&value, "funnelReductionSource")?.clone();
     ensure!(
         text(&funnel_source, "schemaVersion")? == FUNNEL_SOURCE_SCHEMA,
@@ -388,6 +447,35 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         &funnel_source,
         "funnelSourceSha256",
         "funnel reduction source",
+    )?;
+    let state_basis = member(&value, "stateBasis")?.clone();
+    validate_state_basis(&state_basis, generation_index)?;
+    let completed_generation_records = array(&value, "completedGenerationRecords")?.to_vec();
+    ensure!(
+        canonical_sha256(&Value::Array(completed_generation_records.clone()))?
+            == sha(&state_basis, "completedGenerationsSha256")?,
+        "completed generation records drifted from state basis"
+    );
+    for record in &completed_generation_records {
+        verify_self_hash(record, "generationRecordSha256", "prior generation record")?;
+    }
+    let proposal_state_authority = member(&value, "proposalStateAuthority")?.clone();
+    validate_proposal_state_authority(&proposal_state_authority)?;
+    let campaigns = validate_admitted_campaign_ledger(
+        member(&value, "admittedCampaignLedger")?,
+        generation_index,
+        &rotating_sha,
+        &cohort,
+        &provisional,
+    )?;
+    validate_panel_coverage(
+        member(&value, "panelCoverage")?,
+        generation_index,
+        &rotating_sha,
+        &cohort,
+        &provisional,
+        &required_panel_ids,
+        &baseline_bundles,
     )?;
     Ok(Source {
         value: value.clone(),
@@ -407,12 +495,13 @@ fn load_source(manifest: &Manifest) -> Result<Source> {
         rich_members,
         current_member_count,
         cell_capacity,
-        campaigns: array(&value, "campaigns")?.to_vec(),
-        artifact_ledger_base: member(&value, "artifactLedgerBase")?.clone(),
-        publication_paths: member(&value, "publicationPaths")?.clone(),
+        campaigns,
         funnel_source,
-        generation_record_base: member(&value, "generationRecordBase")?.clone(),
-        state_transition_base: member(&value, "stateTransitionBase")?.clone(),
+        state_basis,
+        semantic_authority_sha256,
+        runtime_authority_sha256,
+        completed_generation_records,
+        proposal_state_authority,
         expected_plan,
         source_sha256: source_sha,
     })
@@ -441,6 +530,341 @@ fn validate_corrected_archive_policy(value: &Value) -> Result<()> {
             && canonical_sha256(member(value, "frozenPolicy")?)? == expected_sha,
         "archive policy frozen identity mismatch"
     );
+    Ok(())
+}
+
+fn derive_cell_capacity(archive_policy: &Value) -> Result<usize> {
+    let capacity = unsigned(
+        member(member(archive_policy, "frozenPolicy")?, "archive")?,
+        "defaultCellCapacity",
+    )? as usize;
+    ensure!(
+        capacity > 0,
+        "frozen archive policy cell capacity must be positive"
+    );
+    Ok(capacity)
+}
+
+fn validate_previous_parent_summary(summary: &Value) -> Result<()> {
+    let map = object(summary, "previous parent summary")?;
+    let mut keys = vec![
+        "schemaVersion",
+        "archiveSha256",
+        "candidateCountSeen",
+        "memberCount",
+        "cellIds",
+        "summarySha256",
+    ];
+    if map.contains_key("bidirectionalPairPolicy") {
+        keys.push("bidirectionalPairPolicy");
+    }
+    exact_keys(map, &keys, "previous parent summary")?;
+    ensure!(
+        text(summary, "schemaVersion")? == PREVIOUS_PARENT_SUMMARY_SCHEMA,
+        "unsupported previous parent summary schema"
+    );
+    sha(summary, "archiveSha256")?;
+    unsigned(summary, "candidateCountSeen")?;
+    unsigned(summary, "memberCount")?;
+    let cell_ids = array(summary, "cellIds")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("previous parent cell ID must be text"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut sorted = cell_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    ensure!(
+        cell_ids == sorted,
+        "previous parent cell IDs must be unique and sorted"
+    );
+    if let Some(pair_policy) = map.get("bidirectionalPairPolicy") {
+        object(pair_policy, "previous parent bidirectional pair policy")?;
+    }
+    verify_self_hash(summary, "summarySha256", "previous parent summary")
+}
+
+fn validate_state_basis(value: &Value, generation_index: u64) -> Result<()> {
+    let map = object(value, "generation state basis")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "configSha256",
+            "generationIndex",
+            "completedGenerationsSha256",
+            "uniqueCandidatesEvaluated",
+            "workerTasksCompleted",
+            "nextImmigrantContinuationOrdinal",
+            "uniqueIdentityCounts",
+            "duplicateCounters",
+            "proposalSlotCounters",
+            "stateBasisSha256",
+        ],
+        "generation state basis",
+    )?;
+    ensure!(
+        text(value, "schemaVersion")? == "temporal_qd_v5_generation_state_basis_v1"
+            && unsigned(value, "generationIndex")? == generation_index,
+        "state basis schema or generation drifted"
+    );
+    verify_self_hash(value, "stateBasisSha256", "generation state basis")?;
+    for key in [
+        "uniqueCandidatesEvaluated",
+        "workerTasksCompleted",
+        "nextImmigrantContinuationOrdinal",
+    ] {
+        unsigned(value, key)?;
+    }
+    Ok(())
+}
+
+fn validate_proposal_state_authority(value: &Value) -> Result<()> {
+    exact_keys(
+        object(value, "proposal state authority")?,
+        &[
+            "generationKind",
+            "proposalManifestSha256",
+            "proposalReceiptSha256",
+            "generationJournalSha256",
+            "inputIdentityLedgerSha256",
+            "outputIdentityLedgerRelativePath",
+            "outputIdentityLedgerSha256",
+            "outputIdentityLedgerFileSha256",
+        ],
+        "proposal state authority",
+    )?;
+    let generation_kind = text(value, "generationKind")?;
+    ensure!(
+        matches!(generation_kind, "g0" | "evolved"),
+        "proposal state authority generation kind is invalid"
+    );
+    for field in [
+        "proposalManifestSha256",
+        "proposalReceiptSha256",
+        "generationJournalSha256",
+        "outputIdentityLedgerSha256",
+        "outputIdentityLedgerFileSha256",
+    ] {
+        sha(value, field)?;
+    }
+    let input = member(value, "inputIdentityLedgerSha256")?;
+    match generation_kind {
+        "g0" => ensure!(input.is_null(), "G0 must not have an input identity ledger"),
+        "evolved" => {
+            sha(value, "inputIdentityLedgerSha256")?;
+        }
+        _ => unreachable!(),
+    }
+    let relative = Path::new(text(value, "outputIdentityLedgerRelativePath")?);
+    ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "identity ledger output path must be a safe relative path"
+    );
+    Ok(())
+}
+
+fn validate_selected_rich_members(
+    source: &Value,
+    generation_index: u64,
+    cohort: &Value,
+    provisional: &Value,
+) -> Result<Vec<Value>> {
+    let value = member(source, "selectedRichMembers")?;
+    exact_keys(
+        object(value, "selected rich members")?,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "cohortSha256",
+            "provisionalSha256",
+            "members",
+            "memberCount",
+            "selectedRichMembersSha256",
+        ],
+        "selected rich members",
+    )?;
+    ensure!(
+        text(value, "schemaVersion")? == "temporal_qd_selected_rich_members_v1"
+            && unsigned(value, "generationIndex")? == generation_index
+            && sha(value, "cohortSha256")? == sha(cohort, "cohortSha256")?
+            && sha(value, "provisionalSha256")? == sha(provisional, "provisionalSha256")?,
+        "selected rich member binding drifted"
+    );
+    verify_self_hash(value, "selectedRichMembersSha256", "selected rich members")?;
+    let members = array(value, "members")?.to_vec();
+    ensure!(
+        unsigned(value, "memberCount")? == members.len() as u64,
+        "selected rich member count drifted"
+    );
+    let provisional_ids = provisional_map_from_value(provisional)?;
+    let mut seen = BTreeSet::new();
+    for member_value in &members {
+        let id = text(member_value, "candidateId")?;
+        let provisional_member = provisional_ids
+            .get(id)
+            .ok_or_else(|| anyhow!("selected rich member is not provisional"))?;
+        for field in [
+            "candidateIdentitySha256",
+            "programSha256",
+            "profileSnapshotSha256",
+        ] {
+            ensure!(
+                sha(member_value, field)? == sha(provisional_member, field)?,
+                "selected rich member identity drifted"
+            );
+        }
+        ensure!(
+            seen.insert(id.to_owned()),
+            "selected rich member repeats candidate"
+        );
+    }
+    Ok(members)
+}
+
+fn provisional_map_from_value(provisional: &Value) -> Result<BTreeMap<String, Value>> {
+    let mut result = BTreeMap::new();
+    for candidate in array(provisional, "candidates")? {
+        let id = text(candidate, "candidateId")?.to_owned();
+        ensure!(
+            result.insert(id, candidate.clone()).is_none(),
+            "provisional repeats candidate"
+        );
+    }
+    Ok(result)
+}
+
+fn validate_admitted_campaign_ledger(
+    value: &Value,
+    generation_index: u64,
+    rotating_sha: &str,
+    cohort: &Value,
+    provisional: &Value,
+) -> Result<Vec<Value>> {
+    exact_keys(
+        object(value, "admitted campaign ledger")?,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "rotatingEvidenceSha256",
+            "cohortSha256",
+            "provisionalSha256",
+            "campaigns",
+            "admittedCampaignLedgerSha256",
+        ],
+        "admitted campaign ledger",
+    )?;
+    ensure!(
+        text(value, "schemaVersion")? == "temporal_qd_v5_admitted_campaign_ledger_v1"
+            && unsigned(value, "generationIndex")? == generation_index
+            && sha(value, "rotatingEvidenceSha256")? == rotating_sha
+            && sha(value, "cohortSha256")? == sha(cohort, "cohortSha256")?
+            && sha(value, "provisionalSha256")? == sha(provisional, "provisionalSha256")?,
+        "admitted campaign ledger binding drifted"
+    );
+    verify_self_hash(
+        value,
+        "admittedCampaignLedgerSha256",
+        "admitted campaign ledger",
+    )?;
+    let campaigns = array(value, "campaigns")?.to_vec();
+    let mut roles = BTreeSet::new();
+    for campaign in &campaigns {
+        exact_keys(
+            object(campaign, "admitted campaign ledger entry")?,
+            &[
+                "campaignRole",
+                "panelId",
+                "semanticReceiptSha256",
+                "receiptSha256",
+                "receipt",
+            ],
+            "admitted campaign ledger entry",
+        )?;
+        let role = text(campaign, "campaignRole")?;
+        let panel = text(campaign, "panelId")?;
+        ensure!(
+            roles.insert((role.to_owned(), panel.to_owned())),
+            "campaign ledger repeats role/panel"
+        );
+        let receipt = member(campaign, "receipt")?;
+        ensure!(
+            text(receipt, "schemaVersion")? == ROTATING_CAMPAIGN_RECEIPT_SCHEMA
+                && unsigned(receipt, "generationIndex")? == generation_index
+                && sha(receipt, "rotatingEvidenceSha256")? == rotating_sha
+                && text(receipt, "campaignRole")? == role
+                && text(receipt, "panelId")? == panel
+                && sha(receipt, "semanticReceiptSha256")?
+                    == sha(campaign, "semanticReceiptSha256")?
+                && sha(receipt, "receiptSha256")? == sha(campaign, "receiptSha256")?,
+            "campaign ledger receipt binding drifted"
+        );
+        verify_self_hash(receipt, "receiptSha256", "campaign receipt")?;
+        unsigned(member(receipt, "campaignFreeze")?, "taskCount")?;
+    }
+    Ok(campaigns)
+}
+
+fn validate_panel_coverage(
+    value: &Value,
+    generation_index: u64,
+    rotating_sha: &str,
+    cohort: &Value,
+    provisional: &Value,
+    required_panels: &[String],
+    bundles: &[Value],
+) -> Result<()> {
+    exact_keys(
+        object(value, "panel coverage")?,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "rotatingEvidenceSha256",
+            "cohortSha256",
+            "provisionalSha256",
+            "requiredPanelIds",
+            "candidatePanelBundleSha256",
+            "coverage",
+            "panelCoverageSha256",
+        ],
+        "panel coverage",
+    )?;
+    ensure!(
+        text(value, "schemaVersion")? == "temporal_qd_v5_panel_coverage_v1"
+            && unsigned(value, "generationIndex")? == generation_index
+            && sha(value, "rotatingEvidenceSha256")? == rotating_sha
+            && sha(value, "cohortSha256")? == sha(cohort, "cohortSha256")?
+            && sha(value, "provisionalSha256")? == sha(provisional, "provisionalSha256")?
+            && sha(value, "candidatePanelBundleSha256")?
+                == canonical_sha256(&Value::Array(bundles.to_vec()))?,
+        "panel coverage binding drifted"
+    );
+    verify_self_hash(value, "panelCoverageSha256", "panel coverage")?;
+    let panels = string_array(value, "requiredPanelIds")?;
+    ensure!(
+        panels == required_panels,
+        "panel coverage required panel ordering drifted"
+    );
+    let provisional_ids = provisional_map_from_value(provisional)?;
+    let coverage = object(member(value, "coverage")?, "panel coverage map")?;
+    ensure!(
+        coverage.len() == provisional_ids.len(),
+        "panel coverage candidate count drifted"
+    );
+    for candidate in provisional_ids.keys() {
+        let observed = member(member(value, "coverage")?, candidate)?;
+        ensure!(
+            string_array(observed, "panelIds")? == panels,
+            "panel coverage is incomplete"
+        );
+    }
     Ok(())
 }
 
@@ -1702,6 +2126,7 @@ fn build_ledger(
     archive: &Value,
     checkpoint: &Value,
 ) -> Result<Value> {
+    validate_cohort_partition(source)?;
     let campaigns = campaign_bindings(source)?;
     let mut v = json!({"schemaVersion":"temporal_qd_rotating_generation_ledger_v1","rotatingEvidenceSha256":source.rotating_sha,"generationIndex":source.generation_index,"panelId":source.current_panel_id,"cohortSha256":sha(&source.cohort,"cohortSha256")?,"proposalCandidateIds":member(&source.cohort,"newProposalCandidateIds")?,"retainedParentEvaluationCandidateIds":member(&source.cohort,"retainedParentEvaluationCandidateIds")?,"proposalOnlyFunnelReporting":true,"campaigns":campaigns,"provisionalSha256":sha(&source.provisional,"provisionalSha256")?,"cumulativeArchiveSha256":sha(cumulative,"archiveSha256")?,"checkpointSha256":sha(checkpoint,"checkpointSha256")?,"parentArchiveSha256":sha(archive,"archiveSha256")?});
     add_self_hash(&mut v, "ledgerSha256")?;
@@ -1712,7 +2137,25 @@ fn build_generation_record(
     plan: &Value,
     outputs: &FinalizedOutputs<'_>,
 ) -> Result<Value> {
-    let mut v = source.generation_record_base.clone();
+    // Publication and transition bases are derived from the sealed v5 state
+    // basis and the prefinalizer's admitted result.  V1 accepted these as an
+    // unchecked Python `finalizerContext`, which allowed a valid archive to be
+    // paired with arbitrary state/accounting metadata.
+    let mut v = json!({
+        "schemaVersion":"temporal_qd_generation_record_v2",
+        "generationIndex":source.generation_index,
+        // The historical supervisor contract counts the sealed proposal
+        // evaluation population, including terminal evaluation rejections.
+        // The current-panel cohort is post-reduction and can be smaller; it
+        // may also contain retained-parent reevaluations, which are not new
+        // proposals. The proposal-only funnel is the authenticated authority
+        // for this generation counter.
+        "candidateCount":unsigned(outputs.funnel, "candidateCount")?,
+        "totalGenerationTaskCount":campaign_task_count(&source.campaigns)?,
+        "stateBasisSha256":sha(&source.state_basis, "stateBasisSha256")?,
+        "semanticAuthoritySha256":source.semantic_authority_sha256,
+        "runtimeAuthoritySha256":source.runtime_authority_sha256,
+    });
     let m = object_mut(&mut v, "generation record")?;
     m.insert("generationIndex".into(), json!(source.generation_index));
     m.insert(
@@ -1747,10 +2190,7 @@ fn build_generation_record(
         "generationFunnelSnapshotSha256".into(),
         json!(sha(outputs.funnel_snapshot, "snapshotSha256")?),
     );
-    m.insert(
-        "archivePath".into(),
-        member(&source.publication_paths, "archive")?.clone(),
-    );
+    m.insert("archivePath".into(), json!(ARCHIVE_PATH));
     for (field, key) in [
         ("occupiedCellCount", "occupiedCellCount"),
         ("newCellCount", "newCellCount"),
@@ -1784,23 +2224,18 @@ fn build_generation_record(
 }
 
 fn build_artifact_ledger(source: &Source, outputs: &FinalizedOutputs<'_>) -> Result<Value> {
-    let mut artifacts = source.artifact_ledger_base.clone();
+    let mut artifacts = json!({
+        "schemaVersion":"temporal_qd_generation_artifacts_v2",
+        "semanticAuthoritySha256":source.semantic_authority_sha256,
+    });
     let map = object_mut(&mut artifacts, "artifact ledger base")?;
     map.insert(
         "archive".into(),
-        semantic_artifact_descriptor(
-            text(&source.publication_paths, "archive")?,
-            outputs.archive,
-            "archiveSha256",
-        )?,
+        semantic_artifact_descriptor(ARCHIVE_PATH, outputs.archive, "archiveSha256")?,
     );
     map.insert(
         "generationFunnel".into(),
-        semantic_artifact_descriptor(
-            text(&source.publication_paths, "generationFunnel")?,
-            outputs.funnel,
-            "artifactSha256",
-        )?,
+        semantic_artifact_descriptor(FUNNEL_PATH, outputs.funnel, "artifactSha256")?,
     );
     map.insert(
         "generationFunnelSnapshot".into(),
@@ -1808,27 +2243,15 @@ fn build_artifact_ledger(source: &Source, outputs: &FinalizedOutputs<'_>) -> Res
     );
     map.insert(
         "rotatingEvidenceLedger".into(),
-        semantic_artifact_descriptor(
-            text(&source.publication_paths, "rotatingEvidenceLedger")?,
-            outputs.ledger,
-            "ledgerSha256",
-        )?,
+        semantic_artifact_descriptor(LEDGER_PATH, outputs.ledger, "ledgerSha256")?,
     );
     map.insert(
         "rotatingEvidenceCheckpoint".into(),
-        semantic_artifact_descriptor(
-            text(&source.publication_paths, "rotatingEvidenceCheckpoint")?,
-            outputs.checkpoint,
-            "checkpointSha256",
-        )?,
+        semantic_artifact_descriptor(CHECKPOINT_PATH, outputs.checkpoint, "checkpointSha256")?,
     );
     map.insert(
         "cumulativeBreederArchive".into(),
-        semantic_artifact_descriptor(
-            text(&source.publication_paths, "cumulativeBreederArchive")?,
-            outputs.cumulative,
-            "archiveSha256",
-        )?,
+        semantic_artifact_descriptor(CUMULATIVE_PATH, outputs.cumulative, "archiveSha256")?,
     );
     Ok(artifacts)
 }
@@ -1840,20 +2263,431 @@ fn semantic_artifact_descriptor(path: &str, value: &Value, field: &str) -> Resul
     Ok(descriptor)
 }
 fn build_state_patch(source: &Source, record: &Value) -> Result<Value> {
-    let mut v = source.state_transition_base.clone();
-    let m = object_mut(&mut v, "state transition")?;
-    m.insert(
-        "schemaVersion".into(),
-        json!("temporal_qd_generation_state_patch_v1"),
+    let selected_new_proposal_count = validate_cohort_partition(source)?;
+    let new_proposal_count = unsigned(record, "candidateCount")?;
+    ensure!(
+        new_proposal_count >= selected_new_proposal_count,
+        "generation record proposal count is smaller than the selected proposal cohort"
     );
-    m.insert("generationIndex".into(), json!(source.generation_index));
-    m.insert(
-        "generationRecordSha256".into(),
-        json!(sha(record, "generationRecordSha256")?),
-    );
-    m.insert("generationRecord".into(), record.clone());
+    let mut completed = source.completed_generation_records.clone();
+    completed.push(record.clone());
+    let mut v = json!({
+        "schemaVersion":"temporal_qd_generation_state_patch_v2",
+        "stateBasisSha256":sha(&source.state_basis, "stateBasisSha256")?,
+        "generationIndex":source.generation_index,
+        "nextGenerationIndex":source.generation_index.checked_add(1).context("generation index overflow")?,
+        "nextStage":"generation_proposal",
+        "uniqueCandidatesEvaluated":unsigned(&source.state_basis, "uniqueCandidatesEvaluated")?.checked_add(new_proposal_count).context("candidate accounting overflow")?,
+        "workerTasksCompleted":unsigned(&source.state_basis, "workerTasksCompleted")?.checked_add(campaign_task_count(&source.campaigns)?).context("task accounting overflow")?,
+        "nextImmigrantContinuationOrdinal":unsigned(&source.state_basis, "nextImmigrantContinuationOrdinal")?,
+        "uniqueIdentityCounts":member(&source.state_basis, "uniqueIdentityCounts")?,
+        "duplicateCounters":member(&source.state_basis, "duplicateCounters")?,
+        "proposalSlotCounters":member(&source.state_basis, "proposalSlotCounters")?,
+        "completedGenerationsSha256":canonical_sha256(&Value::Array(completed))?,
+        "generationRecordSha256":sha(record, "generationRecordSha256")?,
+        "generationRecord":record,
+        "semanticAuthoritySha256":source.semantic_authority_sha256,
+        "runtimeAuthoritySha256":source.runtime_authority_sha256,
+    });
     add_self_hash(&mut v, "statePatchSha256")?;
     Ok(v)
+}
+
+fn validate_cohort_partition(source: &Source) -> Result<u64> {
+    ensure!(
+        !member(&source.cohort, "parentReevaluationIsProposal")?
+            .as_bool()
+            .unwrap_or(true),
+        "parent reevaluation must not be counted as a proposal"
+    );
+    let ids = |key: &str| -> Result<BTreeSet<String>> {
+        array(&source.cohort, key)?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("{key} must contain nonempty candidate IDs"))
+            })
+            .collect()
+    };
+    let proposal = ids("newProposalCandidateIds")?;
+    ensure!(
+        proposal.len() == array(&source.cohort, "newProposalCandidateIds")?.len(),
+        "new proposal candidate IDs repeat"
+    );
+    let retained = ids("retainedParentEvaluationCandidateIds")?;
+    ensure!(
+        retained.len() == array(&source.cohort, "retainedParentEvaluationCandidateIds")?.len(),
+        "retained parent candidate IDs repeat"
+    );
+    ensure!(
+        proposal.is_disjoint(&retained),
+        "cohort proposal/parent roles overlap"
+    );
+    let candidates = array(&source.cohort, "candidates")?;
+    let candidate_ids = candidates
+        .iter()
+        .map(|candidate| text(candidate, "candidateId").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        candidate_ids.len() == candidates.len(),
+        "cohort candidates repeat"
+    );
+    ensure!(
+        proposal.union(&retained).cloned().collect::<BTreeSet<_>>() == candidate_ids,
+        "cohort candidates do not exactly partition proposal and retained-parent roles"
+    );
+    Ok(proposal.len() as u64)
+}
+
+fn campaign_task_count(campaigns: &[Value]) -> Result<u64> {
+    campaigns.iter().try_fold(0_u64, |total, campaign| {
+        let task_count = unsigned(campaign, "taskCount")
+            .or_else(|_| unsigned(member(campaign, "campaignFreeze")?, "taskCount"))
+            .or_else(|_| {
+                unsigned(
+                    member(member(campaign, "receipt")?, "campaignFreeze")?,
+                    "taskCount",
+                )
+            })?;
+        total
+            .checked_add(task_count)
+            .context("campaign task count overflow")
+    })
+}
+
+fn build_state_application_sidecar(
+    source: &Source,
+    manifest: &Manifest,
+    commit: &Value,
+    record: &Value,
+    patch: &Value,
+) -> Result<Value> {
+    ensure!(
+        member(patch, "generationRecord")? == record
+            && sha(patch, "generationRecordSha256")? == sha(record, "generationRecordSha256")?,
+        "state patch does not contain the exact Rust generation record"
+    );
+    let authority = &source.proposal_state_authority;
+    let generation_kind = text(authority, "generationKind")?;
+    let finalization = json!({
+        "sourceSha256":source.source_sha256,
+        "manifestSha256":manifest.manifest_sha256,
+        "commitSha256":sha(commit, "commitSha256")?,
+        "generationRecordSha256":sha(record, "generationRecordSha256")?,
+        "statePatchSha256":sha(patch, "statePatchSha256")?,
+    });
+    let next_state = json!({
+        "stage":"generation_proposal",
+        "currentGenerationIndex":unsigned(patch, "nextGenerationIndex")?,
+        "uniqueCandidatesEvaluated":unsigned(patch, "uniqueCandidatesEvaluated")?,
+        "workerTasksCompleted":unsigned(patch, "workerTasksCompleted")?,
+        "nextImmigrantContinuationOrdinal":unsigned(patch, "nextImmigrantContinuationOrdinal")?,
+        "uniqueIdentityCounts":member(patch, "uniqueIdentityCounts")?,
+        "duplicateCounters":member(patch, "duplicateCounters")?,
+        "proposalSlotCounters":member(patch, "proposalSlotCounters")?,
+        "completedGenerationsSha256":sha(patch, "completedGenerationsSha256")?,
+    });
+    let identity_ledger_promotion = json!({
+        "inputIdentityLedgerSha256":member(authority, "inputIdentityLedgerSha256")?,
+        "outputRelativePath":member(authority, "outputIdentityLedgerRelativePath")?,
+        "outputIdentityLedgerSha256":sha(authority, "outputIdentityLedgerSha256")?,
+        "outputIdentityLedgerFileSha256":sha(authority, "outputIdentityLedgerFileSha256")?,
+    });
+    let mut sidecar = json!({
+        "schemaVersion":STATE_APPLICATION_SIDECAR_SCHEMA,
+        "contractVersion":CONTRACT_VERSION,
+        "generationIndex":source.generation_index,
+        "generationKind":generation_kind,
+        "configSha256":sha(&source.state_basis, "configSha256")?,
+        "stateBasisSha256":sha(&source.state_basis, "stateBasisSha256")?,
+        "completedGenerationsBeforeSha256":sha(&source.state_basis, "completedGenerationsSha256")?,
+        "semanticAuthoritySha256":source.semantic_authority_sha256,
+        "runtimeAuthoritySha256":source.runtime_authority_sha256,
+        "finalization":finalization,
+        "proposalStateAuthority":{
+            "proposalManifestSha256":sha(authority, "proposalManifestSha256")?,
+            "proposalReceiptSha256":sha(authority, "proposalReceiptSha256")?,
+            "generationJournalSha256":sha(authority, "generationJournalSha256")?,
+        },
+        "nextState":next_state,
+        "identityLedgerPromotion":identity_ledger_promotion,
+    });
+    add_self_hash(&mut sidecar, "sidecarSha256")?;
+    validate_state_application_sidecar_value(&sidecar, source, manifest, commit, record, patch)?;
+    Ok(sidecar)
+}
+
+fn validate_state_application_sidecar(
+    root: &Path,
+    manifest: &Manifest,
+    commit: &Value,
+) -> Result<()> {
+    let sidecar_path = output_path(root, STATE_APPLICATION_SIDECAR_PATH)?;
+    if !sidecar_path.exists() {
+        // Compact historical commits predate the v2 state patch. They are
+        // restart-checkable output bundles, but cannot represent a v2 state
+        // application boundary. A v2 patch without its receipt-last sidecar
+        // is always rejected.
+        let patch_bytes = fs::read(output_path(root, STATE_PATCH_PATH)?)?;
+        let patch_value: Value = serde_json::from_slice(&patch_bytes).unwrap_or(Value::Null);
+        ensure!(
+            text(&patch_value, "schemaVersion").ok()
+                != Some("temporal_qd_generation_state_patch_v2"),
+            "v2 state patch lacks its state application sidecar"
+        );
+        return Ok(());
+    }
+    let sidecar = read_self_hashed(
+        &sidecar_path,
+        "sidecarSha256",
+        STATE_APPLICATION_SIDECAR_SCHEMA,
+    )?;
+    validate_state_application_sidecar_shape(&sidecar)?;
+    let record = read_self_hashed(
+        &output_path(root, RECORD_PATH)?,
+        "generationRecordSha256",
+        "temporal_qd_generation_record_v2",
+    )?;
+    let patch = read_self_hashed(
+        &output_path(root, STATE_PATCH_PATH)?,
+        "statePatchSha256",
+        "temporal_qd_generation_state_patch_v2",
+    )?;
+    let finalization = member(&sidecar, "finalization")?;
+    ensure!(
+        sha(finalization, "sourceSha256")? == manifest.source_sha256
+            && sha(finalization, "manifestSha256")? == manifest.manifest_sha256
+            && sha(finalization, "commitSha256")? == sha(commit, "commitSha256")?
+            && sha(finalization, "generationRecordSha256")?
+                == sha(&record, "generationRecordSha256")?
+            && sha(finalization, "statePatchSha256")? == sha(&patch, "statePatchSha256")?,
+        "state application sidecar finalization binding drifted"
+    );
+    ensure!(
+        member(&patch, "generationRecord")? == &record
+            && sha(&patch, "generationRecordSha256")? == sha(&record, "generationRecordSha256")?,
+        "state application sidecar patch/record drifted"
+    );
+    ensure!(
+        sha(&sidecar, "runtimeAuthoritySha256")? == manifest.runtime_authority_sha256
+            && sha(&sidecar, "semanticAuthoritySha256")? == manifest.semantic_authority_sha256
+            && unsigned(&sidecar, "generationIndex")? == unsigned(commit, "generationIndex")?,
+        "state application sidecar authority or generation drifted"
+    );
+    Ok(())
+}
+
+fn validate_state_application_sidecar_shape(sidecar: &Value) -> Result<()> {
+    exact_keys(
+        object(sidecar, "state application sidecar")?,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "generationIndex",
+            "generationKind",
+            "configSha256",
+            "stateBasisSha256",
+            "completedGenerationsBeforeSha256",
+            "semanticAuthoritySha256",
+            "runtimeAuthoritySha256",
+            "finalization",
+            "proposalStateAuthority",
+            "nextState",
+            "identityLedgerPromotion",
+            "sidecarSha256",
+        ],
+        "state application sidecar",
+    )?;
+    exact_keys(
+        object(member(sidecar, "finalization")?, "sidecar finalization")?,
+        &[
+            "sourceSha256",
+            "manifestSha256",
+            "commitSha256",
+            "generationRecordSha256",
+            "statePatchSha256",
+        ],
+        "sidecar finalization",
+    )?;
+    exact_keys(
+        object(
+            member(sidecar, "proposalStateAuthority")?,
+            "sidecar proposal authority",
+        )?,
+        &[
+            "proposalManifestSha256",
+            "proposalReceiptSha256",
+            "generationJournalSha256",
+        ],
+        "sidecar proposal authority",
+    )?;
+    exact_keys(
+        object(member(sidecar, "nextState")?, "sidecar next state")?,
+        &[
+            "stage",
+            "currentGenerationIndex",
+            "uniqueCandidatesEvaluated",
+            "workerTasksCompleted",
+            "nextImmigrantContinuationOrdinal",
+            "uniqueIdentityCounts",
+            "duplicateCounters",
+            "proposalSlotCounters",
+            "completedGenerationsSha256",
+        ],
+        "sidecar next state",
+    )?;
+    exact_keys(
+        object(
+            member(sidecar, "identityLedgerPromotion")?,
+            "sidecar identity promotion",
+        )?,
+        &[
+            "inputIdentityLedgerSha256",
+            "outputRelativePath",
+            "outputIdentityLedgerSha256",
+            "outputIdentityLedgerFileSha256",
+        ],
+        "sidecar identity promotion",
+    )?;
+    ensure!(
+        matches!(text(sidecar, "generationKind")?, "g0" | "evolved"),
+        "sidecar generation kind is invalid"
+    );
+    ensure!(
+        text(
+            member(sidecar, "identityLedgerPromotion")?,
+            "outputRelativePath"
+        )? == "proposal/v5-native/identity-ledger.json",
+        "sidecar identity ledger output path drifted"
+    );
+    Ok(())
+}
+
+fn validate_state_application_sidecar_value(
+    sidecar: &Value,
+    source: &Source,
+    manifest: &Manifest,
+    commit: &Value,
+    record: &Value,
+    patch: &Value,
+) -> Result<()> {
+    exact_keys(
+        object(sidecar, "state application sidecar")?,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "generationIndex",
+            "generationKind",
+            "configSha256",
+            "stateBasisSha256",
+            "completedGenerationsBeforeSha256",
+            "semanticAuthoritySha256",
+            "runtimeAuthoritySha256",
+            "finalization",
+            "proposalStateAuthority",
+            "nextState",
+            "identityLedgerPromotion",
+            "sidecarSha256",
+        ],
+        "state application sidecar",
+    )?;
+    verify_self_hash(sidecar, "sidecarSha256", "state application sidecar")?;
+    exact_keys(
+        object(member(sidecar, "finalization")?, "sidecar finalization")?,
+        &[
+            "sourceSha256",
+            "manifestSha256",
+            "commitSha256",
+            "generationRecordSha256",
+            "statePatchSha256",
+        ],
+        "sidecar finalization",
+    )?;
+    exact_keys(
+        object(
+            member(sidecar, "proposalStateAuthority")?,
+            "sidecar proposal authority",
+        )?,
+        &[
+            "proposalManifestSha256",
+            "proposalReceiptSha256",
+            "generationJournalSha256",
+        ],
+        "sidecar proposal authority",
+    )?;
+    exact_keys(
+        object(member(sidecar, "nextState")?, "sidecar next state")?,
+        &[
+            "stage",
+            "currentGenerationIndex",
+            "uniqueCandidatesEvaluated",
+            "workerTasksCompleted",
+            "nextImmigrantContinuationOrdinal",
+            "uniqueIdentityCounts",
+            "duplicateCounters",
+            "proposalSlotCounters",
+            "completedGenerationsSha256",
+        ],
+        "sidecar next state",
+    )?;
+    exact_keys(
+        object(
+            member(sidecar, "identityLedgerPromotion")?,
+            "sidecar identity ledger promotion",
+        )?,
+        &[
+            "inputIdentityLedgerSha256",
+            "outputRelativePath",
+            "outputIdentityLedgerSha256",
+            "outputIdentityLedgerFileSha256",
+        ],
+        "sidecar identity ledger promotion",
+    )?;
+    ensure!(
+        text(sidecar, "contractVersion")? == CONTRACT_VERSION
+            && unsigned(sidecar, "generationIndex")? == source.generation_index
+            && sha(sidecar, "configSha256")? == sha(&source.state_basis, "configSha256")?
+            && sha(sidecar, "stateBasisSha256")? == sha(&source.state_basis, "stateBasisSha256")?
+            && sha(sidecar, "completedGenerationsBeforeSha256")?
+                == sha(&source.state_basis, "completedGenerationsSha256")?
+            && sha(sidecar, "semanticAuthoritySha256")? == manifest.semantic_authority_sha256
+            && sha(sidecar, "runtimeAuthoritySha256")? == manifest.runtime_authority_sha256,
+        "state application sidecar authority drifted"
+    );
+    let next = member(sidecar, "nextState")?;
+    ensure!(
+        text(next, "stage")? == "generation_proposal"
+            && unsigned(next, "currentGenerationIndex")? == unsigned(patch, "nextGenerationIndex")?
+            && unsigned(next, "uniqueCandidatesEvaluated")?
+                == unsigned(patch, "uniqueCandidatesEvaluated")?
+            && unsigned(next, "workerTasksCompleted")? == unsigned(patch, "workerTasksCompleted")?
+            && unsigned(next, "nextImmigrantContinuationOrdinal")?
+                == unsigned(patch, "nextImmigrantContinuationOrdinal")?
+            && member(next, "uniqueIdentityCounts")? == member(patch, "uniqueIdentityCounts")?
+            && member(next, "duplicateCounters")? == member(patch, "duplicateCounters")?
+            && member(next, "proposalSlotCounters")? == member(patch, "proposalSlotCounters")?,
+        "state application sidecar next state is not the absolute Rust patch"
+    );
+    let mut completed = source.completed_generation_records.clone();
+    completed.push(record.clone());
+    ensure!(
+        sha(next, "completedGenerationsSha256")? == canonical_sha256(&Value::Array(completed))?,
+        "state application sidecar completed generation root drifted"
+    );
+    let finalization = member(sidecar, "finalization")?;
+    ensure!(
+        sha(finalization, "sourceSha256")? == source.source_sha256
+            && sha(finalization, "manifestSha256")? == manifest.manifest_sha256
+            && sha(finalization, "commitSha256")? == sha(commit, "commitSha256")?
+            && sha(finalization, "generationRecordSha256")?
+                == sha(record, "generationRecordSha256")?
+            && sha(finalization, "statePatchSha256")? == sha(patch, "statePatchSha256")?,
+        "state application sidecar finalization substitution"
+    );
+    Ok(())
 }
 
 fn execution(
@@ -2046,10 +2880,14 @@ fn validate_commit_outputs(root: &Path, commit: &Value) -> Result<()> {
             text(descriptor, "path")? == expected_path,
             "committed descriptor path drifted"
         );
-        let path = root.join(expected_path);
+        let path = output_path(root, expected_path)?;
         ensure!(
             path.is_file(),
             "committed output is missing: {expected_path}"
+        );
+        ensure!(
+            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "committed output must not be a symlink: {expected_path}"
         );
         let metadata = fs::metadata(&path)?;
         ensure!(
@@ -2113,13 +2951,22 @@ fn read_self_hashed(path: &Path, field: &str, schema: &str) -> Result<Value> {
 }
 fn publish_value_once(root: &Path, name: &str, value: &Value) -> Result<()> {
     let bytes = canonical_json_line(value)?;
-    let path = root.join(name);
+    let path = output_path(root, name)?;
     if path.exists() {
+        ensure!(
+            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "immutable output {name} must not be a symlink"
+        );
         ensure!(fs::read(&path)? == bytes, "immutable output {name} differs");
         return Ok(());
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let tmp = root.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+    let parent = path.parent().context("output has no parent")?;
+    let filename = path
+        .file_name()
+        .context("output has no filename")?
+        .to_string_lossy();
+    let tmp = parent.join(format!(".{filename}.{}.{nonce}.tmp", std::process::id()));
     let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     f.write_all(&bytes)?;
     f.sync_all()?;
@@ -2127,13 +2974,13 @@ fn publish_value_once(root: &Path, name: &str, value: &Value) -> Result<()> {
     match fs::hard_link(&tmp, &path) {
         Ok(()) => {
             fs::remove_file(&tmp)?;
-            sync_directory(root)?;
+            sync_directory(parent)?;
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure!(fs::read(&path)? == bytes, "immutable output {name} differs");
             fs::remove_file(&tmp)?;
-            sync_directory(root)?;
+            sync_directory(parent)?;
             Ok(())
         }
         Err(e) => {
@@ -2141,6 +2988,37 @@ fn publish_value_once(root: &Path, name: &str, value: &Value) -> Result<()> {
             Err(e.into())
         }
     }
+}
+
+fn output_path(root: &Path, name: &str) -> Result<PathBuf> {
+    let relative = Path::new(name);
+    ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "output path must be a safe relative path"
+    );
+    let root = root
+        .canonicalize()
+        .context("canonicalize finalization root")?;
+    let mut current = root.clone();
+    let components = relative.components().collect::<Vec<_>>();
+    ensure!(!components.is_empty(), "output path is empty");
+    for component in &components[..components.len() - 1] {
+        current.push(component.as_os_str());
+        if current.exists() {
+            ensure!(
+                !fs::symlink_metadata(&current)?.file_type().is_symlink() && current.is_dir(),
+                "output directory must be a real directory"
+            );
+        } else {
+            fs::create_dir(&current)?;
+        }
+    }
+    let path = root.join(relative);
+    ensure!(path.starts_with(&root), "output escapes finalization root");
+    Ok(path)
 }
 #[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<()> {
@@ -2176,6 +3054,17 @@ fn sync_directory(path: &Path) -> Result<()> {
 fn existing_file(path: &Path, name: &str) -> Result<PathBuf> {
     ensure!(path.is_file(), "{name} is missing");
     Ok(path.canonicalize()?)
+}
+
+fn existing_file_under(path: &Path, root: &Path, name: &str) -> Result<PathBuf> {
+    ensure!(path.is_absolute(), "{name} execution path must be absolute");
+    let root = root.canonicalize()?;
+    let resolved = existing_file(path, name)?;
+    ensure!(
+        resolved.starts_with(&root),
+        "{name} escapes finalization root"
+    );
+    Ok(resolved)
 }
 fn object<'a>(v: &'a Value, name: &str) -> Result<&'a Map<String, Value>> {
     v.as_object()
@@ -2262,6 +3151,41 @@ mod tests {
     const HASH_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HASH_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn derives_scalar_cell_capacity_from_the_frozen_archive_policy() {
+        let policy = json!({
+            "frozenPolicy": {"archive": {"defaultCellCapacity": 4}}
+        });
+        assert_eq!(derive_cell_capacity(&policy).unwrap(), 4);
+    }
+
+    #[test]
+    fn previous_parent_summary_requires_complete_sorted_archive_accounting() {
+        let mut summary = json!({
+            "schemaVersion": PREVIOUS_PARENT_SUMMARY_SCHEMA,
+            "archiveSha256": HASH_A,
+            "candidateCountSeen": 11,
+            "memberCount": 2,
+            "cellIds": ["a", "z"],
+            "bidirectionalPairPolicy": {"schemaVersion":"fixture"}
+        });
+        add_self_hash(&mut summary, "summarySha256").unwrap();
+        validate_previous_parent_summary(&summary).unwrap();
+
+        let mut reordered = summary.clone();
+        reordered["cellIds"] = json!(["z", "a"]);
+        add_self_hash(&mut reordered, "summarySha256").unwrap();
+        assert!(validate_previous_parent_summary(&reordered).is_err());
+
+        let mut incomplete = summary;
+        incomplete
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateCountSeen");
+        add_self_hash(&mut incomplete, "summarySha256").unwrap();
+        assert!(validate_previous_parent_summary(&incomplete).is_err());
+    }
 
     fn synthetic_bundle(candidate: &Value, panel_id: &str, window_id: &str) -> Value {
         let mut record = json!({
@@ -2366,20 +3290,65 @@ mod tests {
             current_member_count: 1,
             cell_capacity: 1,
             campaigns: Vec::new(),
-            artifact_ledger_base: json!({"schemaVersion":"temporal_qd_supervisor_generation_artifacts_v1"}),
-            publication_paths: json!({
-                "archive":"archive.json",
-                "generationFunnel":"generation-funnel.json",
-                "rotatingEvidenceLedger":"generation-ledger.json",
-                "rotatingEvidenceCheckpoint":"checkpoint.json",
-                "cumulativeBreederArchive":"cumulative-archive.json",
-            }),
             funnel_source: Value::Null,
-            generation_record_base: json!({}),
-            state_transition_base: json!({}),
+            state_basis: json!({}),
+            semantic_authority_sha256: HASH_B.into(),
+            runtime_authority_sha256: HASH_C.into(),
+            completed_generation_records: Vec::new(),
+            proposal_state_authority: json!({}),
             expected_plan: None,
             source_sha256: HASH_A.into(),
         }
+    }
+
+    fn current_policy_parity_source() -> Source {
+        let candidate = json!({
+            "candidateId":"candidate-1","candidateIdentitySha256":HASH_A,
+            "programSha256":HASH_B,"profileSnapshotSha256":HASH_C,
+        });
+        let mut source = synthetic_source(
+            vec![
+                synthetic_bundle(&candidate, "panel-1", "w1"),
+                synthetic_bundle(&candidate, "panel-2", "w2"),
+            ],
+            Vec::new(),
+        );
+        source.complete_bundle_snapshot = true;
+        source.previous_parent = {
+            let mut value = json!({
+                "schemaVersion":"temporal_qd_previous_parent_archive_summary_v1",
+                "archiveSha256":HASH_A,"candidateCountSeen":0,"memberCount":0,"cellIds":[],
+            });
+            add_self_hash(&mut value, "summarySha256").unwrap();
+            value
+        };
+        // This is a bounded v4-shaped authority projection.  Production v2
+        // validates its full known frozen-policy hash before reaching these
+        // unchanged builders; the builder parity gate only needs the same
+        // authenticated policy fields that determine emitted archive bytes.
+        source.archive_policy = json!({
+            "schemaVersion":"temporal_qd_archive_policy_binding_v1",
+            "qdVersion":QD_VERSION,"policyName":QD_POLICY_NAME,"policySha256":QD_POLICY_SHA256,
+            "frozenPolicy":{"archive":{"defaultCellCapacity":1}},
+        });
+        source.rich_members = vec![json!({
+            "candidateId":"candidate-1",
+            "candidate":candidate,
+            "descriptor":{"cellId":"cell-1"},
+            "objectives":{"structuralComplexity":1.0},
+        })];
+        source.funnel_source = {
+            let mut value = json!({
+                "schemaVersion":FUNNEL_SOURCE_SCHEMA,
+                "completenessPolicy":{"schemaVersion":"temporal_generation_funnel_completeness_v1"},
+                "proposalAccounting":{"dispositionCounts":{"materialized":1},"originProposalCounts":{"immigrant":1}},
+                "proposalAttempts":[{"proposalOrdinal":0,"attemptIdentitySha256":HASH_A,"originKind":"immigrant","disposition":"materialized","candidateId":"candidate-1","rawSourceProfileSha256":HASH_C}],
+                "candidateStageRows":[{"candidateId":"candidate-1","identity":{"candidateId":"candidate-1","rawSourceProfileSha256":HASH_C},"stages":{"proposed":{"outcome":"proposed"},"staticallyReachable":{"outcome":"rejected"}},"terminalDisposition":"static_reachability_rejected","operatorIds":["seed"],"motifIds":["seed"],"direction":"long"}],
+            });
+            add_self_hash(&mut value, "funnelSourceSha256").unwrap();
+            value
+        };
+        source
     }
     #[test]
     fn dominance_is_strict_and_multidimensional() {
@@ -2399,7 +3368,8 @@ mod tests {
         let source_sha = HASH_A;
         let mut manifest = json!({
             "schemaVersion":MANIFEST_SCHEMA,"contractVersion":CONTRACT_VERSION,
-            "operation":OPERATION,"sourcePath":root.path().join("absent-source.json").to_string_lossy(),
+            "operation":OPERATION,"runtimeAuthoritySha256":HASH_B,"semanticAuthoritySha256":HASH_C,
+            "sourcePath":root.path().join("absent-source.json").to_string_lossy(),
             "sourceSha256":source_sha,"resultPath":COMMIT_PATH,
         });
         add_self_hash(&mut manifest, "manifestSha256").unwrap();
@@ -2408,6 +3378,7 @@ mod tests {
         let mut commit = json!({
             "schemaVersion":COMMIT_SCHEMA,"contractVersion":CONTRACT_VERSION,
             "sourceSha256":source_sha,"manifestSha256":sha(&manifest,"manifestSha256").unwrap(),
+            "runtimeAuthoritySha256":HASH_B,"semanticAuthoritySha256":HASH_C,
             "generationIndex":1,"auxiliaryPlanSha256":HASH_B,
         });
         for (descriptor_name, output_path) in [
@@ -2421,7 +3392,9 @@ mod tests {
             ("statePatch", STATE_PATCH_PATH),
         ] {
             let bytes = b"{}\n";
-            fs::write(root.path().join(output_path), bytes).unwrap();
+            let output = root.path().join(output_path);
+            fs::create_dir_all(output.parent().unwrap()).unwrap();
+            fs::write(output, bytes).unwrap();
             commit[descriptor_name] = json!({
                 "path":output_path,"bytes":bytes.len(),"fileSha256":sha256_bytes(bytes)
             });
@@ -2441,6 +3414,323 @@ mod tests {
         commit["generationIndex"] = json!(2);
         fs::write(&commit_path, canonical_json_line(&commit).unwrap()).unwrap();
         assert!(execute_manifest(&manifest_path).is_err());
+    }
+
+    #[test]
+    fn v2_manifest_and_source_are_exact_and_execution_paths_cannot_escape() {
+        let root = tempdir().unwrap();
+        let source_path = root.path().join("source.json");
+        let mut source = json!({
+            "schemaVersion":SOURCE_SCHEMA,
+            "contractVersion":CONTRACT_VERSION,
+            "finalizerContext":{"unchecked":"must-not-pass"},
+        });
+        add_self_hash(&mut source, "sourceSha256").unwrap();
+        fs::write(&source_path, canonical_json_line(&source).unwrap()).unwrap();
+
+        let mut manifest = json!({
+            "schemaVersion":MANIFEST_SCHEMA,"contractVersion":CONTRACT_VERSION,
+            "operation":OPERATION,"runtimeAuthoritySha256":HASH_B,"semanticAuthoritySha256":HASH_C,
+            "sourcePath":source_path.to_string_lossy(),"sourceSha256":sha(&source,"sourceSha256").unwrap(),
+            "resultPath":COMMIT_PATH,
+        });
+        add_self_hash(&mut manifest, "manifestSha256").unwrap();
+        let manifest_path = root.path().join("manifest.json");
+        fs::write(&manifest_path, canonical_json_line(&manifest).unwrap()).unwrap();
+        assert!(
+            execute_manifest(&manifest_path).is_err(),
+            "source unknown fields must fail closed"
+        );
+
+        let mut escaped = manifest.clone();
+        escaped["sourcePath"] = json!(
+            root.path()
+                .parent()
+                .unwrap()
+                .join("source.json")
+                .to_string_lossy()
+        );
+        escaped.as_object_mut().unwrap().remove("manifestSha256");
+        add_self_hash(&mut escaped, "manifestSha256").unwrap();
+        assert!(parse_manifest(&canonical_json_line(&escaped).unwrap(), root.path()).is_err());
+
+        let mut unknown = manifest;
+        unknown["unchecked"] = json!(true);
+        unknown.as_object_mut().unwrap().remove("manifestSha256");
+        add_self_hash(&mut unknown, "manifestSha256").unwrap();
+        assert!(parse_manifest(&canonical_json_line(&unknown).unwrap(), root.path()).is_err());
+    }
+
+    #[test]
+    fn v2_sealed_bases_and_coverage_reject_self_rehashed_drift() {
+        let mut state_basis = json!({
+            "schemaVersion":"temporal_qd_v5_generation_state_basis_v1",
+            "configSha256":HASH_A,"generationIndex":2,"completedGenerationsSha256":HASH_B,
+            "uniqueCandidatesEvaluated":3,"workerTasksCompleted":4,"nextImmigrantContinuationOrdinal":5,
+            "uniqueIdentityCounts":{},"duplicateCounters":{},"proposalSlotCounters":{},
+        });
+        add_self_hash(&mut state_basis, "stateBasisSha256").unwrap();
+        validate_state_basis(&state_basis, 2).unwrap();
+        state_basis["generationIndex"] = json!(3);
+        state_basis
+            .as_object_mut()
+            .unwrap()
+            .remove("stateBasisSha256");
+        add_self_hash(&mut state_basis, "stateBasisSha256").unwrap();
+        assert!(validate_state_basis(&state_basis, 2).is_err());
+
+        let mut cohort = json!({"schemaVersion":COHORT_SCHEMA,"generationIndex":2,"rotatingEvidenceSha256":HASH_A,"panelId":"panel-2","candidates":[],"newProposalCandidateIds":[],"retainedParentEvaluationCandidateIds":[],"parentReevaluationIsProposal":false});
+        add_self_hash(&mut cohort, "cohortSha256").unwrap();
+        let candidate = json!({"candidateId":"candidate-1","candidateIdentitySha256":HASH_A,"programSha256":HASH_B,"profileSnapshotSha256":HASH_C});
+        let mut provisional = json!({"schemaVersion":PROVISIONAL_SCHEMA,"generationIndex":2,"panelId":"panel-2","cohortSha256":sha(&cohort,"cohortSha256").unwrap(),"candidateCount":1,"candidates":[candidate]});
+        add_self_hash(&mut provisional, "provisionalSha256").unwrap();
+        let bundles = vec![json!({"candidateId":"candidate-1","panelId":"panel-1"})];
+        let mut coverage = json!({
+            "schemaVersion":"temporal_qd_v5_panel_coverage_v1","generationIndex":2,
+            "rotatingEvidenceSha256":HASH_A,"cohortSha256":sha(&cohort,"cohortSha256").unwrap(),
+            "provisionalSha256":sha(&provisional,"provisionalSha256").unwrap(),
+            "requiredPanelIds":["panel-1"],"candidatePanelBundleSha256":canonical_sha256(&Value::Array(bundles.clone())).unwrap(),
+            "coverage":{"candidate-1":{"panelIds":["panel-1"]}},
+        });
+        add_self_hash(&mut coverage, "panelCoverageSha256").unwrap();
+        validate_panel_coverage(
+            &coverage,
+            2,
+            HASH_A,
+            &cohort,
+            &provisional,
+            &["panel-1".into()],
+            &bundles,
+        )
+        .unwrap();
+        coverage["candidatePanelBundleSha256"] = json!(HASH_C);
+        coverage
+            .as_object_mut()
+            .unwrap()
+            .remove("panelCoverageSha256");
+        add_self_hash(&mut coverage, "panelCoverageSha256").unwrap();
+        assert!(
+            validate_panel_coverage(
+                &coverage,
+                2,
+                HASH_A,
+                &cohort,
+                &provisional,
+                &["panel-1".into()],
+                &bundles
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn current_policy_fixture_keeps_stable_outputs_byte_identical_across_operational_roots() {
+        let source_a = current_policy_parity_source();
+        let mut source_b = source_a.clone();
+        // These are execution observations, never source fields. They model
+        // a different output root and dispatcher cap while exercising the
+        // unchanged semantic builders from the same sealed result.
+        source_b.source_sha256 = HASH_C.into();
+        source_b.value["executionOnly"] = json!({"outputRoot":"D:/scratch/run-b","workerCap":1});
+
+        let finalize = |source: &Source| -> (Value, Value, Value, Value, Value) {
+            let plan = build_auxiliary_plan(source).unwrap();
+            let bundles = admit_receipts(source, &plan).unwrap();
+            let cumulative = build_cumulative_archive(source, &bundles).unwrap();
+            let archive = build_parent_archive(source, &cumulative).unwrap();
+            let (funnel, _) = build_funnel(source, &archive).unwrap();
+            let checkpoint = build_checkpoint(source, &cumulative, &archive).unwrap();
+            let ledger = build_ledger(source, &plan, &cumulative, &archive, &checkpoint).unwrap();
+            (cumulative, archive, funnel, ledger, checkpoint)
+        };
+        let left = finalize(&source_a);
+        let right = finalize(&source_b);
+        for (expected, actual) in [
+            (&left.0, &right.0),
+            (&left.1, &right.1),
+            (&left.2, &right.2),
+            (&left.3, &right.3),
+            (&left.4, &right.4),
+        ] {
+            assert_eq!(
+                canonical_json_line(expected).unwrap(),
+                canonical_json_line(actual).unwrap()
+            );
+        }
+
+        let root_a = tempdir().unwrap();
+        let root_b = tempdir().unwrap();
+        for (name, value) in [
+            (CUMULATIVE_PATH, &left.0),
+            (ARCHIVE_PATH, &left.1),
+            (FUNNEL_PATH, &left.2),
+            (LEDGER_PATH, &left.3),
+            (CHECKPOINT_PATH, &left.4),
+        ] {
+            publish_value_once(root_a.path(), name, value).unwrap();
+            publish_value_once(root_b.path(), name, value).unwrap();
+            assert_eq!(
+                fs::read(output_path(root_a.path(), name).unwrap()).unwrap(),
+                fs::read(output_path(root_b.path(), name).unwrap()).unwrap(),
+                "operational output root changed a semantic artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn state_application_sidecar_uses_absolute_rust_state_and_rejects_substitution() {
+        let mut source = synthetic_source(Vec::new(), Vec::new());
+        let mut basis = json!({
+            "schemaVersion":"temporal_qd_v5_generation_state_basis_v1","configSha256":HASH_A,
+            "generationIndex":2,"completedGenerationsSha256":canonical_sha256(&Value::Array(Vec::new())).unwrap(),
+            "uniqueCandidatesEvaluated":10,"workerTasksCompleted":20,"nextImmigrantContinuationOrdinal":30,
+            "uniqueIdentityCounts":{"candidateIdentity":10},"duplicateCounters":{"candidateIdentity":1},"proposalSlotCounters":{"acceptedUniqueProposalSlots":10},
+        });
+        add_self_hash(&mut basis, "stateBasisSha256").unwrap();
+        source.state_basis = basis;
+        source.completed_generation_records = Vec::new();
+        source.proposal_state_authority = json!({
+            "generationKind":"g0","proposalManifestSha256":HASH_A,"proposalReceiptSha256":HASH_B,"generationJournalSha256":HASH_C,
+            "inputIdentityLedgerSha256":null,"outputIdentityLedgerRelativePath":"proposal/v5-native/identity-ledger.json",
+            "outputIdentityLedgerSha256":HASH_A,"outputIdentityLedgerFileSha256":HASH_B,
+        });
+        validate_proposal_state_authority(&source.proposal_state_authority).unwrap();
+        let mut record =
+            json!({"schemaVersion":"temporal_qd_generation_record_v2","generationIndex":2});
+        add_self_hash(&mut record, "generationRecordSha256").unwrap();
+        let mut patch = json!({
+            "schemaVersion":"temporal_qd_generation_state_patch_v2","generationIndex":2,"nextGenerationIndex":3,
+            "uniqueCandidatesEvaluated":11,"workerTasksCompleted":23,"nextImmigrantContinuationOrdinal":30,
+            "uniqueIdentityCounts":{"candidateIdentity":10},"duplicateCounters":{"candidateIdentity":1},"proposalSlotCounters":{"acceptedUniqueProposalSlots":10},
+            "completedGenerationsSha256":canonical_sha256(&Value::Array(vec![record.clone()])).unwrap(),
+            "generationRecordSha256":sha(&record,"generationRecordSha256").unwrap(),"generationRecord":record,
+        });
+        add_self_hash(&mut patch, "statePatchSha256").unwrap();
+        let manifest = Manifest {
+            runtime_authority_sha256: HASH_C.into(),
+            semantic_authority_sha256: HASH_B.into(),
+            source_path: PathBuf::new(),
+            source_sha256: HASH_A.into(),
+            manifest_sha256: HASH_B.into(),
+        };
+        source.runtime_authority_sha256 = HASH_C.into();
+        source.semantic_authority_sha256 = HASH_B.into();
+        source.source_sha256 = HASH_A.into();
+        let mut commit = json!({"schemaVersion":COMMIT_SCHEMA,"commitSha256":HASH_C});
+        commit["commitSha256"] =
+            json!(canonical_sha256_without_object_field(&commit, "commitSha256").unwrap());
+        let sidecar = build_state_application_sidecar(
+            &source,
+            &manifest,
+            &commit,
+            member(&patch, "generationRecord").unwrap(),
+            &patch,
+        )
+        .unwrap();
+        assert_eq!(sidecar["nextState"]["uniqueCandidatesEvaluated"], 11);
+        assert_eq!(sidecar["nextState"]["workerTasksCompleted"], 23);
+        assert_eq!(
+            sidecar["identityLedgerPromotion"]["inputIdentityLedgerSha256"],
+            Value::Null
+        );
+        let mut substituted = sidecar;
+        substituted["finalization"]["commitSha256"] = json!(HASH_A);
+        substituted.as_object_mut().unwrap().remove("sidecarSha256");
+        add_self_hash(&mut substituted, "sidecarSha256").unwrap();
+        assert!(
+            validate_state_application_sidecar_value(
+                &substituted,
+                &source,
+                &manifest,
+                &commit,
+                member(&patch, "generationRecord").unwrap(),
+                &patch
+            )
+            .is_err()
+        );
+
+        source.proposal_state_authority["generationKind"] = json!("evolved");
+        assert!(validate_proposal_state_authority(&source.proposal_state_authority).is_err());
+    }
+
+    #[test]
+    fn state_accounting_counts_only_new_proposals_and_rejects_cohort_role_tamper() {
+        let mut source = synthetic_source(Vec::new(), Vec::new());
+        let retained = json!({"candidateId":"parent-1","candidateIdentitySha256":HASH_B,"cohortRole":"retained_parent"});
+        source.cohort["candidates"] = json!([
+            {"candidateId":"candidate-1","candidateIdentitySha256":HASH_A,"cohortRole":"new_proposal"},
+            retained,
+        ]);
+        source.cohort["newProposalCandidateIds"] = json!(["candidate-1"]);
+        source.cohort["retainedParentEvaluationCandidateIds"] = json!(["parent-1"]);
+        source
+            .cohort
+            .as_object_mut()
+            .unwrap()
+            .remove("cohortSha256");
+        add_self_hash(&mut source.cohort, "cohortSha256").unwrap();
+        assert_eq!(validate_cohort_partition(&source).unwrap(), 1);
+
+        let mut basis = json!({
+            "schemaVersion":"temporal_qd_v5_generation_state_basis_v1","configSha256":HASH_A,"generationIndex":2,
+            "completedGenerationsSha256":canonical_sha256(&Value::Array(Vec::new())).unwrap(),
+            "uniqueCandidatesEvaluated":10,"workerTasksCompleted":20,"nextImmigrantContinuationOrdinal":0,
+            "uniqueIdentityCounts":{},"duplicateCounters":{},"proposalSlotCounters":{},
+        });
+        add_self_hash(&mut basis, "stateBasisSha256").unwrap();
+        source.state_basis = basis;
+        let mut record =
+            json!({"schemaVersion":"temporal_qd_generation_record_v2","candidateCount":2});
+        add_self_hash(&mut record, "generationRecordSha256").unwrap();
+        let patch = build_state_patch(&source, &record).unwrap();
+        // One selected proposal plus one terminal evaluation rejection still
+        // consumes two unique evaluation slots; the retained parent consumes
+        // neither.
+        assert_eq!(patch["uniqueCandidatesEvaluated"], 12);
+
+        let mut undercounted = record.clone();
+        undercounted["candidateCount"] = json!(0);
+        undercounted
+            .as_object_mut()
+            .unwrap()
+            .remove("generationRecordSha256");
+        add_self_hash(&mut undercounted, "generationRecordSha256").unwrap();
+        assert!(build_state_patch(&source, &undercounted).is_err());
+
+        for (proposal, retained, candidates) in [
+            (
+                json!(["candidate-1", "candidate-1"]),
+                json!(["parent-1"]),
+                source.cohort["candidates"].clone(),
+            ),
+            (
+                json!(["candidate-1", "parent-1"]),
+                json!(["parent-1"]),
+                source.cohort["candidates"].clone(),
+            ),
+            (
+                json!(["candidate-1"]),
+                json!([]),
+                source.cohort["candidates"].clone(),
+            ),
+        ] {
+            let mut tampered = source.clone();
+            tampered.cohort["newProposalCandidateIds"] = proposal;
+            tampered.cohort["retainedParentEvaluationCandidateIds"] = retained;
+            tampered.cohort["candidates"] = candidates;
+            assert!(validate_cohort_partition(&tampered).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v2_output_layout_rejects_symlinked_evidence_directory() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink_dir(outside.path(), root.path().join("evidence")).unwrap();
+        assert!(output_path(root.path(), CUMULATIVE_PATH).is_err());
     }
 
     #[test]

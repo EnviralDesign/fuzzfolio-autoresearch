@@ -33,7 +33,10 @@ from .temporal_qd_pair_factory import (
     load_pair_run_config,
     pair_policy_from_config,
 )
-from .temporal_qd_pair_generation import _rotating_parent_schedule
+from .temporal_qd_pair_generation import (
+    _rotating_parent_schedule,
+    build_pair_generation_config,
+)
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
     QD_IDENTITY_LEDGER_SCHEMA,
@@ -72,6 +75,66 @@ from .temporal_qd_native import (
     validate_g0_finalization_runtime_config,
     validate_pair_generation_runtime_config,
 )
+from .temporal_qd_v5_native import (
+    TemporalQDV5NativeError,
+    V5_EVOLVED_GENERATION_CONSTRUCTION_ADAPTER_SCHEMA,
+    V5_EVOLVED_NATIVE_V5_INVOCATION_SCHEMA,
+    V5_EVOLVED_PROPOSAL_RESULT_SCHEMA,
+    V5_EVOLVED_PUBLICATION_FRAGMENTS_CORE_SCHEMA,
+    V5_EVOLVED_PUBLICATION_FRAGMENTS_DESCRIPTOR_SCHEMA,
+    V5_G0_FUNNEL_FRAGMENTS_CORE_SCHEMA,
+    V5_G0_FUNNEL_FRAGMENTS_DESCRIPTOR_SCHEMA,
+    V5_G0_FUNNEL_PROJECTION_STREAM_CORE_SCHEMA,
+    V5_G0_FUNNEL_PROJECTION_STREAM_DESCRIPTOR_SCHEMA,
+    V5_G0_FUNNEL_PROJECTION_STREAM_PATH,
+    V5_G0_FUNNEL_PROJECTION_STREAM_ROW_SCHEMA,
+    V5_G0_NATIVE_V5_INVOCATION_SCHEMA,
+    V5_GENERATION_CONSTRUCTION_ADAPTER_SCHEMA,
+    V5_INVOCATION_DOCUMENT_DESCRIPTOR_SCHEMA,
+    V5_PROPOSAL_MANIFEST_SCHEMA,
+    V5_PROPOSAL_RESULT_SCHEMA,
+    V5_PROPOSAL_RESULT_FILENAME,
+    V5_PROPOSAL_GENERATION_EVOLVED,
+    V5_PROPOSAL_GENERATION_G0,
+    V5_PROPOSAL_OPERATION,
+    V5_PROPOSAL_THREAD_CAP_MAXIMUM,
+    build_v5_bidirectional_pair_policy,
+    build_v5_proposal_input_binding,
+    build_v5_generation_bindings,
+    build_v5_native_operator_authority,
+    run_native_v5_generation_construction,
+    validate_v5_proposal_input_binding,
+)
+from .temporal_qd_v5_native_tail import (
+    build_v5_directional_tail_authority,
+    validate_v5_directional_tail_index,
+    v5_directional_compact_window_evidence,
+)
+from .temporal_qd_v5_control_plane import (
+    GENERATION_RECORD_SCHEMA,
+    GENERATION_STATE_APPLICATION_SIDECAR_FILENAME,
+    GENERATION_STATE_APPLICATION_SIDECAR_SCHEMA,
+    GENERATION_STATE_PATCH_SCHEMA,
+    TemporalQDV5ControlPlaneError,
+    build_native_campaign_seal_source,
+    build_native_panel_bundle_sidecar,
+    build_native_rotating_campaign_receipt,
+    build_native_v5_prefinalizer_base_manifest,
+    build_native_v5_prefinalizer_resume_manifest,
+    certify_native_v5_initial_archive,
+    native_v5_archive_transport_path_matches,
+    native_v5_transport_path_matches,
+    assemble_native_v5_funnel_reduction_source,
+    extract_native_v5_evolved_attempt_chain,
+    extract_native_v5_g0_selected_attempts,
+    run_native_campaign_seal,
+    run_native_gateway_dispatch,
+    run_native_v5_campaign_freeze,
+    run_native_v5_generation_finalizer,
+    run_native_v5_rotating_prefinalizer,
+    run_native_v5_evidence_ladder_archive_freeze,
+    run_native_v5_archive_reducer,
+)
 from .temporal_qd_evidence_ladder import (
     build_evidence_ladder,
     validate_template_discovery_windows,
@@ -109,7 +172,15 @@ from .temporal_generation_funnel import (
 )
 from .temporal_search import run_temporal_search_tasks
 from .temporal_proposal_lineage_artifact import write_proposal_lineage_unavailable
-from .result_codec import ResultCodecError, read_json_object
+from .result_codec import ResultCodecError, canonical_json_bytes, read_json_object
+
+# Invocation manifests carry the frozen static authority graph (not rows or
+# result inventory).  The production G0 authority is about 1.1 MiB, so it has
+# a separate, fixed 2 MiB transport budget.  Invocation results/receipts stay
+# capped at 1 MiB; anything candidate-scale belongs in Rust-owned sidecars.
+_NATIVE_V5_INVOCATION_MANIFEST_LIMIT_BYTES = 2 * 1_048_576
+_NATIVE_V5_INVOCATION_RESULT_LIMIT_BYTES = 1_048_576
+
 
 SUPERVISOR_VERSION = "temporal_qd_supervisor_v3"
 SUPERVISOR_CONFIG_SCHEMA = "temporal_qd_supervisor_config_v3"
@@ -183,11 +254,2142 @@ NATIVE_FINALIZATION_ADOPTION_AUTHORITY_SCHEMA = (
 NATIVE_FINALIZATION_ADOPTION_AUTHORITY_FILE = (
     "native-finalization-adoption-authority.json"
 )
+NATIVE_V5_CONTROL_PLANE_RUNTIME_ROLES = frozenset(
+    {
+        "campaignFreeze",
+        "gatewayDispatch",
+        "campaignSeal",
+        "tailReducer",
+        "rotatingPrefinalizer",
+        "generationFinalizer",
+        "archiveReducer",
+    }
+)
 GENERATION_FINALIZATION_ENGINE_PYTHON = "python"
 GENERATION_FINALIZATION_ENGINE_RUST = "rust"
+GENERATION_FINALIZATION_ENGINE_DEFAULT = GENERATION_FINALIZATION_ENGINE_RUST
 _GENERATION_FINALIZATION_ENGINES = frozenset(
     {GENERATION_FINALIZATION_ENGINE_PYTHON, GENERATION_FINALIZATION_ENGINE_RUST}
 )
+NATIVE_V5_PROPOSAL_RUNTIME_SCHEMA = "temporal_qd_native_v5_proposal_runtime_v1"
+NATIVE_V5_PROPOSAL_ENGINE = "rust_native_v5_transaction"
+NATIVE_V5_SUPERVISOR_INVOCATION_SCHEMA = (
+    "temporal_qd_native_v5_supervisor_invocation_v1"
+)
+NATIVE_V5_IDENTITY_LEDGER_TRANSACTION_SCHEMA = (
+    "temporal_qd_native_v5_identity_ledger_transaction_v1"
+)
+NATIVE_V5_STATE_APPLICATION_PENDING_KEY = "nativeV5StateApplicationPending"
+NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY = "nativeV5CommittedIdentityLedger"
+
+
+def _v5_evolvable_authority(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return only a fresh directional v5 authority, never a near match.
+
+    The distinction matters because a legacy pair authority may still use the
+    generic Rust bridge.  The evolvable authority is the unambiguous cutover
+    signal: it requires the one-shot v5 transaction and rejects every Python
+    construction route.
+    """
+
+    authority = config.get("evolvableModuleAuthority")
+    if authority is None:
+        return None
+    if not isinstance(authority, Mapping):
+        raise TemporalDiscoveryContractError("evolvable v5 module authority is invalid")
+    policy = authority.get("archivePolicyAuthority")
+    if not isinstance(policy, Mapping):
+        raise TemporalDiscoveryContractError(
+            "evolvable v5 module authority lacks archive policy authority"
+        )
+    try:
+        _name, _sha, _frozen, directional = _resolve_archive_policy_authority(policy)
+    except TemporalDiscoveryContractError as exc:
+        raise TemporalDiscoveryContractError(
+            "evolvable v5 module authority archive policy is invalid"
+        ) from exc
+    if not directional:
+        raise TemporalDiscoveryContractError(
+            "evolvable module authority requires the exact v5 archive policy"
+        )
+    return authority
+
+
+def _native_v5_proposal_enabled(config: Mapping[str, Any]) -> bool:
+    """Tell fresh native-v5 configs apart from archived Python-era v5 runs.
+
+    The runtime seal was introduced by this cutover.  Its absence therefore
+    identifies a historical artifact that may be reopened read-only, but can
+    never become a new Python production construction route.  A malformed
+    fresh seal is rejected by ``_validate_native_v5_proposal_runtime`` before
+    anything is allowed to run.
+    """
+
+    return "nativeV5ProposalRuntime" in config
+
+
+def _native_v5_qd_engine_version(
+    *, config: Mapping[str, Any], evolvable_authority: Mapping[str, Any]
+) -> str:
+    """Use the archive-authority version, never an independently supplied label."""
+
+    archive_authority = evolvable_authority.get("archivePolicyAuthority")
+    if not isinstance(archive_authority, Mapping):
+        raise TemporalDiscoveryContractError("native v5 archive authority is unavailable")
+    qd_engine_version = archive_authority.get("qdVersion")
+    if not isinstance(qd_engine_version, str) or not qd_engine_version:
+        raise TemporalDiscoveryContractError("native v5 archive QD version is invalid")
+    if config.get("qdVersion") != qd_engine_version:
+        raise TemporalDiscoveryContractError(
+            "native v5 archive QD version drifted from the frozen supervisor"
+        )
+    return qd_engine_version
+
+
+def _build_native_v5_proposal_runtime(
+    *,
+    pair_source_authority: Mapping[str, Any],
+    evolvable_module_authority: Mapping[str, Any],
+    generation_run_config: Mapping[str, Any],
+    execution_timeout_seconds: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Seal the pure v5 control plane without opening a Python authority.
+
+    The v5 bridge owns static authority projection.  This helper intentionally
+    does not import or instantiate ``PairAuthorityBundle``: doing so would
+    recreate the retired Dashboard/Python construction path before Rust has a
+    chance to own the first proposal.
+    """
+
+    try:
+        pair_policy = build_v5_bidirectional_pair_policy(
+            pair_source_authority=pair_source_authority
+        )
+        bindings = build_v5_generation_bindings(
+            generation_run_config=generation_run_config,
+            pair_source_authority=pair_source_authority,
+            evolvable_module_authority=evolvable_module_authority,
+        )
+        native_operator = build_v5_native_operator_authority(
+            pair_source_authority=pair_source_authority,
+            evolvable_module_authority=evolvable_module_authority,
+        )
+    except TemporalQDV5NativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    if (
+        bindings.get("archivePolicyAuthority")
+        != evolvable_module_authority.get("archivePolicyAuthority")
+        or bindings.get("behaviorAttributionRequirement")
+        != evolvable_module_authority.get("behaviorAttributionRequirement")
+    ):
+        raise TemporalDiscoveryContractError("native v5 generation bindings drifted")
+    try:
+        timeout = int(execution_timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise TemporalDiscoveryContractError(
+            "native v5 proposal execution timeout is invalid"
+        ) from exc
+    if isinstance(execution_timeout_seconds, bool) or timeout < 1:
+        raise TemporalDiscoveryContractError(
+            "native v5 proposal execution timeout is invalid"
+        )
+    runtime = {
+        "schemaVersion": NATIVE_V5_PROPOSAL_RUNTIME_SCHEMA,
+        "engine": NATIVE_V5_PROPOSAL_ENGINE,
+        "executionTimeoutSeconds": timeout,
+        "threadCap": V5_PROPOSAL_THREAD_CAP_MAXIMUM,
+        "nativeOperatorAuthority": _clone(
+            native_operator, name="native v5 operator authority"
+        ),
+        "nativeOperatorAuthoritySha256": native_operator[
+            "nativeOperatorAuthoritySha256"
+        ],
+        "bidirectionalPairPolicy": _clone(
+            pair_policy, name="native v5 bidirectional pair policy"
+        ),
+        "bidirectionalPairPolicySha256": canonical_sha256(pair_policy),
+    }
+    runtime["runtimeSha256"] = canonical_sha256(runtime)
+    return runtime, _clone(bindings, name="native v5 generation bindings")
+
+
+def _validate_native_v5_proposal_runtime(
+    *, config: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rebuild and compare the sealed v5 control plane before every phase."""
+
+    evolvable = _v5_evolvable_authority(config)
+    if evolvable is None:
+        raise TemporalDiscoveryContractError("native v5 proposal runtime lacks v5 authority")
+    source = config.get("bidirectionalPairSourceAuthority")
+    run_config = config.get("bidirectionalPairGeneration")
+    stored = config.get("nativeV5ProposalRuntime")
+    if not isinstance(source, Mapping) or not isinstance(run_config, Mapping):
+        raise TemporalDiscoveryContractError("native v5 pair source authority is unavailable")
+    if not isinstance(stored, Mapping):
+        raise TemporalDiscoveryContractError("native v5 proposal runtime is unavailable")
+    material = _clone(stored, name="native v5 proposal runtime")
+    supplied = material.pop("runtimeSha256", None)
+    expected_fields = {
+        "schemaVersion",
+        "engine",
+        "executionTimeoutSeconds",
+        "threadCap",
+        "nativeOperatorAuthority",
+        "nativeOperatorAuthoritySha256",
+        "bidirectionalPairPolicy",
+        "bidirectionalPairPolicySha256",
+    }
+    if (
+        set(material) != expected_fields
+        or stored.get("schemaVersion") != NATIVE_V5_PROPOSAL_RUNTIME_SCHEMA
+        or stored.get("engine") != NATIVE_V5_PROPOSAL_ENGINE
+        or supplied != canonical_sha256(material)
+    ):
+        raise TemporalDiscoveryContractError("native v5 proposal runtime identity drifted")
+    source_generation_run_config = _clone(
+        source, name="native v5 source generation run config"
+    )
+    # Rebuild from the original sealed source, not from the enriched output
+    # persisted in the supervisor config.  The latter is comparison evidence
+    # only and must never become a second source authority.
+    source_generation_run_config.pop("operatorImplementation", None)
+    rebuilt, bindings = _build_native_v5_proposal_runtime(
+        pair_source_authority=source,
+        evolvable_module_authority=evolvable,
+        generation_run_config=source_generation_run_config,
+        execution_timeout_seconds=stored["executionTimeoutSeconds"],
+    )
+    if _clone(stored, name="native v5 proposal runtime") != rebuilt:
+        raise TemporalDiscoveryContractError("native v5 proposal runtime authority drifted")
+    return rebuilt, bindings
+
+
+def _native_v5_proposal_root(root: Path, generation_index: int) -> Path:
+    return root / "generations" / f"generation-{generation_index:04d}" / "proposal"
+
+
+def _native_v5_identity_ledger_output_path(root: Path, generation_index: int) -> Path:
+    return _native_v5_proposal_root(root, generation_index) / "v5-native" / "identity-ledger.json"
+
+
+def _native_v5_identity_ledger_snapshot_path(root: Path, generation_index: int) -> Path:
+    return _native_v5_proposal_root(root, generation_index) / "input-identity-ledger.json"
+
+
+def _validated_native_v5_identity_ledger(
+    path: Path, *, name: str
+) -> tuple[dict[str, Any], str]:
+    """Historical-only ledger reader.
+
+    Current Rust-native v5 never calls this helper.  Its proposal ledger is a
+    receipt-authenticated opaque artifact, carried by the adapter descriptor
+    into the next native transaction.  Keep this reader for explicit legacy
+    migration/oracle paths only; making it part of current-v5 admission would
+    turn a candidate-scale identity ledger back into a Python control input.
+    """
+
+    ledger = _canonical_file(path, name=name)
+    ledger_sha256 = _identity_payload(ledger, "identityLedgerSha256", name=name)
+    return ledger, ledger_sha256
+
+
+def _native_v5_adapter_artifact(
+    *,
+    adapter: Mapping[str, Any],
+    name: str,
+    relative_path: str,
+    proposal_root: Path,
+) -> dict[str, Any]:
+    artifact = adapter.get(name)
+    if not isinstance(artifact, Mapping):
+        raise TemporalDiscoveryContractError(f"native v5 construction lacks {name} artifact")
+    material = _clone(artifact, name=f"native v5 {name} artifact")
+    if set(material) != {
+        "relativePath",
+        "absolutePath",
+        "semanticSha256",
+        "fileSha256",
+        "byteLength",
+    }:
+        raise TemporalDiscoveryContractError(f"native v5 {name} artifact is malformed")
+    expected_path = Path(os.path.abspath(str(proposal_root / relative_path)))
+    supplied_path = str(material["absolutePath"])
+    if (
+        material["relativePath"] != relative_path
+        or supplied_path != str(Path(os.path.abspath(supplied_path)))
+        or supplied_path != str(expected_path)
+    ):
+        raise TemporalDiscoveryContractError(f"native v5 {name} artifact path drifted")
+    semantic_sha256 = _sha256(
+        material["semanticSha256"], name=f"native v5 {name} semantic identity"
+    )
+    file_sha256 = _sha256(
+        material["fileSha256"], name=f"native v5 {name} file identity"
+    )
+    byte_length = material["byteLength"]
+    if (
+        isinstance(byte_length, bool)
+        or not isinstance(byte_length, int)
+        or byte_length < 0
+    ):
+        raise TemporalDiscoveryContractError(f"native v5 {name} artifact descriptor drifted")
+    # The Rust proposal receipt is the authority for the candidate-scale
+    # artifact bytes.  Python must only retain this exact bounded descriptor:
+    # a stat/hash/read here would reintroduce a per-population control loop and
+    # would make a completed native receipt non-resumable after source pruning.
+    return {
+        "relativePath": relative_path,
+        "absolutePath": str(expected_path),
+        "semanticSha256": semantic_sha256,
+        "fileSha256": file_sha256,
+        "byteLength": byte_length,
+    }
+
+
+def _read_native_v5_compact_document_bytes(
+    path: Path,
+    *,
+    name: str,
+    maximum_bytes: int,
+) -> bytes:
+    """Read one receipt-addressed control document, never a row stream."""
+
+    if (
+        isinstance(maximum_bytes, bool)
+        or not isinstance(maximum_bytes, int)
+        or maximum_bytes < 1
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} compact-document limit is invalid"
+        )
+    try:
+        if path.stat().st_size > maximum_bytes:
+            raise TemporalDiscoveryContractError(
+                f"native v5 {name} invocation document exceeds the compact-document limit"
+            )
+        with path.open("rb") as handle:
+            raw = handle.read(maximum_bytes + 1)
+    except TemporalDiscoveryContractError:
+        raise
+    except OSError as exc:
+        raise TemporalDiscoveryContractError(
+            f"could not read native v5 {name} invocation document"
+        ) from exc
+    if len(raw) > maximum_bytes:
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation document exceeds the compact-document limit"
+        )
+    return raw
+
+
+def _native_v5_invocation_document_limit(document_schema: str) -> int:
+    """Return the distinct bounded transport budget for an invocation leaf."""
+
+    if document_schema == V5_PROPOSAL_MANIFEST_SCHEMA:
+        return _NATIVE_V5_INVOCATION_MANIFEST_LIMIT_BYTES
+    if document_schema in {
+        V5_PROPOSAL_RESULT_SCHEMA,
+        V5_EVOLVED_PROPOSAL_RESULT_SCHEMA,
+    }:
+        return _NATIVE_V5_INVOCATION_RESULT_LIMIT_BYTES
+    raise TemporalDiscoveryContractError(
+        "native v5 invocation document schema is unsupported"
+    )
+
+
+def _native_v5_invocation_document(
+    *,
+    descriptor: object,
+    proposal_root: Path,
+    relative_path: str,
+    document_schema: str,
+    identity_field: str,
+    name: str,
+) -> dict[str, Any]:
+    """Open one receipt-addressed control document at its only valid path.
+
+    This is deliberately narrower than an artifact loader: evolved proposal
+    invocation documents are compact canonical control objects, and their
+    semantic identities are what authorise the Rust prefinalizer to reopen the
+    proposal transaction.  The supervisor must not discover them by scanning a
+    proposal directory or accept an alias/symlink in their place.
+    """
+
+    material = _clone(descriptor, name=f"native v5 {name} descriptor")
+    expected_keys = {
+        "schemaVersion",
+        "documentSchemaVersion",
+        "relativePath",
+        "absolutePath",
+        "semanticSha256",
+        "fileSha256",
+        "byteLength",
+    }
+    if set(material) != expected_keys:
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation descriptor is malformed"
+        )
+    expected_path = Path(os.path.abspath(str(proposal_root / relative_path)))
+    supplied_path = material["absolutePath"]
+    if (
+        material["schemaVersion"] != V5_INVOCATION_DOCUMENT_DESCRIPTOR_SCHEMA
+        or material["documentSchemaVersion"] != document_schema
+        or material["relativePath"] != relative_path
+        or not isinstance(supplied_path, str)
+        or supplied_path != str(Path(os.path.abspath(supplied_path)))
+        or supplied_path != str(expected_path)
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation descriptor path/schema drifted"
+        )
+    try:
+        path_status = expected_path.lstat()
+    except OSError as exc:
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation document is unavailable"
+        ) from exc
+    if not os.path.isfile(expected_path) or os.path.islink(expected_path):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation document is not a regular file"
+        )
+    byte_length = material["byteLength"]
+    semantic_sha256 = _sha256(
+        material["semanticSha256"], name=f"native v5 {name} semantic identity"
+    )
+    file_sha256 = _sha256(
+        material["fileSha256"], name=f"native v5 {name} file identity"
+    )
+    maximum_bytes = _native_v5_invocation_document_limit(document_schema)
+    if (
+        isinstance(byte_length, bool)
+        or not isinstance(byte_length, int)
+        or byte_length < 0
+        or byte_length > maximum_bytes
+        or path_status.st_size != byte_length
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation document receipt drifted"
+        )
+    try:
+        raw = _read_native_v5_compact_document_bytes(
+            expected_path,
+            name=name,
+            maximum_bytes=maximum_bytes,
+        )
+        if "sha256:" + hashlib.sha256(raw).hexdigest() != file_sha256:
+            raise TemporalDiscoveryContractError(
+                f"native v5 {name} invocation document receipt drifted"
+            )
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TemporalDiscoveryContractError(
+            f"could not parse native v5 {name} invocation document"
+        ) from exc
+    if not isinstance(document, Mapping) or canonical_json_bytes(dict(document)) + b"\n" != raw:
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation document is not canonical"
+        )
+    checked = _clone(document, name=f"native v5 {name} invocation document")
+    supplied_identity = _sha256(
+        checked.pop(identity_field, None),
+        name=f"native v5 {name} invocation identity",
+    )
+    if (
+        checked.get("schemaVersion") != document_schema
+        or supplied_identity != semantic_sha256
+        or canonical_sha256(checked) != supplied_identity
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {name} invocation document identity drifted"
+        )
+    checked[identity_field] = supplied_identity
+    return {
+        "schemaVersion": V5_INVOCATION_DOCUMENT_DESCRIPTOR_SCHEMA,
+        "documentSchemaVersion": document_schema,
+        "relativePath": relative_path,
+        "absolutePath": str(expected_path),
+        "semanticSha256": semantic_sha256,
+        "fileSha256": file_sha256,
+        "byteLength": byte_length,
+        "document": checked,
+    }
+
+
+def _validate_native_v5_generation_invocation_descriptor(
+    *,
+    adapter: Mapping[str, Any],
+    proposal_root: Path,
+    generation_kind: str,
+) -> dict[str, Any]:
+    """Validate the family-specific exact native invocation descriptor.
+
+    Both current adapter families now bind their compact invocation documents
+    by fixed receipt-addressed paths.  The descriptor schema intentionally
+    differs by family so a G0 funnel receipt can never be replayed as an
+    evolved all-attempt transaction (or the reverse).
+    """
+
+    raw_value = adapter.get("nativeV5Invocation")
+    if not isinstance(raw_value, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 generation lacks its invocation descriptor"
+        )
+    value = _clone(raw_value, name="native v5 generation invocation")
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        invocation_schema = V5_G0_NATIVE_V5_INVOCATION_SCHEMA
+        result_schema = V5_PROPOSAL_RESULT_SCHEMA
+        family = "G0"
+    elif generation_kind == V5_PROPOSAL_GENERATION_EVOLVED:
+        invocation_schema = V5_EVOLVED_NATIVE_V5_INVOCATION_SCHEMA
+        result_schema = V5_EVOLVED_PROPOSAL_RESULT_SCHEMA
+        family = "evolved"
+    else:
+        raise TemporalDiscoveryContractError("native v5 invocation generation kind is invalid")
+    expected_keys = {
+        "schemaVersion",
+        "proposalManifest",
+        "proposalResult",
+        "proposalReceiptSha256",
+        "outputInventorySha256",
+    }
+    if (
+        set(value) != expected_keys
+        or value["schemaVersion"] != invocation_schema
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {family} invocation descriptor shape drifted"
+        )
+    manifest_hint = _clone(
+        value["proposalManifest"], name=f"native v5 {family} proposal manifest hint"
+    )
+    if not isinstance(manifest_hint, Mapping):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {family} proposal manifest descriptor is invalid"
+        )
+    manifest_semantic = _sha256(
+        manifest_hint.get("semanticSha256"),
+        name=f"native v5 {family} proposal manifest identity",
+    )
+    invocation_root = "native-batch/v5-proposal/" + manifest_semantic.removeprefix(
+        "sha256:"
+    )
+    manifest = _native_v5_invocation_document(
+        descriptor=manifest_hint,
+        proposal_root=proposal_root,
+        relative_path=f"{invocation_root}/manifest.json",
+        document_schema=V5_PROPOSAL_MANIFEST_SCHEMA,
+        identity_field="manifestSha256",
+        name=f"{family} proposal manifest",
+    )
+    result = _native_v5_invocation_document(
+        descriptor=value["proposalResult"],
+        proposal_root=proposal_root,
+        relative_path=f"{invocation_root}/{V5_PROPOSAL_RESULT_FILENAME}",
+        document_schema=result_schema,
+        identity_field="resultSha256",
+        name=f"{family} proposal result",
+    )
+    proposal_receipt_sha256 = _sha256(
+        value["proposalReceiptSha256"],
+        name=f"native v5 {family} proposal receipt identity",
+    )
+    output_inventory_sha256 = _sha256(
+        value["outputInventorySha256"],
+        name=f"native v5 {family} output inventory identity",
+    )
+    if (
+        manifest["document"].get("generationKind") != generation_kind
+        or manifest["document"].get("outputRoot") != str(proposal_root)
+        or manifest["document"].get("resultPath") != V5_PROPOSAL_RESULT_FILENAME
+        or result["document"].get("manifestSha256") != manifest["semanticSha256"]
+        or result["semanticSha256"] != adapter["proposalResultSha256"]
+        or result["document"].get("receiptSha256") != proposal_receipt_sha256
+        or result["document"].get("outputInventorySha256") != output_inventory_sha256
+        or proposal_receipt_sha256 != adapter["proposalReceiptSha256"]
+        or output_inventory_sha256 != adapter["outputInventorySha256"]
+        or (
+            generation_kind == V5_PROPOSAL_GENERATION_G0
+            and result["document"].get("g0FunnelFragmentsSha256")
+            != adapter["g0FunnelFragments"]["semanticSha256"]
+        )
+        or (
+            generation_kind == V5_PROPOSAL_GENERATION_G0
+            and result["document"].get("g0FunnelProjectionStreamReceiptSha256")
+            != adapter["g0FunnelProjectionStream"]["stream"]["semanticSha256"]
+        )
+    ):
+        raise TemporalDiscoveryContractError(
+            f"native v5 {family} invocation receipt binding drifted"
+        )
+    return {
+        "schemaVersion": invocation_schema,
+        "proposalManifest": {
+            key: manifest[key]
+            for key in (
+                "schemaVersion",
+                "documentSchemaVersion",
+                "relativePath",
+                "absolutePath",
+                "semanticSha256",
+                "fileSha256",
+                "byteLength",
+            )
+        },
+        "proposalResult": {
+            key: result[key]
+            for key in (
+                "schemaVersion",
+                "documentSchemaVersion",
+                "relativePath",
+                "absolutePath",
+                "semanticSha256",
+                "fileSha256",
+                "byteLength",
+            )
+        },
+        "proposalReceiptSha256": proposal_receipt_sha256,
+        "outputInventorySha256": output_inventory_sha256,
+    }
+
+
+def _validate_native_v5_g0_funnel_projection_stream(
+    *, adapter: Mapping[str, Any], proposal_root: Path
+) -> dict[str, Any]:
+    """Validate G0's fixed Rust-owned public funnel stream without reading rows.
+
+    The adapter is the only public handoff for this JSONL.  Its companion
+    receipt object authenticates the stream's bytes and ties them back to the
+    G0 funnel fragments root.  Python deliberately does not deserialize the
+    stream: candidate ordering and row semantics remain owned by the native
+    transaction and its eventual native prefinalizer consumer.
+    """
+
+    value = _clone(
+        adapter.get("g0FunnelProjectionStream"),
+        name="native v5 G0 funnel projection stream",
+    )
+    expected_fields = {
+        "schemaVersion",
+        "coreReceiptSchemaVersion",
+        "rowSchemaVersion",
+        "stream",
+        "receiptObject",
+    }
+    if (
+        set(value) != expected_fields
+        or value.get("schemaVersion")
+        != V5_G0_FUNNEL_PROJECTION_STREAM_DESCRIPTOR_SCHEMA
+        or value.get("coreReceiptSchemaVersion")
+        != V5_G0_FUNNEL_PROJECTION_STREAM_CORE_SCHEMA
+        or value.get("rowSchemaVersion") != V5_G0_FUNNEL_PROJECTION_STREAM_ROW_SCHEMA
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 G0 funnel projection stream descriptor drifted"
+        )
+
+    def bound_file(
+        *, raw_value: object, relative_path: str, semantic_sha256: str, name: str
+    ) -> dict[str, Any]:
+        material = _clone(raw_value, name=name)
+        expected = {
+            "relativePath",
+            "absolutePath",
+            "semanticSha256",
+            "fileSha256",
+            "byteLength",
+        }
+        expected_path = Path(os.path.abspath(str(proposal_root / relative_path)))
+        supplied_path = material.get("absolutePath")
+        byte_length = material.get("byteLength")
+        if (
+            set(material) != expected
+            or material.get("relativePath") != relative_path
+            or material.get("semanticSha256") != semantic_sha256
+            or not isinstance(supplied_path, str)
+            or supplied_path != str(Path(os.path.abspath(supplied_path)))
+            or supplied_path != str(expected_path)
+            or isinstance(byte_length, bool)
+            or not isinstance(byte_length, int)
+            or byte_length < 0
+        ):
+            raise TemporalDiscoveryContractError(f"native v5 {name} binding drifted")
+        file_sha256 = _sha256(
+            material.get("fileSha256"), name=f"native v5 {name} file identity"
+        )
+        return {
+            "relativePath": relative_path,
+            "absolutePath": str(expected_path),
+            "semanticSha256": semantic_sha256,
+            "fileSha256": file_sha256,
+            "byteLength": byte_length,
+        }
+
+    stream_material = _clone(value.get("stream"), name="native v5 G0 funnel stream")
+    stream_root = _sha256(
+        stream_material.get("semanticSha256"),
+        name="native v5 G0 funnel projection stream receipt identity",
+    )
+    stream = bound_file(
+        raw_value=stream_material,
+        relative_path=V5_G0_FUNNEL_PROJECTION_STREAM_PATH,
+        semantic_sha256=stream_root,
+        name="G0 funnel projection stream",
+    )
+    receipt_relative_path = (
+        "v5-native/objects/sha256/" + stream_root.removeprefix("sha256:") + ".json"
+    )
+    receipt_object = bound_file(
+        raw_value=value.get("receiptObject"),
+        relative_path=receipt_relative_path,
+        semantic_sha256=stream_root,
+        name="G0 funnel projection receipt object",
+    )
+    # The authenticated object-store entry is deliberately Core's wrapper,
+    # not a bare receipt.  The Rust G0 extractor reopens and validates that
+    # wrapper plus its nested receipt and stream.  Python transports only the
+    # sealed descriptor; parsing it here would deserialize candidate-scale
+    # provenance on every restart.
+    fragments = adapter.get("g0FunnelFragments")
+    if not isinstance(fragments, Mapping):
+        raise TemporalDiscoveryContractError("native v5 G0 funnel fragments are unavailable")
+    _sha256(
+        fragments.get("semanticSha256"),
+        name="native v5 G0 funnel fragments descriptor identity",
+    )
+    return {
+        "schemaVersion": V5_G0_FUNNEL_PROJECTION_STREAM_DESCRIPTOR_SCHEMA,
+        "coreReceiptSchemaVersion": V5_G0_FUNNEL_PROJECTION_STREAM_CORE_SCHEMA,
+        "rowSchemaVersion": V5_G0_FUNNEL_PROJECTION_STREAM_ROW_SCHEMA,
+        "stream": stream,
+        "receiptObject": receipt_object,
+    }
+
+
+def _validate_native_v5_construction_adapter(
+    *,
+    value: Mapping[str, Any],
+    proposal_root: Path,
+    generation_index: int,
+    generation_kind: str,
+    generation_config_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate the exact bridge handoff without reconstructing a population.
+
+    The bridge already authenticates the manifest/result/receipt/inventory
+    chain.  The supervisor stores this self-hashed projection as bounded
+    descriptor evidence; Rust owns reauthentication of every candidate-scale
+    receipt-addressed artifact.
+    """
+
+    adapter = _clone(value, name="native v5 construction adapter")
+    expected_fields = {
+        "schemaVersion",
+        "operation",
+        "completed",
+        "generationKind",
+        "generationIndex",
+        "generationConfigSha256",
+        "authoritySha256",
+        "attemptCount",
+        "acceptedCandidateCount",
+        "selectedEvaluationCandidateCount",
+        "publicationPlanSha256",
+        "publicationRequestSha256",
+        "proposalResultSha256",
+        "proposalReceiptSha256",
+        "outputInventorySha256",
+        "population",
+        "evaluationPopulation",
+        "generationJournal",
+        "identityLedger",
+        "adapterSha256",
+    }
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        expected_fields.update(
+            {
+                "g0FunnelFragments",
+                "g0FunnelProjectionStream",
+                "nativeV5Invocation",
+            }
+        )
+    elif generation_kind == V5_PROPOSAL_GENERATION_EVOLVED:
+        expected_fields.update(
+            {"evolvedPublicationFragments", "nativeV5Invocation"}
+        )
+    if set(adapter) != expected_fields:
+        raise TemporalDiscoveryContractError("native v5 construction adapter shape drifted")
+    supplied_adapter_sha256 = _sha256(
+        adapter.pop("adapterSha256"), name="native v5 construction adapter"
+    )
+    if supplied_adapter_sha256 != canonical_sha256(adapter):
+        raise TemporalDiscoveryContractError("native v5 construction adapter identity drifted")
+    adapter["adapterSha256"] = supplied_adapter_sha256
+    expected_schema = (
+        V5_EVOLVED_GENERATION_CONSTRUCTION_ADAPTER_SCHEMA
+        if generation_kind == V5_PROPOSAL_GENERATION_EVOLVED
+        else V5_GENERATION_CONSTRUCTION_ADAPTER_SCHEMA
+    )
+    if (
+        adapter["schemaVersion"] != expected_schema
+        or adapter["operation"] != V5_PROPOSAL_OPERATION
+        or adapter["completed"] is not True
+        or adapter["generationKind"] != generation_kind
+        or adapter["generationIndex"] != generation_index
+    ):
+        raise TemporalDiscoveryContractError("native v5 construction adapter binding drifted")
+    config_sha256 = _sha256(
+        adapter["generationConfigSha256"], name="native v5 generation config"
+    )
+    if generation_config_sha256 is not None and config_sha256 != generation_config_sha256:
+        raise TemporalDiscoveryContractError("native v5 construction generation config drifted")
+    for field in (
+        "authoritySha256",
+        "publicationPlanSha256",
+        "publicationRequestSha256",
+        "proposalResultSha256",
+        "proposalReceiptSha256",
+        "outputInventorySha256",
+    ):
+        _sha256(adapter[field], name=f"native v5 {field}")
+    counts: dict[str, int] = {}
+    for field in (
+        "attemptCount",
+        "acceptedCandidateCount",
+        "selectedEvaluationCandidateCount",
+    ):
+        count = adapter[field]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise TemporalDiscoveryContractError(f"native v5 {field} is invalid")
+        counts[field] = count
+    if (
+        counts["acceptedCandidateCount"] > counts["attemptCount"]
+        or counts["selectedEvaluationCandidateCount"]
+        > counts["acceptedCandidateCount"]
+    ):
+        raise TemporalDiscoveryContractError("native v5 construction counts drifted")
+    for name, relative_path in (
+        ("population", "population.json"),
+        ("evaluationPopulation", "evaluation-population.json"),
+        ("generationJournal", "generation-journal.json"),
+        ("identityLedger", "v5-native/identity-ledger.json"),
+    ):
+        adapter[name] = _native_v5_adapter_artifact(
+            adapter=adapter,
+            name=name,
+            relative_path=relative_path,
+            proposal_root=proposal_root,
+        )
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        fragment_key = "g0FunnelFragments"
+        fragment_schema = V5_G0_FUNNEL_FRAGMENTS_DESCRIPTOR_SCHEMA
+        fragment_core_schema = V5_G0_FUNNEL_FRAGMENTS_CORE_SCHEMA
+        fragment_label = "G0 funnel fragments"
+    elif generation_kind == V5_PROPOSAL_GENERATION_EVOLVED:
+        fragment_key = "evolvedPublicationFragments"
+        fragment_schema = V5_EVOLVED_PUBLICATION_FRAGMENTS_DESCRIPTOR_SCHEMA
+        fragment_core_schema = V5_EVOLVED_PUBLICATION_FRAGMENTS_CORE_SCHEMA
+        fragment_label = "evolved publication fragments"
+    else:
+        raise TemporalDiscoveryContractError("native v5 construction generation kind is invalid")
+    if generation_kind in {
+        V5_PROPOSAL_GENERATION_G0,
+        V5_PROPOSAL_GENERATION_EVOLVED,
+    }:
+        fragments = _clone(
+            adapter[fragment_key],
+            name=f"native v5 {fragment_label}",
+        )
+        if set(fragments) != {
+            "schemaVersion",
+            "coreSchemaVersion",
+            "relativePath",
+            "absolutePath",
+            "semanticSha256",
+            "fileSha256",
+            "byteLength",
+        }:
+            raise TemporalDiscoveryContractError(
+                f"native v5 {fragment_label} descriptor is malformed"
+            )
+        semantic_sha256 = _sha256(
+            fragments["semanticSha256"],
+            name=f"native v5 {fragment_label} semantic identity",
+        )
+        expected_relative_path = (
+            "v5-native/objects/sha256/"
+            + semantic_sha256.removeprefix("sha256:")
+            + ".json"
+        )
+        expected_absolute_path = Path(
+            os.path.abspath(str(proposal_root / expected_relative_path))
+        )
+        supplied_absolute_path = str(fragments["absolutePath"])
+        byte_length = fragments["byteLength"]
+        if (
+            fragments["schemaVersion"]
+            != fragment_schema
+            or fragments["coreSchemaVersion"] != fragment_core_schema
+            or fragments["relativePath"] != expected_relative_path
+            or supplied_absolute_path
+            != str(Path(os.path.abspath(supplied_absolute_path)))
+            or Path(supplied_absolute_path) != expected_absolute_path
+            or isinstance(byte_length, bool)
+            or not isinstance(byte_length, int)
+            or byte_length < 0
+        ):
+            raise TemporalDiscoveryContractError(
+                f"native v5 {fragment_label} descriptor drifted"
+            )
+        adapter[fragment_key] = {
+            "schemaVersion": fragment_schema,
+            "coreSchemaVersion": fragment_core_schema,
+            "relativePath": expected_relative_path,
+            "absolutePath": str(expected_absolute_path),
+            "semanticSha256": semantic_sha256,
+            "fileSha256": _sha256(
+                fragments["fileSha256"],
+                name=f"native v5 {fragment_label} file identity",
+            ),
+            "byteLength": byte_length,
+        }
+        if generation_kind == V5_PROPOSAL_GENERATION_G0:
+            adapter["g0FunnelProjectionStream"] = (
+                _validate_native_v5_g0_funnel_projection_stream(
+                    adapter=adapter,
+                    proposal_root=proposal_root,
+                )
+            )
+        adapter["nativeV5Invocation"] = (
+            _validate_native_v5_generation_invocation_descriptor(
+                adapter=adapter,
+                proposal_root=proposal_root,
+                generation_kind=generation_kind,
+            )
+        )
+    return adapter
+
+
+def _build_native_v5_supervisor_invocation(
+    *,
+    root: Path,
+    generation_index: int,
+    generation_config: Mapping[str, Any],
+    generation_kind: str,
+    evaluation_population_size: int,
+    parent_archive_input: Mapping[str, Any] | None,
+    identity_ledger_input: Mapping[str, Any] | None,
+    construction_adapter: Mapping[str, Any],
+) -> dict[str, Any]:
+    proposal_root = _native_v5_proposal_root(root, generation_index)
+    config = _clone(generation_config, name="native v5 generation config")
+    config_sha256 = _sha256(config.get("configSha256"), name="native v5 generation config")
+    config_material = _clone(config, name="native v5 generation config")
+    config_material.pop("configSha256", None)
+    if canonical_sha256(config_material) != config_sha256:
+        raise TemporalDiscoveryContractError("native v5 generation config identity drifted")
+    if config.get("generationIndex") != generation_index:
+        raise TemporalDiscoveryContractError("native v5 invocation generation index drifted")
+    if (
+        isinstance(evaluation_population_size, bool)
+        or not isinstance(evaluation_population_size, int)
+        or evaluation_population_size < 1
+    ):
+        raise TemporalDiscoveryContractError("native v5 evaluation population size is invalid")
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        if parent_archive_input is not None or identity_ledger_input is not None:
+            raise TemporalDiscoveryContractError("native v5 G0 invocation has legacy inputs")
+    elif generation_kind == V5_PROPOSAL_GENERATION_EVOLVED:
+        if not isinstance(parent_archive_input, Mapping) or not isinstance(
+            identity_ledger_input, Mapping
+        ):
+            raise TemporalDiscoveryContractError("native v5 evolved invocation lacks inputs")
+        parent_archive_input = validate_v5_proposal_input_binding(
+            parent_archive_input, expected_kind="parentArchive"
+        )
+        identity_ledger_input = validate_v5_proposal_input_binding(
+            identity_ledger_input, expected_kind="identityLedger"
+        )
+    else:
+        raise TemporalDiscoveryContractError("native v5 invocation generation kind is invalid")
+    adapter = _validate_native_v5_construction_adapter(
+        value=construction_adapter,
+        proposal_root=proposal_root,
+        generation_index=generation_index,
+        generation_kind=generation_kind,
+        generation_config_sha256=config_sha256,
+    )
+    if adapter["selectedEvaluationCandidateCount"] != evaluation_population_size:
+        raise TemporalDiscoveryContractError(
+            "native v5 construction evaluation count drifted"
+        )
+    invocation = {
+        "schemaVersion": NATIVE_V5_SUPERVISOR_INVOCATION_SCHEMA,
+        "generationIndex": generation_index,
+        "generationKind": generation_kind,
+        "outputRoot": str(Path(os.path.abspath(str(proposal_root)))),
+        "generationConfig": config,
+        "generationConfigSha256": config_sha256,
+        "evaluationPopulationSize": evaluation_population_size,
+        "parentArchiveInput": _clone(
+            parent_archive_input, name="native v5 parent archive input"
+        )
+        if parent_archive_input is not None
+        else None,
+        "identityLedgerInput": _clone(
+            identity_ledger_input, name="native v5 identity-ledger input"
+        )
+        if identity_ledger_input is not None
+        else None,
+        "constructionAdapter": adapter,
+    }
+    invocation["invocationSha256"] = canonical_sha256(invocation)
+    return invocation
+
+
+def _validate_native_v5_supervisor_invocation(
+    *, root: Path, value: Mapping[str, Any]
+) -> dict[str, Any]:
+    invocation = _clone(value, name="native v5 supervisor invocation")
+    expected_fields = {
+        "schemaVersion",
+        "generationIndex",
+        "generationKind",
+        "outputRoot",
+        "generationConfig",
+        "generationConfigSha256",
+        "evaluationPopulationSize",
+        "parentArchiveInput",
+        "identityLedgerInput",
+        "constructionAdapter",
+        "invocationSha256",
+    }
+    if set(invocation) != expected_fields:
+        raise TemporalDiscoveryContractError("native v5 supervisor invocation shape drifted")
+    supplied_sha256 = _sha256(
+        invocation.pop("invocationSha256"), name="native v5 supervisor invocation"
+    )
+    if supplied_sha256 != canonical_sha256(invocation):
+        raise TemporalDiscoveryContractError("native v5 supervisor invocation identity drifted")
+    invocation["invocationSha256"] = supplied_sha256
+    generation_index = invocation["generationIndex"]
+    if (
+        invocation["schemaVersion"] != NATIVE_V5_SUPERVISOR_INVOCATION_SCHEMA
+        or isinstance(generation_index, bool)
+        or not isinstance(generation_index, int)
+        or generation_index < 1
+    ):
+        raise TemporalDiscoveryContractError("native v5 supervisor invocation is invalid")
+    proposal_root = _native_v5_proposal_root(root, generation_index)
+    if invocation["outputRoot"] != str(Path(os.path.abspath(str(proposal_root)))):
+        raise TemporalDiscoveryContractError("native v5 supervisor invocation output root drifted")
+    config = invocation["generationConfig"]
+    if not isinstance(config, Mapping):
+        raise TemporalDiscoveryContractError("native v5 supervisor generation config is invalid")
+    config_sha256 = _sha256(
+        invocation["generationConfigSha256"], name="native v5 supervisor config"
+    )
+    if config.get("configSha256") != config_sha256:
+        raise TemporalDiscoveryContractError("native v5 supervisor generation config drifted")
+    config_material = _clone(config, name="native v5 supervisor generation config")
+    config_material.pop("configSha256", None)
+    if (
+        canonical_sha256(config_material) != config_sha256
+        or config.get("generationIndex") != generation_index
+    ):
+        raise TemporalDiscoveryContractError("native v5 supervisor generation config identity drifted")
+    evaluation_population_size = invocation["evaluationPopulationSize"]
+    if (
+        isinstance(evaluation_population_size, bool)
+        or not isinstance(evaluation_population_size, int)
+        or evaluation_population_size < 1
+    ):
+        raise TemporalDiscoveryContractError("native v5 supervisor evaluation size is invalid")
+    generation_kind = invocation["generationKind"]
+    parent_archive_input = invocation["parentArchiveInput"]
+    identity_ledger_input = invocation["identityLedgerInput"]
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        if parent_archive_input is not None or identity_ledger_input is not None:
+            raise TemporalDiscoveryContractError("native v5 G0 invocation input drifted")
+    elif generation_kind == V5_PROPOSAL_GENERATION_EVOLVED:
+        if not isinstance(parent_archive_input, Mapping) or not isinstance(
+            identity_ledger_input, Mapping
+        ):
+            raise TemporalDiscoveryContractError("native v5 evolved invocation input drifted")
+        invocation["parentArchiveInput"] = validate_v5_proposal_input_binding(
+            parent_archive_input, expected_kind="parentArchive"
+        )
+        invocation["identityLedgerInput"] = validate_v5_proposal_input_binding(
+            identity_ledger_input, expected_kind="identityLedger"
+        )
+    else:
+        raise TemporalDiscoveryContractError("native v5 supervisor generation kind is invalid")
+    invocation["constructionAdapter"] = _validate_native_v5_construction_adapter(
+        value=invocation["constructionAdapter"],
+        proposal_root=proposal_root,
+        generation_index=generation_index,
+        generation_kind=generation_kind,
+        generation_config_sha256=config_sha256,
+    )
+    if (
+        invocation["constructionAdapter"]["selectedEvaluationCandidateCount"]
+        != evaluation_population_size
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 supervisor evaluation count drifted"
+        )
+    return invocation
+
+
+def _reauthenticate_native_v5_supervisor_invocation(
+    *, root: Path, config: Mapping[str, Any], invocation: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Force the bridge's receipt-last adoption pass on every completed reopen."""
+
+    checked = _validate_native_v5_supervisor_invocation(root=root, value=invocation)
+    runtime, _bindings = _validate_native_v5_proposal_runtime(config=config)
+    source = config.get("bidirectionalPairSourceAuthority")
+    evolvable = _v5_evolvable_authority(config)
+    if not isinstance(source, Mapping) or evolvable is None:
+        raise TemporalDiscoveryContractError("native v5 invocation lacks frozen authority")
+    qd_engine_version = _native_v5_qd_engine_version(
+        config=config, evolvable_authority=evolvable
+    )
+    try:
+        adapter = run_native_v5_generation_construction(
+            output_root=checked["outputRoot"],
+            generation_config=checked["generationConfig"],
+            pair_source_authority=source,
+            evolvable_module_authority=evolvable,
+            bidirectional_pair_policy=runtime["bidirectionalPairPolicy"],
+            native_operator_authority=runtime["nativeOperatorAuthority"],
+            qd_engine_version=qd_engine_version,
+            evaluation_population_size=checked["evaluationPopulationSize"],
+            execution_timeout_seconds=runtime["executionTimeoutSeconds"],
+            thread_cap=runtime["threadCap"],
+            generation_kind=checked["generationKind"],
+            parent_archive_input=checked["parentArchiveInput"],
+            identity_ledger_input=checked["identityLedgerInput"],
+        )
+    except TemporalQDV5NativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    reopened = _validate_native_v5_construction_adapter(
+        value=adapter,
+        proposal_root=_native_v5_proposal_root(root, checked["generationIndex"]),
+        generation_index=checked["generationIndex"],
+        generation_kind=checked["generationKind"],
+        generation_config_sha256=checked["generationConfigSha256"],
+    )
+    if reopened != checked["constructionAdapter"]:
+        raise TemporalDiscoveryContractError(
+            "native v5 receipt adoption disagrees with the completed generation"
+        )
+    return reopened
+
+
+def _native_v5_proposal_archive_descriptor(
+    value: Mapping[str, Any], *, name: str
+) -> dict[str, Any]:
+    """Accept the sole four-field archive transport used by qd-batch.
+
+    Current-v5 Python never reopens an archive to make this binding.  Fresh
+    G0 receives the reducer-certified initial descriptor and later generations
+    receive the exact descriptor projected from the prior Rust finalizer
+    commit.  Keeping the projection separate from the general supervisor
+    archive records prevents an accidental path/hash fallback from creeping
+    into proposal construction.
+    """
+
+    descriptor = _clone(value, name=name)
+    if not isinstance(descriptor, Mapping) or set(descriptor) != {
+        "absolutePath",
+        "fileSha256",
+        "semanticSha256",
+        "byteLength",
+    }:
+        raise TemporalDiscoveryContractError(f"{name} descriptor schema drifted")
+    path = descriptor.get("absolutePath")
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise TemporalDiscoveryContractError(f"{name} path is invalid")
+    _sha256(descriptor.get("fileSha256"), name=f"{name} file identity")
+    _sha256(descriptor.get("semanticSha256"), name=f"{name} semantic identity")
+    byte_length = descriptor.get("byteLength")
+    if isinstance(byte_length, bool) or not isinstance(byte_length, int) or byte_length < 0:
+        raise TemporalDiscoveryContractError(f"{name} byte length is invalid")
+    return dict(descriptor)
+
+
+def _native_v5_prefinalizer_archive_binding(
+    value: Mapping[str, Any], *, name: str
+) -> dict[str, Any]:
+    """Project one finalizer/certifier archive descriptor for prefinalizer v2.
+
+    The target ABI names its transport fields differently from qd-batch.  This
+    is a name-only projection of an authenticated compact descriptor, never a
+    file lookup or rehash.
+    """
+
+    descriptor = _native_v5_proposal_archive_descriptor(value, name=name)
+    return {
+        "path": descriptor["absolutePath"],
+        "rawSha256": descriptor["fileSha256"],
+        "sizeBytes": descriptor["byteLength"],
+        "archiveSha256": descriptor["semanticSha256"],
+    }
+
+
+def _native_v5_archive_policy_binding(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Seal the frozen evolvable policy in the prefinalizer's exact ABI.
+
+    The launch authority stores the policy body and its semantic policy hash.
+    The Rust prefinalizer/finalizer additionally require a self-hashed binding
+    wrapper.  This is a bounded control-object projection; it does not inspect
+    any candidate, archive, or result payload.
+    """
+
+    policy = _clone(value, name="native v5 archive policy authority")
+    if not isinstance(policy, Mapping) or set(policy) != {
+        "qdVersion",
+        "policyName",
+        "policySha256",
+        "frozenPolicy",
+    }:
+        raise TemporalDiscoveryContractError(
+            "native v5 archive policy authority schema drifted"
+        )
+    _sha256(policy.get("policySha256"), name="native v5 archive policy identity")
+    for field in ("qdVersion", "policyName"):
+        if not isinstance(policy.get(field), str) or not policy[field]:
+            raise TemporalDiscoveryContractError(
+                f"native v5 archive policy {field} is invalid"
+            )
+    if not isinstance(policy.get("frozenPolicy"), Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 frozen archive policy is invalid"
+        )
+    return _native_self_hash(
+        {
+            "schemaVersion": "temporal_qd_archive_policy_binding_v1",
+            "qdVersion": policy["qdVersion"],
+            "policyName": policy["policyName"],
+            "policySha256": policy["policySha256"],
+            "frozenPolicy": policy["frozenPolicy"],
+        },
+        "policyBindingSha256",
+    )
+
+
+def _native_v5_archive_descriptor_from_finalizer_artifact(
+    value: Mapping[str, Any], *, name: str, expected_relative_path: str
+) -> dict[str, Any]:
+    """Project a finalizer artifact descriptor for the next v5 transaction."""
+
+    artifact = _clone(value, name=name)
+    if not isinstance(artifact, Mapping) or set(artifact) != {
+        "relativePath",
+        "absolutePath",
+        "semanticSha256",
+        "fileSha256",
+        "byteLength",
+    } or artifact.get("relativePath") != expected_relative_path:
+        raise TemporalDiscoveryContractError(f"{name} descriptor schema drifted")
+    return _native_v5_proposal_archive_descriptor(
+        {
+            "absolutePath": artifact["absolutePath"],
+            "fileSha256": artifact["fileSha256"],
+            "semanticSha256": artifact["semanticSha256"],
+            "byteLength": artifact["byteLength"],
+        },
+        name=name,
+    )
+
+
+def _run_native_v5_generation(
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    parent_archive_descriptor: Mapping[str, Any],
+    parent_schedule: Mapping[str, Any] | None,
+    identity_ledger_input: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Construct one generation solely through the receipt-authenticated Rust API."""
+
+    runtime, bindings = _validate_native_v5_proposal_runtime(config=config)
+    source = config.get("bidirectionalPairSourceAuthority")
+    evolvable = _v5_evolvable_authority(config)
+    if not isinstance(source, Mapping) or evolvable is None:
+        raise TemporalDiscoveryContractError("native v5 construction lacks frozen authority")
+    qd_engine_version = _native_v5_qd_engine_version(
+        config=config, evolvable_authority=evolvable
+    )
+    g0 = config.get("g0Bootstrap")
+    is_g0 = isinstance(g0, Mapping) and generation_index == 1
+    if is_g0:
+        generation_kind = V5_PROPOSAL_GENERATION_G0
+        construction_width = int(g0["initialConstructionPoolSize"])
+        evaluation_width = int(g0["evaluationPopulationSize"])
+        parent_input = None
+        if identity_ledger_input is not None:
+            raise TemporalDiscoveryContractError("native v5 G0 cannot bind an identity ledger")
+        generation_parent_schedule = None
+    else:
+        generation_kind = V5_PROPOSAL_GENERATION_EVOLVED
+        construction_width = int(config["frozenSearchPolicy"]["targetUniqueCandidates"])
+        evaluation_width = construction_width
+        if not isinstance(identity_ledger_input, Mapping):
+            raise TemporalDiscoveryContractError(
+                "native v5 evolved generation lacks its frozen identity ledger"
+            )
+        try:
+            parent_input = build_v5_proposal_input_binding(
+                kind="parentArchive",
+                sealed_descriptor=_native_v5_proposal_archive_descriptor(
+                    parent_archive_descriptor,
+                    name="native v5 evolved parent archive",
+                ),
+            )
+        except TemporalQDV5NativeError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+        generation_parent_schedule = parent_schedule
+    immigrant_policy = source.get("immigrantConstructionPolicy")
+    if not isinstance(immigrant_policy, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 source authority lacks immutable immigrant construction policy"
+        )
+    generation_config = build_pair_generation_config(
+        generation_index=generation_index,
+        target_unique_candidates=construction_width,
+        max_proposal_attempts=int(config["frozenSearchPolicy"]["maxProposalAttempts"]),
+        run_config=bindings["runConfig"],
+        pair_policy=runtime["bidirectionalPairPolicy"],
+        operator_implementation_identity=bindings["operatorImplementation"],
+        # Parent parsing and selection belongs to Rust for v5.  The frozen
+        # schedule is control-plane material only; the parent archive itself
+        # is bound as an opaque, receipt-validated native input below.
+        parent_archive=None,
+        immigrant_construction_policy=immigrant_policy,
+        global_identity_ledger_enabled=(
+            generation_kind == V5_PROPOSAL_GENERATION_EVOLVED
+        ),
+        parent_schedule=generation_parent_schedule,
+    )
+    proposal_root = _native_v5_proposal_root(root, generation_index)
+    try:
+        adapter = run_native_v5_generation_construction(
+            output_root=proposal_root,
+            generation_config=generation_config,
+            pair_source_authority=source,
+            evolvable_module_authority=evolvable,
+            bidirectional_pair_policy=runtime["bidirectionalPairPolicy"],
+            native_operator_authority=runtime["nativeOperatorAuthority"],
+            qd_engine_version=qd_engine_version,
+            evaluation_population_size=evaluation_width,
+            execution_timeout_seconds=runtime["executionTimeoutSeconds"],
+            thread_cap=runtime["threadCap"],
+            generation_kind=generation_kind,
+            parent_archive_input=parent_input,
+            identity_ledger_input=identity_ledger_input,
+        )
+    except TemporalQDV5NativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    checked_adapter = _validate_native_v5_construction_adapter(
+        value=adapter,
+        proposal_root=proposal_root,
+        generation_index=generation_index,
+        generation_kind=generation_kind,
+        generation_config_sha256=generation_config["configSha256"],
+    )
+    if (
+        checked_adapter["selectedEvaluationCandidateCount"] != evaluation_width
+        or checked_adapter["acceptedCandidateCount"] < evaluation_width
+        or (is_g0 and checked_adapter["acceptedCandidateCount"] != construction_width)
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 construction receipt count disagrees with frozen dimensions"
+        )
+    invocation = _build_native_v5_supervisor_invocation(
+        root=root,
+        generation_index=generation_index,
+        generation_config=generation_config,
+        generation_kind=generation_kind,
+        evaluation_population_size=evaluation_width,
+        parent_archive_input=parent_input,
+        identity_ledger_input=identity_ledger_input,
+        construction_adapter=checked_adapter,
+    )
+    return {
+        "completed": True,
+        "generationKind": generation_kind,
+        "populationSha256": checked_adapter["population"]["semanticSha256"],
+        "evaluationPopulationSha256": checked_adapter["evaluationPopulation"][
+            "semanticSha256"
+        ],
+        "journalSha256": checked_adapter["generationJournal"]["semanticSha256"],
+        "proposalCount": checked_adapter["attemptCount"],
+        "candidateCount": checked_adapter["selectedEvaluationCandidateCount"],
+        "acceptedCandidateCount": checked_adapter["acceptedCandidateCount"],
+        # These supervisor counters are intentionally a compact projection of
+        # the receipt fields, not a reconstructed proposal journal.  Keeping
+        # their v5 names makes it impossible to mistake them for legacy
+        # per-origin Python accounting.
+        "originProposalCounts": {
+            "nativeV5AttemptCount": checked_adapter["attemptCount"]
+        },
+        "originAcceptedCounts": {
+            "nativeV5AcceptedCandidateCount": checked_adapter[
+                "acceptedCandidateCount"
+            ]
+        },
+        "proposalSlots": {
+            "targetUniqueCandidates": evaluation_width,
+            "acceptedUniqueCandidates": checked_adapter[
+                "selectedEvaluationCandidateCount"
+            ],
+            "proposalAttempts": checked_adapter["attemptCount"],
+            "remainingUniqueCandidateSlots": 0,
+        },
+        "uniqueIdentityCounts": {
+            "nativeV5SelectedEvaluationCandidateCount": checked_adapter[
+                "selectedEvaluationCandidateCount"
+            ]
+        },
+        "duplicateCounters": {},
+        "proposalSlotCounters": {
+            "nativeV5AttemptCount": checked_adapter["attemptCount"],
+            "nativeV5AcceptedCandidateCount": checked_adapter[
+                "acceptedCandidateCount"
+            ],
+            "nativeV5SelectedEvaluationCandidateCount": checked_adapter[
+                "selectedEvaluationCandidateCount"
+            ],
+        },
+        # Parent scheduling lives inside the immutable native generation
+        # config.  The legacy continuation cursor has no v5 proposal role.
+        "nextImmigrantContinuationOrdinal": 0,
+        "nativeV5Construction": checked_adapter,
+        "nativeV5Invocation": invocation,
+    }
+
+
+def _native_v5_campaign_timeout(value: object, *, name: str) -> int:
+    """Accept the frozen integral timeout without silently rounding it."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TemporalDiscoveryContractError(f"native v5 {name} is invalid")
+    timeout = int(value)
+    if timeout < 1 or timeout != value:
+        raise TemporalDiscoveryContractError(f"native v5 {name} is invalid")
+    return timeout
+
+
+def _run_native_v5_campaign_round(
+    *,
+    runtime_authority: Mapping[str, Any],
+    config: Mapping[str, Any],
+    generation_index: int,
+    evaluation_population_path: Path,
+    evaluation_population_raw_sha256: str,
+    campaign_root: Path,
+    panel: Mapping[str, Any],
+    campaign_role: str,
+    cohort_source: Mapping[str, Any],
+    gateway_token: str | None,
+    cohort_selection_path: Path | None = None,
+    timeout_seconds: int = 900,
+) -> dict[str, Any]:
+    """Run one current-v5 campaign as sealed Rust-to-Rust handoffs only.
+
+    This is deliberately a control-plane join.  It forwards an opaque native
+    evaluation population or native selection descriptor to the freezer and
+    carries only its compact receipts into dispatch, seal, sidecar, and the
+    rotating campaign receipt.  No candidate, task, result, or archive row is
+    decoded here.
+    """
+
+    if not _native_v5_proposal_enabled(config):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign round requires the current v5 proposal runtime"
+        )
+    if isinstance(generation_index, bool) or not isinstance(generation_index, int) or generation_index < 1:
+        raise TemporalDiscoveryContractError("native v5 campaign generation is invalid")
+    rotating = config.get("rotatingEvidence")
+    if not isinstance(rotating, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign round requires frozen rotating evidence"
+        )
+    current_panel = panel_for_generation(rotating, generation_index)
+    if campaign_role in {
+        "proposal_current_panel",
+        "retained_parent_current_panel",
+    }:
+        expected_panel = current_panel
+        if dict(panel) != expected_panel:
+            raise TemporalDiscoveryContractError(
+                "native v5 current-panel campaign drifted from frozen absolute generation mapping"
+            )
+    elif campaign_role == "prior_panel_backfill":
+        panels = rotating.get("panels")
+        panel_id_value = panel.get("panelId") if isinstance(panel, Mapping) else None
+        expected_panel = next(
+            (
+                dict(item)
+                for item in panels or []
+                if isinstance(item, Mapping) and item.get("panelId") == panel_id_value
+            ),
+            None,
+        )
+        if expected_panel is None or dict(panel) != expected_panel:
+            raise TemporalDiscoveryContractError(
+                "native v5 prior-panel backfill names an unbound frozen panel"
+            )
+    else:
+        raise TemporalDiscoveryContractError("native v5 campaign role is invalid")
+    panel_id = expected_panel.get("panelId")
+    if not isinstance(panel_id, str) or not panel_id:
+        raise TemporalDiscoveryContractError("native v5 campaign panel is invalid")
+    templates = rotating.get("panelTemplates")
+    template = templates.get(panel_id) if isinstance(templates, Mapping) else None
+    if (
+        not isinstance(template, Mapping)
+        or not isinstance(template.get("path"), str)
+        or not isinstance(template.get("preparationSha256"), str)
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign lacks its frozen panel template"
+        )
+    construction = config.get("constructionOperatorPolicy")
+    catalog = (
+        construction.get("catalog", {}).get("path")
+        if isinstance(construction, Mapping)
+        and isinstance(construction.get("catalog"), Mapping)
+        else None
+    )
+    if not isinstance(catalog, str) or not catalog:
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign requires a frozen construction catalog"
+        )
+    catalog_binding = construction.get("catalog") if isinstance(construction, Mapping) else None
+    if not isinstance(catalog_binding, Mapping) or not isinstance(
+        catalog_binding.get("catalogSha256"), str
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign construction catalog lacks its frozen identity"
+        )
+    evaluation_raw_sha256 = _sha256(
+        evaluation_population_raw_sha256,
+        name="native v5 campaign evaluation population identity",
+    )
+    template_sha256 = _sha256(
+        template["preparationSha256"],
+        name="native v5 campaign template preparation identity",
+    )
+    catalog_sha256 = _sha256(
+        catalog_binding["catalogSha256"],
+        name="native v5 campaign construction catalog identity",
+    )
+    repositories = config.get("repositories")
+    evaluation = config.get("evaluation")
+    policy = config.get("frozenSearchPolicy")
+    evolvable = _v5_evolvable_authority(config)
+    if (
+        not isinstance(repositories, Mapping)
+        or not isinstance(evaluation, Mapping)
+        or not isinstance(policy, Mapping)
+        or evolvable is None
+        or not isinstance(evolvable.get("archivePolicyAuthority"), Mapping)
+        or not isinstance(evaluation.get("behaviorAttributionRequirement"), Mapping)
+        or not isinstance(evaluation.get("gatewayUrl"), str)
+        or not evaluation["gatewayUrl"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign lacks frozen execution authority"
+        )
+    execution_engine_commit = repositories.get("executionEngineCommit")
+    worker_contract_sha256 = config.get("workerContractSha256")
+    if not isinstance(execution_engine_commit, str) or not isinstance(
+        worker_contract_sha256, str
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign frozen repository/worker binding is invalid"
+        )
+    numeric_names = {
+        "minimumTotalTrades": "minimum total trades",
+        "minimumTradesPerWindow": "minimum trades per window",
+        "capTrades": "cap trades",
+    }
+    numeric: dict[str, int] = {}
+    for key, label in numeric_names.items():
+        value = policy.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TemporalDiscoveryContractError(f"native v5 {label} is invalid")
+        numeric[key] = value
+    provisional = rotating.get("provisionalReduction")
+    provisional_limit = (
+        provisional.get("maxCandidates") if isinstance(provisional, Mapping) else None
+    )
+    if (
+        isinstance(provisional_limit, bool)
+        or not isinstance(provisional_limit, int)
+        or provisional_limit < 1
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign provisional limit is invalid"
+        )
+    if campaign_role == "proposal_current_panel":
+        if cohort_selection_path is not None:
+            raise TemporalDiscoveryContractError(
+                "native v5 proposal campaign cannot supply a cohort selection"
+            )
+    elif campaign_role in {
+        "retained_parent_current_panel",
+        "prior_panel_backfill",
+    }:
+        if cohort_selection_path is None:
+            raise TemporalDiscoveryContractError(
+                "native v5 resumed campaign lacks its Rust cohort selection"
+            )
+    else:
+        raise TemporalDiscoveryContractError("native v5 campaign role is invalid")
+
+    # Each subprocess receives a directory chosen by the immutable generation
+    # layout.  `exist_ok` only permits restart of the same receipt-last
+    # transaction; all control documents below remain write-once.
+    campaign_root.mkdir(parents=True, exist_ok=True)
+    source_root = campaign_root / "campaign-seal-source"
+    source_root.mkdir(parents=True, exist_ok=True)
+    sidecar_root = campaign_root / "panel-bundle-sidecar"
+    sidecar_root.mkdir(parents=True, exist_ok=True)
+    receipt_root = campaign_root / "rotating-campaign-receipt"
+    receipt_root.mkdir(parents=True, exist_ok=True)
+    # The freezer seals its own empty screening-run checkpoint.  Gateway
+    # completion compacts a mutable checkpoint, so it must publish beneath a
+    # distinct operational root rather than mutate the freezer's receipt
+    # inventory and make every restart fail closed.
+    gateway_root = campaign_root / "gateway-dispatch"
+    gateway_receipt = gateway_root / ".native-gateway-dispatch" / "execution-receipt.json"
+    try:
+        freeze = run_native_v5_campaign_freeze(
+            runtime_authority=runtime_authority,
+            evaluation_population_path=evaluation_population_path,
+            evaluation_population_raw_sha256=evaluation_raw_sha256,
+            template_preparation_path=Path(str(template["path"])),
+            template_preparation_sha256=template_sha256,
+            construction_catalog_path=Path(catalog),
+            construction_catalog_sha256=catalog_sha256,
+            output_root=campaign_root,
+            execution_engine_commit=execution_engine_commit,
+            worker_contract_sha256=worker_contract_sha256,
+            rotating_evidence=rotating,
+            archive_policy_authority=evolvable["archivePolicyAuthority"],
+            behavior_attribution_requirement=evaluation[
+                "behaviorAttributionRequirement"
+            ],
+            campaign_role=campaign_role,
+            panel_id=panel_id,
+            cohort_selection_path=cohort_selection_path,
+            timeout_seconds=timeout_seconds,
+        )
+        gateway = run_native_gateway_dispatch(
+            runtime_authority=runtime_authority,
+            task_manifest_path=campaign_root / "screening-run" / "task-manifest.json",
+            output_root=gateway_root,
+            gateway_url=str(evaluation["gatewayUrl"]),
+            mode="resume" if gateway_receipt.exists() else "fresh",
+            timeout_seconds=_native_v5_campaign_timeout(
+                evaluation.get("timeoutSecondsPerGeneration"),
+                name="gateway timeout",
+            ),
+            gateway_token=gateway_token,
+            enqueue_batch_size=_native_v5_campaign_timeout(
+                evaluation.get("enqueueBatchSize"), name="enqueue batch size"
+            ),
+        )
+        source = build_native_campaign_seal_source(
+            runtime_authority=runtime_authority,
+            freezer_root=Path(str(freeze["outputRoot"])),
+            gateway_output_root=Path(str(gateway["outputRoot"])),
+            source_root=source_root,
+            funnel_projection_included=True,
+            timeout_seconds=timeout_seconds,
+        )
+        seal = run_native_campaign_seal(
+            runtime_authority=runtime_authority,
+            source_build=source,
+            # The native freezer owns the role-specific cohort population.
+            # In particular, retained/backfill rows may not exist in the
+            # proposal evaluation population.  The tail reducer reopens this
+            # exact receipt-inventoried artifact; Python never decodes it.
+            evaluation_population_path=(
+                Path(str(freeze["outputRoot"])) / "cohort-population.json"
+            ),
+            evaluation_population_sha256=str(freeze["cohortPopulationSha256"]),
+            output_root=campaign_root,
+            generation_index=generation_index,
+            minimum_total_trades=numeric["minimumTotalTrades"],
+            minimum_trades_per_window=numeric["minimumTradesPerWindow"],
+            cap_trades=numeric["capTrades"],
+            provisional_limit=provisional_limit,
+            timeout_seconds=timeout_seconds,
+        )
+        panel_input = {
+            "schemaVersion": "temporal_qd_v5_rotating_panel_bundle_input_v2",
+            "contractVersion": "temporal_qd_native_foundation_v1",
+            "generationIndex": generation_index,
+            "campaignRole": campaign_role,
+            "campaignSeal": seal["campaignSeal"],
+            "tailAuthority": seal["tailAuthorityReceipt"],
+            "tailResultIndex": seal["tailResultIndex"],
+            "directionalTailAuthority": seal["directionalTailAuthority"],
+            "rotatingEvidence": dict(rotating),
+            "panel": expected_panel,
+        }
+        sidecar = build_native_panel_bundle_sidecar(
+            runtime_authority=runtime_authority,
+            panel_input=panel_input,
+            output_root=sidecar_root,
+            timeout_seconds=timeout_seconds,
+        )
+        receipt = build_native_rotating_campaign_receipt(
+            runtime_authority=runtime_authority,
+            campaign_freeze=freeze,
+            campaign_seal=seal,
+            panel_bundle_sidecar=sidecar,
+            output_root=receipt_root,
+            generation_index=generation_index,
+            campaign_role=campaign_role,
+            panel_id=panel_id,
+            rotating_evidence_sha256=str(rotating.get("rotatingEvidenceSha256") or ""),
+            cohort_source=cohort_source,
+            timeout_seconds=timeout_seconds,
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    return {
+        "campaignFreeze": freeze,
+        "gatewayDispatch": gateway,
+        "sourceBuild": source,
+        "campaignSeal": seal,
+        "panelBundleSidecar": sidecar,
+        "campaignReceipt": receipt,
+    }
+
+
+def _native_v5_panel_by_id(
+    *, rotating_evidence: Mapping[str, Any], panel_id: str
+) -> dict[str, Any]:
+    """Return one sealed panel authority without selecting any candidates."""
+
+    if not isinstance(panel_id, str) or not panel_id:
+        raise TemporalDiscoveryContractError("native v5 panel identity is invalid")
+    panels = rotating_evidence.get("panels")
+    if not isinstance(panels, list):
+        raise TemporalDiscoveryContractError("native v5 rotating panels are unavailable")
+    matches = [
+        _clone(item, name="native v5 rotating panel")
+        for item in panels
+        if isinstance(item, Mapping) and item.get("panelId") == panel_id
+    ]
+    if len(matches) != 1:
+        raise TemporalDiscoveryContractError("native v5 rotating panel binding drifted")
+    return matches[0]
+
+
+def _native_v5_proposal_state_authority_for_generation(
+    *,
+    root: Path,
+    generation_index: int,
+    generation_result: Mapping[str, Any],
+    identity_ledger_input: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Project the eight-field Rust proposal authority from one sealed adapter.
+
+    This is deliberately a compact root-to-root join.  It neither reads a
+    proposal population nor reconstructs a journal; the adapter was already
+    receipt-authenticated by ``_run_native_v5_generation``.
+    """
+
+    kind = generation_result.get("generationKind")
+    if kind not in {V5_PROPOSAL_GENERATION_G0, V5_PROPOSAL_GENERATION_EVOLVED}:
+        raise TemporalDiscoveryContractError("native v5 generation kind is invalid")
+    adapter = _validate_native_v5_construction_adapter(
+        value=_clone(
+            generation_result.get("nativeV5Construction"),
+            name="native v5 proposal construction adapter",
+        ),
+        proposal_root=_native_v5_proposal_root(root, generation_index),
+        generation_index=generation_index,
+        generation_kind=kind,
+    )
+    native_invocation = adapter.get("nativeV5Invocation")
+    if not isinstance(native_invocation, Mapping) or not isinstance(
+        native_invocation.get("proposalManifest"), Mapping
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 construction lacks its immutable invocation descriptor"
+        )
+    supervisor_invocation = generation_result.get("nativeV5Invocation")
+    if not isinstance(supervisor_invocation, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 generation lacks its supervisor invocation"
+        )
+    if kind == V5_PROPOSAL_GENERATION_G0:
+        if identity_ledger_input is not None or supervisor_invocation.get(
+            "identityLedgerInput"
+        ) is not None:
+            raise TemporalDiscoveryContractError(
+                "native v5 G0 proposal unexpectedly has an input identity ledger"
+            )
+        input_ledger_sha256: str | None = None
+    else:
+        supplied = supervisor_invocation.get("identityLedgerInput")
+        if not isinstance(identity_ledger_input, Mapping) or not isinstance(
+            supplied, Mapping
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 evolved proposal lacks its sealed input identity ledger"
+            )
+        try:
+            checked_input = validate_v5_proposal_input_binding(
+                identity_ledger_input, expected_kind="identityLedger"
+            )
+            checked_supplied = validate_v5_proposal_input_binding(
+                supplied, expected_kind="identityLedger"
+            )
+        except TemporalQDV5NativeError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+        if checked_input != checked_supplied:
+            raise TemporalDiscoveryContractError(
+                "native v5 evolved input identity-ledger invocation drifted"
+            )
+        input_ledger_sha256 = _sha256(
+            checked_input["semanticSha256"],
+            name="native v5 evolved input identity-ledger identity",
+        )
+    proposal_manifest = native_invocation["proposalManifest"]
+    ledger = adapter.get("identityLedger")
+    journal = adapter.get("generationJournal")
+    if not isinstance(ledger, Mapping) or not isinstance(journal, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 construction lacks compact ledger/journal descriptors"
+        )
+    proposal_manifest_sha256 = _sha256(
+        proposal_manifest.get("semanticSha256"),
+        name="native v5 proposal manifest identity",
+    )
+    proposal_receipt_sha256 = _sha256(
+        adapter.get("proposalReceiptSha256"), name="native v5 proposal receipt identity"
+    )
+    generation_journal_sha256 = _sha256(
+        journal.get("semanticSha256"), name="native v5 proposal journal identity"
+    )
+    output_ledger_sha256 = _sha256(
+        ledger.get("semanticSha256"), name="native v5 proposal output ledger identity"
+    )
+    output_ledger_file_sha256 = _sha256(
+        ledger.get("fileSha256"), name="native v5 proposal output ledger file identity"
+    )
+    if native_invocation.get("proposalReceiptSha256") != proposal_receipt_sha256:
+        raise TemporalDiscoveryContractError(
+            "native v5 proposal invocation receipt identity drifted"
+        )
+    authority = {
+        "generationKind": kind,
+        "proposalManifestSha256": proposal_manifest_sha256,
+        "proposalReceiptSha256": proposal_receipt_sha256,
+        "generationJournalSha256": generation_journal_sha256,
+        "inputIdentityLedgerSha256": input_ledger_sha256,
+        "outputIdentityLedgerRelativePath": "proposal/v5-native/identity-ledger.json",
+        "outputIdentityLedgerSha256": output_ledger_sha256,
+        "outputIdentityLedgerFileSha256": output_ledger_file_sha256,
+    }
+    semantic_roots = {
+        "proposalReceiptSha256": proposal_receipt_sha256,
+        "generationJournalSha256": generation_journal_sha256,
+    }
+    return adapter, authority, semantic_roots
+
+
+def _complete_native_v5_generation(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    generation_result: Mapping[str, Any],
+    identity_ledger_input: Mapping[str, Any] | None,
+    parent_archive_descriptor: Mapping[str, Any],
+    previous_cumulative_archive_descriptor: Mapping[str, Any] | None,
+    gateway_token: str | None,
+) -> dict[str, Any]:
+    """Run one entire current-v5 postproposal transaction through Rust.
+
+    Python only writes/reopens compact manifests and receipts.  Candidate
+    construction, campaign task enumeration, gateway result reduction, rich
+    member selection, archive materialization, and finalization all remain in
+    their pinned Rust transactions.
+    """
+
+    if not _native_v5_proposal_enabled(config):
+        raise TemporalDiscoveryContractError(
+            "native v5 postproposal completion requires the current v5 runtime"
+        )
+    rotating = config.get("rotatingEvidence")
+    evolvable = _v5_evolvable_authority(config)
+    policy = config.get("frozenSearchPolicy")
+    if (
+        not isinstance(rotating, Mapping)
+        or evolvable is None
+        or not isinstance(evolvable.get("archivePolicyAuthority"), Mapping)
+        or not isinstance(policy, Mapping)
+    ):
+        raise TemporalDiscoveryContractError(
+            "current native v5 postproposal requires frozen rotating authorities"
+        )
+    runtime_authority = _native_runtime_authority_for_generation(
+        root=root, generation_index=generation_index
+    )
+    _require_native_v5_control_plane_runtime_authority(runtime_authority)
+    adapter, proposal_state_authority, proposal_semantic_roots = (
+        _native_v5_proposal_state_authority_for_generation(
+            root=root,
+            generation_index=generation_index,
+            generation_result=generation_result,
+            identity_ledger_input=identity_ledger_input,
+        )
+    )
+    generation_kind = proposal_state_authority["generationKind"]
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    current_panel = panel_for_generation(rotating, generation_index)
+    evaluation_population_path = Path(
+        str(adapter["evaluationPopulation"]["absolutePath"])
+    )
+    # The adapter's receipt-authenticated descriptor is the sole Python
+    # authority for this candidate-scale population.  The freezer reopens it
+    # through Rust; probing it here would turn restart admission into a Python
+    # file-validation path.
+    state["stage"] = "native_v5_proposal_campaign"
+    _save_state(state_path, state)
+    proposal_campaign = _run_native_v5_campaign_round(
+        runtime_authority=runtime_authority,
+        config=config,
+        generation_index=generation_index,
+        evaluation_population_path=evaluation_population_path,
+        evaluation_population_raw_sha256=str(
+            adapter["evaluationPopulation"]["fileSha256"]
+        ),
+        campaign_root=(generation_root / "campaign" / "proposal-current-panel"),
+        panel=current_panel,
+        campaign_role="proposal_current_panel",
+        cohort_source={
+            "kind": "proposal_evaluation_population",
+            "sourceSemanticSha256": adapter["evaluationPopulation"]["semanticSha256"],
+            "candidateCount": adapter["selectedEvaluationCandidateCount"],
+            "selectionSha256": None,
+        },
+        gateway_token=gateway_token,
+    )
+
+    state["stage"] = "native_v5_funnel_reduction"
+    _save_state(state_path, state)
+    extraction_root = generation_root / "prefinalizer" / "proposal-attempts"
+    try:
+        extraction = (
+            extract_native_v5_g0_selected_attempts(
+                runtime_authority=runtime_authority,
+                construction_adapter=adapter,
+                output_root=extraction_root,
+            )
+            if generation_kind == V5_PROPOSAL_GENERATION_G0
+            else extract_native_v5_evolved_attempt_chain(
+                runtime_authority=runtime_authority,
+                construction_adapter=adapter,
+                output_root=extraction_root,
+            )
+        )
+        funnel = assemble_native_v5_funnel_reduction_source(
+            runtime_authority=runtime_authority,
+            proposal_attempt_authority=extraction["proposalAttemptAuthority"],
+            generation_index=generation_index,
+            evaluation_panel=current_panel,
+            campaign_seal=proposal_campaign["campaignSeal"]["campaignSeal"],
+            tail_authority=proposal_campaign["campaignSeal"]["directionalTailAuthority"],
+            tail_result_index=proposal_campaign["campaignSeal"]["tailResultIndex"],
+            minimum_total_trades=int(policy["minimumTotalTrades"]),
+            minimum_trades_per_window=int(policy["minimumTradesPerWindow"]),
+            output_root=(generation_root / "prefinalizer" / "funnel-reduction"),
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+
+    state["stage"] = "native_v5_rotating_prefinalizer"
+    _save_state(state_path, state)
+    state_basis = _native_v5_generation_state_basis(
+        state=state, config=config, generation_index=generation_index
+    )
+    completed_records = state.get("completedGenerations")
+    if not isinstance(completed_records, list):
+        raise TemporalDiscoveryContractError(
+            "native v5 postproposal completed generation records are invalid"
+        )
+    generation_config_sha256 = _sha256(
+        adapter.get("generationConfigSha256"),
+        name="native v5 proposal generation config identity",
+    )
+    try:
+        base = build_native_v5_prefinalizer_base_manifest(
+            runtime_authority=runtime_authority,
+            # The v2 base uses Rust-canonical transport paths on Windows.
+            # Keep it in a versioned operational root so a precommit manifest
+            # written by the superseded normal-drive spelling is never
+            # overwritten or silently adopted.
+            output_root=(generation_root / "prefinalizer" / "base-v2"),
+            generation_index=generation_index,
+            supervisor_config_sha256=_sha256(
+                config.get("configSha256"), name="native v5 supervisor config identity"
+            ),
+            generation_config_sha256=generation_config_sha256,
+            state_basis=state_basis,
+            completed_generation_records=completed_records,
+            proposal_state_authority=proposal_state_authority,
+            rotating_evidence=rotating,
+            archive_policy_authority=_native_v5_archive_policy_binding(
+                evolvable["archivePolicyAuthority"]
+            ),
+            proposal_semantic_roots=proposal_semantic_roots,
+            identity_ledger_sha256=adapter["identityLedger"]["semanticSha256"],
+            native_v5_invocation=adapter["nativeV5Invocation"],
+            funnel_reduction_input=funnel["input"],
+            funnel_assembly_receipt_binding=funnel["assemblyReceiptBinding"],
+            previous_parent_archive_binding=_native_v5_prefinalizer_archive_binding(
+                parent_archive_descriptor,
+                name="native v5 previous parent archive",
+            ),
+            previous_cumulative_archive_binding=(
+                _native_v5_prefinalizer_archive_binding(
+                    previous_cumulative_archive_descriptor,
+                    name="native v5 previous cumulative archive",
+                )
+                if previous_cumulative_archive_descriptor is not None
+                else None
+            ),
+            proposal_campaign_receipt_path=Path(
+                proposal_campaign["campaignReceipt"]["receiptPath"]
+            ),
+            finalizer_output_root=_native_finalization_root(root, generation_index),
+        )
+        prefinalizer = run_native_v5_rotating_prefinalizer(
+            runtime_authority=runtime_authority,
+            manifest_path=Path(base["manifestPath"]),
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+
+    while prefinalizer["receipt"]["status"] != "ready_for_finalizer":
+        selections = tuple(prefinalizer["taskSelections"])
+        if not selections:
+            raise TemporalDiscoveryContractError(
+                "native v5 prefinalizer awaited work without a native selection"
+            )
+        state["stage"] = "native_v5_rotating_campaign_round"
+        _save_state(state_path, state)
+        receipts: list[Path] = []
+        for selection in sorted(selections, key=lambda item: int(item["taskOrdinal"])):
+            panel = _native_v5_panel_by_id(
+                rotating_evidence=rotating, panel_id=str(selection["panelId"])
+            )
+            round_root = (
+                generation_root
+                / "campaign"
+                / "prefinalizer"
+                / f"round-{int(prefinalizer['receipt']['roundIndex']):04d}"
+                / f"task-{int(selection['taskOrdinal']):04d}"
+            )
+            campaign = _run_native_v5_campaign_round(
+                runtime_authority=runtime_authority,
+                config=config,
+                generation_index=generation_index,
+                evaluation_population_path=evaluation_population_path,
+                evaluation_population_raw_sha256=str(
+                    adapter["evaluationPopulation"]["fileSha256"]
+                ),
+                campaign_root=round_root,
+                panel=panel,
+                campaign_role=str(selection["campaignRole"]),
+                cohort_source={
+                    "kind": "sealed_cohort_selection",
+                    "sourceSemanticSha256": selection["candidateSetSha256"],
+                    "candidateCount": selection["candidateCount"],
+                    "selectionSha256": selection["selectionSha256"],
+                },
+                cohort_selection_path=Path(selection["selectionPath"]),
+                gateway_token=gateway_token,
+            )
+            receipts.append(Path(campaign["campaignReceipt"]["receiptPath"]))
+        state["stage"] = "native_v5_rotating_prefinalizer"
+        _save_state(state_path, state)
+        try:
+            resume = build_native_v5_prefinalizer_resume_manifest(
+                runtime_authority=runtime_authority,
+                output_root=(
+                    generation_root
+                    / "prefinalizer"
+                    / f"round-{int(prefinalizer['receipt']['roundIndex']) + 1:04d}"
+                ),
+                base_manifest_path=Path(base["manifestPath"]),
+                previous_execution_receipt=prefinalizer["receipt"],
+                new_campaign_receipt_paths=tuple(receipts),
+            )
+            prefinalizer = run_native_v5_rotating_prefinalizer(
+                runtime_authority=runtime_authority,
+                manifest_path=Path(resume["manifestPath"]),
+            )
+        except TemporalQDV5ControlPlaneError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+
+    finalizer_binding = prefinalizer["receipt"].get("finalizerManifest")
+    if (
+        not isinstance(finalizer_binding, Mapping)
+        or set(finalizer_binding)
+        != {"schemaVersion", "path", "rawSha256", "sizeBytes", "manifestSha256"}
+        or finalizer_binding.get("schemaVersion")
+        != "temporal_qd_v5_prefinalizer_finalizer_manifest_descriptor_v1"
+        or not native_v5_transport_path_matches(
+            finalizer_binding.get("path"),
+            _native_finalization_root(root, generation_index) / "manifest.json",
+        )
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 prefinalizer omitted its fixed finalizer-root manifest"
+        )
+    finalizer_manifest = Path(str(finalizer_binding["path"]))
+    state["stage"] = "native_v5_generation_finalization"
+    _save_state(state_path, state)
+    try:
+        finalization = run_native_v5_generation_finalizer(
+            runtime_authority=runtime_authority, manifest_path=finalizer_manifest
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    record = _apply_native_v5_state_application(
+        root=root,
+        state=state,
+        state_path=state_path,
+        config=config,
+        generation_index=generation_index,
+        generation_kind=generation_kind,
+        finalization=finalization,
+        construction_adapter=adapter,
+    )
+    return {
+        "generationRecord": record,
+        "proposalCampaign": proposal_campaign,
+        "proposalAttemptExtraction": extraction,
+        "funnelReduction": funnel,
+        "prefinalizer": prefinalizer,
+        "finalization": finalization,
+    }
 
 
 def _normalize_tail_result_mode(value: str) -> str:
@@ -234,7 +2436,10 @@ def _require_irreversible_native_cutover_engine(
         state
         and any(
             isinstance(record, Mapping)
-            and isinstance(record.get("nativeGenerationFinalization"), Mapping)
+            and (
+                isinstance(record.get("nativeGenerationFinalization"), Mapping)
+                or record.get("schemaVersion") == GENERATION_RECORD_SCHEMA
+            )
             for record in state.get("completedGenerations") or []
         )
     )
@@ -244,6 +2449,38 @@ def _require_irreversible_native_cutover_engine(
         raise TemporalDiscoveryContractError(
             "run has crossed the native finalization boundary; every restart must "
             "explicitly select the Rust finalization engine"
+        )
+
+
+def _require_native_v5_finalization_engine(
+    *,
+    generation_finalization_engine: str,
+    supplied_evolvable_authority: Mapping[str, Any] | None,
+    persisted_config: Mapping[str, Any] | None,
+) -> None:
+    """Fail before authority hydration when a fresh/current v5 run picks Python.
+
+    The old pre-cutover v5 artifacts deliberately have no
+    ``nativeV5ProposalRuntime`` seal and remain readable as historical evidence.
+    A supplied evolvable authority is a fresh v5 request; a persisted runtime
+    seal is a current v5 restart.  Neither may route post-proposal work through
+    the Python finalizer.
+    """
+
+    current_v5 = (
+        supplied_evolvable_authority is not None
+        or (
+            isinstance(persisted_config, Mapping)
+            and _native_v5_proposal_enabled(persisted_config)
+        )
+    )
+    if (
+        current_v5
+        and generation_finalization_engine != GENERATION_FINALIZATION_ENGINE_RUST
+    ):
+        raise TemporalDiscoveryContractError(
+            "fresh/current v5 requires generation_finalization_engine='rust'; "
+            "Python finalization is oracle-only"
         )
 
 
@@ -1515,14 +3752,19 @@ def _validate_generation_artifacts(
         and native_binding.get("authorityMode")
         == "native_production_compact_commit"
     )
+    native_v5_construction = isinstance(
+        generation_record.get("nativeV5Construction"), Mapping
+    )
     current = _capture_generation_artifacts(
         root=root,
         generation_index=generation_index,
         generation_funnel_enabled=funnel_enabled,
         tail_result_mode=tail_result_mode,
         tail_result_indexes=tail_result_indexes,
-        verify_population_file=not native_production,
-        verify_rotating_campaign_artifacts=not native_production,
+        verify_population_file=not (native_production or native_v5_construction),
+        verify_rotating_campaign_artifacts=not (
+            native_production or native_v5_construction
+        ),
     )
     if not _generation_artifact_ledgers_match(
         recorded=recorded,
@@ -1614,11 +3856,33 @@ def _validate_generation_artifacts(
             "completed generation evaluation population identity disagrees with supervisor record"
         )
     expected_g0 = config.get("g0Bootstrap") if generation_index == 1 else None
-    if expected_g0 is not None:
+    if expected_g0 is not None and native_v5_construction:
+        adapter = _native_v5_recorded_adapter(
+            root=root, generation_record=generation_record
+        )
+        if (
+            adapter["generationKind"] != V5_PROPOSAL_GENERATION_G0
+            or adapter["acceptedCandidateCount"]
+            != int(expected_g0["initialConstructionPoolSize"])
+            or adapter["selectedEvaluationCandidateCount"]
+            != int(expected_g0["evaluationPopulationSize"])
+        ):
+            raise TemporalDiscoveryContractError(
+                "completed native v5 G0 receipt disagrees with its frozen dimensions"
+            )
+    elif expected_g0 is not None:
         current_g0 = current.get("g0Bootstrap")
         recorded_g0 = generation_record.get("g0Bootstrap")
         if not isinstance(current_g0, Mapping) or current_g0 != recorded_g0:
             raise TemporalDiscoveryContractError("completed G0 bootstrap identities disagree with immutable outputs")
+    elif native_v5_construction:
+        adapter = _native_v5_recorded_adapter(
+            root=root, generation_record=generation_record
+        )
+        if adapter["generationKind"] != V5_PROPOSAL_GENERATION_EVOLVED:
+            raise TemporalDiscoveryContractError(
+                "completed native v5 evolved generation has G0 construction kind"
+            )
     elif "g0Bootstrap" in current or "g0Bootstrap" in generation_record:
         raise TemporalDiscoveryContractError("G0 bootstrap appeared outside its frozen generation-1 boundary")
     archive = _canonical_file(
@@ -1712,6 +3976,15 @@ def _validate_completed_generations(
 
     records = _validate_completed_generation_ledger(state=state, config=config)
     for index in sorted(records):
+        if _native_v5_proposal_enabled(config):
+            invocation = records[index].get("nativeV5Invocation")
+            if not isinstance(invocation, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "completed native v5 generation lacks receipt adoption authority"
+                )
+            _reauthenticate_native_v5_supervisor_invocation(
+                root=root, config=config, invocation=invocation
+            )
         _validate_generation_artifacts(
             root=root,
             generation_record=records[index],
@@ -2157,6 +4430,1375 @@ def _promote_native_pair_identity_ledger(
         _after_step("transaction_cleared")
 
 
+def _native_v5_recorded_adapter(
+    *, root: Path, generation_record: Mapping[str, Any]
+) -> dict[str, Any]:
+    invocation = generation_record.get("nativeV5Invocation")
+    if not isinstance(invocation, Mapping):
+        raise TemporalDiscoveryContractError(
+            "completed native v5 generation lacks its immutable invocation"
+        )
+    checked = _validate_native_v5_supervisor_invocation(root=root, value=invocation)
+    recorded_adapter = generation_record.get("nativeV5Construction")
+    if not isinstance(recorded_adapter, Mapping) or recorded_adapter != checked[
+        "constructionAdapter"
+    ]:
+        raise TemporalDiscoveryContractError(
+            "completed native v5 generation construction binding drifted"
+        )
+    return checked["constructionAdapter"]
+
+
+def _native_v5_identity_ledger_descriptor(
+    value: object,
+    *,
+    name: str,
+    expected_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate one opaque, receipt-addressed v5 ledger descriptor.
+
+    This is deliberately a descriptor validator, not a file validator.  The
+    identity ledger is candidate-scale state owned by qd-batch/finalizer; its
+    bytes are reauthenticated by Rust when used.  Python may persist the
+    sealed path and roots for restart, but may not open, hash, copy, or
+    snapshot the ledger.
+    """
+
+    descriptor = _clone(value, name=name)
+    expected_fields = {
+        "absolutePath",
+        "semanticSha256",
+        "fileSha256",
+        "byteLength",
+    }
+    if not isinstance(descriptor, Mapping) or set(descriptor) != expected_fields:
+        raise TemporalDiscoveryContractError(f"{name} descriptor schema drifted")
+    supplied_path = descriptor.get("absolutePath")
+    if not isinstance(supplied_path, str) or not Path(supplied_path).is_absolute():
+        raise TemporalDiscoveryContractError(f"{name} descriptor path is invalid")
+    canonical_path = str(Path(os.path.abspath(supplied_path)))
+    if supplied_path != canonical_path:
+        raise TemporalDiscoveryContractError(f"{name} descriptor path is not canonical")
+    if expected_path is not None and canonical_path != str(
+        Path(os.path.abspath(str(expected_path)))
+    ):
+        raise TemporalDiscoveryContractError(f"{name} descriptor path drifted")
+    semantic_sha256 = _sha256(
+        descriptor.get("semanticSha256"), name=f"{name} semantic identity"
+    )
+    file_sha256 = _sha256(
+        descriptor.get("fileSha256"), name=f"{name} file identity"
+    )
+    byte_length = descriptor.get("byteLength")
+    if isinstance(byte_length, bool) or not isinstance(byte_length, int) or byte_length < 0:
+        raise TemporalDiscoveryContractError(f"{name} descriptor byte length is invalid")
+    return {
+        "absolutePath": canonical_path,
+        "semanticSha256": semantic_sha256,
+        "fileSha256": file_sha256,
+        "byteLength": byte_length,
+    }
+
+
+def _native_v5_identity_ledger_descriptor_from_adapter(
+    *,
+    adapter: Mapping[str, Any],
+    root: Path,
+    generation_index: int,
+    name: str,
+) -> dict[str, Any]:
+    artifact = adapter.get("identityLedger")
+    if not isinstance(artifact, Mapping):
+        raise TemporalDiscoveryContractError(f"{name} is unavailable")
+    material = _native_v5_identity_ledger_descriptor(
+        {
+            "absolutePath": artifact.get("absolutePath"),
+            "semanticSha256": artifact.get("semanticSha256"),
+            "fileSha256": artifact.get("fileSha256"),
+            "byteLength": artifact.get("byteLength"),
+        },
+        name=name,
+        expected_path=_native_v5_identity_ledger_output_path(root, generation_index),
+    )
+    if artifact.get("relativePath") != "v5-native/identity-ledger.json":
+        raise TemporalDiscoveryContractError(f"{name} relative path drifted")
+    return material
+
+
+def _reconcile_native_v5_identity_ledger(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    completed_by_index: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Recover the opaque current-v5 ledger authority without reopening it.
+
+    A completed direct Rust record deliberately has no Python wrapper.  The
+    separately persisted descriptor is therefore the sole next-generation
+    input authority.  It is bound to the latest compact finalizer sidecar and
+    remains an immutable proposal output; Rust reauthenticates its bytes when
+    an evolved proposal uses it.
+    """
+
+    # Old root/snapshot transactions are a pre-cutover representation.  They
+    # must never be silently imported into a current-v5 run.
+    if state.get("nativeV5IdentityLedgerTransaction") is not None:
+        raise TemporalDiscoveryContractError(
+            "current native v5 rejects legacy root identity-ledger transactions"
+        )
+    latest = max(completed_by_index) if completed_by_index else None
+    raw_descriptor = state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY)
+    if latest is None:
+        if raw_descriptor is not None:
+            raise TemporalDiscoveryContractError(
+                "current native v5 has an unbound committed identity-ledger descriptor"
+            )
+        return None
+    if not isinstance(raw_descriptor, Mapping):
+        raise TemporalDiscoveryContractError(
+            "current native v5 lacks its committed identity-ledger descriptor"
+        )
+    descriptor = _native_v5_identity_ledger_descriptor(
+        raw_descriptor,
+        name="current native v5 committed identity ledger",
+        expected_path=_native_v5_identity_ledger_output_path(root, latest),
+    )
+    sidecar = _canonical_file(
+        _native_finalization_root(root, latest)
+        / GENERATION_STATE_APPLICATION_SIDECAR_FILENAME,
+        name="latest committed native v5 state-application sidecar",
+    )
+    if (
+        _identity_payload(
+            sidecar,
+            "sidecarSha256",
+            name="latest committed native v5 state-application sidecar",
+        )
+        != sidecar.get("sidecarSha256")
+        or sidecar.get("generationIndex") != latest
+        or not isinstance(sidecar.get("identityLedgerPromotion"), Mapping)
+    ):
+        raise TemporalDiscoveryContractError(
+            "latest native v5 identity-ledger sidecar drifted"
+        )
+    promotion = sidecar["identityLedgerPromotion"]
+    if (
+        promotion.get("outputRelativePath") != "proposal/v5-native/identity-ledger.json"
+        or promotion.get("outputIdentityLedgerSha256")
+        != descriptor["semanticSha256"]
+        or promotion.get("outputIdentityLedgerFileSha256")
+        != descriptor["fileSha256"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "current native v5 committed identity-ledger descriptor drifted"
+        )
+    # Canonicalise only the bounded state field before the next write; no
+    # ledger byte access occurs here.
+    if raw_descriptor != descriptor:
+        state[NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY] = descriptor
+        _save_state(state_path, state)
+    return descriptor
+
+
+def _build_native_v5_identity_ledger_input(
+    *,
+    generation_kind: str,
+    committed_identity_ledger_descriptor: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Bind one prior immutable ledger descriptor for the native proposal."""
+
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        if committed_identity_ledger_descriptor is not None:
+            raise TemporalDiscoveryContractError(
+                "native v5 G0 cannot inherit an identity-ledger descriptor"
+            )
+        return None
+    if generation_kind != V5_PROPOSAL_GENERATION_EVOLVED:
+        raise TemporalDiscoveryContractError("native v5 identity-ledger kind is invalid")
+    if not isinstance(committed_identity_ledger_descriptor, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 evolved generation lacks a committed identity-ledger descriptor"
+        )
+    descriptor = _native_v5_identity_ledger_descriptor(
+        committed_identity_ledger_descriptor,
+        name="native v5 evolved committed identity ledger",
+    )
+    try:
+        return build_v5_proposal_input_binding(
+            kind="identityLedger", sealed_descriptor=descriptor
+        )
+    except TemporalQDV5NativeError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+
+
+def _legacy_reconcile_native_v5_identity_ledger(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    completed_by_index: Mapping[int, Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Recover only the receipt-bound v5 ledger boundary after interruption.
+
+    Unlike the legacy native bridge, the v5 batch never mutates the campaign
+    root ledger during construction.  The supervisor publishes the exact
+    receipt-addressed output only after the generation record is durable.
+    That gives restart a small, explicit two-state repair window and makes
+    every other root value a tripwire.
+    """
+
+    root_path = root / "identity-ledger.json"
+    transaction = state.get("nativeV5IdentityLedgerTransaction")
+    latest = max(completed_by_index) if completed_by_index else None
+    expected_path: Path | None = None
+    expected_sha256: str | None = None
+    if latest is not None:
+        expected_path = _native_v5_identity_ledger_output_path(root, latest)
+        _ledger, expected_sha256 = _validated_native_v5_identity_ledger(
+            expected_path, name="latest committed native v5 identity ledger"
+        )
+        latest_record = completed_by_index[latest]
+        if latest_record.get("schemaVersion") == GENERATION_RECORD_SCHEMA:
+            sidecar = _canonical_file(
+                _native_finalization_root(root, latest)
+                / GENERATION_STATE_APPLICATION_SIDECAR_FILENAME,
+                name="latest committed native v5 state-application sidecar",
+            )
+            if (
+                _identity_payload(
+                    sidecar,
+                    "sidecarSha256",
+                    name="latest committed native v5 state-application sidecar",
+                )
+                != sidecar.get("sidecarSha256")
+                or sidecar.get("generationIndex") != latest
+                or not isinstance(sidecar.get("identityLedgerPromotion"), Mapping)
+                or sidecar["identityLedgerPromotion"].get(
+                    "outputIdentityLedgerSha256"
+                )
+                != expected_sha256
+            ):
+                raise TemporalDiscoveryContractError(
+                    "latest committed native v5 state-application ledger drifted"
+                )
+        else:
+            adapter = _native_v5_recorded_adapter(
+                root=root, generation_record=latest_record
+            )
+            if (
+                adapter["identityLedger"]["absolutePath"] != str(expected_path.resolve())
+                or adapter["identityLedger"]["semanticSha256"] != expected_sha256
+            ):
+                raise TemporalDiscoveryContractError(
+                    "latest committed native v5 identity ledger receipt drifted"
+                )
+    if transaction is not None and not isinstance(transaction, Mapping):
+        raise TemporalDiscoveryContractError("native v5 identity-ledger transaction is invalid")
+    if isinstance(transaction, Mapping):
+        transaction = _clone(transaction, name="native v5 identity-ledger transaction")
+        transaction_index = transaction.get("generationIndex")
+        if (
+            transaction.get("schemaVersion")
+            != NATIVE_V5_IDENTITY_LEDGER_TRANSACTION_SCHEMA
+            or isinstance(transaction_index, bool)
+            or not isinstance(transaction_index, int)
+            or transaction_index < 1
+            or transaction.get("generationKind")
+            not in {V5_PROPOSAL_GENERATION_G0, V5_PROPOSAL_GENERATION_EVOLVED}
+            or transaction.get("phase")
+            not in {
+                "generation_proposal",
+                "proposal_committed",
+                "generation_boundary_ready",
+            }
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 identity-ledger transaction is malformed"
+            )
+        output_path = _native_v5_identity_ledger_output_path(root, transaction_index)
+        if transaction.get("outputLedgerPath") != str(output_path.resolve()):
+            raise TemporalDiscoveryContractError(
+                "native v5 identity-ledger output path drifted"
+            )
+        if transaction["generationKind"] == V5_PROPOSAL_GENERATION_G0:
+            if transaction.get("inputLedgerPath") is not None or transaction.get(
+                "inputLedgerSha256"
+            ) is not None:
+                raise TemporalDiscoveryContractError(
+                    "native v5 G0 identity-ledger transaction has inputs"
+                )
+            input_path = None
+            input_sha256 = None
+        else:
+            input_path = _native_v5_identity_ledger_snapshot_path(root, transaction_index)
+            if transaction.get("inputLedgerPath") != str(input_path.resolve()):
+                raise TemporalDiscoveryContractError(
+                    "native v5 identity-ledger input path drifted"
+                )
+            _input, input_sha256 = _validated_native_v5_identity_ledger(
+                input_path, name="native v5 frozen input identity ledger"
+            )
+            if transaction.get("inputLedgerSha256") != input_sha256:
+                raise TemporalDiscoveryContractError(
+                    "native v5 identity-ledger input drifted"
+                )
+        output_sha256 = transaction.get("outputLedgerSha256")
+        if output_sha256 is not None:
+            output_sha256 = _sha256(
+                output_sha256, name="native v5 identity-ledger output"
+            )
+            _output, verified_output_sha256 = _validated_native_v5_identity_ledger(
+                output_path, name="native v5 transaction output identity ledger"
+            )
+            if verified_output_sha256 != output_sha256:
+                raise TemporalDiscoveryContractError(
+                    "native v5 identity-ledger output drifted"
+                )
+        if transaction["phase"] == "generation_boundary_ready":
+            if (
+                latest is None
+                or transaction_index != latest
+                or expected_sha256 is None
+                or output_sha256 != expected_sha256
+            ):
+                raise TemporalDiscoveryContractError(
+                    "ready native v5 identity-ledger transaction is not committed"
+                )
+            if root_path.is_file():
+                _root, root_sha256 = _validated_native_v5_identity_ledger(
+                    root_path, name="campaign native v5 identity ledger"
+                )
+                if root_sha256 not in {input_sha256, expected_sha256}:
+                    raise TemporalDiscoveryContractError(
+                        "campaign native v5 identity ledger is tampered"
+                    )
+            elif input_sha256 is not None:
+                raise TemporalDiscoveryContractError(
+                    "campaign native v5 identity ledger is missing"
+                )
+            _publish_committed_file(
+                expected_path, root_path, replace_existing=True
+            )
+            state.pop("nativeV5IdentityLedgerTransaction", None)
+            _save_state(state_path, state)
+        elif latest is not None and transaction_index <= latest:
+            raise TemporalDiscoveryContractError(
+                "native v5 identity-ledger transaction lags a completed generation"
+            )
+        else:
+            # An unfinished invocation must not have published a new campaign
+            # ledger.  It will be reauthenticated by the exact same native
+            # manifest before we accept its output on the resumed attempt.
+            if input_sha256 is None:
+                if root_path.exists():
+                    raise TemporalDiscoveryContractError(
+                        "native v5 G0 transaction unexpectedly has a campaign ledger"
+                    )
+            else:
+                _root, root_sha256 = _validated_native_v5_identity_ledger(
+                    root_path, name="campaign native v5 identity ledger"
+                )
+                if root_sha256 != input_sha256:
+                    raise TemporalDiscoveryContractError(
+                        "native v5 unfinished transaction changed the campaign ledger"
+                    )
+
+    if latest is None:
+        if transaction is None and root_path.exists():
+            raise TemporalDiscoveryContractError(
+                "native v5 campaign has an unbound identity ledger"
+            )
+        return None, None
+    assert expected_path is not None and expected_sha256 is not None
+    _committed, root_sha256 = _validated_native_v5_identity_ledger(
+        root_path, name="committed native v5 campaign identity ledger"
+    )
+    if root_sha256 != expected_sha256:
+        raise TemporalDiscoveryContractError(
+            "committed native v5 campaign identity ledger drifted"
+        )
+    return _committed, expected_sha256
+
+
+def _legacy_prepare_native_v5_identity_ledger_transaction(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    generation_index: int,
+    generation_kind: str,
+    committed_identity_ledger_sha256: str | None,
+) -> dict[str, Any] | None:
+    """Freeze an evolved input ledger before the one-shot v5 invocation."""
+
+    proposal_root = _native_v5_proposal_root(root, generation_index)
+    output_path = _native_v5_identity_ledger_output_path(root, generation_index)
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        if committed_identity_ledger_sha256 is not None or (root / "identity-ledger.json").exists():
+            raise TemporalDiscoveryContractError(
+                "native v5 G0 cannot inherit a campaign identity ledger"
+            )
+        input_path: Path | None = None
+        input_sha256: str | None = None
+        input_binding = None
+    elif generation_kind == V5_PROPOSAL_GENERATION_EVOLVED:
+        root_path = root / "identity-ledger.json"
+        _ledger, input_sha256 = _validated_native_v5_identity_ledger(
+            root_path, name="committed native v5 campaign identity ledger"
+        )
+        if input_sha256 != committed_identity_ledger_sha256:
+            raise TemporalDiscoveryContractError(
+                "native v5 committed identity ledger drifted before construction"
+            )
+        input_path = _native_v5_identity_ledger_snapshot_path(root, generation_index)
+        _publish_committed_file(root_path, input_path)
+        _snapshot, snapshot_sha256 = _validated_native_v5_identity_ledger(
+            input_path, name="native v5 frozen input identity ledger"
+        )
+        if snapshot_sha256 != input_sha256:
+            raise TemporalDiscoveryContractError(
+                "native v5 frozen input identity ledger drifted"
+            )
+        try:
+            input_binding = build_v5_proposal_input_binding(
+                kind="identityLedger",
+                sealed_descriptor={
+                    "absolutePath": str(input_path.resolve()),
+                    "fileSha256": _native_binary_file_sha256(input_path),
+                    "semanticSha256": input_sha256,
+                    "byteLength": input_path.stat().st_size,
+                },
+            )
+        except TemporalQDV5NativeError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+    else:
+        raise TemporalDiscoveryContractError("native v5 identity-ledger kind is invalid")
+    expected = {
+        "schemaVersion": NATIVE_V5_IDENTITY_LEDGER_TRANSACTION_SCHEMA,
+        "generationIndex": generation_index,
+        "generationKind": generation_kind,
+        "inputLedgerPath": str(input_path.resolve()) if input_path is not None else None,
+        "inputLedgerSha256": input_sha256,
+        "outputLedgerPath": str(output_path.resolve()),
+        "phase": "generation_proposal",
+    }
+    existing = state.get("nativeV5IdentityLedgerTransaction")
+    if existing is not None:
+        if not isinstance(existing, Mapping):
+            raise TemporalDiscoveryContractError("native v5 identity-ledger transaction is invalid")
+        comparable = {
+            key: value
+            for key, value in dict(existing).items()
+            if key
+            not in {
+                "outputLedgerSha256",
+                "outputLedgerFileSha256",
+                "constructionAdapterSha256",
+                "phase",
+            }
+        }
+        if comparable != {key: value for key, value in expected.items() if key != "phase"}:
+            raise TemporalDiscoveryContractError(
+                "native v5 identity-ledger transaction drifted"
+            )
+        if existing.get("phase") not in {"generation_proposal", "proposal_committed"}:
+            raise TemporalDiscoveryContractError(
+                "native v5 identity-ledger transaction cannot resume"
+            )
+        expected.update(
+            {
+                key: existing[key]
+                for key in (
+                    "outputLedgerSha256",
+                    "outputLedgerFileSha256",
+                    "constructionAdapterSha256",
+                    "phase",
+                )
+                if key in existing
+            }
+        )
+    state["nativeV5IdentityLedgerTransaction"] = expected
+    _save_state(state_path, state)
+    return input_binding
+
+
+def _legacy_seal_native_v5_identity_ledger_output(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    generation_index: int,
+    generation_kind: str,
+    construction_adapter: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    adapter = _validate_native_v5_construction_adapter(
+        value=construction_adapter,
+        proposal_root=_native_v5_proposal_root(root, generation_index),
+        generation_index=generation_index,
+        generation_kind=generation_kind,
+    )
+    output_path = _native_v5_identity_ledger_output_path(root, generation_index)
+    output, output_sha256 = _validated_native_v5_identity_ledger(
+        output_path, name="native v5 proposal output identity ledger"
+    )
+    if (
+        adapter["identityLedger"]["absolutePath"] != str(output_path.resolve())
+        or adapter["identityLedger"]["semanticSha256"] != output_sha256
+        or adapter["identityLedger"]["fileSha256"]
+        != _native_binary_file_sha256(output_path)
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 proposal output identity-ledger receipt disagrees"
+        )
+    transaction = state.get("nativeV5IdentityLedgerTransaction")
+    if (
+        not isinstance(transaction, Mapping)
+        or transaction.get("generationIndex") != generation_index
+        or transaction.get("generationKind") != generation_kind
+        or transaction.get("phase") not in {"generation_proposal", "proposal_committed"}
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 identity ledger is not ready for proposal commit"
+        )
+    if transaction.get("phase") == "proposal_committed":
+        if (
+            transaction.get("outputLedgerSha256") != output_sha256
+            or transaction.get("constructionAdapterSha256") != adapter["adapterSha256"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 proposal commit transaction drifted"
+            )
+        return output, output_sha256
+    state["nativeV5IdentityLedgerTransaction"] = {
+        **dict(transaction),
+        "outputLedgerSha256": output_sha256,
+        "outputLedgerFileSha256": adapter["identityLedger"]["fileSha256"],
+        "constructionAdapterSha256": adapter["adapterSha256"],
+        "phase": "proposal_committed",
+    }
+    _save_state(state_path, state)
+    return output, output_sha256
+
+
+def _legacy_promote_native_v5_identity_ledger(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    generation_index: int,
+    generation_record: Mapping[str, Any],
+) -> None:
+    transaction = state.get("nativeV5IdentityLedgerTransaction")
+    adapter = _native_v5_recorded_adapter(root=root, generation_record=generation_record)
+    if (
+        not isinstance(transaction, Mapping)
+        or transaction.get("generationIndex") != generation_index
+        or transaction.get("phase") != "proposal_committed"
+        or transaction.get("constructionAdapterSha256") != adapter["adapterSha256"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 identity ledger is not ready for generation promotion"
+        )
+    output_path = _native_v5_identity_ledger_output_path(root, generation_index)
+    _output, output_sha256 = _validated_native_v5_identity_ledger(
+        output_path, name="committing native v5 identity ledger"
+    )
+    if (
+        transaction.get("outputLedgerSha256") != output_sha256
+        or adapter["identityLedger"]["semanticSha256"] != output_sha256
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 identity-ledger promotion binding drifted"
+        )
+    state["nativeV5IdentityLedgerTransaction"] = {
+        **dict(transaction),
+        "phase": "generation_boundary_ready",
+    }
+    _save_state(state_path, state)
+    _publish_committed_file(
+        output_path, root / "identity-ledger.json", replace_existing=True
+    )
+    _promoted, promoted_sha256 = _validated_native_v5_identity_ledger(
+        root / "identity-ledger.json", name="promoted native v5 identity ledger"
+    )
+    if promoted_sha256 != output_sha256:
+        raise TemporalDiscoveryContractError(
+            "native v5 identity-ledger promotion did not converge"
+        )
+    state.pop("nativeV5IdentityLedgerTransaction", None)
+    _save_state(state_path, state)
+
+
+def _native_v5_generation_state_basis(
+    *, state: Mapping[str, Any], config: Mapping[str, Any], generation_index: int
+) -> dict[str, Any]:
+    """Build the small, candidate-free Rust state basis for one v5 boundary."""
+
+    if isinstance(generation_index, bool) or not isinstance(generation_index, int) or generation_index < 1:
+        raise TemporalDiscoveryContractError("native v5 state-basis generation is invalid")
+    config_sha256 = _sha256(
+        config.get("configSha256"), name="native v5 state-basis config identity"
+    )
+    if state.get("configSha256") != config_sha256:
+        raise TemporalDiscoveryContractError("native v5 state-basis config drifted")
+    completed = state.get("completedGenerations")
+    if not isinstance(completed, list) or not all(
+        isinstance(record, Mapping) for record in completed
+    ):
+        raise TemporalDiscoveryContractError("native v5 state-basis completed records are invalid")
+    counters: dict[str, int] = {}
+    for field in (
+        "uniqueCandidatesEvaluated",
+        "workerTasksCompleted",
+        "nextImmigrantContinuationOrdinal",
+    ):
+        value = state.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TemporalDiscoveryContractError(f"native v5 state-basis {field} is invalid")
+        counters[field] = value
+    mappings: dict[str, dict[str, Any]] = {}
+    for field in (
+        "uniqueIdentityCounts",
+        "duplicateCounters",
+        "proposalSlotCounters",
+    ):
+        value = state.get(field)
+        if not isinstance(value, Mapping):
+            raise TemporalDiscoveryContractError(f"native v5 state-basis {field} is invalid")
+        mappings[field] = _clone(value, name=f"native v5 state-basis {field}")
+    basis = {
+        "schemaVersion": "temporal_qd_v5_generation_state_basis_v1",
+        "configSha256": config_sha256,
+        "generationIndex": generation_index,
+        "completedGenerationsSha256": canonical_sha256(completed),
+        **counters,
+        **mappings,
+    }
+    basis["stateBasisSha256"] = canonical_sha256(basis)
+    return basis
+
+
+def _native_v5_state_application_marker(
+    value: object, *, generation_index: int | None = None
+) -> dict[str, Any]:
+    """Validate the compact descriptor handoff across the crash window."""
+
+    if not isinstance(value, Mapping):
+        raise TemporalDiscoveryContractError("native v5 state-application marker is invalid")
+    marker = _clone(value, name="native v5 state-application marker")
+    if set(marker) != {
+        "generationIndex",
+        "sidecarSha256",
+        "identityLedger",
+        "phase",
+    } or (
+        isinstance(marker.get("generationIndex"), bool)
+        or not isinstance(marker.get("generationIndex"), int)
+        or marker["generationIndex"] < 1
+        or marker.get("phase") not in {"pending", "ledger_promoted"}
+    ):
+        raise TemporalDiscoveryContractError("native v5 state-application marker drifted")
+    _sha256(marker.get("sidecarSha256"), name="native v5 state-application marker")
+    if generation_index is not None and marker["generationIndex"] != generation_index:
+        raise TemporalDiscoveryContractError("native v5 state-application marker generation drifted")
+    marker["identityLedger"] = _native_v5_identity_ledger_descriptor(
+        marker["identityLedger"],
+        name="native v5 state-application marker identity ledger",
+    )
+    return marker
+
+
+def _native_v5_direct_finalization_payloads(
+    *, finalization: Mapping[str, Any], generation_index: int
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Require the direct Rust record/patch/sidecar, never a legacy wrapper."""
+
+    raw_record = finalization.get("generationRecord")
+    raw_patch = finalization.get("statePatch")
+    raw_sidecar = finalization.get("stateApplicationSidecar")
+    if not all(isinstance(value, Mapping) for value in (raw_record, raw_patch, raw_sidecar)):
+        raise TemporalDiscoveryContractError(
+            "native v5 direct finalization omitted its compact state receipts"
+        )
+    record = _clone(raw_record, name="native v5 direct generation record")
+    patch = _clone(raw_patch, name="native v5 direct generation state patch")
+    sidecar = _clone(
+        raw_sidecar, name="native v5 generation state-application sidecar"
+    )
+    if (
+        record.get("schemaVersion") != GENERATION_RECORD_SCHEMA
+        or _identity_payload(
+            record, "generationRecordSha256", name="native v5 direct generation record"
+        )
+        != record.get("generationRecordSha256")
+        or patch.get("schemaVersion") != GENERATION_STATE_PATCH_SCHEMA
+        or _identity_payload(
+            patch, "statePatchSha256", name="native v5 direct generation state patch"
+        )
+        != patch.get("statePatchSha256")
+        or sidecar.get("schemaVersion") != GENERATION_STATE_APPLICATION_SIDECAR_SCHEMA
+        or _identity_payload(
+            sidecar,
+            "sidecarSha256",
+            name="native v5 generation state-application sidecar",
+        )
+        != sidecar.get("sidecarSha256")
+        or record.get("generationIndex") != generation_index
+        or patch.get("generationIndex") != generation_index
+        or sidecar.get("generationIndex") != generation_index
+        or patch.get("generationRecord") != record
+        or patch.get("generationRecordSha256") != record.get("generationRecordSha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 direct generation state-application chain drifted"
+        )
+    return record, patch, sidecar
+
+
+def _validate_native_v5_state_application(
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    config: Mapping[str, Any],
+    generation_index: int,
+    generation_kind: str,
+    finalization: Mapping[str, Any],
+    construction_adapter: Mapping[str, Any] | None,
+    require_pre_state: bool,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
+    """Cross-check Rust's sidecar against the exact proposal/state boundary.
+
+    This is intentionally a compact authority check.  The Rust finalizer has
+    already validated the native source and state patch; Python only compares
+    immutable roots, a compact ledger identity, and absolute state values.
+    """
+
+    if generation_kind not in {
+        V5_PROPOSAL_GENERATION_G0,
+        V5_PROPOSAL_GENERATION_EVOLVED,
+    }:
+        raise TemporalDiscoveryContractError("native v5 state-application kind is invalid")
+    record, patch, sidecar = _native_v5_direct_finalization_payloads(
+        finalization=finalization, generation_index=generation_index
+    )
+    expected_fields = {
+        "schemaVersion",
+        "contractVersion",
+        "generationIndex",
+        "generationKind",
+        "configSha256",
+        "stateBasisSha256",
+        "completedGenerationsBeforeSha256",
+        "semanticAuthoritySha256",
+        "runtimeAuthoritySha256",
+        "finalization",
+        "proposalStateAuthority",
+        "nextState",
+        "identityLedgerPromotion",
+        "sidecarSha256",
+    }
+    if (
+        set(sidecar) != expected_fields
+        or sidecar.get("contractVersion") != NATIVE_FOUNDATION_CONTRACT_VERSION
+        or sidecar.get("generationKind") != generation_kind
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application sidecar schema drifted"
+        )
+    basis = _native_v5_generation_state_basis(
+        state=state, config=config, generation_index=generation_index
+    )
+    if require_pre_state and (
+        sidecar.get("configSha256") != basis["configSha256"]
+        or sidecar.get("stateBasisSha256") != basis["stateBasisSha256"]
+        or sidecar.get("completedGenerationsBeforeSha256")
+        != basis["completedGenerationsSha256"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application state basis drifted"
+        )
+    finalization_binding = sidecar.get("finalization")
+    if not isinstance(finalization_binding, Mapping) or set(finalization_binding) != {
+        "sourceSha256",
+        "manifestSha256",
+        "commitSha256",
+        "generationRecordSha256",
+        "statePatchSha256",
+    }:
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application finalization binding is invalid"
+        )
+    for field, value in finalization_binding.items():
+        _sha256(value, name=f"native v5 state-application finalization {field}")
+    manifest = finalization.get("manifest")
+    commit = finalization.get("commit")
+    if (
+        not isinstance(manifest, Mapping)
+        or not isinstance(commit, Mapping)
+        or finalization_binding.get("sourceSha256")
+        != finalization.get("sourceSha256")
+        or finalization_binding.get("sourceSha256") != manifest.get("sourceSha256")
+        or finalization_binding.get("sourceSha256") != commit.get("sourceSha256")
+        or finalization_binding.get("manifestSha256") != manifest.get("manifestSha256")
+        or finalization_binding.get("commitSha256") != commit.get("commitSha256")
+        or finalization_binding.get("generationRecordSha256")
+        != record.get("generationRecordSha256")
+        or finalization_binding.get("statePatchSha256") != patch.get("statePatchSha256")
+        or sidecar.get("semanticAuthoritySha256")
+        != manifest.get("semanticAuthoritySha256")
+        or sidecar.get("runtimeAuthoritySha256")
+        != manifest.get("runtimeAuthoritySha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application finalization authority drifted"
+        )
+
+    proposal_authority = sidecar.get("proposalStateAuthority")
+    if not isinstance(proposal_authority, Mapping) or set(proposal_authority) != {
+        "proposalManifestSha256",
+        "proposalReceiptSha256",
+        "generationJournalSha256",
+    }:
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application proposal authority is invalid"
+        )
+    for field, value in proposal_authority.items():
+        _sha256(value, name=f"native v5 proposal state authority {field}")
+    output_ledger_descriptor: dict[str, Any] | None = None
+    if construction_adapter is not None:
+        adapter = _validate_native_v5_construction_adapter(
+            value=construction_adapter,
+            proposal_root=_native_v5_proposal_root(root, generation_index),
+            generation_index=generation_index,
+            generation_kind=generation_kind,
+        )
+        invocation = adapter.get("nativeV5Invocation")
+        if not isinstance(invocation, Mapping) or not isinstance(
+            invocation.get("proposalManifest"), Mapping
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 construction lacks its proposal invocation authority"
+            )
+        if (
+            proposal_authority.get("proposalManifestSha256")
+            != invocation["proposalManifest"].get("semanticSha256")
+            or proposal_authority.get("proposalReceiptSha256")
+            != adapter.get("proposalReceiptSha256")
+            or proposal_authority.get("generationJournalSha256")
+            != adapter.get("generationJournal", {}).get("semanticSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 state-application proposal roots drifted"
+            )
+        output_ledger_descriptor = _native_v5_identity_ledger_descriptor_from_adapter(
+            adapter=adapter,
+            root=root,
+            generation_index=generation_index,
+            name="native v5 state-application proposal output ledger",
+        )
+
+    next_state = sidecar.get("nextState")
+    expected_next_state_fields = {
+        "stage",
+        "currentGenerationIndex",
+        "uniqueCandidatesEvaluated",
+        "workerTasksCompleted",
+        "nextImmigrantContinuationOrdinal",
+        "uniqueIdentityCounts",
+        "duplicateCounters",
+        "proposalSlotCounters",
+        "completedGenerationsSha256",
+    }
+    if not isinstance(next_state, Mapping) or set(next_state) != expected_next_state_fields:
+        raise TemporalDiscoveryContractError("native v5 state-application next state is invalid")
+    if (
+        next_state.get("stage") != "generation_proposal"
+        or next_state.get("currentGenerationIndex") != patch.get("nextGenerationIndex")
+        or next_state.get("uniqueCandidatesEvaluated")
+        != patch.get("uniqueCandidatesEvaluated")
+        or next_state.get("workerTasksCompleted") != patch.get("workerTasksCompleted")
+        or next_state.get("nextImmigrantContinuationOrdinal")
+        != patch.get("nextImmigrantContinuationOrdinal")
+        or next_state.get("uniqueIdentityCounts") != patch.get("uniqueIdentityCounts")
+        or next_state.get("duplicateCounters") != patch.get("duplicateCounters")
+        or next_state.get("proposalSlotCounters") != patch.get("proposalSlotCounters")
+        or next_state.get("completedGenerationsSha256")
+        != patch.get("completedGenerationsSha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application absolute next state drifted"
+        )
+    for field in (
+        "currentGenerationIndex",
+        "uniqueCandidatesEvaluated",
+        "workerTasksCompleted",
+        "nextImmigrantContinuationOrdinal",
+    ):
+        value = next_state.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TemporalDiscoveryContractError(
+                f"native v5 state-application {field} is invalid"
+            )
+    for field in ("uniqueIdentityCounts", "duplicateCounters", "proposalSlotCounters"):
+        if not isinstance(next_state.get(field), Mapping):
+            raise TemporalDiscoveryContractError(
+                f"native v5 state-application {field} is invalid"
+            )
+
+    promotion = sidecar.get("identityLedgerPromotion")
+    expected_promotion_fields = {
+        "inputIdentityLedgerSha256",
+        "outputRelativePath",
+        "outputIdentityLedgerSha256",
+        "outputIdentityLedgerFileSha256",
+    }
+    if (
+        not isinstance(promotion, Mapping)
+        or set(promotion) != expected_promotion_fields
+        or promotion.get("outputRelativePath")
+        != "proposal/v5-native/identity-ledger.json"
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application identity-ledger promotion is invalid"
+        )
+    input_ledger_sha256 = promotion.get("inputIdentityLedgerSha256")
+    if generation_kind == V5_PROPOSAL_GENERATION_G0:
+        if input_ledger_sha256 is not None:
+            raise TemporalDiscoveryContractError(
+                "native v5 G0 state application unexpectedly has an input ledger"
+            )
+        if (
+            construction_adapter is not None
+            and state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY) is not None
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 G0 state application has a prior committed ledger"
+            )
+    else:
+        _sha256(input_ledger_sha256, name="native v5 state-application input ledger")
+        if construction_adapter is not None:
+            committed_input = _native_v5_identity_ledger_descriptor(
+                state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY),
+                name="native v5 state-application committed input ledger",
+            )
+            if committed_input["semanticSha256"] != input_ledger_sha256:
+                raise TemporalDiscoveryContractError(
+                    "native v5 state-application input ledger descriptor drifted"
+                )
+    output_ledger_sha256 = _sha256(
+        promotion.get("outputIdentityLedgerSha256"),
+        name="native v5 state-application output ledger",
+    )
+    output_ledger_file_sha256 = _sha256(
+        promotion.get("outputIdentityLedgerFileSha256"),
+        name="native v5 state-application output ledger file",
+    )
+    if output_ledger_descriptor is not None and (
+        output_ledger_descriptor["semanticSha256"] != output_ledger_sha256
+        or output_ledger_descriptor["fileSha256"] != output_ledger_file_sha256
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application output ledger descriptor drifted"
+        )
+    if state.get("nativeV5IdentityLedgerTransaction") is not None:
+        raise TemporalDiscoveryContractError(
+            "current native v5 rejects legacy identity-ledger transactions"
+        )
+    return record, patch, sidecar, dict(next_state), output_ledger_descriptor
+
+
+def _apply_native_v5_state_application(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    generation_kind: str,
+    finalization: Mapping[str, Any],
+    construction_adapter: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Mechanically apply a receipt-bound Rust v5 state boundary.
+
+    The only mutable bridge is a three-step crash-safe authority transaction:
+    save a compact pending marker, promote the immutable ledger *descriptor*,
+    then append the untouched Rust record and absolute state patch fields.
+    Ledger bytes stay in the native proposal tree and are never copied or
+    opened by Python.
+    """
+
+    record, _patch, sidecar, next_state, adapter_ledger_descriptor = (
+        _validate_native_v5_state_application(
+        root=root,
+        state=state,
+        config=config,
+        generation_index=generation_index,
+        generation_kind=generation_kind,
+        finalization=finalization,
+        construction_adapter=construction_adapter,
+        require_pre_state=True,
+        )
+    )
+    if any(
+        isinstance(existing, Mapping)
+        and existing.get("generationIndex") == generation_index
+        for existing in state.get("completedGenerations") or []
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state application would duplicate a completed generation"
+        )
+    existing_marker = state.get(NATIVE_V5_STATE_APPLICATION_PENDING_KEY)
+    if adapter_ledger_descriptor is None:
+        if existing_marker is None:
+            raise TemporalDiscoveryContractError(
+                "native v5 state-application recovery lacks its ledger descriptor marker"
+            )
+        marker = _native_v5_state_application_marker(
+            existing_marker, generation_index=generation_index
+        )
+        if marker["sidecarSha256"] != sidecar["sidecarSha256"]:
+            raise TemporalDiscoveryContractError(
+                "native v5 state-application recovery marker drifted"
+            )
+        ledger_descriptor = marker["identityLedger"]
+    else:
+        ledger_descriptor = adapter_ledger_descriptor
+        marker = {
+            "generationIndex": generation_index,
+            "sidecarSha256": sidecar["sidecarSha256"],
+            "identityLedger": ledger_descriptor,
+            "phase": "pending",
+        }
+    promotion = sidecar["identityLedgerPromotion"]
+    if (
+        ledger_descriptor["absolutePath"]
+        != str(_native_v5_identity_ledger_output_path(root, generation_index).resolve())
+        or ledger_descriptor["semanticSha256"]
+        != promotion["outputIdentityLedgerSha256"]
+        or ledger_descriptor["fileSha256"]
+        != promotion["outputIdentityLedgerFileSha256"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application ledger descriptor binding drifted"
+        )
+    if existing_marker is None:
+        state[NATIVE_V5_STATE_APPLICATION_PENDING_KEY] = marker
+        _save_state(state_path, state)
+    else:
+        marker = _native_v5_state_application_marker(
+            existing_marker, generation_index=generation_index
+        )
+        if (
+            marker["sidecarSha256"] != sidecar["sidecarSha256"]
+            or marker["identityLedger"] != ledger_descriptor
+        ):
+            raise TemporalDiscoveryContractError("native v5 state-application marker drifted")
+
+    if marker["phase"] == "pending":
+        state[NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY] = ledger_descriptor
+        state[NATIVE_V5_STATE_APPLICATION_PENDING_KEY] = {
+            **marker,
+            "phase": "ledger_promoted",
+        }
+        _save_state(state_path, state)
+    else:
+        current_descriptor = _native_v5_identity_ledger_descriptor(
+            state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY),
+            name="native v5 state-application promoted ledger descriptor",
+            expected_path=_native_v5_identity_ledger_output_path(root, generation_index),
+        )
+        if current_descriptor != ledger_descriptor:
+            raise TemporalDiscoveryContractError(
+                "native v5 state-application promoted ledger descriptor drifted"
+            )
+
+    completed = list(state.get("completedGenerations") or [])
+    expected_completed_sha256 = canonical_sha256([*completed, record])
+    if next_state["completedGenerationsSha256"] != expected_completed_sha256:
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application completed generation root drifted"
+        )
+    state.update(
+        {
+            "stage": next_state["stage"],
+            "currentGenerationIndex": next_state["currentGenerationIndex"],
+            "uniqueCandidatesEvaluated": next_state["uniqueCandidatesEvaluated"],
+            "workerTasksCompleted": next_state["workerTasksCompleted"],
+            "nextImmigrantContinuationOrdinal": next_state[
+                "nextImmigrantContinuationOrdinal"
+            ],
+            "uniqueIdentityCounts": _clone(
+                next_state["uniqueIdentityCounts"],
+                name="native v5 state-application unique identity counts",
+            ),
+            "duplicateCounters": _clone(
+                next_state["duplicateCounters"],
+                name="native v5 state-application duplicate counters",
+            ),
+            "proposalSlotCounters": _clone(
+                next_state["proposalSlotCounters"],
+                name="native v5 state-application proposal slot counters",
+            ),
+            "completedGenerations": [*completed, record],
+            NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY: ledger_descriptor,
+        }
+    )
+    state.pop(NATIVE_V5_STATE_APPLICATION_PENDING_KEY, None)
+    _save_state(state_path, state)
+    return record
+
+
+def _recover_native_v5_state_application(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    config: Mapping[str, Any],
+    runtime_authority: Mapping[str, Any],
+) -> bool:
+    """Finish the sole permitted v5 crash window without rebuilding work.
+
+    A marker may represent the old state with either the old or newly promoted
+    ledger, or an already-applied state whose marker-clear was interrupted.
+    In all cases the Rust finalizer is re-run first, which performs its own
+    compact restart validation before Python changes supervisor state.
+    """
+
+    raw_marker = state.get(NATIVE_V5_STATE_APPLICATION_PENDING_KEY)
+    if raw_marker is None:
+        return False
+    marker = _native_v5_state_application_marker(raw_marker)
+    generation_index = marker["generationIndex"]
+    manifest_path = _native_finalization_root(root, generation_index) / "manifest.json"
+    try:
+        finalization = run_native_v5_generation_finalizer(
+            runtime_authority=runtime_authority,
+            manifest_path=manifest_path,
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    record, _patch, sidecar = _native_v5_direct_finalization_payloads(
+        finalization=finalization, generation_index=generation_index
+    )
+    if sidecar.get("sidecarSha256") != marker["sidecarSha256"]:
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application recovery sidecar drifted"
+        )
+    completed = state.get("completedGenerations")
+    if not isinstance(completed, list):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application recovery completed records are invalid"
+        )
+    matching = [
+        item
+        for item in completed
+        if isinstance(item, Mapping) and item.get("generationIndex") == generation_index
+    ]
+    if not matching:
+        _apply_native_v5_state_application(
+            root=root,
+            state=state,
+            state_path=state_path,
+            config=config,
+            generation_index=generation_index,
+            generation_kind=str(sidecar.get("generationKind") or ""),
+            finalization=finalization,
+            construction_adapter=None,
+        )
+        return True
+    if len(matching) != 1 or matching[0] != record:
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application recovery completed record drifted"
+        )
+    next_state = sidecar.get("nextState")
+    promotion = sidecar.get("identityLedgerPromotion")
+    if not isinstance(next_state, Mapping) or not isinstance(promotion, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application recovery receipt is malformed"
+        )
+    if (
+        canonical_sha256(completed) != next_state.get("completedGenerationsSha256")
+        or any(
+            state.get(field) != next_state.get(field)
+            for field in (
+                "currentGenerationIndex",
+                "uniqueCandidatesEvaluated",
+                "workerTasksCompleted",
+                "nextImmigrantContinuationOrdinal",
+                "uniqueIdentityCounts",
+                "duplicateCounters",
+                "proposalSlotCounters",
+            )
+        )
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application recovery applied state drifted"
+        )
+    descriptor = _native_v5_identity_ledger_descriptor(
+        state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY),
+        name="native v5 recovered committed ledger descriptor",
+        expected_path=_native_v5_identity_ledger_output_path(root, generation_index),
+    )
+    if (
+        marker.get("phase") != "ledger_promoted"
+        or marker.get("identityLedger") != descriptor
+        or descriptor["semanticSha256"]
+        != promotion.get("outputIdentityLedgerSha256")
+        or descriptor["fileSha256"]
+        != promotion.get("outputIdentityLedgerFileSha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 state-application recovery ledger descriptor drifted"
+        )
+    state.pop(NATIVE_V5_STATE_APPLICATION_PENDING_KEY, None)
+    _save_state(state_path, state)
+    return True
+
+
+def _admit_completed_generations_native_v5(
+    *,
+    root: Path,
+    state: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> dict[int, dict[str, Any]]:
+    """Replay direct Rust v5 boundaries without legacy record wrapping.
+
+    A current-v5 record is an exact ``temporal_qd_generation_record_v2`` from
+    the finalizer.  The receipt-last sidecar is the sole state-application
+    authority, so this admission never invokes the historical v4 artifact
+    validator or invents ``nativeGenerationFinalization`` around the record.
+    """
+
+    completed = state.get("completedGenerations") or []
+    if not isinstance(completed, list):
+        raise TemporalDiscoveryContractError("native v5 completed records are invalid")
+    records: dict[int, dict[str, Any]] = {}
+    for raw_record in completed:
+        if not isinstance(raw_record, Mapping):
+            raise TemporalDiscoveryContractError("native v5 completed record is invalid")
+        record = _clone(raw_record, name="native v5 completed generation record")
+        if (
+            record.get("schemaVersion") != GENERATION_RECORD_SCHEMA
+            or "nativeGenerationFinalization" in record
+            or _identity_payload(
+                record,
+                "generationRecordSha256",
+                name="native v5 completed generation record",
+            )
+            != record.get("generationRecordSha256")
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 completed record is not the exact Rust finalizer record"
+            )
+        index = record.get("generationIndex")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+            raise TemporalDiscoveryContractError("native v5 completed record index is invalid")
+        if index in records:
+            raise TemporalDiscoveryContractError("native v5 completed record index repeats")
+        records[index] = record
+
+    first = int(config["generationPlan"]["firstGenerationIndex"])
+    last = int(config["generationPlan"]["lastGenerationIndex"])
+    if any(index < first or index > last for index in records):
+        raise TemporalDiscoveryContractError("native v5 completed record is outside bounds")
+    if records:
+        latest = max(records)
+        if set(records) != set(range(first, latest + 1)):
+            raise TemporalDiscoveryContractError("native v5 completed records are not contiguous")
+
+    latest_sidecar: Mapping[str, Any] | None = None
+    for generation_index in sorted(records):
+        record = records[generation_index]
+        candidate_count = record.get("candidateCount")
+        task_count = record.get("totalGenerationTaskCount")
+        if (
+            isinstance(candidate_count, bool)
+            or not isinstance(candidate_count, int)
+            or candidate_count < 0
+            or isinstance(task_count, bool)
+            or not isinstance(task_count, int)
+            or task_count < 0
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 completed record counters are invalid"
+            )
+        try:
+            runtime_authority = _native_runtime_authority_for_generation(
+                root=root, generation_index=generation_index
+            )
+            finalization = run_native_v5_generation_finalizer(
+                runtime_authority=runtime_authority,
+                manifest_path=_native_finalization_root(root, generation_index)
+                / "manifest.json",
+            )
+        except TemporalQDV5ControlPlaneError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+        reopened, patch, sidecar = _native_v5_direct_finalization_payloads(
+            finalization=finalization, generation_index=generation_index
+        )
+        if reopened != record:
+            raise TemporalDiscoveryContractError(
+                "native v5 finalizer replay disagrees with completed record"
+            )
+        expected_kind = (
+            V5_PROPOSAL_GENERATION_G0
+            if generation_index == 1 and isinstance(config.get("g0Bootstrap"), Mapping)
+            else V5_PROPOSAL_GENERATION_EVOLVED
+        )
+        if sidecar.get("generationKind") != expected_kind:
+            raise TemporalDiscoveryContractError(
+                "native v5 finalizer replay generation kind drifted"
+            )
+        previous_records = [records[index] for index in range(first, generation_index)]
+        if (
+            sidecar.get("completedGenerationsBeforeSha256")
+            != canonical_sha256(previous_records)
+            or patch.get("completedGenerationsSha256")
+            != canonical_sha256([*previous_records, record])
+            or sidecar.get("nextState", {}).get("completedGenerationsSha256")
+            != patch.get("completedGenerationsSha256")
+            or record.get("archivePath") != "archive.json"
+            or record.get("archiveSha256")
+            != finalization.get("artifacts", {}).get("parentArchive", {}).get(
+                "semanticSha256"
+            )
+            or record.get("cumulativeArchiveSha256")
+            != finalization.get("artifacts", {}).get("cumulativeArchive", {}).get(
+                "semanticSha256"
+            )
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 finalizer replay boundary drifted"
+            )
+        latest_sidecar = sidecar
+
+    if latest_sidecar is not None:
+        next_state = latest_sidecar.get("nextState")
+        if not isinstance(next_state, Mapping) or any(
+            state.get(field) != next_state.get(field)
+            for field in (
+                "currentGenerationIndex",
+                "uniqueCandidatesEvaluated",
+                "workerTasksCompleted",
+                "nextImmigrantContinuationOrdinal",
+                "uniqueIdentityCounts",
+                "duplicateCounters",
+                "proposalSlotCounters",
+            )
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 direct Rust state does not match the latest sidecar"
+            )
+    return records
+
+
 def _native_self_hash(value: Mapping[str, Any], field: str) -> dict[str, Any]:
     output = _clone(value, name="native finalization identity material")
     if field in output:
@@ -2180,7 +5822,17 @@ def _native_binary_file_sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _native_finalization_runtime_authority(finalizer_binary: Path) -> dict[str, Any]:
+def _native_finalization_runtime_authority(
+    finalizer_binary: Path, *, require_v5_control_plane_roles: bool = False
+) -> dict[str, Any]:
+    """Freeze the exact native binaries for one finalization authority epoch.
+
+    Historical/v4 boundaries retain their original three-role authority shape.
+    Fresh native-v5 control planes deliberately freeze every subprocess role up
+    front: a missing or substituted binary is a contract failure, never a
+    reason to fall back to a Python phase.
+    """
+
     suffix = ".exe" if os.name == "nt" else ""
     binaries = {
         "campaignSeal": finalizer_binary.with_name(
@@ -2191,6 +5843,22 @@ def _native_finalization_runtime_authority(finalizer_binary: Path) -> dict[str, 
         ),
         "generationFinalizer": finalizer_binary,
     }
+    if require_v5_control_plane_roles:
+        binaries = {
+            "campaignFreeze": finalizer_binary.with_name(
+                f"temporal-qd-campaign-freeze{suffix}"
+            ),
+            "gatewayDispatch": finalizer_binary.with_name(
+                f"temporal-qd-gateway-dispatch{suffix}"
+            ),
+            **binaries,
+            "rotatingPrefinalizer": finalizer_binary.with_name(
+                f"temporal-qd-rotating-prefinalizer{suffix}"
+            ),
+            "archiveReducer": finalizer_binary.with_name(
+                f"temporal-qd-archive-reducer{suffix}"
+            ),
+        }
     descriptors: dict[str, Any] = {}
     for role, binary in binaries.items():
         resolved = binary.resolve()
@@ -2212,6 +5880,30 @@ def _native_finalization_runtime_authority(finalizer_binary: Path) -> dict[str, 
         },
         "authoritySha256",
     )
+
+
+def _require_native_v5_control_plane_runtime_authority(
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require the complete runtime role set before opening a native-v5 phase."""
+
+    checked = _validate_native_runtime_authority(authority)
+    binaries = checked.get("binaries")
+    if not isinstance(binaries, Mapping) or set(binaries) != NATIVE_V5_CONTROL_PLANE_RUNTIME_ROLES:
+        raise TemporalDiscoveryContractError(
+            "native v5 runtime authority lacks the complete control-plane binary set"
+        )
+    for role in NATIVE_V5_CONTROL_PLANE_RUNTIME_ROLES:
+        descriptor = binaries.get(role)
+        if not isinstance(descriptor, Mapping) or set(descriptor) != {
+            "path",
+            "bytes",
+            "fileSha256",
+        }:
+            raise TemporalDiscoveryContractError(
+                f"native v5 runtime authority {role} descriptor is malformed"
+            )
+    return checked
 
 
 def _native_runtime_authority_history_path(root: Path, authority_sha256: str) -> Path:
@@ -2409,8 +6101,12 @@ def _freeze_native_finalization_runtime_authority(
     state: Mapping[str, Any],
     authorized_adoption_generations: frozenset[int] = frozenset(),
     authorize_rotation: bool = False,
+    require_v5_control_plane_roles: bool = False,
 ) -> dict[str, Any]:
-    authority = _native_finalization_runtime_authority(finalizer_binary)
+    authority = _native_finalization_runtime_authority(
+        finalizer_binary,
+        require_v5_control_plane_roles=require_v5_control_plane_roles,
+    )
     authority_path = root / "native-finalization-authority.json"
     if not authority_path.exists() and state.get("completedGenerations"):
         unbound_generations = {
@@ -2944,6 +6640,18 @@ def _native_campaign_seal_manifest(
                 contract["provisionalReduction"]["maxCandidates"]
             ),
             "resultPath": "generation-tail-transaction-result.json",
+            **(
+                {
+                    "directionalTailAuthority": build_v5_directional_tail_authority(
+                        runtime_authority_sha256=_native_finalization_authority_sha256(
+                            root, generation_index
+                        ),
+                        generation_index=generation_index,
+                    )
+                }
+                if config.get("evolvableModuleAuthority") is not None
+                else {}
+            ),
         },
         "manifestSha256",
     )
@@ -5123,9 +8831,11 @@ def _open_legacy_v5_g0_reopen_authority(
     except TemporalQDNativeError as exc:
         raise TemporalDiscoveryContractError(str(exc)) from exc
     if pair_runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON:
-        raise TemporalDiscoveryContractError(
-            "legacy G0 runtime migration requires the frozen Python construction runtime"
-        )
+        # Current native-v5 configs do not carry the retired, independent G0
+        # finalization runtime.  A sealed Rust proposal may stop before its
+        # first generation commit, so config presence alone cannot classify
+        # the run as the singleton pre-cutover Python migration.
+        return None
     expected_config_sha = _sha256(
         config.get("configSha256"), name="legacy QD supervisor config"
     )
@@ -5182,6 +8892,26 @@ def _validate_frozen_sources(
         pair_runtime is not None
         and pair_runtime["engine"] == PAIR_GENERATION_RUNTIME_RUST
     )
+    v5_authority = _v5_evolvable_authority(config)
+    native_v5_proposal_transaction = _native_v5_proposal_enabled(config)
+    if native_v5_proposal_transaction:
+        if not native_pair_generation:
+            raise TemporalDiscoveryContractError(
+                "fresh evolvable v5 construction requires the Rust-native v5 transaction"
+            )
+        runtime, bindings = _validate_native_v5_proposal_runtime(config=config)
+        if (
+            bindings.get("runConfig") != pair_config
+            or bindings.get("archivePolicyAuthority")
+            != v5_authority.get("archivePolicyAuthority")
+            or bindings.get("behaviorAttributionRequirement")
+            != v5_authority.get("behaviorAttributionRequirement")
+            or bindings.get("operatorImplementation")
+            != pair_config.get("operatorImplementation")
+            or bindings.get("capacityReceipt") != pair_config.get("capacityReceipt")
+            or runtime.get("engine") != NATIVE_V5_PROPOSAL_ENGINE
+        ):
+            raise TemporalDiscoveryContractError("native v5 generation bindings drifted")
     g0_bootstrap = config.get("g0Bootstrap")
     g0_runtime = _resolve_g0_finalization_runtime_for_reopen(
         config=config, pair_runtime=pair_runtime, run_root=run_root
@@ -5204,7 +8934,76 @@ def _validate_frozen_sources(
         raise TemporalDiscoveryContractError(
             "Python-owned G0 construction lacks its frozen Rust finalization runtime"
         )
-    if native_pair_generation:
+    if native_v5_proposal_transaction:
+        transport = archive_binding.get("transportDescriptor")
+        if not isinstance(transport, Mapping) or set(transport) != {
+            "schemaVersion",
+            "absolutePath",
+            "documentSchemaVersion",
+            "archiveSha256",
+            "fileSha256",
+            "sizeBytes",
+            "descriptorSha256",
+        }:
+            raise TemporalDiscoveryContractError(
+                "QD supervisor native v5 initial archive transport is invalid"
+            )
+        transport_body = _clone(transport, name="native v5 initial archive transport")
+        supplied_transport_sha = _sha256(
+            transport_body.pop("descriptorSha256", None),
+            name="native v5 initial archive transport identity",
+        )
+        path = archive_binding.get("path")
+        if (
+            transport.get("schemaVersion")
+            != "temporal_qd_archive_transport_descriptor_v1"
+            or not native_v5_archive_transport_path_matches(
+                transport.get("absolutePath"), path
+            )
+            or transport.get("documentSchemaVersion") != "temporal_qd_archive_v3"
+            or transport.get("archiveSha256") != archive_binding.get("archiveSha256")
+            or canonical_sha256(transport_body) != supplied_transport_sha
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD supervisor native v5 initial archive transport drifted"
+            )
+        _sha256(transport.get("fileSha256"), name="native v5 initial archive file identity")
+        size = transport.get("sizeBytes")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise TemporalDiscoveryContractError(
+                "QD supervisor native v5 initial archive transport byte length is invalid"
+            )
+        # This cross-binding is a bounded config-only assertion.  Keep it in
+        # the current-v5 path even though the archive/template/catalog bodies
+        # are Rust-owned: otherwise a re-signed envelope could silently make
+        # the evaluator's required attribution weaker than the proposal
+        # authority that Rust will receive.
+        evaluation = config.get("evaluation")
+        if (
+            not isinstance(evaluation, Mapping)
+            or not isinstance(v5_authority, Mapping)
+            or evaluation.get("behaviorAttributionRequirement")
+            != v5_authority.get("behaviorAttributionRequirement")
+        ):
+            raise TemporalDiscoveryContractError(
+                "evolvable v5 evaluation behavior attribution requirement drifted"
+            )
+        # Current v5 intentionally stops here.  Pair bundle hydration,
+        # template/catalog parsing, and archive decoding belong either to the
+        # historical branch below or to their receipt-bound Rust transaction.
+        if run_root is not None:
+            _require_native_v5_control_plane_runtime_authority(
+                _native_runtime_authority_for_generation(
+                    root=run_root,
+                    generation_index=int(
+                        (config.get("generationPlan") or {}).get(
+                            "firstGenerationIndex", 1
+                        )
+                    ),
+                )
+            )
+        return []
+    elif native_pair_generation:
         archive_path = Path(str(archive_binding.get("path") or ""))
         if (
             not archive_path.is_file()
@@ -5438,6 +9237,7 @@ def _frozen_config(
     initial_construction_pool_size: int | None = None,
     evaluation_population_size: int | None = None,
     evolvable_module_authority_config: Mapping[str, Any] | None = None,
+    initial_archive_transport_descriptor: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -5470,8 +9270,84 @@ def _frozen_config(
         raise TemporalDiscoveryContractError(
                 "fresh broad admission requires a frozen evidence ladder or rotating evidence contract and the frozen five-generation x 1,024-candidate contract; a continuation requires exactly four generations"
         )
-    initial_archive, initial_archive_sha = _load_archive(initial_archive_path)
-    initial_parent_schedule = _rotating_parent_schedule(initial_archive)
+    evolvable_authority = (
+        _clone(
+            evolvable_module_authority_config,
+            name="evolvable module authority config",
+        )
+        if evolvable_module_authority_config is not None
+        else None
+    )
+    # A current v5 run receives a Rust-certified archive transport, not an
+    # archive payload.  Reading the archive here used to make fresh G0
+    # creation a Python candidate/archive authority before the first native
+    # transaction existed.  The certified descriptor is the only initial
+    # archive material Python may carry; qd-batch reopens it when needed.
+    initial_archive_transport: dict[str, Any] | None = None
+    initial_archive: dict[str, Any] | None = None
+    initial_parent_schedule: dict[str, Any] | None = None
+    initial_parent_count = 0
+    if evolvable_authority is not None:
+        if initial_archive_transport_descriptor is None:
+            raise TemporalDiscoveryContractError(
+                "fresh current v5 requires a Rust-certified initial archive descriptor"
+            )
+        raw_transport = _clone(
+            initial_archive_transport_descriptor,
+            name="native v5 initial archive transport descriptor",
+        )
+        if not isinstance(raw_transport, Mapping) or set(raw_transport) != {
+            "schemaVersion",
+            "absolutePath",
+            "documentSchemaVersion",
+            "archiveSha256",
+            "fileSha256",
+            "sizeBytes",
+            "descriptorSha256",
+        }:
+            raise TemporalDiscoveryContractError(
+                "native v5 initial archive transport descriptor schema drifted"
+            )
+        descriptor_body = dict(raw_transport)
+        descriptor_sha = _sha256(
+            descriptor_body.pop("descriptorSha256", None),
+            name="native v5 initial archive transport identity",
+        )
+        if (
+            raw_transport.get("schemaVersion")
+            != "temporal_qd_archive_transport_descriptor_v1"
+            or not native_v5_archive_transport_path_matches(
+                raw_transport.get("absolutePath"),
+                str(initial_archive_path.resolve()),
+            )
+            or raw_transport.get("documentSchemaVersion") != "temporal_qd_archive_v3"
+            or canonical_sha256(descriptor_body) != descriptor_sha
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 initial archive transport descriptor binding drifted"
+            )
+        initial_archive_sha = _sha256(
+            raw_transport.get("archiveSha256"),
+            name="native v5 initial archive transport semantic identity",
+        )
+        _sha256(
+            raw_transport.get("fileSha256"),
+            name="native v5 initial archive transport file identity",
+        )
+        size = raw_transport.get("sizeBytes")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise TemporalDiscoveryContractError(
+                "native v5 initial archive transport byte length is invalid"
+            )
+        initial_archive_transport = dict(raw_transport)
+    else:
+        if initial_archive_transport_descriptor is not None:
+            raise TemporalDiscoveryContractError(
+                "historical supervisor cannot carry a native v5 initial archive descriptor"
+            )
+        initial_archive, initial_archive_sha = _load_archive(initial_archive_path)
+        initial_parent_schedule = _rotating_parent_schedule(initial_archive)
+        initial_parent_count = _archive_member_count(initial_archive)
     template = _read(template_preparation_path, name="QD template preparation")
     evidence_ladder = (
         build_evidence_ladder(evidence_ladder_config)
@@ -5547,23 +9423,11 @@ def _frozen_config(
                 cost_views=QD_COST_VIEWS,
             ),
         )
-    pair_authority = load_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
-    pair_source_authority = (
-        _clone(pair_authority, name="base pair source authority")
-        if pair_authority is not None
-        else None
-    )
-    evolvable_authority = (
-        _clone(
-            evolvable_module_authority_config,
-            name="evolvable module authority config",
-        )
-        if evolvable_module_authority_config is not None
-        else None
-    )
+    pair_source_authority: dict[str, Any] | None = None
+    native_v5_proposal_runtime: dict[str, Any] | None = None
     evolvable_capacity_receipt: Mapping[str, Any] | None = None
     if evolvable_authority is not None:
-        if pair_authority is None:
+        if bidirectional_pair_config is None:
             raise TemporalDiscoveryContractError(
                 "evolvable module authority requires bidirectional pair mode"
             )
@@ -5572,30 +9436,40 @@ def _frozen_config(
             raise TemporalDiscoveryContractError(
                 "evolvable module authority lacks archive policy authority"
             )
-        _, _, _, direction_aware = _resolve_archive_policy_authority(policy_authority)
+        _name, _sha, _policy, direction_aware = _resolve_archive_policy_authority(
+            policy_authority
+        )
         if not direction_aware:
             raise TemporalDiscoveryContractError(
                 "evolvable module authority requires the exact v5 archive policy"
             )
-        if not isinstance(evolvable_authority.get("behaviorAttributionRequirement"), Mapping):
-            raise TemporalDiscoveryContractError(
-                "evolvable module authority lacks behavior attribution requirement"
-            )
-        # Freeze the authority-authored operator identity before hashing the
-        # supervisor config.  The generation runtime reopens and verifies this
-        # same material; it must never inherit the legacy pair operator label.
-        with PairAuthorityBundle(pair_authority) as _pair_bundle:
-            _evolvable = _pair_bundle.open_evolvable_module_authority(
-                evolvable_authority
-            )
-            _binding_input = _clone(pair_authority, name="base pair generation config")
-            # The base pair config's v4 operator identity names the legacy
-            # factory.  It remains the source authority, but cannot be passed
-            # through as the v5 generation operator identity.
-            _binding_input.pop("operatorImplementation", None)
-            _bindings = _evolvable.generation_bindings(_binding_input)
-        pair_authority = _bindings["runConfig"]
-        evolvable_capacity_receipt = _bindings["capacityReceipt"]
+        # The source must already be frozen.  Do not call
+        # ``load_pair_run_config`` here: it opens a Python/Dashboard authority
+        # and would recreate the retired construction path before the native
+        # v5 manifest exists.
+        pair_source_authority = _clone(
+            bidirectional_pair_config, name="base pair source authority"
+        )
+        generation_run_config = _clone(
+            pair_source_authority, name="v5 generation run config"
+        )
+        # The historical source implementation is evidence only.  The pure
+        # v5 bridge derives its own Rust-executable implementation closure.
+        generation_run_config.pop("operatorImplementation", None)
+        native_v5_proposal_runtime, bindings = _build_native_v5_proposal_runtime(
+            pair_source_authority=pair_source_authority,
+            evolvable_module_authority=evolvable_authority,
+            generation_run_config=generation_run_config,
+            execution_timeout_seconds=pair_generation_timeout_seconds,
+        )
+        pair_authority = bindings["runConfig"]
+        evolvable_capacity_receipt = bindings["capacityReceipt"]
+    else:
+        pair_authority = (
+            load_pair_run_config(bidirectional_pair_config)
+            if bidirectional_pair_config is not None
+            else None
+        )
     if pair_authority is None and pair_generation_engine is not None:
         raise TemporalDiscoveryContractError(
             "pair generation engine requires bidirectional pair mode"
@@ -5611,9 +9485,13 @@ def _frozen_config(
         )
     except TemporalQDNativeError as exc:
         raise TemporalDiscoveryContractError(str(exc)) from exc
-    if evolvable_authority is not None and pair_generation_runtime["engine"] != PAIR_GENERATION_RUNTIME_PYTHON:
+    if (
+        evolvable_authority is not None
+        and pair_generation_runtime["engine"] != PAIR_GENERATION_RUNTIME_RUST
+    ):
         raise TemporalDiscoveryContractError(
-            "evolvable module authority currently requires the explicit Python pair-generation oracle"
+            "fresh evolvable v5 construction requires the Rust-native v5 transaction; "
+            "Python is an explicit oracle only"
         )
     archive_policy_authority = (
         evolvable_authority["archivePolicyAuthority"]
@@ -5623,7 +9501,7 @@ def _frozen_config(
     policy_name, policy_sha256, frozen_policy, direction_aware = (
         _resolve_archive_policy_authority(archive_policy_authority)
     )
-    if (
+    if initial_archive is not None and (
         initial_archive.get("policyName") != policy_name
         or initial_archive.get("policySha256") != policy_sha256
         or initial_archive.get("frozenPolicy") != frozen_policy
@@ -5681,7 +9559,7 @@ def _frozen_config(
                     first_generation_index=first_generation_index,
                     generation_count=generation_count,
                     proposal_width=int(normalized_parameters["targetUniqueCandidates"]),
-                    initial_parent_count=_archive_member_count(initial_archive),
+                    initial_parent_count=initial_parent_count,
                 )
             }
             if rotating_evidence is not None
@@ -5757,7 +9635,7 @@ def _frozen_config(
                             proposal_width=int(
                                 normalized_parameters["targetUniqueCandidates"]
                             ),
-                            initial_parent_count=_archive_member_count(initial_archive),
+                            initial_parent_count=initial_parent_count,
                         )
                         if rotating_evidence is not None
                         else _broad_admission_contract_values(
@@ -5812,8 +9690,19 @@ def _frozen_config(
         "initialArchive": {
             "path": str(initial_archive_path.resolve()),
             "archiveSha256": initial_archive_sha,
-            "generationIndex": int(initial_archive["generationIndex"]),
-            "resultSetSha256": initial_archive["resultSetSha256"],
+            **(
+                {
+                    "generationIndex": int(initial_archive["generationIndex"]),
+                    "resultSetSha256": initial_archive["resultSetSha256"],
+                }
+                if initial_archive is not None
+                else {}
+            ),
+            **(
+                {"transportDescriptor": initial_archive_transport}
+                if initial_archive_transport is not None
+                else {}
+            ),
             **(
                 {
                     "parentSchedule": _clone(
@@ -5843,6 +9732,11 @@ def _frozen_config(
             **(
                 {"evolvableModuleAuthority": evolvable_authority}
                 if evolvable_authority is not None
+                else {}
+            ),
+            **(
+                {"nativeV5ProposalRuntime": native_v5_proposal_runtime}
+                if native_v5_proposal_runtime is not None
                 else {}
             ),
         }),
@@ -6454,12 +10348,26 @@ def _run_rotating_generation_transaction(
             binary=native_campaign_seal_binary, manifest_path=seal_manifest_path
         )
         seal_root = seal_manifest_path.parent
-        proposal_tail_index = validate_tail_result_index(
-            _canonical_file(
-                seal_root / "tail-result-index-v3.json",
-                name="native sealed proposal tail index",
+        directional_tail_authority = seal_manifest.get("directionalTailAuthority")
+        if config.get("evolvableModuleAuthority") is not None:
+            if not isinstance(directional_tail_authority, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "native v5 campaign seal lacks directional tail authority"
+                )
+            proposal_tail_index = validate_v5_directional_tail_index(
+                _canonical_file(
+                    seal_root / "tail-result-index-v4.json",
+                    name="native sealed v5 directional tail index",
+                ),
+                authority=directional_tail_authority,
             )
-        )
+        else:
+            proposal_tail_index = validate_tail_result_index(
+                _canonical_file(
+                    seal_root / "tail-result-index-v3.json",
+                    name="native sealed proposal tail index",
+                )
+            )
         if (
             seal_execution.get("transaction", {}).get("tailResultIndexSha256")
             != proposal_tail_index.get("tailResultIndexSha256")
@@ -6484,9 +10392,14 @@ def _run_rotating_generation_transaction(
                 "native sealed evaluated members are unavailable"
             ) from exc
         sealed_member_batch = {"members": sealed_members}
-        indexes[(proposal_campaign_root / "screening-run").resolve()] = (
-            proposal_tail_index
-        )
+        # A v4 native v5 tail is never installed into the legacy retained
+        # index map: that map's verifier is intentionally v3-only and may
+        # reopen raw results.  Downstream v5 routing consumes its compact
+        # receipt directly instead.
+        if config.get("evolvableModuleAuthority") is None:
+            indexes[(proposal_campaign_root / "screening-run").resolve()] = (
+                proposal_tail_index
+            )
     else:
         proposal_tail_index = (
             _verified_tail_result_index(
@@ -6656,13 +10569,26 @@ def _run_rotating_generation_transaction(
         for candidate_id, candidate in new_candidates.items()
         if candidate_id in current_members
     }
-    new_records = _campaign_window_evidence(
-        campaign_root=proposal_campaign_root,
-        panel=panel,
-        candidates=evaluated_new_candidates,
-        tail_result_index=proposal_tail_index,
-        direction_aware=config.get("evolvableModuleAuthority") is not None,
-    )
+    if config.get("evolvableModuleAuthority") is not None:
+        directional_tail_authority = seal_manifest.get("directionalTailAuthority")
+        if not isinstance(directional_tail_authority, Mapping):
+            raise TemporalDiscoveryContractError(
+                "native v5 rotating evidence lacks directional tail authority"
+            )
+        new_records = v5_directional_compact_window_evidence(
+            index=proposal_tail_index,
+            authority=directional_tail_authority,
+            panel=panel,
+            candidates=evaluated_new_candidates,
+        )
+    else:
+        new_records = _campaign_window_evidence(
+            campaign_root=proposal_campaign_root,
+            panel=panel,
+            candidates=evaluated_new_candidates,
+            tail_result_index=proposal_tail_index,
+            direction_aware=False,
+        )
     current_records.update(new_records)
     if parent_campaign_root is not None:
         current_records.update(
@@ -6929,7 +10855,7 @@ def _run_rotating_generation_transaction(
 
 
 def _complete_rotating_generation_transaction(**kwargs: Any) -> dict[str, Any]:
-    """Python-oracle materialization entry point retained as the default."""
+    """Explicit Python-oracle materialization entry point for legacy evidence."""
 
     return _run_rotating_generation_transaction(
         **kwargs, finalization_engine=GENERATION_FINALIZATION_ENGINE_PYTHON
@@ -7029,7 +10955,7 @@ def run_qd_supervisor(
     evaluation_population_size: int | None = None,
     tail_result_mode: str = TAIL_RESULT_MODE_LEGACY,
     native_finalization_validation: str = NATIVE_FINALIZATION_VALIDATION_NONE,
-    generation_finalization_engine: str = GENERATION_FINALIZATION_ENGINE_PYTHON,
+    generation_finalization_engine: str = GENERATION_FINALIZATION_ENGINE_DEFAULT,
     generation_finalizer_binary: Path | str | None = None,
     native_generation_deep_audit: bool = False,
     adopt_python_completed_generations: tuple[int, ...] = (),
@@ -7038,18 +10964,23 @@ def run_qd_supervisor(
     evolvable_module_authority_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
-    if (
-        evolvable_module_authority_config is not None
-        and tail_result_mode == TAIL_RESULT_MODE_INDEXED
-    ):
-        raise TemporalDiscoveryContractError(
-            "evolvable v5 authority requires raw rotating result provenance until direction-aware tail indexing is versioned"
-        )
     native_finalization_validation = _normalize_native_finalization_validation(
         native_finalization_validation
     )
     generation_finalization_engine = _normalize_generation_finalization_engine(
         generation_finalization_engine
+    )
+    root = Path(run_root)
+    config_path = root / "config.json"
+    persisted_config = (
+        _canonical_file(config_path, name="existing QD supervisor config")
+        if config_path.is_file()
+        else None
+    )
+    _require_native_v5_finalization_engine(
+        generation_finalization_engine=generation_finalization_engine,
+        supplied_evolvable_authority=evolvable_module_authority_config,
+        persisted_config=persisted_config,
     )
     native_finalizer_binary = (
         Path(generation_finalizer_binary)
@@ -7077,13 +11008,11 @@ def run_qd_supervisor(
         raise TemporalDiscoveryContractError(
             "Python boundary adoption is valid only with the Rust finalization engine"
         )
-    root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
     _require_irreversible_native_cutover_engine(
         root=root,
         generation_finalization_engine=generation_finalization_engine,
     )
-    config_path = root / "config.json"
     legacy_reopen = _open_legacy_v5_g0_reopen_authority(root=root)
     effective_g0_finalization_runtime: dict[str, Any] | None = None
     if legacy_reopen is not None:
@@ -7126,6 +11055,27 @@ def run_qd_supervisor(
         confirmed_entry_dir = Path(confirmed_entry_admission_root) if confirmed_entry_admission_root is not None else root / ".pair-mode-unused-admission"
         template_preparation_file = Path(template_preparation_path)
         validator_file = Path(validator_command_file) if validator_command_file is not None else None
+        initial_archive_transport_descriptor: dict[str, Any] | None = None
+        if evolvable_module_authority_config is not None:
+            # This in-memory authority is byte-identical to the authority
+            # frozen below.  It exists solely to pin the certifier before its
+            # descriptor becomes part of the write-once v5 config; Python
+            # never opens or hashes the archive itself.
+            if native_finalizer_binary is None:
+                raise TemporalDiscoveryContractError(
+                    "fresh current v5 requires the complete Rust runtime authority"
+                )
+            provisional_runtime = _native_finalization_runtime_authority(
+                native_finalizer_binary,
+                require_v5_control_plane_roles=True,
+            )
+            try:
+                initial_archive_transport_descriptor = certify_native_v5_initial_archive(
+                    runtime_authority=provisional_runtime,
+                    archive_path=initial_archive_file,
+                )
+            except TemporalQDV5ControlPlaneError as exc:
+                raise TemporalDiscoveryContractError(str(exc)) from exc
         config, validator_command = _frozen_config(
             initial_archive_path=initial_archive_file,
             source_preparation_path=source_preparation_file,
@@ -7155,6 +11105,7 @@ def run_qd_supervisor(
             initial_construction_pool_size=initial_construction_pool_size,
             evaluation_population_size=evaluation_population_size,
             evolvable_module_authority_config=evolvable_module_authority_config,
+            initial_archive_transport_descriptor=initial_archive_transport_descriptor,
         )
     if (
         tail_result_mode == TAIL_RESULT_MODE_INDEXED
@@ -7208,17 +11159,24 @@ def run_qd_supervisor(
         generation_finalization_engine=generation_finalization_engine,
         state=state,
     )
+    native_v5_control_plane = _native_v5_proposal_enabled(config)
     adoption_authority: Mapping[str, Any] | None = None
+    runtime_authority: Mapping[str, Any] | None = None
     if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
         assert native_finalizer_binary is not None
-        adoption_authority = _prepare_native_finalization_adoption_authority(
-            root=root,
-            state=state,
-            config=config,
-            finalizer_binary=native_finalizer_binary,
-            requested_generations=adopt_python_completed_generations,
-        )
-        _freeze_native_finalization_runtime_authority(
+        if native_v5_control_plane and adopt_python_completed_generations:
+            raise TemporalDiscoveryContractError(
+                "native v5 control-plane generations cannot adopt Python-completed boundaries"
+            )
+        if not native_v5_control_plane:
+            adoption_authority = _prepare_native_finalization_adoption_authority(
+                root=root,
+                state=state,
+                config=config,
+                finalizer_binary=native_finalizer_binary,
+                requested_generations=adopt_python_completed_generations,
+            )
+        runtime_authority = _freeze_native_finalization_runtime_authority(
             root=root,
             finalizer_binary=native_finalizer_binary,
             state=state,
@@ -7226,24 +11184,39 @@ def run_qd_supervisor(
                 (adoption_authority or {}).get("generationIndices") or []
             ),
             authorize_rotation=authorize_native_finalization_authority_rotation,
+            require_v5_control_plane_roles=native_v5_control_plane,
         )
+        if native_v5_control_plane:
+            _require_native_v5_control_plane_runtime_authority(runtime_authority)
+            _recover_native_v5_state_application(
+                root=root,
+                state=state,
+                state_path=state_path,
+                config=config,
+                runtime_authority=runtime_authority,
+            )
     # This is deliberately before both the completed fast path and gateway
     # construction.  A restart must never treat a stale source, or a merely
     # self-claimed completed state, as permission to skip immutable work.
     validator_command = _validate_frozen_sources(config, run_root=root)
     if generation_finalization_engine == GENERATION_FINALIZATION_ENGINE_RUST:
         assert native_finalizer_binary is not None
-        completed_by_index = _admit_completed_generations_native(
-            root=root,
-            state=state,
-            state_path=state_path,
-            config=config,
-            binary=native_finalizer_binary,
-            deep_audit=native_generation_deep_audit,
-            tail_result_mode=tail_result_mode,
-            tail_result_indexes=tail_result_indexes,
-            adoption_authority=adoption_authority,
-        )
+        if native_v5_control_plane:
+            completed_by_index = _admit_completed_generations_native_v5(
+                root=root, state=state, config=config
+            )
+        else:
+            completed_by_index = _admit_completed_generations_native(
+                root=root,
+                state=state,
+                state_path=state_path,
+                config=config,
+                binary=native_finalizer_binary,
+                deep_audit=native_generation_deep_audit,
+                tail_result_mode=tail_result_mode,
+                tail_result_indexes=tail_result_indexes,
+                adoption_authority=adoption_authority,
+            )
     elif native_finalization_validation == NATIVE_FINALIZATION_VALIDATION_HISTORICAL:
         assert native_finalizer_binary is not None
         completed_by_index = _admit_completed_generations_native(
@@ -7264,13 +11237,25 @@ def run_qd_supervisor(
             tail_result_mode=tail_result_mode,
             tail_result_indexes=tail_result_indexes,
         )
+    native_v5_proposal_transaction = _native_v5_proposal_enabled(config)
     native_pair_ledger_transaction = (
         (config.get("pairGenerationRuntime") or {}).get("engine")
         == PAIR_GENERATION_RUNTIME_RUST
+        and not native_v5_proposal_transaction
     )
     committed_identity_ledger: dict[str, Any] | None = None
     committed_identity_ledger_sha256: str | None = None
-    if native_pair_ledger_transaction:
+    committed_native_v5_identity_ledger_descriptor: dict[str, Any] | None = None
+    if native_v5_proposal_transaction:
+        committed_native_v5_identity_ledger_descriptor = (
+            _reconcile_native_v5_identity_ledger(
+            root=root,
+            state=state,
+            state_path=state_path,
+            completed_by_index=completed_by_index,
+            )
+        )
+    elif native_pair_ledger_transaction:
         (
             committed_identity_ledger,
             committed_identity_ledger_sha256,
@@ -7310,17 +11295,42 @@ def run_qd_supervisor(
             "runRoot": str(root.resolve()),
         }
 
-    client = LabGatewayClient(
-        base_url=config["evaluation"]["gatewayUrl"],
-        token=gateway_token,
-        timeout_seconds=30.0,
-    )
+    # Current v5 dispatch is a pinned Rust subprocess.  Do not even create
+    # the historical Python gateway client for that path: a later resumed
+    # stage must not obtain an ambient Python evaluation transport as a
+    # fallback.  Legacy/oracle configurations retain their existing client.
+    client: LabGatewayClient | None = None
+    if not native_v5_proposal_transaction:
+        client = LabGatewayClient(
+            base_url=config["evaluation"]["gatewayUrl"],
+            token=gateway_token,
+            timeout_seconds=30.0,
+        )
     try:
         first = int(config["generationPlan"]["firstGenerationIndex"])
         last = int(config["generationPlan"]["lastGenerationIndex"])
         parent_archive_path = initial_archive_file
         parent_archive_sha256 = config["initialArchive"]["archiveSha256"]
+        parent_archive_descriptor: dict[str, Any] | None = None
+        if native_v5_proposal_transaction:
+            initial_transport = config["initialArchive"].get("transportDescriptor")
+            if not isinstance(initial_transport, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "native v5 initial archive transport descriptor is unavailable"
+                )
+            parent_archive_descriptor = _native_v5_proposal_archive_descriptor(
+                {
+                    "absolutePath": initial_transport.get("absolutePath"),
+                    "fileSha256": initial_transport.get("fileSha256"),
+                    "semanticSha256": initial_transport.get("archiveSha256"),
+                    "byteLength": initial_transport.get("sizeBytes"),
+                },
+                name="native v5 initial archive",
+            )
         parent_schedule = config["initialArchive"].get("parentSchedule")
+        previous_cumulative_archive_path: Path | None = None
+        previous_cumulative_archive_sha256: str | None = None
+        previous_cumulative_archive_descriptor: dict[str, Any] | None = None
         immigrant_cursor = int(initial_immigrant_continuation_ordinal)
         if completed_by_index:
             latest = max(completed_by_index)
@@ -7328,12 +11338,61 @@ def run_qd_supervisor(
                 raise TemporalDiscoveryContractError(
                     "completed QD generations are not contiguous"
                 )
-            parent_archive_path = Path(completed_by_index[latest]["archivePath"])
-            parent_archive_sha256 = completed_by_index[latest]["archiveSha256"]
-            parent_schedule = completed_by_index[latest].get("parentSchedule")
-            immigrant_cursor = int(
-                completed_by_index[latest]["nextImmigrantContinuationOrdinal"]
-            )
+            latest_record = completed_by_index[latest]
+            if native_v5_proposal_transaction:
+                if latest_record.get("archivePath") != "archive.json":
+                    raise TemporalDiscoveryContractError(
+                        "native v5 completed record archive path drifted"
+                    )
+                try:
+                    replay = run_native_v5_generation_finalizer(
+                        runtime_authority=_native_runtime_authority_for_generation(
+                            root=root, generation_index=latest
+                        ),
+                        manifest_path=_native_finalization_root(root, latest)
+                        / "manifest.json",
+                    )
+                except TemporalQDV5ControlPlaneError as exc:
+                    raise TemporalDiscoveryContractError(str(exc)) from exc
+                artifacts = replay.get("artifacts")
+                if not isinstance(artifacts, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "native v5 completed finalizer lacks compact archive descriptors"
+                    )
+                parent_archive_descriptor = _native_v5_archive_descriptor_from_finalizer_artifact(
+                    _clone(artifacts.get("parentArchive"), name="native v5 parent archive artifact"),
+                    name="native v5 completed parent archive",
+                    expected_relative_path="archive.json",
+                )
+                previous_cumulative_archive_descriptor = (
+                    _native_v5_archive_descriptor_from_finalizer_artifact(
+                        _clone(
+                            artifacts.get("cumulativeArchive"),
+                            name="native v5 cumulative archive artifact",
+                        ),
+                        name="native v5 completed cumulative archive",
+                        expected_relative_path="evidence/cumulative-archive.json",
+                    )
+                )
+                parent_archive_path = Path(parent_archive_descriptor["absolutePath"])
+                previous_cumulative_archive_path = Path(
+                    previous_cumulative_archive_descriptor["absolutePath"]
+                )
+                parent_archive_sha256 = parent_archive_descriptor["semanticSha256"]
+                previous_cumulative_archive_sha256 = (
+                    previous_cumulative_archive_descriptor["semanticSha256"]
+                )
+                parent_schedule = latest_record.get("parentSchedule")
+                immigrant_cursor = int(
+                    state.get("nextImmigrantContinuationOrdinal") or 0
+                )
+            else:
+                parent_archive_path = Path(latest_record["archivePath"])
+                parent_archive_sha256 = latest_record["archiveSha256"]
+                parent_schedule = latest_record.get("parentSchedule")
+                immigrant_cursor = int(
+                    latest_record["nextImmigrantContinuationOrdinal"]
+                )
 
         for generation_index in range(first, last + 1):
             if generation_index in completed_by_index:
@@ -7349,8 +11408,13 @@ def run_qd_supervisor(
             if config.get("rotatingEvidence") is not None:
                 template_binding = template_for_generation(config["rotatingEvidence"], generation_index)
                 generation_template_file = Path(template_binding["path"])
-                template_payload = _read(generation_template_file, name="rotating QD panel template")
-                validate_generation_template(template_payload, config["rotatingEvidence"], generation_index)
+                if not native_v5_proposal_transaction:
+                    template_payload = _read(
+                        generation_template_file, name="rotating QD panel template"
+                    )
+                    validate_generation_template(
+                        template_payload, config["rotatingEvidence"], generation_index
+                    )
 
             state.update(
                 {
@@ -7369,7 +11433,21 @@ def run_qd_supervisor(
                 parentArchive=str(parent_archive_path.resolve()),
                 immigrantContinuationOrdinal=immigrant_cursor,
             )
-            if native_pair_ledger_transaction:
+            native_v5_identity_ledger_input: dict[str, Any] | None = None
+            if native_v5_proposal_transaction:
+                native_v5_generation_kind = (
+                    V5_PROPOSAL_GENERATION_G0
+                    if isinstance(config.get("g0Bootstrap"), Mapping)
+                    and generation_index == 1
+                    else V5_PROPOSAL_GENERATION_EVOLVED
+                )
+                native_v5_identity_ledger_input = _build_native_v5_identity_ledger_input(
+                    generation_kind=native_v5_generation_kind,
+                    committed_identity_ledger_descriptor=(
+                        committed_native_v5_identity_ledger_descriptor
+                    ),
+                )
+            elif native_pair_ledger_transaction:
                 assert committed_identity_ledger is not None
                 assert committed_identity_ledger_sha256 is not None
                 _prepare_native_pair_identity_ledger_transaction(
@@ -7414,7 +11492,20 @@ def run_qd_supervisor(
                     else None
                 ),
             )
-            if config.get("bidirectionalPairGeneration") is None:
+            if native_v5_proposal_transaction:
+                if parent_archive_descriptor is None:
+                    raise TemporalDiscoveryContractError(
+                        "native v5 generation lacks its sealed parent archive descriptor"
+                    )
+                generation_result = _run_native_v5_generation(
+                    root=root,
+                    config=config,
+                    generation_index=generation_index,
+                    parent_archive_descriptor=parent_archive_descriptor,
+                    parent_schedule=parent_schedule,
+                    identity_ledger_input=native_v5_identity_ledger_input,
+                )
+            elif config.get("bidirectionalPairGeneration") is None:
                 # Legacy generation owns the file-backed source and command
                 # validator contract.  Pair mode has a distinct native
                 # authority and intentionally carries no legacy validator.
@@ -7555,6 +11646,107 @@ def run_qd_supervisor(
                     input_ledger_sha256=committed_identity_ledger_sha256,
                     generation_result=generation_result,
                 )
+
+            # A current native-v5 receipt may never fall through into the
+            # historic Python campaign/evaluation/archive pipeline.  Its sole
+            # continuation is the receipt-bound Rust campaign/prefinalizer/
+            # finalizer chain below.
+            if native_v5_proposal_transaction:
+                if stop_before_evaluation_generation == generation_index:
+                    raise TemporalDiscoveryContractError(
+                        "current native v5 does not support the legacy Python "
+                        "stop-before-evaluation canary"
+                    )
+                native_completion = _complete_native_v5_generation(
+                    root=root,
+                    state=state,
+                    state_path=state_path,
+                    config=config,
+                    generation_index=generation_index,
+                    generation_result=generation_result,
+                    identity_ledger_input=native_v5_identity_ledger_input,
+                    parent_archive_descriptor=parent_archive_descriptor,
+                    previous_cumulative_archive_descriptor=previous_cumulative_archive_descriptor,
+                    gateway_token=gateway_token,
+                )
+                generation_record = native_completion["generationRecord"]
+                committed_native_v5_identity_ledger_descriptor = (
+                    _native_v5_identity_ledger_descriptor(
+                        state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY),
+                        name="native v5 committed postproposal identity ledger",
+                        expected_path=_native_v5_identity_ledger_output_path(
+                            root, generation_index
+                        ),
+                    )
+                )
+                expected_ledger = _native_v5_identity_ledger_descriptor_from_adapter(
+                    adapter=_clone(
+                        generation_result["nativeV5Construction"],
+                        name="native v5 completed construction adapter",
+                    ),
+                    root=root,
+                    generation_index=generation_index,
+                    name="native v5 completed proposal identity ledger",
+                )
+                if committed_native_v5_identity_ledger_descriptor != expected_ledger:
+                    raise TemporalDiscoveryContractError(
+                        "native v5 postproposal identity-ledger descriptor drifted"
+                    )
+                if generation_record.get("archivePath") != "archive.json":
+                    raise TemporalDiscoveryContractError(
+                        "native v5 finalizer archive path drifted"
+                    )
+                final_artifacts = native_completion["finalization"].get("artifacts")
+                if not isinstance(final_artifacts, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "native v5 finalizer lacks compact archive descriptors"
+                    )
+                parent_archive_descriptor = _native_v5_archive_descriptor_from_finalizer_artifact(
+                    _clone(final_artifacts.get("parentArchive"), name="native v5 finalized parent artifact"),
+                    name="native v5 finalized parent archive",
+                    expected_relative_path="archive.json",
+                )
+                previous_cumulative_archive_descriptor = (
+                    _native_v5_archive_descriptor_from_finalizer_artifact(
+                        _clone(
+                            final_artifacts.get("cumulativeArchive"),
+                            name="native v5 finalized cumulative artifact",
+                        ),
+                        name="native v5 finalized cumulative archive",
+                        expected_relative_path="evidence/cumulative-archive.json",
+                    )
+                )
+                parent_archive_path = Path(parent_archive_descriptor["absolutePath"])
+                previous_cumulative_archive_path = Path(
+                    previous_cumulative_archive_descriptor["absolutePath"]
+                )
+                parent_archive_sha256 = parent_archive_descriptor["semanticSha256"]
+                previous_cumulative_archive_sha256 = (
+                    previous_cumulative_archive_descriptor["semanticSha256"]
+                )
+                parent_schedule = generation_record.get("parentSchedule")
+                immigrant_cursor = int(state["nextImmigrantContinuationOrdinal"])
+                completed_by_index[generation_index] = generation_record
+                _event(
+                    "generation_completed",
+                    generationIndex=generation_index,
+                    uniqueCandidatesEvaluated=state["uniqueCandidatesEvaluated"],
+                    occupiedCellCount=generation_record.get("occupiedCellCount"),
+                    newCellCount=generation_record.get("newCellCount"),
+                    archiveSha256=parent_archive_sha256,
+                )
+                if stop_after_generation == generation_index:
+                    return {
+                        "schemaVersion": "temporal_qd_supervisor_result_v3",
+                        "status": "paused_at_generation_boundary",
+                        "generationIndex": generation_index,
+                        "configSha256": config["configSha256"],
+                        "stateSha256": state["stateSha256"],
+                        "uniqueIdentityCounts": state.get("uniqueIdentityCounts") or {},
+                        "duplicateCounters": state.get("duplicateCounters") or {},
+                        "runRoot": str(root.resolve()),
+                    }
+                continue
 
             state["stage"] = "freezing_evaluation"
             _save_state(state_path, state)
@@ -7811,10 +12003,12 @@ def run_qd_supervisor(
                 verify_population_file=(
                     generation_finalization_engine
                     != GENERATION_FINALIZATION_ENGINE_RUST
+                    and not native_v5_proposal_transaction
                 ),
                 verify_rotating_campaign_artifacts=(
                     generation_finalization_engine
                     != GENERATION_FINALIZATION_ENGINE_RUST
+                    and not native_v5_proposal_transaction
                 ),
             )
             if (
@@ -7837,12 +12031,17 @@ def run_qd_supervisor(
                 raise TemporalDiscoveryContractError(
                     "completed QD generation artifact identities disagree with phase output"
                 )
-            journal = _read(
-                proposal_root / "generation-journal.json",
-                name="QD generation journal",
-            )
-            journal_sha = _identity_payload(
-                journal, "journalSha256", name="QD generation journal"
+            journal_sha = (
+                generation_result["journalSha256"]
+                if native_v5_proposal_transaction
+                else _identity_payload(
+                    _read(
+                        proposal_root / "generation-journal.json",
+                        name="QD generation journal",
+                    ),
+                    "journalSha256",
+                    name="QD generation journal",
+                )
             )
             generation_record = {
                 "generationIndex": generation_index,
@@ -7933,6 +12132,20 @@ def run_qd_supervisor(
                 "nextImmigrantContinuationOrdinal": generation_result[
                     "nextImmigrantContinuationOrdinal"
                 ],
+                **(
+                    {
+                        "nativeV5Construction": _clone(
+                            generation_result["nativeV5Construction"],
+                            name="native v5 construction adapter",
+                        ),
+                        "nativeV5Invocation": _clone(
+                            generation_result["nativeV5Invocation"],
+                            name="native v5 supervisor invocation",
+                        ),
+                    }
+                    if native_v5_proposal_transaction
+                    else {}
+                ),
                 **(
                     {
                         "generationFunnelArtifactSha256": artifacts["generationFunnel"]["artifactSha256"],
@@ -8068,7 +12281,14 @@ def run_qd_supervisor(
                     "evaluationProgress": None,
                 }
             )
-            if native_pair_ledger_transaction:
+            if native_v5_proposal_transaction:
+                # The current-v5 branch returns above after applying the Rust
+                # sidecar.  Falling through would revive the retired
+                # root-ledger copy/promotion path.
+                raise TemporalDiscoveryContractError(
+                    "current native v5 reached the historical generation boundary"
+                )
+            elif native_pair_ledger_transaction:
                 _promote_native_pair_identity_ledger(
                     root=root,
                     state=state,
@@ -8077,7 +12297,11 @@ def run_qd_supervisor(
                     generation_record=generation_record,
                 )
             _save_state(state_path, state)
-            if native_pair_ledger_transaction:
+            if native_v5_proposal_transaction:
+                raise TemporalDiscoveryContractError(
+                    "current native v5 reached the historical ledger boundary"
+                )
+            elif native_pair_ledger_transaction:
                 assert generation_output_identity_ledger is not None
                 assert generation_output_identity_ledger_sha256 is not None
                 committed_identity_ledger = generation_output_identity_ledger
@@ -8207,7 +12431,8 @@ def run_qd_supervisor(
         )
         raise
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 def run_qd_continuation(
@@ -8308,6 +12533,18 @@ def _ladder_population(
 def _run_evidence_ladder(
     *, root: Path, config: Mapping[str, Any], client: LabGatewayClient, final_archive_path: Path
 ) -> dict[str, Any] | None:
+    # A current v5 run may never reconstruct a ladder cohort/population in
+    # Python.  The historic implementation below deliberately remains as an
+    # explicit legacy/oracle path, but it is not a recovery route for the
+    # Rust-native control plane.  Keep this guard before even opening the
+    # final archive so a missing native ladder-selection handoff cannot
+    # silently turn into an O(N) Python scan on a later restart.
+    if _native_v5_proposal_enabled(config):
+        raise TemporalDiscoveryContractError(
+            "current native v5 evidence-ladder execution requires the Rust "
+            "ladder selection/reduction transaction; Python ladder fallback "
+            "is prohibited"
+        )
     ladder = config.get("evidenceLadder")
     execution = config.get("evidenceLadderExecution")
     if ladder is None:
@@ -8432,11 +12669,11 @@ def main() -> None:
     parser.add_argument(
         "--generation-finalization-engine",
         choices=sorted(_GENERATION_FINALIZATION_ENGINES),
-        default=GENERATION_FINALIZATION_ENGINE_PYTHON,
+        default=GENERATION_FINALIZATION_ENGINE_DEFAULT,
         help=(
-            "generation boundary materializer; Python remains the default oracle, "
-            "Rust is an explicit fail-closed opt-in and becomes mandatory for "
-            "every restart after native cutover"
+            "generation boundary materializer; Rust is the fail-closed default. "
+            "Python is an explicit legacy/oracle mode and is forbidden for fresh "
+            "or current v5 runs"
         ),
     )
     parser.add_argument(
@@ -8488,7 +12725,10 @@ def main() -> None:
     parser.add_argument(
         "--evolvable-module-authority-config",
         type=Path,
-        help="fresh closed temporal_qd_evolvable_module_authority_v1 JSON; requires v5 archive and Python pair oracle",
+        help=(
+            "fresh closed temporal_qd_evolvable_module_authority_v1 JSON; requires "
+            "the Rust-native v5 proposal transaction and Rust generation finalization"
+        ),
     )
     parser.add_argument(
         "--pair-generation-engine",

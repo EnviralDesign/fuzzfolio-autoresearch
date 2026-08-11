@@ -99,10 +99,42 @@ def test_codec_dispatch_round_trip_and_id_independent_topology_signature() -> No
     assert original.semantic_topology_signature() == renamed.semantic_topology_signature()
     restored = decode_program(program_kind=PROGRAM_KIND, codec=GENOME_CODEC, payload=original.canonical())
     assert restored.canonical() == original.canonical()
+    assert restored.semantic_topology_signature() == original.semantic_topology_signature()
     result = compile_program(program_kind=PROGRAM_KIND, codec=GENOME_CODEC, payload=original.canonical(), candidate_id="dispatch")
     assert result["genomeSha256"] == original.identity_sha256
     with pytest.raises(EvolvableGenomeError, match="no codec"):
         decode_program(program_kind="old_typed_fragment", codec=GENOME_CODEC, payload=original.canonical())
+
+
+def test_topology_signature_is_independent_of_resource_use_order() -> None:
+    original = _genome()
+    setup_index = next(
+        index for index, node in enumerate(original.nodes) if node.node_id == "setup"
+    )
+    setup = original.nodes[setup_index]
+    reordered_setup = GenomeNodeV1(
+        setup.node_id,
+        setup.zone,
+        setup.kind,
+        setup.guard,
+        tuple(reversed(setup.resources)),
+        setup.timeout_bars,
+    )
+    reordered_nodes = list(original.nodes)
+    reordered_nodes[setup_index] = reordered_setup
+    reordered = EvolvableModuleGenomeV1(
+        original.direction,
+        original.resources,
+        tuple(reordered_nodes),
+        original.edges,
+        original.budget,
+        original.program_kind,
+        original.codec,
+        original.instrument,
+    )
+
+    assert reordered.canonical() == original.canonical()
+    assert reordered.semantic_topology_signature() == original.semantic_topology_signature()
 
 
 @pytest.mark.parametrize(

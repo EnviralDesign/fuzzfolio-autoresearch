@@ -43,16 +43,13 @@ def main() -> None:
 
     load = lambda path: json.loads(Path(path).read_text(encoding="utf-8"))
     config = load(run_root / "config.json")
-    state = load(run_root / "state.json")
     cohort = load(generation / "evidence" / "cohort.json")
     provisional = load(generation / "evidence" / "provisional.json")
     cumulative = load(generation / "evidence" / "cumulative-archive.json")
     archive = load(generation / "archive.json")
-    checkpoint = load(generation / "evidence" / "checkpoint.json")
     ledger = load(generation / "evidence" / "generation-ledger.json")
     funnel = load(generation / "generation-funnel.json")
     previous = load(config["initialArchive"]["path"])
-    generation_record = state["completedGenerations"][0]
 
     rich_members = [member for cell in archive["cells"] for member in cell["members"]]
     previous_summary = self_hash(
@@ -80,18 +77,6 @@ def main() -> None:
         },
         "policyBindingSha256",
     )
-    record_base = {
-        key: value
-        for key, value in generation_record.items()
-        if key
-        not in {
-            "archiveSha256",
-            "resultSetSha256",
-            "rotatingEvidenceLedgerSha256",
-            "rotatingEvidenceCheckpointSha256",
-            "cumulativeArchiveSha256",
-        }
-    }
     funnel_source = self_hash(
         {
             "schemaVersion": "temporal_qd_native_funnel_reduction_source_v1",
@@ -102,46 +87,120 @@ def main() -> None:
         },
         "funnelSourceSha256",
     )
+    provisional_ids = {
+        row["candidateId"] for row in provisional["candidates"]
+    }
+    required_panels = []
+    for index in range(1, 2):
+        panel = config["rotatingEvidence"]["panels"][
+            (index - 1)
+            % config["rotatingEvidence"]["absoluteGenerationMapping"]["cycleLength"]
+        ]["panelId"]
+        if panel not in required_panels:
+            required_panels.append(panel)
+    selected = self_hash(
+        {
+            "schemaVersion": "temporal_qd_selected_rich_members_v1",
+            "generationIndex": 1,
+            "cohortSha256": cohort["cohortSha256"],
+            "provisionalSha256": provisional["provisionalSha256"],
+            "members": rich_members,
+            "memberCount": len(rich_members),
+        },
+        "selectedRichMembersSha256",
+    )
+    coverage = self_hash(
+        {
+            "schemaVersion": "temporal_qd_v5_panel_coverage_v1",
+            "generationIndex": 1,
+            "rotatingEvidenceSha256": config["rotatingEvidence"]["rotatingEvidenceSha256"],
+            "cohortSha256": cohort["cohortSha256"],
+            "provisionalSha256": provisional["provisionalSha256"],
+            "requiredPanelIds": required_panels,
+            "candidatePanelBundleSha256": canonical_sha256(
+                cumulative["candidatePanelBundles"]
+            ),
+            "coverage": {
+                candidate_id: {
+                    "panelIds": required_panels,
+                }
+                for candidate_id in sorted(provisional_ids)
+            },
+        },
+        "panelCoverageSha256",
+    )
+    admitted_campaigns = self_hash(
+        {
+            "schemaVersion": "temporal_qd_v5_admitted_campaign_ledger_v1",
+            "generationIndex": 1,
+            "rotatingEvidenceSha256": config["rotatingEvidence"]["rotatingEvidenceSha256"],
+            "cohortSha256": cohort["cohortSha256"],
+            "provisionalSha256": provisional["provisionalSha256"],
+            "campaigns": ledger["campaigns"],
+        },
+        "admittedCampaignLedgerSha256",
+    )
+    state_basis = self_hash(
+        {
+            "schemaVersion": "temporal_qd_v5_generation_state_basis_v1",
+            "configSha256": canonical_sha256(config),
+            "generationIndex": 1,
+            "completedGenerationsSha256": canonical_sha256([]),
+            "uniqueCandidatesEvaluated": 0,
+            "workerTasksCompleted": 0,
+            "nextImmigrantContinuationOrdinal": 0,
+            "uniqueIdentityCounts": {},
+            "duplicateCounters": {},
+            "proposalSlotCounters": {},
+        },
+        "stateBasisSha256",
+    )
+    semantic_authority = canonical_sha256(
+        {"fixture": "g1-python-oracle-v2", "generationIndex": 1}
+    )
+    runtime_authority = canonical_sha256(
+        {"fixture": "g1-runtime-authority-v2"}
+    )
     source = {
-        "schemaVersion": "temporal_qd_generation_finalization_source_v1",
+        "schemaVersion": "temporal_qd_generation_finalization_source_v2",
         "contractVersion": CONTRACT_VERSION,
         "generationIndex": 1,
+        "semanticAuthoritySha256": semantic_authority,
+        "runtimeAuthoritySha256": runtime_authority,
+        "stateBasis": state_basis,
+        "completedGenerationRecords": [],
+        "proposalStateAuthority": {
+            "generationKind": "g0",
+            "proposalManifestSha256": canonical_sha256({"fixture": "proposal-manifest"}),
+            "proposalReceiptSha256": canonical_sha256({"fixture": "proposal-receipt"}),
+            "generationJournalSha256": canonical_sha256({"fixture": "generation-journal"}),
+            "inputIdentityLedgerSha256": None,
+            "outputIdentityLedgerRelativePath": "proposal/v5-native/identity-ledger.json",
+            "outputIdentityLedgerSha256": canonical_sha256({"fixture": "identity-ledger"}),
+            "outputIdentityLedgerFileSha256": canonical_sha256({"fixture": "identity-ledger-file"}),
+        },
         "rotatingEvidence": config["rotatingEvidence"],
         "cohort": cohort,
         "provisional": provisional,
+        "panelCoverage": coverage,
+        "selectedRichMembers": selected,
         "baselineCandidatePanelBundles": cumulative["candidatePanelBundles"],
-        "completeBundleSnapshot": True,
-        "auxiliaryPlan": None,
-        "auxiliaryCampaignReceipts": [],
         "previousCumulativeArchive": None,
         "previousParentArchiveSummary": previous_summary,
         "archivePolicy": archive_policy,
-        "richMembers": rich_members,
-        "currentMemberCount": archive["candidateCountReducedThisGeneration"],
-        "cellCapacity": archive["cellCapacity"],
-        "campaigns": ledger["campaigns"],
-        "stageArtifacts": checkpoint["stageArtifacts"],
-        "artifactLedger": generation_record["artifacts"],
+        "admittedCampaignLedger": admitted_campaigns,
         "funnelReductionSource": funnel_source,
-        "generationRecordBase": record_base,
-        "stateTransitionBase": {
-            "nextGenerationIndex": 2,
-            "nextStage": "generation_proposal",
-            "candidateCountIncrement": generation_record["candidateCount"],
-            "workerTaskCountIncrement": generation_record["totalGenerationTaskCount"],
-            "nextImmigrantContinuationOrdinal": generation_record[
-                "nextImmigrantContinuationOrdinal"
-            ],
-        },
     }
     self_hash(source, "sourceSha256")
     source_path = output / "source.json"
     write_canonical(source_path, source)
     manifest = self_hash(
         {
-            "schemaVersion": "temporal_qd_generation_finalization_manifest_v1",
+            "schemaVersion": "temporal_qd_generation_finalization_manifest_v2",
             "contractVersion": CONTRACT_VERSION,
             "operation": "finalize_rotating_generation",
+            "runtimeAuthoritySha256": runtime_authority,
+            "semanticAuthoritySha256": semantic_authority,
             "sourcePath": str(source_path),
             "sourceSha256": source["sourceSha256"],
             "resultPath": "generation-commit.json",

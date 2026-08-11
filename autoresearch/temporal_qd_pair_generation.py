@@ -4374,7 +4374,7 @@ def _generate_pair_population_optimized_impl(
         }
 
 
-def generate_pair_population(
+def _generate_pair_population_impl(
     *,
     output_root: Path | str,
     generation_index: int,
@@ -4490,4 +4490,163 @@ def generate_pair_population(
         trace.close(outcome=outcome, error_type=error_type)
 
 
-__all__ = ["DEFAULT_POPULATION_FINALIZER", "PAIR_GENERATION_IMPLEMENTATION_LEGACY", "PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED", "PAIR_GENERATION_SCHEMA", "PAIR_PROPOSAL_SCHEMA", "POPULATION_FINALIZER_PYTHON", "POPULATION_FINALIZER_RUST", "PairModuleOperator", "TypedGrammarPairOperator", "TypedPairFactory", "generate_pair_population", "materialize_pair_candidate", "propose_pair", "propose_same_side_crossover", "replay_pair_proposal"]
+def _is_directional_v5_policy_binding(value: object) -> bool:
+    """Recognize v5 policy material without opening a live pair authority."""
+
+    if not isinstance(value, Mapping):
+        return False
+    # Import lazily: temporal_qd_evolution itself imports this module only when
+    # it reaches the legacy Python construction branch.
+    from .temporal_qd_evolution import (
+        DIRECTIONAL_QD_POLICY_NAME,
+        DIRECTIONAL_QD_POLICY_SHA256,
+    )
+
+    frozen = value.get("frozenPolicy")
+    return (
+        value.get("policyName") == DIRECTIONAL_QD_POLICY_NAME
+        or value.get("policySha256") == DIRECTIONAL_QD_POLICY_SHA256
+        or (
+            isinstance(frozen, Mapping)
+            and (
+                frozen.get("policyName") == DIRECTIONAL_QD_POLICY_NAME
+                or "directionSelection" in frozen
+            )
+        )
+    )
+
+
+def _requires_v5_python_oracle(
+    *,
+    run_config: Mapping[str, Any],
+    parent_archive: Mapping[str, Any] | None,
+    archive_policy_authority: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether these inputs carry a directional/v5 archive authority."""
+
+    bindings: list[object] = [archive_policy_authority, parent_archive]
+    if isinstance(run_config, Mapping):
+        bindings.extend(
+            (
+                run_config.get("archivePolicyAuthority"),
+                run_config.get("evolvableModuleAuthority"),
+            )
+        )
+    for binding in bindings:
+        if _is_directional_v5_policy_binding(binding):
+            return True
+        if isinstance(binding, Mapping) and _is_directional_v5_policy_binding(
+            binding.get("archivePolicyAuthority")
+        ):
+            return True
+    return False
+
+
+def _reject_directional_v5_python_construction(
+    *,
+    run_config: Mapping[str, Any],
+    parent_archive: Mapping[str, Any] | None,
+    archive_policy_authority: Mapping[str, Any] | None,
+) -> None:
+    if _requires_v5_python_oracle(
+        run_config=run_config,
+        parent_archive=parent_archive,
+        archive_policy_authority=archive_policy_authority,
+    ):
+        raise TemporalDiscoveryContractError(
+            "directional/v5 pair construction is unavailable through "
+            "generate_pair_population; use the Rust-native v5 proposal "
+            "transaction (or the explicitly named Python oracle helper)"
+        )
+
+
+def generate_pair_population(
+    *,
+    output_root: Path | str,
+    generation_index: int,
+    target_unique_candidates: int,
+    run_config: Mapping[str, Any],
+    pair_policy: Mapping[str, Any],
+    parent_pairs: Sequence[FrozenPair] = (),
+    parent_archive: Mapping[str, Any] | None = None,
+    pair_factory: TypedPairFactory | None = None,
+    module_authority: PairModuleOperator,
+    native_validator: NativeModuleValidator,
+    pair_compiler: CanonicalPairCompiler,
+    evidence_identity_context: Mapping[str, Any] | None = None,
+    operator_implementation_identity: Mapping[str, Any] | None = None,
+    identity_ledger_path: Path | str | None = None,
+    max_proposal_attempts: int = DEFAULT_MAX_PROPOSAL_ATTEMPTS,
+    max_new_proposals: int | None = None,
+    implementation: str = PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED,
+    population_finalizer: str = DEFAULT_POPULATION_FINALIZER,
+    g0_evaluation_width: int | None = None,
+    g0_finalization_runtime: Mapping[str, Any] | None = None,
+    archive_policy_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Generate only legacy/v4 pair populations through the public API.
+
+    Fresh directional v5 construction has one production route: the
+    receipt-authenticated Rust transaction.  Keeping this public compatibility
+    API v4-only prevents a caller from accidentally reopening the retired
+    Python factory/compiler loop.
+    """
+
+    _reject_directional_v5_python_construction(
+        run_config=run_config,
+        parent_archive=parent_archive,
+        archive_policy_authority=archive_policy_authority,
+    )
+    return _generate_pair_population_impl(
+        output_root=output_root,
+        generation_index=generation_index,
+        target_unique_candidates=target_unique_candidates,
+        run_config=run_config,
+        pair_policy=pair_policy,
+        parent_pairs=parent_pairs,
+        parent_archive=parent_archive,
+        pair_factory=pair_factory,
+        module_authority=module_authority,
+        native_validator=native_validator,
+        pair_compiler=pair_compiler,
+        evidence_identity_context=evidence_identity_context,
+        operator_implementation_identity=operator_implementation_identity,
+        identity_ledger_path=identity_ledger_path,
+        max_proposal_attempts=max_proposal_attempts,
+        max_new_proposals=max_new_proposals,
+        implementation=implementation,
+        population_finalizer=population_finalizer,
+        g0_evaluation_width=g0_evaluation_width,
+        g0_finalization_runtime=g0_finalization_runtime,
+        archive_policy_authority=archive_policy_authority,
+    )
+
+
+def generate_v5_pair_population_python_oracle(**kwargs: Any) -> dict[str, Any]:
+    """Run the retired v5 Python loop only for explicit oracle/test evidence."""
+
+    if "_v5_python_oracle_token" in kwargs:
+        raise TemporalDiscoveryContractError(
+            "v5 Python oracle routing is controlled by the explicit helper"
+        )
+    run_config = kwargs.get("run_config")
+    parent_archive = kwargs.get("parent_archive")
+    archive_policy_authority = kwargs.get("archive_policy_authority")
+    if not isinstance(run_config, Mapping) or not _requires_v5_python_oracle(
+        run_config=run_config,
+        parent_archive=(
+            parent_archive if isinstance(parent_archive, Mapping) else None
+        ),
+        archive_policy_authority=(
+            archive_policy_authority
+            if isinstance(archive_policy_authority, Mapping)
+            else None
+        ),
+    ):
+        raise TemporalDiscoveryContractError(
+            "v5 Python oracle requires an exact directional/v5 archive authority"
+        )
+    return _generate_pair_population_impl(**kwargs)
+
+
+__all__ = ["DEFAULT_POPULATION_FINALIZER", "PAIR_GENERATION_IMPLEMENTATION_LEGACY", "PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED", "PAIR_GENERATION_SCHEMA", "PAIR_PROPOSAL_SCHEMA", "POPULATION_FINALIZER_PYTHON", "POPULATION_FINALIZER_RUST", "PairModuleOperator", "TypedGrammarPairOperator", "TypedPairFactory", "generate_pair_population", "generate_v5_pair_population_python_oracle", "materialize_pair_candidate", "propose_pair", "propose_same_side_crossover", "replay_pair_proposal"]

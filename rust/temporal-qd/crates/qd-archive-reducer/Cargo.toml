@@ -1,0 +1,17 @@
+[package]
+name = "temporal-qd-archive-reducer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-tail-reducer = { path = "../qd-tail-reducer" }
+
+[dev-dependencies]
+tempfile = "3"

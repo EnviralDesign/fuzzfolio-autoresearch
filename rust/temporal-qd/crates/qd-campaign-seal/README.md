@@ -20,12 +20,27 @@ A fresh invocation performs these stages:
 3. Durably publish `tail-result-index-v3.json`,
    `raw-result-inventory.jsonl`, and finally `campaign-seal-result.json`.
 4. Invoke the native tail reducer using only the compact index and evaluation
-   population, then commit `generation-tail-transaction-result.json` last.
+   population, commit `generation-tail-transaction-result.json`, then publish
+   the fixed self-hashed `campaign-seal-execution-receipt.json` last.
 
-The campaign seal is the recovery boundary. After it exists, restart never
-opens or stats a raw result path. It revalidates the source identity and compact
-artifacts, then resumes or reopens the tail transaction. A separate future
-audit operation should be responsible for deliberate full raw re-verification.
+## V5 directional-tail authority
+
+An evolvable v5 Rust-finalized generation adds a self-hashed
+`directionalTailAuthority` to the manifest. It is bound to the runtime
+authority and generation and selects `temporal_qd_tail_result_index_v4`.
+During the one permitted raw read, the seal derives the exact conservative
+`realizedBehavior` projection and records a `rawRotatingProvenance` binding
+for every admitted entry. Restarts and the tail reducer consume only the v4
+compact index; a v3 index is never treated as direction-safe.
+
+For runtime-authority manifests, the v2 execution receipt is the recovery
+boundary. It binds the manifest/runtime/source chain and fixed descriptors for
+the campaign seal, v4 index, generation transaction, and tail-authority
+receipt. Restart revalidates those durable siblings without reopening the
+retired source, task manifest, evaluation population, or raw results. Stdout
+contains only the receipt reference and runtime metrics; candidate-bearing
+transaction arrays remain on disk. Historical committed manifests without a
+runtime authority retain the v1 execution response.
 
 Runtime-only timing and byte counters are returned on stdout and excluded from
 all durable identities. Set `TEMPORAL_QD_SEAL_REPORT_PEAK=1` to report the

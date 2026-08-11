@@ -108,7 +108,7 @@ def test_fresh_v5_pair_generation_requires_and_forwards_the_exact_authority(
     monkeypatch.setattr(qd, "_bidirectional_pair_policy", lambda _: policy)
     monkeypatch.setattr(
         pair_generation,
-        "generate_pair_population",
+        "generate_v5_pair_population_python_oracle",
         lambda **kwargs: seen.update(kwargs) or {"completed": True},
     )
     common = {
@@ -125,7 +125,9 @@ def test_fresh_v5_pair_generation_requires_and_forwards_the_exact_authority(
     }
     with pytest.raises(TemporalDiscoveryContractError, match="requires its exact archive policy authority"):
         qd.generate_qd_generation(**common)
-    assert qd.generate_qd_generation(
+    with pytest.raises(TemporalDiscoveryContractError, match="native v5 proposal transaction"):
+        qd.generate_qd_generation(**common, archive_policy_authority=authority)
+    assert qd.generate_v5_qd_generation_python_oracle(
         **common, archive_policy_authority=authority
     ) == {"completed": True}
     assert seen["archive_policy_authority"] == authority

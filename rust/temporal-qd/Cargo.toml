@@ -6,8 +6,12 @@ members = [
     "crates/qd-runtime",
     "crates/qd-batch",
     "crates/qd-tail-reducer",
+    "crates/qd-archive-reducer",
     "crates/qd-campaign-seal",
     "crates/qd-generation-finalizer",
+    "crates/qd-rotating-prefinalizer",
+    "crates/qd-campaign-freeze",
+    "crates/qd-gateway-dispatch",
 ]
 resolver = "3"
 
