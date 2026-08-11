@@ -354,6 +354,24 @@ def test_native_prelaunch_resource_guard_binds_memory_and_output_volume(
         "targetUniqueCandidates": 4000,
     }
 
+    monkeypatch.setenv(
+        native.NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV,
+        str(12 * 1024**3),
+    )
+    monkeypatch.setattr(
+        native.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=8 * 1024**3),
+    )
+    with pytest.raises(
+        native.TemporalQDNativeError,
+        match=r"minimumHostAvailableBytes=12884901888",
+    ):
+        native._assert_native_prelaunch_resources(
+            output_root=tmp_path,
+            target_unique_candidates=1,
+        )
+
     monkeypatch.setattr(
         native.psutil,
         "virtual_memory",
@@ -386,6 +404,40 @@ def test_native_prelaunch_resource_guard_binds_memory_and_output_volume(
             output_root=tmp_path,
             target_unique_candidates=4000,
         )
+
+
+def test_native_resource_guard_environment_is_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for invalid in ("", "0", "+1", " 1", "1 ", "1.0", "١"):
+        monkeypatch.setenv(native.NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV, invalid)
+        with pytest.raises(
+            native.TemporalQDNativeError,
+            match="must be a positive base-10 byte count",
+        ):
+            native._native_minimum_host_available_bytes()
+
+
+def test_native_checked_command_kills_owned_tree_on_host_memory_breach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        native.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=512 * 1024**2),
+    )
+    started = time.monotonic()
+    with pytest.raises(
+        native.TemporalQDNativeError,
+        match="minimum_host_available_breached",
+    ):
+        native._run_checked(
+            (sys.executable, "-c", "import time; time.sleep(60)"),
+            cwd=tmp_path,
+            timeout=60,
+            minimum_host_available_bytes=1024**3,
+        )
+    assert time.monotonic() - started < 10
 
 
 def test_native_command_timeout_is_fail_closed(tmp_path: Path) -> None:

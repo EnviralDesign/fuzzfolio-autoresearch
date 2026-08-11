@@ -82,15 +82,37 @@ PAIR_GENERATION_SCHEMA = "temporal_qd_pair_generation_v2"
 PAIR_GENERATION_RESULT_SCHEMA = "temporal_qd_pair_generation_result_v1"
 PAIR_GENERATION_PROGRESS_SCHEMA = "temporal_qd_front_generation_progress_v1"
 NATIVE_BINARY_ENV = "FUZZFOLIO_TEMPORAL_QD_NATIVE_BINARY"
+NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV = (
+    "FUZZFOLIO_TEMPORAL_QD_MINIMUM_HOST_AVAILABLE_BYTES"
+)
 NATIVE_BINARY_NAME = "temporal-qd-batch"
 _SHARING_RETRY_DELAYS_SECONDS = (0.005, 0.01, 0.02, 0.04, 0.08)
 _NATIVE_CAPTURE_LIMIT_BYTES = 1024 * 1024
+_NATIVE_RESOURCE_GUARD_POLL_SECONDS = 0.5
 _NATIVE_OUTPUT_BASE_HEADROOM_BYTES = 4 * 1024**3
 _NATIVE_OUTPUT_BYTES_PER_TARGET_CANDIDATE = 8 * 1024**2
 
 
 class TemporalQDNativeError(RuntimeError):
     """The exact native foundation could not be resolved or verified."""
+
+
+def _native_minimum_host_available_bytes() -> int:
+    raw = os.environ.get(NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV)
+    if raw is None:
+        return DEFAULT_MINIMUM_HOST_AVAILABLE_BYTES
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise TemporalQDNativeError(
+            f"{NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV} must be a positive "
+            "base-10 byte count"
+        )
+    value = int(raw)
+    if value < 1:
+        raise TemporalQDNativeError(
+            f"{NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV} must be a positive "
+            "base-10 byte count"
+        )
+    return value
 
 
 def _assert_native_prelaunch_resources(
@@ -106,6 +128,7 @@ def _assert_native_prelaunch_resources(
         raise TemporalQDNativeError(
             "native Temporal QD prelaunch target width is invalid"
         )
+    minimum_host_available_bytes = _native_minimum_host_available_bytes()
     host_available_bytes = int(psutil.virtual_memory().available)
     output_free_bytes = int(shutil.disk_usage(output_root).free)
     required_output_free_bytes = (
@@ -113,7 +136,7 @@ def _assert_native_prelaunch_resources(
         + target_unique_candidates * _NATIVE_OUTPUT_BYTES_PER_TARGET_CANDIDATE
     )
     reasons: list[str] = []
-    if host_available_bytes < DEFAULT_MINIMUM_HOST_AVAILABLE_BYTES:
+    if host_available_bytes < minimum_host_available_bytes:
         reasons.append("minimum_host_available_breached")
     if output_free_bytes < required_output_free_bytes:
         reasons.append("minimum_output_volume_free_space_breached")
@@ -122,14 +145,14 @@ def _assert_native_prelaunch_resources(
             "native Temporal QD prelaunch resource guard stopped the run: "
             f"{','.join(reasons)}; "
             f"hostAvailableBytes={host_available_bytes}; "
-            f"minimumHostAvailableBytes={DEFAULT_MINIMUM_HOST_AVAILABLE_BYTES}; "
+            f"minimumHostAvailableBytes={minimum_host_available_bytes}; "
             f"outputFreeBytes={output_free_bytes}; "
             f"requiredOutputFreeBytes={required_output_free_bytes}; "
             f"targetUniqueCandidates={target_unique_candidates}"
         )
     return {
         "hostAvailableBytes": host_available_bytes,
-        "minimumHostAvailableBytes": DEFAULT_MINIMUM_HOST_AVAILABLE_BYTES,
+        "minimumHostAvailableBytes": minimum_host_available_bytes,
         "outputFreeBytes": output_free_bytes,
         "requiredOutputFreeBytes": required_output_free_bytes,
         "targetUniqueCandidates": target_unique_candidates,
@@ -566,6 +589,7 @@ def _run_checked(
     on_process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
     stdout_limit_bytes: int = _NATIVE_CAPTURE_LIMIT_BYTES,
     stderr_limit_bytes: int = _NATIVE_CAPTURE_LIMIT_BYTES,
+    minimum_host_available_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one native command with complete child-tree ownership.
 
@@ -583,6 +607,16 @@ def _run_checked(
         or stderr_limit_bytes < 1
     ):
         raise TemporalQDNativeError("native command capture limits must be positive integers")
+    if minimum_host_available_bytes is None:
+        minimum_host_available_bytes = _native_minimum_host_available_bytes()
+    if (
+        isinstance(minimum_host_available_bytes, bool)
+        or not isinstance(minimum_host_available_bytes, int)
+        or minimum_host_available_bytes < 1
+    ):
+        raise TemporalQDNativeError(
+            "native command minimum host-available byte threshold must be a positive integer"
+        )
     command_strings = [str(part) for part in command]
     popen_options: dict[str, Any] = {
         "cwd": cwd,
@@ -643,15 +677,36 @@ def _run_checked(
                     "could not resume native Temporal QD command after Windows job assignment"
                 ) from exc
         try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            _terminate_process_group(process)
-            if job is not None:
-                job.close()
-            process.wait()
-            raise TemporalQDNativeError(
-                f"native Temporal QD command exceeded its frozen {timeout:g}s timeout"
-            ) from exc
+            deadline = time.monotonic() + timeout
+            while True:
+                host_available_bytes = int(psutil.virtual_memory().available)
+                if host_available_bytes < minimum_host_available_bytes:
+                    _terminate_process_group(process)
+                    if job is not None:
+                        job.close()
+                    process.wait()
+                    raise TemporalQDNativeError(
+                        "native Temporal QD host resource guard stopped the run: "
+                        "minimum_host_available_breached; "
+                        f"hostAvailableBytes={host_available_bytes}; "
+                        f"minimumHostAvailableBytes={minimum_host_available_bytes}"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_process_group(process)
+                    if job is not None:
+                        job.close()
+                    process.wait()
+                    raise TemporalQDNativeError(
+                        f"native Temporal QD command exceeded its frozen {timeout:g}s timeout"
+                    )
+                try:
+                    returncode = process.wait(
+                        timeout=min(_NATIVE_RESOURCE_GUARD_POLL_SECONDS, remaining)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         finally:
             # The main process can exit while a retained descendant still has
             # either output pipe open. Close/kill the owned tree before joining
@@ -3377,6 +3432,7 @@ __all__ = [
     "NATIVE_BINARY_ENV",
     "NATIVE_CONTRACT_VERSION",
     "NATIVE_MANIFEST_SCHEMA",
+    "NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV",
     "NATIVE_RESULT_SCHEMA",
     "G0_FINALIZATION_RUNTIME_DEFAULT",
     "G0_FINALIZATION_RUNTIME_PYTHON_ORACLE",
