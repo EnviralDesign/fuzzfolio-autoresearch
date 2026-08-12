@@ -12,13 +12,13 @@ use temporal_qd_runtime::{DashboardPort, RuntimeManifest, RuntimePairAuthority};
 
 const FIXTURE_ROOT: &str = "../../../../tests/fixtures/temporal_qd_runtime_oracle";
 const ORACLE_FIXTURE_FILE_SHA256: &str =
-    "27f28515b8c1db55125eb5b10c7bd357c5cb56d43025745925d2ae780aff11a8";
+    "bdb4f81ff90dc2ca24f89518eda94f9a332b39775bc27d62dc8bf2b10a0cea6f";
 const ORACLE_MANIFEST_FILE_SHA256: &str =
     "57af8529b5024340e691c25a7538c80375d4814250a110165c62d4861bbe6c99";
 const ORACLE_TRANSCRIPT_FILE_SHA256: &str =
     "d9ccc1df5e1314b715167c30e35d065ebdca44451ee61305859d4a29d64f3124";
 const ORACLE_GENERATOR_SOURCE_SHA256: &str =
-    "sha256:9154451f361c9440d2f11a81db36fddf81f24e65259876a7234ae2f00dcbab1b";
+    "sha256:a7d4a742821a17641e79bb153f296d56fc53de6cf4e0bbafcf179fe289b9bc58";
 
 fn fixture_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT)

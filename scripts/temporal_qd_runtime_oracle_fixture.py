@@ -181,6 +181,7 @@ def _materialized_crossover_witness(
             parent=parent,
             mate=mate,
             module_authority=runtime.operator,
+            native_validator=runtime.validator,
             pair_compiler=runtime.compiler,
             parent_selection=None,
             mate_selection=None,
@@ -274,7 +275,7 @@ def materialize_runtime_oracle_fixture(output_root: Path | str, *, dashboard_roo
                 immigrant,
                 long=replace(immigrant.long, native_authority=foreign_authority),
             )
-            rejected_pair, rejected = _propose_crossover(proposal_seed=rejection_seed, parent=immigrant, mate=foreign_mate, module_authority=runtime.operator, pair_compiler=runtime.compiler, parent_selection=None, mate_selection=None, mate_selection_attempts=[])
+            rejected_pair, rejected = _propose_crossover(proposal_seed=rejection_seed, parent=immigrant, mate=foreign_mate, module_authority=runtime.operator, native_validator=runtime.validator, pair_compiler=runtime.compiler, parent_selection=None, mate_selection=None, mate_selection_attempts=[])
             if rejected_pair is not None or rejected.get("disposition") != "operation_rejected":
                 raise AssertionError("foreign-authority crossover must be the rejection witness")
             cases["sameSideCrossoverRejected"] = (rejected_pair, rejected)
