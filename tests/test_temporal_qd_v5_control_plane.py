@@ -396,6 +396,10 @@ def test_gateway_dispatch_requires_a_pinned_binary_and_receipt(
     )
     assert result["receipt"]["completedTaskCount"] == 1
     assert calls and calls[0][0] == runtime["binaries"]["gatewayDispatch"]["path"]
+    result_batch_flag = calls[0].index("--result-batch-size")
+    enqueue_batch_flag = calls[0].index("--enqueue-batch-size")
+    assert calls[0][result_batch_flag + 1] == "1"
+    assert calls[0][enqueue_batch_flag + 1] == "128"
 
     tampered = dict(runtime)
     tampered["binaries"] = dict(runtime["binaries"])
@@ -1218,6 +1222,7 @@ def _legacy_prefinalizer_v1_fixture_is_retained_for_oracle_reference(
         calls.append(command)
         assert command[0] == runtime["binaries"]["rotatingPrefinalizer"]["path"]
         assert len(command) == 2
+        assert kwargs["timeout_seconds"] == 3_600
         manifest_path = Path(command[1])
         manifest = control._read_canonical_object(
             manifest_path, name="fixture invoked prefinalizer manifest"

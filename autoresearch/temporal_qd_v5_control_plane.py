@@ -3006,9 +3006,16 @@ def run_native_v5_rotating_prefinalizer(
     *,
     runtime_authority: Mapping[str, Any],
     manifest_path: Path | str,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 3_600,
 ) -> dict[str, Any]:
-    """Execute a v2 prefinalizer transaction through its compact receipt."""
+    """Execute a v2 prefinalizer transaction through its compact receipt.
+
+    A full 1,024-member generation authenticates and reduces tens of
+    megabytes of sealed member and bundle material.  Production G0 evidence
+    shows that this bounded Rust pass can legitimately take roughly half an
+    hour on the controller host, so the historical five-minute helper default
+    is not an admissible generation-scale timeout.
+    """
 
     authority = _validate_runtime_authority(runtime_authority)
     path = _real_path(manifest_path, name="native v5 prefinalizer manifest")
@@ -4424,7 +4431,7 @@ def run_native_gateway_dispatch(
     request_timeout_seconds: int = 30,
     poll_interval_millis: int = 250,
     enqueue_batch_size: int = 128,
-    result_batch_size: int = 128,
+    result_batch_size: int = 1,
     max_request_bytes: int = 64 * 1024 * 1024,
     max_response_bytes: int = 64 * 1024 * 1024,
 ) -> dict[str, Any]:
@@ -4433,7 +4440,9 @@ def run_native_gateway_dispatch(
     The receipt deliberately summarizes the result-inventory sidecar.  Python
     must not reopen that sidecar, the task manifest, checkpoint, or completion
     journal: the pinned dispatcher validates their bytes before it publishes
-    the bounded receipt.
+    the bounded receipt.  Candidate-window result payloads can individually
+    approach the gateway response cap, so the production default drains one
+    durable result per response while retaining batched task enqueue.
     """
 
     authority = _validate_runtime_authority(runtime_authority)

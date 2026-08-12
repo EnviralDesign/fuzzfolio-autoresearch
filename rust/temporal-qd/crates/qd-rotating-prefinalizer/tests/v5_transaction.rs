@@ -856,6 +856,104 @@ fn write_manifest(root: &TempDir, name: &str, v: &Value) -> PathBuf {
     fs::write(&p, canonical_json_line(v).unwrap()).unwrap();
     p
 }
+
+#[test]
+fn v5_finalizer_source_excludes_authenticated_non_survivor_bundles() {
+    let root = TempDir::new().unwrap();
+    let ids = ["a", "b", "c", "d", "e"];
+    let proposal = receipt(
+        root.path(),
+        "proposal_current_panel",
+        "p2",
+        ids.iter()
+            .map(|id| json!({"candidate":candidate(id)}))
+            .collect(),
+        bundles(&ids, "p2"),
+    );
+    let mut parent = json!({"schemaVersion":"temporal_qd_archive_v3","candidateCountSeen":0,"memberCount":0,"cells":[]});
+    add(&mut parent, "archiveSha256");
+    let base_manifest = base(root.path(), &proposal, &parent);
+
+    let round0 = root.path().join("survivor-round-0");
+    fs::create_dir(&round0).unwrap();
+    fs::write(
+        round0.join("manifest.json"),
+        canonical_json_line(&base_manifest).unwrap(),
+    )
+    .unwrap();
+    let first = execute_manifest(&round0.join("manifest.json")).unwrap()["result"].clone();
+    assert_eq!(first["status"], "awaiting_prior_panel_backfill");
+    let selected = first["provisional"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["candidateId"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 4);
+    let selected_refs = selected.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let task = &first["taskPlan"]["tasks"][0];
+    let mut backfill = receipt(
+        root.path(),
+        "prior_panel_backfill",
+        "p1",
+        selected
+            .iter()
+            .map(|id| json!({"candidate":candidate(id)}))
+            .collect(),
+        bundles(&selected_refs, "p1"),
+    );
+    bind_receipt_to_task(&mut backfill, &round0, task);
+
+    let round1 = root.path().join("survivor-round-1");
+    fs::create_dir(&round1).unwrap();
+    for relative in [
+        task["selectionDocumentRelativePath"].as_str().unwrap(),
+        task["selectionReceiptRelativePath"].as_str().unwrap(),
+        task["cohortSelection"]["candidateRows"]["path"]
+            .as_str()
+            .unwrap(),
+    ] {
+        let source = round0.join(relative);
+        let destination = round1.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(source, destination).unwrap();
+    }
+    let resumed = resume(&round1, &base_manifest, &first, &[backfill]);
+    fs::write(
+        round1.join("manifest.json"),
+        canonical_json_line(&resumed).unwrap(),
+    )
+    .unwrap();
+    let ready = execute_manifest(&round1.join("manifest.json")).unwrap()["result"].clone();
+    assert_eq!(ready["status"], "ready_for_finalizer");
+
+    let source: Value = serde_json::from_slice(
+        &fs::read(
+            root.path()
+                .join("immutable-generation-finalizer/source.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let final_bundles = source["baselineCandidatePanelBundles"].as_array().unwrap();
+    assert_eq!(final_bundles.len(), selected.len() * 2);
+    assert!(final_bundles.iter().all(|bundle| {
+        selected
+            .iter()
+            .any(|id| bundle["candidateId"].as_str() == Some(id.as_str()))
+    }));
+    let excluded = ids
+        .iter()
+        .find(|id| !selected.iter().any(|selected_id| selected_id == **id))
+        .unwrap();
+    assert!(
+        final_bundles
+            .iter()
+            .all(|bundle| bundle["candidateId"].as_str() != Some(excluded))
+    );
+}
+
 #[test]
 fn v5_rejects_conflicting_current_bundle_over_retained_cumulative_bundle() {
     let root = TempDir::new().unwrap();

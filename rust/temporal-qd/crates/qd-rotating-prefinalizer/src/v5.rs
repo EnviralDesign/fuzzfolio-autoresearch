@@ -935,7 +935,18 @@ fn prepare(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    let bundles = all_bundles(base, &receipts, root)?;
+    let mut bundles = all_bundles(base, &receipts, root)?;
+    // Campaign receipts deliberately authenticate the complete evaluated
+    // cohort.  The finalizer boundary is narrower: candidate panel bundles
+    // are breeding evidence and may name only provisional survivors.  Keep
+    // validating the full receipt closure in `all_bundles`, then project that
+    // authenticated set to the exact survivor authority before coverage,
+    // backfill planning, or finalizer-source publication.
+    let selected_ids = selected
+        .iter()
+        .map(|candidate| text(candidate, "candidateId").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    bundles.retain(|(candidate_id, _), _| selected_ids.contains(candidate_id));
     let missing: Vec<String> = required
         .iter()
         .filter(|p| {
