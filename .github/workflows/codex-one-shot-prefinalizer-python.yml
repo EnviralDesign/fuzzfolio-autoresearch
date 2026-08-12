@@ -1,0 +1,38 @@
+name: Codex one-shot prefinalizer Python portability
+
+on:
+  push:
+    branches:
+      - codex/temporal-qd-simplification
+    paths:
+      - .codex/prefinalizer-python-portability.patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-one-shot-prefinalizer-python
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/temporal-qd-simplification
+          fetch-depth: 0
+
+      - name: Apply portability sweep and remove transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .codex/prefinalizer-python-portability.patch
+          git config user.name "Codex"
+          git config user.email "codex@openai.com"
+          git apply --check .codex/prefinalizer-python-portability.patch
+          git apply --index --whitespace=nowarn .codex/prefinalizer-python-portability.patch
+          git rm -f .codex/prefinalizer-python-portability.patch .github/workflows/codex-one-shot-prefinalizer-python.yml
+          git commit -m "Use project Python for remaining prefinalizer oracles"
+          git push origin HEAD:codex/temporal-qd-simplification
