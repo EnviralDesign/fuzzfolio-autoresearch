@@ -21,6 +21,9 @@ import tempfile
 from typing import Any, Protocol
 
 from .temporal_discovery_base import TemporalDiscoveryContractError, _clone
+from .temporal_bidirectional_genome import (
+    normalize_behaviorally_redundant_transitions,
+)
 from .temporal_search import canonical_sha256
 
 
@@ -875,6 +878,16 @@ class TypedFragmentGrammar:
         result = _clone(dict(authority.compile_pair(long_profile=long.profile, short_profile=short.profile, candidate_id=candidate_id)), name="pair authority result")
         profile, validation = result.get("profile"), result.get("validation")
         if not isinstance(profile, Mapping) or not isinstance(validation, Mapping) or validation.get("schemaVersion") != "temporal_search_candidate_validation_v1" or validation.get("candidateId") != candidate_id or validation.get("rawSourceProfileSha256") != canonical_sha256(profile) or validation.get("status") != "valid_evaluable" or not str(validation.get("evaluatorId") or "") or validation.get("candidateAcceptable") is not True or not str(validation.get("programSha256") or "").startswith("sha256:") or not str(validation.get("validationReportSha256") or "").startswith("sha256:") or profile.get("version") != "v3" or profile.get("directionMode") != "both": raise GrammarError("canonical Dashboard pair compiler rejected pair")
+        _normalized_profile, transition_deduplication = (
+            normalize_behaviorally_redundant_transitions(
+                profile,
+                preserve_referenced_transition_ids=False,
+            )
+        )
+        if transition_deduplication["removedTransitionCount"]:
+            raise GrammarError(
+                "canonical Dashboard pair compiler emitted behaviorally redundant transitions"
+            )
         manifests = ((profile.get("graph") or {}).get("entryArbitration") or {}).get("modules") or []
         native_snapshots = {item.get("direction"): item.get("sourceProfileSnapshotSha256") for item in manifests if isinstance(item, Mapping)}
         if native_snapshots.get("long") != long.native_report.get("profileSnapshotSha256") or native_snapshots.get("short") != short.native_report.get("profileSnapshotSha256"):
