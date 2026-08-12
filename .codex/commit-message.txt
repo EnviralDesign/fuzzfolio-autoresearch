@@ -1,0 +1,1 @@
+Eliminate quadratic prefinalizer member reload

@@ -1,0 +1,54 @@
+diff --git a/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs b/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs
+index 3030b1b..da8400c 100644
+--- a/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs
++++ b/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs
+@@ -1631,31 +1631,31 @@ fn all_bundles(
+         }
+     }
+     for r in rs {
+-        let member_ids = receipt_rows(r, "evaluatedMembers", root)?
+-            .into_iter()
+-            .map(|row| row.get("candidate").unwrap_or(&row).clone())
+-            .map(|row| text(&row, "candidateId").map(str::to_owned))
+-            .collect::<Result<BTreeSet<_>>>()?;
+-        for b in receipt_rows(r, "candidatePanelBundles", root)? {
++        // Authenticate and parse the evaluated-member stream exactly once for
++        // this receipt.  The previous implementation reopened, rehashed,
++        // reparsed, and linearly searched the complete stream for every bundle,
++        // turning a candidate/bundle join into O(n²) filesystem and JSON work.
++        let mut members_by_id = BTreeMap::new();
++        for row in receipt_rows(r, "evaluatedMembers", root)? {
++            let candidate = row.get("candidate").unwrap_or(&row).clone();
++            let candidate_id = text(&candidate, "candidateId")?.to_owned();
+             ensure!(
+-                member_ids.contains(text(&b, "candidateId")?),
+-                "campaign receipt contains a bundle for a non-cohort candidate"
++                members_by_id.insert(candidate_id, candidate).is_none(),
++                "campaign receipt repeats an evaluated member"
+             );
++        }
++        for b in receipt_rows(r, "candidatePanelBundles", root)? {
++            let candidate_id = text(&b, "candidateId")?;
++            let candidate = members_by_id.get(candidate_id).ok_or_else(|| {
++                anyhow!("campaign receipt contains a bundle for a non-cohort candidate")
++            })?;
+             ensure!(
+                 text(&b, "panelId")? == text(r, "panelId")?,
+                 "campaign receipt bundle panel relabelled"
+             );
+-            let candidate = receipt_rows(r, "evaluatedMembers", root)?
+-                .into_iter()
+-                .find_map(|row| {
+-                    let candidate = row.get("candidate").unwrap_or(&row);
+-                    (text(candidate, "candidateId").ok() == Some(text(&b, "candidateId").ok()?))
+-                        .then_some(candidate.clone())
+-                })
+-                .ok_or_else(|| anyhow!("campaign receipt bundle candidate is absent"))?;
+-            validate_bundle(base, &b, Some(&candidate))?;
++            validate_bundle(base, &b, Some(candidate))?;
+             let k = (
+-                text(&b, "candidateId")?.to_owned(),
++                candidate_id.to_owned(),
+                 text(&b, "panelId")?.to_owned(),
+             );
+             if let Some(old) = out.insert(k, b.clone()) {
