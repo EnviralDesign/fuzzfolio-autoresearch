@@ -7,6 +7,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(REPO))
 
+from autoresearch import temporal_qd_native as native
 from autoresearch import temporal_qd_v5_native as v5
 from autoresearch.result_codec import canonical_json_bytes, sha256
 from tests.test_temporal_qd_v5_native_bridge import _native_run_kwargs
@@ -22,7 +23,7 @@ def main(root: Path) -> None:
     # The bridge fail-closes on a stale executable. This integration fixture
     # consumes the already sealed production publisher and never triggers a
     # nested release build from `cargo test`.
-    binary = REPO / "rust" / "temporal-qd" / "target" / "release" / "temporal-qd-batch.exe"
+    binary = native.resolve_native_batch_binary() or native.native_batch_binary_path()
     if not binary.is_file():
         raise RuntimeError(f"sealed native batch fixture prerequisite is absent: {binary}")
     kwargs = _native_run_kwargs(root / "output")

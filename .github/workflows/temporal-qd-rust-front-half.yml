@@ -119,6 +119,10 @@ jobs:
         working-directory: rust/temporal-qd
         run: cargo fmt --check
 
+      - name: Build sealed native proposal fixture
+        working-directory: rust/temporal-qd
+        run: cargo build --release -p temporal-qd-batch --jobs 2
+
       - name: Run Rust workspace tests
         working-directory: rust/temporal-qd
         run: cargo test --workspace --all-targets --jobs 2
