@@ -1457,7 +1457,7 @@ mod tests {
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest["tailAuthority"]["receiptPath"] =
-            json!(root.path().join("..\\tail-authority.json"));
+            json!(root.path().join("../tail-authority.json"));
         manifest.as_object_mut().unwrap().remove("manifestSha256");
         manifest["manifestSha256"] = json!(sha_value(&manifest));
         write_value(&manifest_path, &manifest);
@@ -1755,10 +1755,16 @@ mod tests {
         } else {
             PathBuf::from("python3")
         };
+        let mut python_paths = vec![repo.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            python_paths.extend(std::env::split_paths(&existing));
+        }
+        let python_path = std::env::join_paths(python_paths).unwrap();
         let status = Command::new(python)
             .arg(script)
             .arg(root.path())
             .current_dir(repo)
+            .env("PYTHONPATH", python_path)
             .status()
             .unwrap();
         assert!(status.success());
