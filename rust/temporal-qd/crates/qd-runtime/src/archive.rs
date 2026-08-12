@@ -999,6 +999,18 @@ fn validate_direction_selection(
         } else {
             ("inactive_or_unsupported", false, None)
         };
+    let has_selection = member.contains_key("directionSelection");
+    let has_behavior_lane = member.contains_key("directionBehaviorLane");
+    let has_breeding_lane = member.contains_key("directionBreedingLane");
+    if !has_selection && !has_behavior_lane && !has_breeding_lane {
+        // Native rotating-generation archives preserve the authoritative
+        // aggregate realized behavior but currently omit the redundant Python
+        // direction-selection projection.  Parent admission must derive
+        // the frozen policy decision from that authenticated behavior instead
+        // of rejecting an otherwise valid committed archive.  Any partially
+        // materialized projection remains invalid below.
+        return Ok(quality_eligible && expected_eligible);
+    }
     let selection = map(
         field(member, "directionSelection", label)?,
         "direction selection",

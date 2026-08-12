@@ -718,6 +718,36 @@ fn direction_aware_archive_admits_balanced_breeding_and_rejects_harmful_hiding()
 }
 
 #[test]
+fn direction_aware_native_rotating_archive_derives_omitted_projection() {
+    let mut archive = directional_archive(archive(), "harmful");
+    for cell in archive["cells"].as_array_mut().unwrap() {
+        for member in cell["members"].as_array_mut().unwrap() {
+            let member = member.as_object_mut().unwrap();
+            member.remove("directionSelection");
+            member.remove("directionBehaviorLane");
+            member.remove("directionBreedingLane");
+        }
+    }
+    archive.as_object_mut().unwrap().remove("archiveSha256");
+    archive["archiveSha256"] = Value::String(canonical_sha256(&archive).unwrap());
+
+    VerifiedParentArchive::from_archive(&archive)
+        .expect("native rotating archive must derive its direction projection");
+    let selector = ArchiveParentSelector::from_archive(&archive, GENERATION_SEED, false)
+        .expect("derived direction projection must remain selectable");
+    assert!(selector.eligible_parent_count() < 5);
+
+    archive["cells"][0]["members"][0]["directionBehaviorLane"] =
+        Value::String("balanced_bidirectional".into());
+    archive.as_object_mut().unwrap().remove("archiveSha256");
+    archive["archiveSha256"] = Value::String(canonical_sha256(&archive).unwrap());
+    assert!(
+        VerifiedParentArchive::from_archive(&archive).is_err(),
+        "partial direction projections must remain fail-closed"
+    );
+}
+
+#[test]
 fn direction_aware_archive_preserves_specialists_and_excludes_inactive_lanes() {
     for scenario in ["long_specialist", "short_specialist"] {
         let archive = directional_archive(archive(), scenario);
