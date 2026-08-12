@@ -1,0 +1,37 @@
+name: Codex one-shot archive Python fix
+
+on:
+  push:
+    branches:
+      - codex/temporal-qd-simplification
+    paths:
+      - .codex/archive-python.patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-one-shot-archive-python
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/temporal-qd-simplification
+          fetch-depth: 0
+
+      - name: Apply tested patch and remove transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .codex/archive-python.patch
+          git config user.name "Codex"
+          git config user.email "codex@openai.com"
+          git apply --index --whitespace=nowarn .codex/archive-python.patch
+          git rm -f .codex/archive-python.patch .github/workflows/codex-one-shot-archive-python.yml
+          git commit -m "Use project Python for archive oracle tests"
+          git push origin HEAD:codex/temporal-qd-simplification
