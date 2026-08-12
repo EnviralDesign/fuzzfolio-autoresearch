@@ -33,4 +33,4 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-# Temporary exact-head refresh for the Tranche 2 publish boundary.
+# Temporary exact-head refresh for production verification.
