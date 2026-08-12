@@ -6,6 +6,7 @@ on:
       - codex/temporal-qd-simplification
     paths:
       - .codex/apply.patch
+      - .codex/apply.patch.gz
       - .codex/commit-message.txt
 
 permissions:
@@ -28,7 +29,7 @@ jobs:
       - name: Apply tested patch and commit
         shell: bash
         run: |
-          if [[ ! -f .codex/apply.patch ]]; then
+          if [[ ! -f .codex/apply.patch && ! -f .codex/apply.patch.gz ]]; then
             echo "No staged patch remains; nothing to apply."
             exit 0
           fi
@@ -37,9 +38,14 @@ jobs:
             exit 2
           fi
           commit_message="$(cat .codex/commit-message.txt)"
+          patch_path=.codex/apply.patch
+          if [[ -f .codex/apply.patch.gz ]]; then
+            gzip -dc .codex/apply.patch.gz > "$RUNNER_TEMP/apply.patch"
+            patch_path="$RUNNER_TEMP/apply.patch"
+          fi
           git config user.name "Codex"
           git config user.email "codex@openai.com"
-          git apply --index --whitespace=nowarn .codex/apply.patch
-          git rm -f .codex/apply.patch .codex/commit-message.txt
+          git apply --index --whitespace=nowarn "$patch_path"
+          git rm -f --ignore-unmatch .codex/apply.patch .codex/apply.patch.gz .codex/commit-message.txt
           git commit -m "$commit_message"
           git push origin HEAD:codex/temporal-qd-simplification
