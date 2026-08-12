@@ -1745,13 +1745,15 @@ mod tests {
             .nth(4)
             .unwrap();
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/python_oracle_fixture.py");
-        let python = if cfg!(windows) {
-            let local = repo.join(".venv/Scripts/python.exe");
-            if local.is_file() {
-                local
-            } else {
-                PathBuf::from("python")
-            }
+        let local_python = if cfg!(windows) {
+            repo.join(".venv/Scripts/python.exe")
+        } else {
+            repo.join(".venv/bin/python")
+        };
+        let python = if local_python.is_file() {
+            local_python
+        } else if cfg!(windows) {
+            PathBuf::from("python")
         } else {
             PathBuf::from("python3")
         };
