@@ -11,7 +11,11 @@ use temporal_qd_rotating_prefinalizer::{
 fn fixture(root: &Path) {
     let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../.venv/Scripts/python.exe")
+            .join(if cfg!(windows) {
+                "../../../../.venv/Scripts/python.exe"
+            } else {
+                "../../../../.venv/bin/python"
+            })
             .into_os_string()
     });
     let script =
