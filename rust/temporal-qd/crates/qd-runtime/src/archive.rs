@@ -137,6 +137,69 @@ fn canonical_identity(payload: &Value, identity_key: &str, label: &str) -> Resul
     Ok(identity)
 }
 
+fn realized_behavior_identity(payload: &Value) -> Result<String> {
+    let source = map(payload, "realized behavior")?;
+    let identity = string(source, "identitySha256", "realized behavior")?;
+    exact_sha256(&identity, "realized behavior identitySha256")?;
+    let identity_material = field(source, "identityMaterial", "realized behavior")?;
+    let identity_map = map(identity_material, "realized behavior identity material")?;
+    if identity_map.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_realized_behavior_identity_v1")
+        || canonical_sha256(identity_material).map_err(|error| {
+            invalid(format!(
+                "realized behavior identity is not canonical: {error}"
+            ))
+        })? != identity
+    {
+        return Err(invalid("realized behavior identity mismatch"));
+    }
+
+    let bound_sides = map(
+        field(identity_map, "sides", "realized behavior identity material")?,
+        "realized behavior identity sides",
+    )?;
+    let observed_sides = map(
+        field(source, "sides", "realized behavior")?,
+        "realized behavior sides",
+    )?;
+    const IDENTITY_SIDE_FIELDS: [&str; 18] = [
+        "closedTrades",
+        "wins",
+        "losses",
+        "flatTrades",
+        "grossR",
+        "netR",
+        "costR",
+        "holdingBars",
+        "holdingHours",
+        "active",
+        "activeWindowCount",
+        "exposureProxy",
+        "terminalDirectionCount",
+        "conflictAbstentions",
+        "closeReasonDistribution",
+        "actionDistribution",
+        "transitionDistribution",
+        "terminalStatusCounts",
+    ];
+    for side in ["long", "short"] {
+        let bound = map(
+            field(bound_sides, side, "realized behavior identity sides")?,
+            "realized behavior identity side",
+        )?;
+        let observed = map(
+            field(observed_sides, side, "realized behavior sides")?,
+            "realized behavior side",
+        )?;
+        for key in IDENTITY_SIDE_FIELDS {
+            if bound.get(key) != observed.get(key) {
+                return Err(invalid("realized behavior side identity drifted"));
+            }
+        }
+    }
+    Ok(identity)
+}
+
 #[derive(Clone, Debug)]
 struct SelectionState {
     base_selection_visits: u64,
@@ -915,7 +978,7 @@ fn validate_direction_selection(
     {
         return Err(invalid("direction realized behavior schema is unsupported"));
     }
-    canonical_identity(behavior, "identitySha256", "realized behavior")?;
+    realized_behavior_identity(behavior)?;
     let window_count = nonnegative_count(behavior_map.get("windowCount"), "direction windowCount")?;
     if window_count < 1 {
         return Err(invalid("direction behavior windowCount must be positive"));

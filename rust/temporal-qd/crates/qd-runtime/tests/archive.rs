@@ -549,16 +549,34 @@ fn direction_behavior(
             "terminalDirectionCount": 0
         })
     };
-    let mut value = json!({
+    let sides = json!({
+        "long": side(long_net, long_trades, long_windows),
+        "short": side(short_net, short_trades, short_windows)
+    });
+    let identity_material = json!({
+        "schemaVersion": "temporal_realized_behavior_identity_v1",
+        "totalObservations": 0,
+        "windowSignatures": [],
+        "terminalStatusCounts": {},
+        "terminalDirectionCounts": {},
+        "conflictAbstentions": 0,
+        "unattributedConflictAbstentions": 0,
+        "unattributedClosedTrades": 0,
+        "sides": sides.clone()
+    });
+    json!({
         "schemaVersion": "temporal_realized_behavior_v1",
         "windowCount": 4,
-        "sides": {
-            "long": side(long_net, long_trades, long_windows),
-            "short": side(short_net, short_trades, short_windows)
-        }
-    });
-    value["identitySha256"] = Value::String(canonical_sha256(&value).unwrap());
-    value
+        "totalObservations": 0,
+        "terminalStatusCounts": {},
+        "terminalDirectionCounts": {},
+        "conflictAbstentions": 0,
+        "unattributedConflictAbstentions": 0,
+        "unattributedClosedTrades": 0,
+        "sides": sides,
+        "identityMaterial": identity_material,
+        "identitySha256": canonical_sha256(&identity_material).unwrap()
+    })
 }
 
 fn direction_selection(
@@ -687,6 +705,16 @@ fn direction_aware_archive_admits_balanced_breeding_and_rejects_harmful_hiding()
     forged.as_object_mut().unwrap().remove("archiveSha256");
     forged["archiveSha256"] = Value::String(canonical_sha256(&forged).unwrap());
     assert!(VerifiedParentArchive::from_archive(&forged).is_err());
+
+    let mut drifted_behavior = balanced;
+    drifted_behavior["cells"][0]["members"][0]["aggregate"]["realizedBehavior"]["sides"]["long"]
+        ["grossR"] = json!(99.0);
+    drifted_behavior
+        .as_object_mut()
+        .unwrap()
+        .remove("archiveSha256");
+    drifted_behavior["archiveSha256"] = Value::String(canonical_sha256(&drifted_behavior).unwrap());
+    assert!(VerifiedParentArchive::from_archive(&drifted_behavior).is_err());
 }
 
 #[test]
