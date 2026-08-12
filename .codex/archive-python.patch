@@ -1,0 +1,16 @@
+--- a/rust/temporal-qd/crates/qd-archive-reducer/src/lib.rs
++++ b/rust/temporal-qd/crates/qd-archive-reducer/src/lib.rs
+@@ -1753,7 +1753,12 @@
+                 PathBuf::from("python")
+             }
+         } else {
+-            PathBuf::from("python3")
++            let local = repo.join(".venv/bin/python");
++            if local.is_file() {
++                local
++            } else {
++                PathBuf::from("python3")
++            }
+         };
+         let mut python_paths = vec![repo.to_path_buf()];
+         if let Some(existing) = std::env::var_os("PYTHONPATH") {
