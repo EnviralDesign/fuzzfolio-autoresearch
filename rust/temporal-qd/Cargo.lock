@@ -1142,6 +1142,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "temporal-qd-contract",
+ "temporal-qd-tail-reducer",
 ]
 
 [[package]]

@@ -8,10 +8,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use base64::Engine;
+use flate2::read::GzDecoder;
 use serde_json::{Map, Value, json};
 use sha2::Digest;
 use temporal_qd_contract::{
@@ -827,13 +829,13 @@ fn build_bundles(
             })
             .map(|(id, bounds)| (id.clone(), bounds.clone()))
             .context("v4 tail task is outside panel")?;
-        let metrics = member(entry, "rotatingEvidenceMetrics")?;
+        let metrics = directional_metrics(entry)?;
         ensure!(
-            text(metrics, "sourceProfileSnapshotSha256")?
+            text(&metrics, "sourceProfileSnapshotSha256")?
                 == text(candidate, "profileSnapshotSha256")?,
             "v5 directional source profile binding drifted"
         );
-        let record = window_record(candidate, panel, &window_id, task, metrics, entry, index)?;
+        let record = window_record(candidate, panel, &window_id, task, &metrics, entry, index)?;
         ensure!(
             evidence
                 .entry(candidate_id.to_owned())
@@ -864,6 +866,66 @@ fn build_bundles(
         )?);
     }
     Ok(bundles)
+}
+
+/// Recover the realized-behavior projection already sealed inside the v4
+/// stage projection.  The compact rotating metrics remain the economic
+/// authority; every overlapping field must match before the behavior value
+/// is carried into the cumulative evidence bundle.
+fn directional_metrics(entry: &Value) -> Result<Value> {
+    let compact = member(entry, "rotatingEvidenceMetrics")?;
+    let projection = member(entry, "stageProjection")?;
+    ensure!(
+        text(projection, "schemaVersion")? == "temporal_qd_tail_stage_projection_v1"
+            && text(projection, "codec")? == "gzip-canonical-json-v1",
+        "v4 tail stage projection is incompatible"
+    );
+    let encoded = text(projection, "blobBase64")?;
+    let compressed = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .context("decode v4 tail stage projection")?;
+    let mut decoder = GzDecoder::new(compressed.as_slice());
+    let mut raw = Vec::new();
+    decoder
+        .read_to_end(&mut raw)
+        .context("decompress v4 tail stage projection")?;
+    ensure!(
+        raw.len() as u64 == unsigned(projection, "semanticSizeBytes")?
+            && format!("sha256:{:x}", sha2::Sha256::digest(&raw))
+                == sha(projection, "semanticSha256")?,
+        "v4 tail stage projection identity drifted"
+    );
+    let stage: Value = serde_json::from_slice(&raw).context("parse v4 tail stage projection")?;
+    ensure!(
+        canonical_json_bytes(&stage)? == raw,
+        "v4 tail stage projection is not canonical JSON"
+    );
+    for (metric, stage_field) in [
+        ("conservativeNetR", "conservativeNetR"),
+        ("noCostNetR", "noCostNetR"),
+        ("maxDrawdownR", "maxDrawdownR"),
+        ("closedTrades", "trades"),
+        ("observations", "observations"),
+        ("v3Admissible", "v3Admissible"),
+        ("resolvedProgramSha256", "resolvedProgramSha256"),
+        (
+            "resolvedProfileSnapshotSha256",
+            "resolvedProfileSnapshotSha256",
+        ),
+        ("sourceProfileSnapshotSha256", "sourceProfileSnapshotSha256"),
+    ] {
+        ensure!(
+            compact.get(metric) == stage.get(stage_field),
+            "v4 tail compact/stage metric drifted for {metric}"
+        );
+    }
+    let realized_behavior = stage
+        .get("realizedBehavior")
+        .filter(|value| value.is_object())
+        .context("v4 tail stage projection lacks realized behavior")?;
+    let mut metrics = object(compact, "v4 tail rotating metrics")?.clone();
+    metrics.insert("realizedBehavior".to_owned(), realized_behavior.clone());
+    Ok(Value::Object(metrics))
 }
 
 fn window_record(

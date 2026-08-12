@@ -28,6 +28,7 @@ use crate::{
         V5SealedEvolvedPairRecompiler, V5SharedConstructionAuthority,
         build_v5_evolved_accepted_material, build_v5_evolved_immigrant_programs,
         load_v5_evolved_parent, load_v5_evolved_parent_from_snapshot,
+        parent_reference_from_v5_evolved_material,
     },
     v5_operators::{
         V5EvolvedOperatorDelta, V5EvolvedOperatorExecution, V5EvolvedSameSideCrossoverExecution,
@@ -4641,6 +4642,60 @@ pub(crate) fn replay_v5_evolved_transaction_with_accepted_sink(
     request.validate_shape()?;
     let authority = V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)?;
     result.verify_offline_replay_with_authority_and_accepted_sink(request, &authority, sink)
+}
+
+/// Recover only the archive-retained children from a sealed evolved
+/// transaction.  The public result contains no rich genome payload, so the
+/// next generation must replay the authenticated transaction/snapshot chain
+/// through the compiler before it can obtain an opaque `ParentReference`.
+/// Callers name the bounded retained candidate set; no unselected rich parent
+/// material crosses this boundary.
+pub fn reconstruct_selected_parent_references(
+    request: &V5EvolvedTransactionRequest,
+    result: &V5EvolvedTransactionResult,
+    selected_candidate_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, ParentReference>> {
+    struct SelectedParentSink<'a> {
+        selected: &'a BTreeSet<String>,
+        references: BTreeMap<String, ParentReference>,
+    }
+
+    impl V5EvolvedAcceptedReplaySink for SelectedParentSink<'_> {
+        fn accept(
+            &mut self,
+            _authority: &V5SharedConstructionAuthority,
+            material: &V5CoreEvolvedAcceptedMaterial,
+        ) -> Result<()> {
+            if self.selected.contains(&material.record.candidate_id) {
+                let reference =
+                    parent_reference_from_v5_evolved_material(&material.parent_material)?;
+                if self
+                    .references
+                    .insert(material.record.candidate_id.clone(), reference)
+                    .is_some()
+                {
+                    return Err(contract(
+                        "v5 evolved selected-parent replay repeats a candidate",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut sink = SelectedParentSink {
+        selected: selected_candidate_ids,
+        references: BTreeMap::new(),
+    };
+    replay_v5_evolved_transaction_with_accepted_sink(request, result, &mut sink)?;
+    if sink.references.keys().collect::<BTreeSet<_>>()
+        != selected_candidate_ids.iter().collect::<BTreeSet<_>>()
+    {
+        return Err(contract(
+            "v5 evolved selected-parent replay lacks an archive candidate",
+        ));
+    }
+    Ok(sink.references)
 }
 
 fn snapshot_parent_reference_for_offline_replay(

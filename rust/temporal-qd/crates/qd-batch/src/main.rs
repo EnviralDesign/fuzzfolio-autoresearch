@@ -51,6 +51,7 @@ use temporal_qd_kernel::{
     },
     v5_evolved_transaction::{
         V5EvolvedTransactionRequest, V5EvolvedTransactionResult, execute_v5_evolved_transaction,
+        reconstruct_selected_parent_references,
     },
     v5_g0_funnel::{
         V5_G0_FUNNEL_PROJECTION_STREAM_PATH, V5G0FunnelProjectionStreamReceiptObjectBinding,
@@ -2420,6 +2421,241 @@ fn native_v5_g0_parent_references(
     Ok(references)
 }
 
+fn native_v5_archive_candidate_ids(archive: &Value) -> Result<BTreeSet<String>> {
+    let cells = archive
+        .get("cells")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("native v5 parent archive cells are invalid"))?;
+    let mut candidate_ids = BTreeSet::new();
+    for cell in cells {
+        let members = cell
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("native v5 parent archive cell members are invalid"))?;
+        for member in members {
+            let candidate_id = member
+                .get("candidate")
+                .and_then(Value::as_object)
+                .and_then(|candidate| candidate.get("candidateId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("native v5 parent archive member lacks candidateId"))?;
+            if !candidate_ids.insert(candidate_id.to_owned()) {
+                bail!("native v5 parent archive repeats a candidate");
+            }
+        }
+    }
+    Ok(candidate_ids)
+}
+
+fn validate_native_v5_self_hash(value: &Value, field: &str, label: &str) -> Result<String> {
+    let supplied = value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{label} lacks {field}"))?
+        .to_owned();
+    let mut semantic = value.clone();
+    semantic
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{label} is not an object"))?
+        .remove(field);
+    if canonical_sha256(&semantic).with_context(|| format!("identify {label}"))? != supplied {
+        bail!("{label} identity drifted");
+    }
+    Ok(supplied)
+}
+
+/// Reconstruct retained children from the immediately preceding evolved
+/// proposal.  The final archive deliberately carries no genome payload; its
+/// sibling state-application sidecar binds the exact prior proposal manifest
+/// and receipt, while the kernel replays the sealed transaction/snapshots and
+/// returns only the archive-selected opaque parent references.
+fn native_v5_evolved_parent_references(
+    manifest: &V5ProposalManifest,
+    archive: &V5EvolvedInputDocument,
+) -> Result<BTreeMap<String, ParentReference>> {
+    if manifest.generation_index < 3 {
+        bail!("native v5 evolved parent recovery requires generation three or later");
+    }
+    let selected_candidate_ids = native_v5_archive_candidate_ids(&archive.value)?;
+    if selected_candidate_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let finalization_root = archive
+        .path
+        .parent()
+        .filter(|path| {
+            path.file_name().and_then(|value| value.to_str()) == Some("native-finalization")
+        })
+        .ok_or_else(|| {
+            anyhow!("native v5 evolved parent archive is outside native-finalization")
+        })?;
+    if archive.path.file_name().and_then(|value| value.to_str()) != Some("archive.json") {
+        bail!("native v5 evolved parent archive has an unexpected filename");
+    }
+    let generation_root = finalization_root
+        .parent()
+        .ok_or_else(|| anyhow!("native v5 evolved parent archive lacks a generation root"))?;
+
+    let sidecar_path = safe_existing_file(
+        &finalization_root.join("generation-state-application-sidecar.json"),
+        "native v5 previous generation state-application sidecar",
+    )?;
+    let sidecar_raw = read_stable_existing_file(
+        &sidecar_path,
+        "native v5 previous generation state-application sidecar",
+    )?;
+    let sidecar: Value = serde_json::from_slice(&sidecar_raw)
+        .context("parse native v5 previous generation state-application sidecar")?;
+    if canonical_json_line(&sidecar)? != sidecar_raw
+        || sidecar.get("schemaVersion").and_then(Value::as_str)
+            != Some("temporal_qd_v5_generation_state_application_sidecar_v1")
+        || sidecar.get("generationIndex").and_then(Value::as_u64)
+            != Some(manifest.generation_index - 1)
+    {
+        bail!("native v5 previous generation state-application sidecar is incompatible");
+    }
+    validate_native_v5_self_hash(
+        &sidecar,
+        "sidecarSha256",
+        "native v5 previous generation state-application sidecar",
+    )?;
+    let commit_path = safe_existing_file(
+        &finalization_root.join("generation-commit.json"),
+        "native v5 previous generation commit",
+    )?;
+    let commit_raw =
+        read_stable_existing_file(&commit_path, "native v5 previous generation commit")?;
+    let commit: Value = serde_json::from_slice(&commit_raw)
+        .context("parse native v5 previous generation commit")?;
+    if canonical_json_line(&commit)? != commit_raw
+        || commit.get("schemaVersion").and_then(Value::as_str)
+            != Some("temporal_qd_generation_commit_v1")
+        || commit.get("generationIndex").and_then(Value::as_u64)
+            != Some(manifest.generation_index - 1)
+    {
+        bail!("native v5 previous generation commit is incompatible");
+    }
+    let commit_sha256 = validate_native_v5_self_hash(
+        &commit,
+        "commitSha256",
+        "native v5 previous generation commit",
+    )?;
+    if sidecar
+        .get("finalization")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("commitSha256"))
+        .and_then(Value::as_str)
+        != Some(commit_sha256.as_str())
+        || commit
+            .get("parentArchive")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str)
+            != Some("archive.json")
+        || commit
+            .get("parentArchive")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("archiveSha256"))
+            .and_then(Value::as_str)
+            != Some(archive.semantic_sha256.as_str())
+    {
+        bail!("native v5 previous generation commit/archive binding drifted");
+    }
+    let proposal_state = sidecar
+        .get("proposalStateAuthority")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("native v5 previous generation sidecar lacks proposal authority"))?;
+    let proposal_manifest_sha256 = proposal_state
+        .get("proposalManifestSha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native v5 previous generation sidecar lacks proposal manifest"))?;
+    let proposal_receipt_sha256 = proposal_state
+        .get("proposalReceiptSha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native v5 previous generation sidecar lacks proposal receipt"))?;
+    let proposal_manifest_digest = proposal_manifest_sha256
+        .strip_prefix("sha256:")
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .ok_or_else(|| anyhow!("native v5 previous proposal manifest identity is invalid"))?;
+    let proposal_root = generation_root.join("proposal");
+    let invocation_root = proposal_root
+        .join("native-batch/v5-proposal")
+        .join(proposal_manifest_digest);
+    let previous_manifest_path = safe_existing_file(
+        &invocation_root.join("manifest.json"),
+        "native v5 previous evolved proposal manifest",
+    )?;
+    let previous_manifest_raw = read_stable_existing_file(
+        &previous_manifest_path,
+        "native v5 previous evolved proposal manifest",
+    )?;
+    let previous_manifest = parse_v5_proposal_manifest(&previous_manifest_raw)
+        .context("parse native v5 previous evolved proposal manifest")?;
+    if previous_manifest.manifest_sha256 != proposal_manifest_sha256
+        || previous_manifest.generation_kind != "evolved"
+        || previous_manifest.generation_index != manifest.generation_index - 1
+    {
+        bail!("native v5 previous evolved proposal manifest binding drifted");
+    }
+    let previous_result_path = safe_existing_file(
+        &invocation_root.join(V5_PROPOSAL_RESULT_PATH),
+        "native v5 previous evolved proposal result",
+    )?;
+    let previous_result_raw = read_stable_existing_file(
+        &previous_result_path,
+        "native v5 previous evolved proposal result",
+    )?;
+    let previous_result_value: Value = serde_json::from_slice(&previous_result_raw)
+        .context("parse native v5 previous evolved proposal result")?;
+    if canonical_json_line(&previous_result_value)? != previous_result_raw {
+        bail!("native v5 previous evolved proposal result is not canonical JSON plus LF");
+    }
+    let previous_result =
+        validate_v5_evolved_proposal_result(&previous_result_value, &previous_manifest)
+            .context("validate native v5 previous evolved proposal result")?;
+    if previous_result
+        .value
+        .get("proposalReceiptSha256")
+        .and_then(Value::as_str)
+        != Some(proposal_receipt_sha256)
+    {
+        bail!("native v5 previous evolved proposal receipt binding drifted");
+    }
+    let transaction_sha256 = previous_result
+        .value
+        .get("transactionSha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native v5 previous evolved result lacks transaction root"))?;
+    let transaction_path = native_v5_object_path(
+        &proposal_root.join("v5-native/objects/sha256"),
+        transaction_sha256,
+        "native v5 previous evolved transaction root",
+    )?;
+    let transaction_raw = read_stable_existing_file(
+        &transaction_path,
+        "native v5 previous evolved transaction root",
+    )?;
+    let transaction_value: Value = serde_json::from_slice(&transaction_raw)
+        .context("parse native v5 previous evolved transaction root")?;
+    if canonical_json_line(&transaction_value)? != transaction_raw {
+        bail!("native v5 previous evolved transaction root is not canonical JSON plus LF");
+    }
+    let transaction = V5EvolvedTransactionResult::from_value(&transaction_value)
+        .context("validate native v5 previous evolved transaction root")?;
+    if transaction.transaction_sha256()? != transaction_sha256 {
+        bail!("native v5 previous evolved transaction identity drifted");
+    }
+    let request = v5_evolved_adoption_request(&previous_manifest, &transaction)
+        .context("reconstruct native v5 previous evolved replay request")?;
+    reconstruct_selected_parent_references(&request, &transaction, &selected_candidate_ids)
+        .context("reconstruct native v5 selected evolved parent references")
+}
+
 /// Authenticate both later-generation input bindings and translate them into
 /// the exact typed runtime state consumed by the write-neutral core.  G2 is
 /// intentionally restored from the public compact G0 ledger; G3+ restores
@@ -2445,24 +2681,42 @@ fn v5_evolved_transaction_request(
     if archive_sha256 != parent_archive.semantic_sha256 {
         bail!("sealed native v5 evolved parent archive semantic identity drifted from its binding");
     }
-    let (allow_empty_quality_bootstrap, parent_schedule) =
-        v5_evolved_runtime_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
+    let configured_parent_schedule =
+        v5_evolved_configured_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
+    // A rotating v2 schedule records the selected robust reservoir before the
+    // direction-aware parent projection is applied.  Its frozen
+    // `unsupportedParentPolicy` explicitly converts unsupported parent share
+    // to immigrants.  Open the selector with that empty-pool outcome admitted,
+    // then bind the kernel to the exact supported count derived from the
+    // authenticated archive.  This is especially important for a G0 frontier
+    // whose cumulative economics are all direction-ineligible: it is a valid
+    // all-immigrant G1 authority, not a corrupt archive.
     let parents = if manifest.generation_index == 2 {
-        let references = native_v5_g0_parent_references(manifest, &parent_archive)?;
-        RuntimeParentSelector::from_native_v5_archive(
-            &parent_archive.value,
-            &references,
-            &manifest.generation_config_sha256,
-            allow_empty_quality_bootstrap,
-        )
+        native_v5_g0_parent_references(manifest, &parent_archive).and_then(|references| {
+            RuntimeParentSelector::from_native_v5_archive(
+                &parent_archive.value,
+                &references,
+                &manifest.generation_config_sha256,
+                true,
+            )
+            .map_err(Into::into)
+        })
     } else {
-        RuntimeParentSelector::from_archive(
-            &parent_archive.value,
-            &manifest.generation_config_sha256,
-            allow_empty_quality_bootstrap,
-        )
+        native_v5_evolved_parent_references(manifest, &parent_archive).and_then(|references| {
+            RuntimeParentSelector::from_native_v5_archive(
+                &parent_archive.value,
+                &references,
+                &manifest.generation_config_sha256,
+                true,
+            )
+            .map_err(Into::into)
+        })
     }
     .context("open typed native v5 evolved parent selector")?;
+    let parent_schedule = v5_evolved_effective_parent_schedule(
+        configured_parent_schedule,
+        parents.eligible_parent_count(),
+    )?;
 
     let input_ledger =
         read_v5_evolved_input_document(manifest, "identityLedger", "identity ledger")?;
@@ -2557,9 +2811,13 @@ fn v5_evolved_adoption_request(
     {
         bail!("native v5 evolved transaction roots drift from the sealed adoption manifest");
     }
-    let (_allow_empty_quality_bootstrap, parent_schedule) =
-        v5_evolved_runtime_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
     let schedule = &transaction.schedule_state_receipt;
+    let configured_parent_schedule =
+        v5_evolved_configured_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
+    let parent_schedule = v5_evolved_adopted_parent_schedule(
+        configured_parent_schedule,
+        schedule.parent_schedule_sha256.as_deref(),
+    )?;
     let request = V5EvolvedTransactionRequest {
         shared_authority: manifest.frozen_authority.clone(),
         generation_config_sha256: manifest.generation_config_sha256.clone(),
@@ -4645,17 +4903,44 @@ fn parse_parent_schedule(value: Option<&Value>) -> Result<Option<RotatingParentS
 /// archive may be empty and the core request must carry no selectable parent
 /// schedule. Nonzero projections remain strict and must match the archive's
 /// exact quality-eligible parent count during core admission.
-fn v5_evolved_runtime_parent_schedule(
-    value: Option<&Value>,
-) -> Result<(bool, Option<RotatingParentSchedule>)> {
-    let schedule = parse_parent_schedule(value)?.ok_or_else(|| {
-        anyhow!("sealed native v5 evolved generation config lacks parentSchedule")
-    })?;
-    if schedule.breeder_parent_count == 0 {
-        Ok((true, None))
-    } else {
-        Ok((false, Some(schedule)))
+fn v5_evolved_configured_parent_schedule(value: Option<&Value>) -> Result<RotatingParentSchedule> {
+    parse_parent_schedule(value)?
+        .ok_or_else(|| anyhow!("sealed native v5 evolved generation config lacks parentSchedule"))
+}
+
+fn v5_evolved_effective_parent_schedule(
+    configured: RotatingParentSchedule,
+    eligible_parent_count: usize,
+) -> Result<Option<RotatingParentSchedule>> {
+    let eligible_parent_count = u64::try_from(eligible_parent_count)
+        .context("native v5 eligible parent count exceeds u64")?;
+    if eligible_parent_count > configured.breeder_width {
+        bail!("native v5 eligible parent count exceeds the frozen breeder width")
     }
+    if eligible_parent_count == 0 {
+        return Ok(None);
+    }
+    RotatingParentSchedule::from_counts(configured.breeder_width, eligible_parent_count)
+        .context("derive native v5 supported-parent schedule")
+        .map(Some)
+}
+
+fn v5_evolved_adopted_parent_schedule(
+    configured: RotatingParentSchedule,
+    sealed_schedule_sha256: Option<&str>,
+) -> Result<Option<RotatingParentSchedule>> {
+    let Some(sealed_schedule_sha256) = sealed_schedule_sha256 else {
+        return Ok(None);
+    };
+    for eligible_parent_count in 1..=configured.breeder_width {
+        let candidate =
+            RotatingParentSchedule::from_counts(configured.breeder_width, eligible_parent_count)
+                .context("reconstruct native v5 adopted parent schedule")?;
+        if candidate.schedule_sha256() == sealed_schedule_sha256 {
+            return Ok(Some(candidate));
+        }
+    }
+    bail!("sealed native v5 evolved parent schedule is not derivable from its breeder width")
 }
 
 fn parse_python_pretty_json_document(
@@ -8885,7 +9170,7 @@ mod tests {
     const EXACT: &[u8] = b"exact\n";
 
     #[test]
-    fn v5_zero_parent_schedule_is_an_explicit_immigrant_only_bootstrap() {
+    fn v5_unsupported_parent_share_is_rebound_to_the_verified_archive() {
         let zero = RotatingParentSchedule::from_counts(128, 0).unwrap();
         let zero_value = serde_json::json!({
             "schemaVersion": "temporal_qd_rotating_parent_schedule_v2",
@@ -8898,10 +9183,11 @@ mod tests {
             "schedulingMethod": "accepted_quota_prefix_balance_v1",
             "scheduleSha256": zero.schedule_sha256(),
         });
-        let (allow_empty, runtime_schedule) =
-            v5_evolved_runtime_parent_schedule(Some(&zero_value)).unwrap();
-        assert!(allow_empty);
-        assert_eq!(runtime_schedule, None);
+        let configured = v5_evolved_configured_parent_schedule(Some(&zero_value)).unwrap();
+        assert_eq!(
+            v5_evolved_effective_parent_schedule(configured, 0).unwrap(),
+            None
+        );
 
         let populated = RotatingParentSchedule::from_counts(128, 3).unwrap();
         let populated_value = serde_json::json!({
@@ -8915,10 +9201,33 @@ mod tests {
             "schedulingMethod": "accepted_quota_prefix_balance_v1",
             "scheduleSha256": populated.schedule_sha256(),
         });
-        let (allow_empty, runtime_schedule) =
-            v5_evolved_runtime_parent_schedule(Some(&populated_value)).unwrap();
-        assert!(!allow_empty);
-        assert_eq!(runtime_schedule, Some(populated));
+        let configured = v5_evolved_configured_parent_schedule(Some(&populated_value)).unwrap();
+        assert_eq!(
+            v5_evolved_effective_parent_schedule(configured, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            v5_evolved_effective_parent_schedule(configured, 2).unwrap(),
+            Some(RotatingParentSchedule::from_counts(128, 2).unwrap())
+        );
+        let effective = RotatingParentSchedule::from_counts(128, 2).unwrap();
+        assert_eq!(
+            v5_evolved_adopted_parent_schedule(configured, Some(&effective.schedule_sha256()))
+                .unwrap(),
+            Some(effective)
+        );
+        assert_eq!(
+            v5_evolved_adopted_parent_schedule(configured, None).unwrap(),
+            None
+        );
+        assert!(v5_evolved_effective_parent_schedule(configured, 129).is_err());
+        assert!(
+            v5_evolved_adopted_parent_schedule(
+                configured,
+                Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+            )
+            .is_err()
+        );
     }
 
     #[test]

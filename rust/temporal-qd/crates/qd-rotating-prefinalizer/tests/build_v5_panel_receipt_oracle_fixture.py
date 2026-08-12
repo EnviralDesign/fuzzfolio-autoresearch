@@ -6,6 +6,8 @@ builders, while the input index and members are fully sealed local artifacts.
 from __future__ import annotations
 
 import hashlib
+import base64
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -70,8 +72,16 @@ def main() -> None:
             task = {"taskId": f"{candidate_id}-{window['windowId']}", "candidateId": candidate_id, "analysisWindowStart": window["analysisWindowStart"], "analysisWindowEnd": window["analysisWindowEnd"], "evidencePlanSemanticSha256": digest("e" + marker), "taskPayloadSha256": digest("t" + marker)}
             raw = {"schemaVersion": "temporal_qd_tail_raw_result_ref_v1", "relativePath": "opaque", "codec": "gzip-json-v1", "resultSha256": digest("z" + marker), "semanticSizeBytes": 1, "uncompressedSha256": digest("u" + marker), "uncompressedSizeBytes": 1, "blobSha256": digest("g" + marker), "blobSizeBytes": 1}
             metrics = {"conservativeNetR": 1.25, "noCostNetR": 1.5, "maxDrawdownR": -0.5, "closedTrades": 3, "observations": 5, "v3Admissible": True, "resolvedProgramSha256": candidate["programSha256"], "resolvedProfileSnapshotSha256": digest("q" + marker), "sourceProfileSnapshotSha256": candidate["profileSnapshotSha256"]}
-            raw_provenance = {"schemaVersion": "temporal_qd_v5_raw_rotating_provenance_v1", "taskId": task["taskId"], "resultSha256": raw["resultSha256"], "observationStreamSha256": digest("o" + marker), "conservativeReplayStreamSha256": digest("c" + marker), "realizedBehaviorSha256": digest("h" + marker)}
-            entry = {"schemaVersion": "temporal_qd_tail_result_index_entry_v4", "task": task, "rawResultRef": raw, "rawTaskProvenance": {"taskId": task["taskId"], "resultSha256": raw["resultSha256"]}, "stageProjection": {"opaque": True}, "rotatingEvidenceMetrics": metrics, "funnelProjection": {"opaque": True}, "rawRotatingProvenance": raw_provenance}
+            zero_side = {"closedTrades": 0, "wins": 0, "losses": 0, "flatTrades": 0, "grossR": 0.0, "netR": 0.0, "costR": 0.0, "holdingBars": 0, "holdingHours": 0.0, "activeWindowCount": 0, "closeReasonCounts": {}, "actionCounts": {}, "transitionCounts": {}, "terminalStatusCounts": {}, "terminalDirectionCount": 0, "conflictAbstentions": 0, "tradeSequence": [], "active": False, "activeWindowFraction": 0.0, "exposureProxy": 0.0, "averageHoldingBars": 0.0, "closeReasonDistribution": {}, "actionDistribution": {}, "transitionDistribution": {}}
+            long_side = {**zero_side, "closedTrades": 3, "wins": 3, "grossR": 1.5, "netR": 1.25, "costR": 0.25, "holdingBars": 6, "holdingHours": 6.0, "activeWindowCount": 1, "active": True, "activeWindowFraction": 1.0, "exposureProxy": 1.2, "averageHoldingBars": 2.0}
+            realized = {"schemaVersion": "temporal_realized_behavior_v1", "windowId": window["windowId"], "reportedClosedTrades": 3, "materializedClosedTrades": 3, "unattributedClosedTrades": 0, "observations": 5, "terminal": {}, "conflictAbstentions": 0, "unattributedConflictAbstentions": 0, "sides": {"long": long_side, "short": zero_side}}
+            stage = {**metrics, "trades": metrics["closedTrades"], "realizedBehavior": realized}
+            stage.pop("closedTrades")
+            stage_raw = dump(stage, lf=False)
+            stage_blob = gzip.compress(stage_raw, mtime=0)
+            stage_projection = {"schemaVersion": "temporal_qd_tail_stage_projection_v1", "codec": "gzip-canonical-json-v1", "semanticSha256": "sha256:" + hashlib.sha256(stage_raw).hexdigest(), "semanticSizeBytes": len(stage_raw), "blobBase64": base64.b64encode(stage_blob).decode()}
+            raw_provenance = {"schemaVersion": "temporal_qd_v5_raw_rotating_provenance_v1", "taskId": task["taskId"], "resultSha256": raw["resultSha256"], "observationStreamSha256": digest("o" + marker), "conservativeReplayStreamSha256": digest("c" + marker), "realizedBehaviorSha256": canonical_sha256(realized)}
+            entry = {"schemaVersion": "temporal_qd_tail_result_index_entry_v4", "task": task, "rawResultRef": raw, "rawTaskProvenance": {"taskId": task["taskId"], "resultSha256": raw["resultSha256"]}, "stageProjection": stage_projection, "rotatingEvidenceMetrics": metrics, "funnelProjection": {"opaque": True}, "rawRotatingProvenance": raw_provenance}
             self_hash(entry, "entrySha256"); entries.append(entry)
     index = {"schemaVersion": "temporal_qd_tail_result_index_v4", "authorityId": digest("i"), "authoritySha256": digest("j"), "taskMatrixSha256": digest("m"), "taskManifestSha256": digest("n"), "checkpointSha256": digest("k"), "taskCount": len(entries), "funnelProjectionIncluded": True, "sourceResultBlobBytes": 0, "entries": entries}
     self_hash(index, "tailResultIndexSha256")
@@ -94,7 +104,10 @@ def main() -> None:
         for entry in entries:
             if entry["task"]["candidateId"] == candidate["candidateId"]:
                 window = next(row for row in panel["windows"] if row["analysisWindowStart"] == entry["task"]["analysisWindowStart"] and row["analysisWindowEnd"] == entry["task"]["analysisWindowEnd"])
-                rows.append(build_candidate_window_evidence(candidate=candidate, panel=panel, window=window, metrics=entry["rotatingEvidenceMetrics"], evidence_plan_semantic_sha256=entry["task"]["evidencePlanSemanticSha256"], provenance={"authorityId": index["authorityId"], "taskMatrixSha256": index["taskMatrixSha256"], **entry["rawTaskProvenance"], "rawRotatingProvenanceSha256": canonical_sha256(entry["rawRotatingProvenance"])}))
+                stage_blob = gzip.decompress(base64.b64decode(entry["stageProjection"]["blobBase64"]))
+                stage = json.loads(stage_blob)
+                enriched_metrics = {**entry["rotatingEvidenceMetrics"], "realizedBehavior": stage["realizedBehavior"]}
+                rows.append(build_candidate_window_evidence(candidate=candidate, panel=panel, window=window, metrics=enriched_metrics, evidence_plan_semantic_sha256=entry["task"]["evidencePlanSemanticSha256"], provenance={"authorityId": index["authorityId"], "taskMatrixSha256": index["taskMatrixSha256"], **entry["rawTaskProvenance"], "rawRotatingProvenanceSha256": canonical_sha256(entry["rawRotatingProvenance"])}))
         records[candidate["candidateId"]] = rows
     bundles = [build_candidate_panel_bundle(contract=contract, candidate=candidate, panel_id=panel["panelId"], records=records[candidate["candidateId"]]) for candidate in candidates]
     source = self_hash({"schemaVersion": "temporal_qd_v5_rotating_compact_evidence_source_v1", "tailAuthority": authority, "tailResultIndex": {"schemaVersion": "temporal_qd_v5_tail_result_index_v4_descriptor_v1", "relativePath": "tail-result-index-v4.json", "tailResultIndexSha256": index["tailResultIndexSha256"]}}, "compactEvidenceSourceSha256")

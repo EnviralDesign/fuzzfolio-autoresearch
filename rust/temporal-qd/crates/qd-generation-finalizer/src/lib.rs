@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use temporal_qd_contract::{
     CONTRACT_VERSION, canonical_json_line, canonical_sha256, canonical_sha256_without_object_field,
 };
+use temporal_qd_tail_reducer::aggregate_realized_behavior;
 
 pub const SOURCE_SCHEMA: &str = "temporal_qd_generation_finalization_source_v2";
 const PREVIOUS_PARENT_SUMMARY_SCHEMA: &str = "temporal_qd_previous_parent_archive_summary_v1";
@@ -1265,6 +1266,7 @@ fn build_cumulative_archive(
         let mut source_profiles = BTreeSet::new();
         let mut resolved_profiles = BTreeSet::new();
         let mut resolved_programs = BTreeSet::new();
+        let mut realized_behavior_windows = Vec::new();
         for panel_id in &source.required_panel_ids {
             let bundle = candidate_bundles
                 .iter()
@@ -1280,6 +1282,12 @@ fn build_cumulative_archive(
                 source_profiles.insert(source_profile.clone());
                 resolved_profiles.insert(resolved_profile.clone());
                 resolved_programs.insert(resolved_program.clone());
+                let realized_behavior = metrics
+                    .get("realizedBehavior")
+                    .filter(|value| value.is_object())
+                    .context("direction-aware cumulative evidence lacks realized behavior")?;
+                realized_behavior_windows
+                    .push(json!({"realizedBehavior": realized_behavior.clone()}));
                 windows.push(json!({
                     "panelId": panel_id,
                     "windowId": text(record,"windowId")?,
@@ -1312,6 +1320,8 @@ fn build_cumulative_archive(
                     .ok_or_else(|| anyhow!("missing bundle hash"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let cumulative_realized_behavior = aggregate_realized_behavior(&realized_behavior_windows)
+            .context("aggregate cumulative realized behavior")?;
         members.push(json!({
             "candidateId": candidate_id,
             "candidateIdentitySha256": sha(candidate,"candidateIdentitySha256")?,
@@ -1325,6 +1335,7 @@ fn build_cumulative_archive(
             "resolvedProfileSnapshotSha256": resolved_profiles.iter().next().unwrap(),
             "resolvedProgramSha256": resolved_programs.iter().next().unwrap(),
             "novelty": optional_f64(candidate,"novelty")?.unwrap_or(0.0),
+            "cumulativeRealizedBehavior": cumulative_realized_behavior,
             "currentPanelId": source.current_panel_id,
             "requiredPanelIds": source.required_panel_ids,
             "panelBundles": panel_hashes,
@@ -1338,7 +1349,25 @@ fn build_cumulative_archive(
     .context("robust policy missing")?
     .clone();
     verify_self_hash(&policy, "policySha256", "robust policy")?;
-    let classified = classify(members, &policy, source.breeder_width)?;
+    let direction_policy = member(
+        member(
+            member(&source.archive_policy, "frozenPolicy")?,
+            "directionSelection",
+        )?,
+        "selectionPolicy",
+    )?;
+    let direction_policy_sha256 = sha(
+        member(
+            member(&source.archive_policy, "frozenPolicy")?,
+            "directionSelection",
+        )?,
+        "selectionPolicySha256",
+    )?;
+    ensure!(
+        canonical_sha256(direction_policy)? == direction_policy_sha256,
+        "direction-selection policy identity drifted"
+    );
+    let classified = classify(members, &policy, direction_policy, source.breeder_width)?;
     let mut output = json!({
         "schemaVersion": CUMULATIVE_SCHEMA,
         "mode": "replace",
@@ -1367,7 +1396,12 @@ struct Classified {
     frontier_ids: Vec<String>,
 }
 
-fn classify(mut rows: Vec<Value>, policy: &Value, width: usize) -> Result<Classified> {
+fn classify(
+    mut rows: Vec<Value>,
+    policy: &Value,
+    direction_policy: &Value,
+    width: usize,
+) -> Result<Classified> {
     let min_active = number_f64(policy, "minimumActiveWindowFraction")?;
     let min_trades = number_f64(policy, "minimumAverageClosedTradesPerCandidateMonth")?;
     let mut quality = Vec::new();
@@ -1407,9 +1441,13 @@ fn classify(mut rows: Vec<Value>, policy: &Value, width: usize) -> Result<Classi
         object_mut(&mut row,"candidate")?.insert("robustObjectives".into(),json!({"worstWindowConservativeNetR":worst,"drawdown":max_dd,"costDrag":drag,"novelty":novelty}));
         let supported =
             active as f64 / window_count as f64 >= min_active && trades / months >= min_trades;
-        if supported && sum_net > 0.0 && median > 0.0 {
+        let direction_eligible = direction_selection_eligible(
+            member(&row, "cumulativeRealizedBehavior")?,
+            direction_policy,
+        )?;
+        if supported && direction_eligible && sum_net > 0.0 && median > 0.0 {
             quality.push(row)
-        } else if supported {
+        } else if supported && direction_eligible {
             frontier.push(row)
         }
     }
@@ -1454,6 +1492,66 @@ fn classify(mut rows: Vec<Value>, policy: &Value, width: usize) -> Result<Classi
         quality_ids,
         frontier_ids,
     })
+}
+
+fn direction_selection_eligible(behavior: &Value, policy: &Value) -> Result<bool> {
+    ensure!(
+        text(behavior, "schemaVersion")? == "temporal_realized_behavior_v1",
+        "direction realized behavior schema is unsupported"
+    );
+    let window_count = unsigned(behavior, "windowCount")?;
+    let minimum_active_windows = unsigned(policy, "minimum_active_windows_per_side")?;
+    ensure!(
+        window_count >= minimum_active_windows && window_count > 0,
+        "direction behavior windowCount cannot meet the active-window contract"
+    );
+    let minimum_closed_trades = unsigned(policy, "minimum_closed_trades_per_side")?;
+    let minimum_acceptable_net = number_f64(policy, "minimum_acceptable_side_net_r")?;
+    let harmful_net = number_f64(policy, "harmful_opposite_net_r")?;
+    ensure!(
+        harmful_net < minimum_acceptable_net,
+        "direction harmful-side threshold is invalid"
+    );
+    let side = |name: &str| -> Result<(bool, bool, bool)> {
+        let row = member(member(behavior, "sides")?, name)?;
+        let closed = unsigned(row, "closedTrades")?;
+        let active_windows = unsigned(row, "activeWindowCount")?;
+        ensure!(
+            active_windows <= window_count,
+            "direction active-window count exceeds behavior window count"
+        );
+        let active_fraction = number_f64(row, "activeWindowFraction")?;
+        ensure!(
+            (active_fraction - active_windows as f64 / window_count as f64).abs() <= 1e-12,
+            "direction active-window evidence is inconsistent"
+        );
+        let gross = number_f64(row, "grossR")?;
+        let net = number_f64(row, "netR")?;
+        let cost = number_f64(row, "costR")?;
+        ensure!(
+            (gross - net - cost).abs() <= 1e-9,
+            "direction gross/net/cost R does not reconcile"
+        );
+        let terminal = unsigned(row, "terminalDirectionCount")?;
+        ensure!(
+            row.get("active").and_then(Value::as_bool) == Some(closed > 0 || terminal > 0),
+            "direction active flag is inconsistent"
+        );
+        let supported = closed >= minimum_closed_trades && active_windows >= minimum_active_windows;
+        Ok((
+            supported,
+            supported && net >= minimum_acceptable_net,
+            supported && net <= harmful_net,
+        ))
+    };
+    let (long_supported, long_acceptable, long_harmful) = side("long")?;
+    let (short_supported, short_acceptable, short_harmful) = side("short")?;
+    if (long_acceptable && short_harmful) || (short_acceptable && long_harmful) {
+        return Ok(false);
+    }
+    Ok((long_acceptable && short_acceptable)
+        || (long_acceptable && !short_supported)
+        || (short_acceptable && !long_supported))
 }
 
 fn pareto(mut rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
@@ -1633,28 +1731,38 @@ fn build_parent_archive(source: &Source, cumulative: &Value) -> Result<Value> {
             "rotating_frontier"
         };
         let robust = member(c, "robustObjectives")?.clone();
+        let cumulative_behavior = member(c, "cumulativeRealizedBehavior")?.clone();
+        let cumulative_behavior_sha256 = sha(&cumulative_behavior, "identitySha256")?.to_owned();
         let structural =
             optional_f64(member(&row, "objectives")?, "structuralComplexity")?.unwrap_or(0.0);
-        let map = row.as_object_mut().unwrap();
-        map.insert("objectives".into(),json!({"worstWindowConservativeNetR":number_f64(&robust,"worstWindowConservativeNetR")?,"maximumDrawdownR":number_f64(&robust,"drawdown")?,"structuralComplexity":structural}));
-        map.insert("archiveLane".into(), json!(lane));
-        map.insert(
-            "retentionReason".into(),
-            json!(if lane == "quality" {
-                "cumulative_robust_quality"
-            } else {
-                "bounded_cumulative_frontier_fallback"
-            }),
+        {
+            let map = row.as_object_mut().unwrap();
+            map.insert("objectives".into(),json!({"worstWindowConservativeNetR":number_f64(&robust,"worstWindowConservativeNetR")?,"maximumDrawdownR":number_f64(&robust,"drawdown")?,"structuralComplexity":structural}));
+            map.insert("archiveLane".into(), json!(lane));
+            map.insert(
+                "retentionReason".into(),
+                json!(if lane == "quality" {
+                    "cumulative_robust_quality"
+                } else {
+                    "bounded_cumulative_frontier_fallback"
+                }),
+            );
+            map.insert("robustBreederEligible".into(), json!(true));
+            map.insert("cumulativeEvidence".into(), c.clone());
+            map.insert(
+                "cumulativeEvidenceArchiveSha256".into(),
+                json!(sha(cumulative, "archiveSha256")?),
+            );
+            map.insert("robustObjectives".into(), robust);
+            map.insert("paretoFront".into(), Value::Null);
+            map.insert("crowdingDistance".into(), Value::Null);
+        }
+        let aggregate = object_mut(&mut row, "aggregate")?;
+        aggregate.insert("realizedBehavior".into(), cumulative_behavior);
+        aggregate.insert(
+            "behaviorIdentitySha256".into(),
+            Value::String(cumulative_behavior_sha256),
         );
-        map.insert("robustBreederEligible".into(), json!(true));
-        map.insert("cumulativeEvidence".into(), c.clone());
-        map.insert(
-            "cumulativeEvidenceArchiveSha256".into(),
-            json!(sha(cumulative, "archiveSha256")?),
-        );
-        map.insert("robustObjectives".into(), robust);
-        map.insert("paretoFront".into(), Value::Null);
-        map.insert("crowdingDistance".into(), Value::Null);
         let cell = text(member(&row, "descriptor")?, "cellId")?.to_owned();
         groups.entry(cell).or_default().push(row);
     }
@@ -3188,6 +3296,31 @@ mod tests {
     }
 
     fn synthetic_bundle(candidate: &Value, panel_id: &str, window_id: &str) -> Value {
+        let inactive_side = json!({
+            "closedTrades":0,"wins":0,"losses":0,"flatTrades":0,
+            "grossR":0.0,"netR":0.0,"costR":0.0,"holdingBars":0,"holdingHours":0.0,
+            "activeWindowCount":0,"closeReasonCounts":{},"actionCounts":{},
+            "transitionCounts":{},"terminalStatusCounts":{},"terminalDirectionCount":0,
+            "conflictAbstentions":0,"tradeSequence":[],"active":false,
+            "activeWindowFraction":0.0,"exposureProxy":0.0,"averageHoldingBars":0.0,
+            "closeReasonDistribution":{},"actionDistribution":{},"transitionDistribution":{},
+        });
+        let mut active_side = inactive_side.clone();
+        active_side["closedTrades"] = json!(20);
+        active_side["wins"] = json!(20);
+        active_side["grossR"] = json!(1.1);
+        active_side["netR"] = json!(1.0);
+        active_side["costR"] = json!(0.1);
+        active_side["activeWindowCount"] = json!(1);
+        active_side["active"] = json!(true);
+        active_side["activeWindowFraction"] = json!(1.0);
+        let realized_behavior = json!({
+            "schemaVersion":"temporal_realized_behavior_v1","windowId":window_id,
+            "reportedClosedTrades":20,"materializedClosedTrades":20,
+            "unattributedClosedTrades":0,"observations":100,"terminal":{},
+            "conflictAbstentions":0,"unattributedConflictAbstentions":0,
+            "sides":{"long":active_side,"short":inactive_side},
+        });
         let mut record = json!({
             "schemaVersion": WINDOW_SCHEMA,
             "candidateId": text(candidate,"candidateId").unwrap(),
@@ -3206,6 +3339,7 @@ mod tests {
                 "sourceProfileSnapshotSha256": HASH_C,
                 "resolvedProfileSnapshotSha256": HASH_C,
                 "resolvedProgramSha256": HASH_B,
+                "realizedBehavior": realized_behavior,
             },
             "evidenceDigestSha256": HASH_A,
             "rawTaskProvenance": {"authorityId":HASH_A,"taskMatrixSha256":HASH_A,"taskId":format!("{panel_id}-{window_id}"),"resultSha256":HASH_A},
@@ -3326,16 +3460,30 @@ mod tests {
         // validates its full known frozen-policy hash before reaching these
         // unchanged builders; the builder parity gate only needs the same
         // authenticated policy fields that determine emitted archive bytes.
+        let direction_policy = json!({
+            "schemaVersion":"temporal_direction_selection_policy_v1",
+            "minimum_closed_trades_per_side":1,
+            "minimum_active_windows_per_side":1,
+            "minimum_acceptable_side_net_r":0.0,
+            "harmful_opposite_net_r":-0.25,
+        });
         source.archive_policy = json!({
             "schemaVersion":"temporal_qd_archive_policy_binding_v1",
             "qdVersion":QD_VERSION,"policyName":QD_POLICY_NAME,"policySha256":QD_POLICY_SHA256,
-            "frozenPolicy":{"archive":{"defaultCellCapacity":1}},
+            "frozenPolicy":{
+                "archive":{"defaultCellCapacity":1},
+                "directionSelection":{
+                    "selectionPolicy":direction_policy,
+                    "selectionPolicySha256":canonical_sha256(&direction_policy).unwrap(),
+                },
+            },
         });
         source.rich_members = vec![json!({
             "candidateId":"candidate-1",
             "candidate":candidate,
             "descriptor":{"cellId":"cell-1"},
             "objectives":{"structuralComplexity":1.0},
+            "aggregate":{},
         })];
         source.funnel_source = {
             let mut value = json!({

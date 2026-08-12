@@ -11,6 +11,7 @@ anyhow.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-tail-reducer = { path = "../qd-tail-reducer" }
 
 [dev-dependencies]
 tempfile = "3"

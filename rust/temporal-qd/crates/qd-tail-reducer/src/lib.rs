@@ -1617,7 +1617,10 @@ fn aggregate_candidate(candidate: &Value, windows: &[Value]) -> Result<Value> {
     Ok(aggregate)
 }
 
-fn aggregate_realized_behavior(windows: &[Value]) -> Result<Value> {
+/// Aggregate the exact per-window realized-behavior projection used by the
+/// tail reducer.  Rotating finalization reuses this authority so cumulative
+/// parent evidence cannot drift from the archive member aggregation.
+pub fn aggregate_realized_behavior(windows: &[Value]) -> Result<Value> {
     ensure!(
         !windows.is_empty(),
         "realized behavior requires at least one window"
