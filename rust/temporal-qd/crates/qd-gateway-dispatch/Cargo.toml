@@ -17,6 +17,7 @@ reqwest = { version = "0.12.28", default-features = false, features = ["blocking
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+temporal-qd-campaign-freeze = { path = "../qd-campaign-freeze" }
 temporal-qd-campaign-seal = { path = "../qd-campaign-seal" }
 temporal-qd-contract = { path = "../qd-contract" }
 

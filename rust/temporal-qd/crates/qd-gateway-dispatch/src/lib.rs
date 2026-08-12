@@ -1,10 +1,10 @@
 //! Bounded native dispatcher for the existing local Lab gateway contract.
 //!
-//! The task matrix remains immutable.  This crate writes each task exactly
-//! once into a content-addressed sidecar, keeps only compact task-index and
-//! completion-journal metadata in memory, and writes the legacy Python
-//! checkpoint a single time after every task has a durable terminal record.
-//! A result is fsynced and journaled before its gateway lease is acknowledged.
+//! The campaign-input checkpoint owns one immutable canonical JSONL task pack.
+//! This crate indexes that payload without copying it into per-task files, keeps
+//! only compact task-index and completion metadata in memory, and writes the
+//! legacy Python checkpoint once after every task has a durable terminal record.
+//! A result is durably recorded before its gateway lease is acknowledged.
 
 #![recursion_limit = "256"]
 
@@ -13,7 +13,7 @@ use std::{
     error::Error as StdError,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -22,10 +22,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use flate2::{Compression, GzBuilder, read::GzDecoder};
 use reqwest::{StatusCode, blocking::Client};
-use serde::Deserializer as _;
-use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use temporal_qd_campaign_freeze::{V5CampaignInputCheckpoint, open_v5_campaign_input_checkpoint};
 use temporal_qd_campaign_seal::{
     CandidateWindowResultAdmission, admit_candidate_window_task_result,
 };
@@ -37,21 +36,13 @@ use temporal_qd_contract::{
 pub const DISPATCH_SCHEMA: &str = "temporal_qd_native_gateway_dispatch_result_v1";
 pub const TASK_INDEX_SCHEMA: &str = "temporal_qd_native_gateway_task_index_v1";
 pub const TASK_INDEX_ENTRY_SCHEMA: &str = "temporal_qd_native_gateway_task_index_entry_v1";
-pub const TASK_OBJECT_SCHEMA: &str = "temporal_qd_native_gateway_task_object_v1";
 pub const COMPLETION_JOURNAL_SCHEMA: &str =
     "temporal_qd_native_gateway_completion_journal_entry_v1";
 pub const FAILURE_RECEIPT_SCHEMA: &str = "temporal_qd_native_gateway_failure_receipt_v1";
 pub const TELEMETRY_SCHEMA: &str = "temporal_qd_native_gateway_dispatch_telemetry_v1";
 /// Current-runtime receipt ABI.  Version one deliberately remains historical:
 /// v5 callers must never fall back to its embedded O(T) result inventory.
-pub const EXECUTION_RECEIPT_SCHEMA: &str = "temporal_qd_native_gateway_execution_receipt_v2";
-pub const RESULT_INVENTORY_ENTRY_SCHEMA: &str =
-    "temporal_qd_native_gateway_result_inventory_entry_v2";
-pub const RESULT_INVENTORY_ROOT_SCHEMA: &str =
-    "temporal_qd_native_gateway_result_inventory_root_v2";
-
-const TASK_MANIFEST_SCHEMA: &str = "temporal_graph_candidate_window_manifest_v1";
-const CHECKPOINT_SCHEMA: &str = "temporal_graph_candidate_window_checkpoint_v1";
+pub const EXECUTION_RECEIPT_SCHEMA: &str = "temporal_qd_native_gateway_execution_receipt_v3";
 const TASK_KIND: &str = "temporal_graph_candidate_window";
 #[cfg(test)]
 const ADMITTED_SCHEMA: &str = "temporal_graph_candidate_window_result_v1";
@@ -60,12 +51,8 @@ const SIDECAR_DIR: &str = ".native-gateway-dispatch";
 const TASK_INDEX_NAME: &str = "task-index.jsonl";
 const TASK_INDEX_ROOT_NAME: &str = "task-index.json";
 const COMPLETION_JOURNAL_NAME: &str = "completion-journal.jsonl";
-const RESULT_INVENTORY_NAME: &str = "result-inventory.jsonl";
-const RESULT_INVENTORY_ROOT_NAME: &str = "result-inventory.json";
-const TASK_OBJECT_DIR: &str = "tasks";
-const RESULTS_DIR: &str = "results";
+pub const RESULT_PACK_NAME: &str = "results.pack";
 const FAILURES_DIR: &str = "failures";
-const CHECKPOINT_NAME: &str = "checkpoint.json";
 const EXECUTION_RECEIPT_NAME: &str = "execution-receipt.json";
 const MAX_SAFE_BATCH: usize = 1_000;
 const MAX_RESULT_BATCH: usize = 1_024;
@@ -80,7 +67,7 @@ pub enum DispatchMode {
 /// Immutable local inputs and explicit bounded-work controls.
 #[derive(Clone, Debug)]
 pub struct GatewayDispatchRequest {
-    pub task_manifest_path: PathBuf,
+    pub campaign_input_checkpoint_path: PathBuf,
     pub output_root: PathBuf,
     pub mode: DispatchMode,
     pub timeout: Duration,
@@ -100,12 +87,12 @@ pub struct GatewayDispatchRequest {
 
 impl GatewayDispatchRequest {
     pub fn bounded(
-        task_manifest_path: impl Into<PathBuf>,
+        campaign_input_checkpoint_path: impl Into<PathBuf>,
         output_root: impl Into<PathBuf>,
         mode: DispatchMode,
     ) -> Self {
         Self {
-            task_manifest_path: task_manifest_path.into(),
+            campaign_input_checkpoint_path: campaign_input_checkpoint_path.into(),
             output_root: output_root.into(),
             mode,
             timeout: Duration::from_secs(900),
@@ -121,8 +108,8 @@ impl GatewayDispatchRequest {
 
     fn validate(&self) -> Result<()> {
         ensure!(
-            !self.task_manifest_path.as_os_str().is_empty(),
-            "task manifest path is required"
+            !self.campaign_input_checkpoint_path.as_os_str().is_empty(),
+            "campaign-input checkpoint path is required"
         );
         ensure!(
             !self.output_root.as_os_str().is_empty(),
@@ -200,7 +187,7 @@ pub struct GatewayDispatchTelemetry {
     pub peak_live_task_batch: usize,
     pub peak_live_completion_batch: usize,
     pub peak_completion_bytes: usize,
-    pub checkpoint_compacted: bool,
+    pub result_pack_committed: bool,
     pub maintenance_activations: u64,
     pub maintenance_probe_count: u64,
     pub maintenance_pause_millis: u64,
@@ -223,7 +210,7 @@ impl GatewayDispatchTelemetry {
             "peakLiveTaskBatch": self.peak_live_task_batch,
             "peakLiveCompletionBatch": self.peak_live_completion_batch,
             "peakCompletionBytes": self.peak_completion_bytes,
-            "checkpointCompacted": self.checkpoint_compacted,
+            "resultPackCommitted": self.result_pack_committed,
             "maintenanceActivations": self.maintenance_activations,
             "maintenanceProbeCount": self.maintenance_probe_count,
             "maintenancePauseMillis": self.maintenance_pause_millis,
@@ -522,6 +509,8 @@ pub fn execute_gateway_dispatch_with_client(
     client: &mut dyn GatewayClient,
 ) -> Result<Value> {
     request.validate()?;
+    let campaign_input = open_v5_campaign_input_checkpoint(&request.campaign_input_checkpoint_path)
+        .context("open gateway campaign-input checkpoint")?;
     fs::create_dir_all(&request.output_root).with_context(|| {
         format!(
             "create dispatcher output root: {}",
@@ -530,16 +519,22 @@ pub fn execute_gateway_dispatch_with_client(
     })?;
     let paths = DispatchPaths::new(&request.output_root);
     paths.ensure_directories()?;
-    let (index, created_sidecar) = open_or_build_task_index(request, &paths)?;
+    let (index, created_index) = open_or_build_task_index(request, &paths, &campaign_input)?;
     let mut journal = load_completion_journal(&paths, &index)?;
     if paths.execution_receipt.exists() {
         ensure!(
             matches!(request.mode, DispatchMode::Resume),
             "fresh dispatcher run cannot reuse a committed execution receipt"
         );
-        return load_gateway_execution_receipt(&paths, &index, &journal, created_sidecar);
+        return load_gateway_execution_receipt(
+            &paths,
+            &index,
+            &journal,
+            created_index,
+            &request.campaign_input_checkpoint_path,
+        );
     }
-    validate_mode_and_checkpoint(request, &paths, &index, &journal)?;
+    validate_dispatch_mode(request, &journal)?;
     let mut telemetry = GatewayDispatchTelemetry {
         task_count: index.task_count,
         completed_task_count: journal.len() as u64,
@@ -567,7 +562,6 @@ pub fn execute_gateway_dispatch_with_client(
     enqueue_missing_tasks(
         client,
         request,
-        &paths,
         &index,
         &journal,
         &mut telemetry,
@@ -600,20 +594,21 @@ pub fn execute_gateway_dispatch_with_client(
             thread::sleep(request.poll_interval);
         }
     }
-    compact_legacy_checkpoint_once(&paths, &index, &journal)?;
     telemetry.completed_task_count = journal.len() as u64;
-    telemetry.checkpoint_compacted = true;
+    telemetry.result_pack_committed = true;
     let receipt = commit_gateway_execution_receipt(&paths, &index, &journal)?;
     Ok(json!({
         "schemaVersion": DISPATCH_SCHEMA,
         "authorityId": index.authority_id,
         "taskMatrixSha256": index.task_matrix_sha256,
+        "campaignInputCheckpointSha256": index.campaign_input_checkpoint_sha256,
+        "campaignInputCheckpointPath": request.campaign_input_checkpoint_path,
         "taskCount": index.task_count,
         "completedTaskCount": journal.len(),
         "taskIndexRootSha256": index.root_sha256,
-        "checkpointPath": paths.checkpoint.to_string_lossy(),
+        "resultPackPath": paths.result_pack.to_string_lossy(),
         "sidecarRoot": paths.sidecar_root.to_string_lossy(),
-        "createdTaskSidecar": created_sidecar,
+        "createdTaskIndex": created_index,
         "executionReceiptSha256": receipt.receipt_sha256,
         "semanticExecutionReceiptSha256": receipt.semantic_receipt_sha256,
         "executionReceiptPath": paths.execution_receipt.to_string_lossy(),
@@ -624,15 +619,11 @@ pub fn execute_gateway_dispatch_with_client(
 #[derive(Clone, Debug)]
 struct DispatchPaths {
     sidecar_root: PathBuf,
-    task_objects: PathBuf,
     task_index: PathBuf,
     task_index_root: PathBuf,
     completion_journal: PathBuf,
-    result_inventory: PathBuf,
-    result_inventory_root: PathBuf,
-    results: PathBuf,
+    result_pack: PathBuf,
     failures: PathBuf,
-    checkpoint: PathBuf,
     execution_receipt: PathBuf,
 }
 
@@ -640,15 +631,11 @@ impl DispatchPaths {
     fn new(output_root: &Path) -> Self {
         let sidecar_root = output_root.join(SIDECAR_DIR);
         Self {
-            task_objects: sidecar_root.join(TASK_OBJECT_DIR),
             task_index: sidecar_root.join(TASK_INDEX_NAME),
             task_index_root: sidecar_root.join(TASK_INDEX_ROOT_NAME),
             completion_journal: sidecar_root.join(COMPLETION_JOURNAL_NAME),
-            result_inventory: sidecar_root.join(RESULT_INVENTORY_NAME),
-            result_inventory_root: sidecar_root.join(RESULT_INVENTORY_ROOT_NAME),
-            results: output_root.join(RESULTS_DIR),
+            result_pack: sidecar_root.join(RESULT_PACK_NAME),
             failures: output_root.join(FAILURES_DIR),
-            checkpoint: output_root.join(CHECKPOINT_NAME),
             execution_receipt: sidecar_root.join(EXECUTION_RECEIPT_NAME),
             sidecar_root,
         }
@@ -657,8 +644,6 @@ impl DispatchPaths {
     fn ensure_directories(&self) -> Result<()> {
         for (path, label) in [
             (&self.sidecar_root, "dispatcher sidecar root"),
-            (&self.task_objects, "dispatcher task object root"),
-            (&self.results, "dispatcher result root"),
             (&self.failures, "dispatcher failure root"),
         ] {
             fs::create_dir_all(path)
@@ -666,16 +651,6 @@ impl DispatchPaths {
             ensure_real_directory(path, label)?;
         }
         Ok(())
-    }
-
-    fn task_object_path(&self, task_id: &str) -> Result<PathBuf> {
-        safe_identifier_value(task_id, "task id")?;
-        Ok(self.task_objects.join(format!("{task_id}.json")))
-    }
-
-    fn result_path(&self, task_id: &str) -> Result<PathBuf> {
-        safe_identifier_value(task_id, "task id")?;
-        Ok(self.results.join(format!("{task_id}.json.gz")))
     }
 
     fn failure_path(&self, task_id: &str) -> Result<PathBuf> {
@@ -698,209 +673,123 @@ fn gateway_runtime_role_sha256() -> Result<String> {
     }))?)
 }
 
-#[derive(Clone, Debug)]
-struct ResultInventoryRoot {
-    sha256: String,
-    size_bytes: u64,
-    count: u64,
-    root_sha256: String,
+fn journal_entries_in_ordinal_order(
+    journal: &CompletionJournal,
+) -> Result<Vec<&CompletionJournalEntry>> {
+    let mut entries = journal.values().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.ordinal);
+    for (ordinal, entry) in entries.iter().enumerate() {
+        ensure!(
+            entry.ordinal == ordinal as u64,
+            "completion journal ordinals are not contiguous"
+        );
+    }
+    Ok(entries)
 }
 
-fn result_inventory_entry(
-    ordinal: u64,
-    task_id: &str,
-    entry: &CompletionJournalEntry,
-    paths: &DispatchPaths,
-) -> Result<Value> {
-    let record = object(&entry.record, "receipt completion record")?;
-    let blob_sha256 = sha_file(&paths.result_path(task_id)?)?;
-    ensure!(
-        blob_sha256 == sha_field(record, "resultBlobSha256")?,
-        "receipt result blob identity drifted"
-    );
-    let mut value = json!({
-        "schemaVersion": RESULT_INVENTORY_ENTRY_SCHEMA,
-        "ordinal": ordinal,
-        "taskId": task_id,
-        "taskSha256": entry.task_sha256,
-        "completionSha256": entry.completion_sha256,
-        "resultBlobSha256": blob_sha256,
-        "resultSemanticSha256": sha_field(record, "resultSemanticSha256")?,
-        "outcome": record.get("outcome").cloned().unwrap_or(Value::String("admitted".into())),
-    });
-    let entry_sha256 = canonical_sha256(&value)?;
-    value["entrySha256"] = Value::String(entry_sha256);
-    Ok(value)
+fn committed_result_pack_end(journal: &CompletionJournal) -> Result<u64> {
+    let mut expected_offset = 0_u64;
+    for entry in journal_entries_in_ordinal_order(journal)? {
+        let record = object(&entry.record, "completion journal result record")?;
+        ensure!(
+            unsigned(record, "resultPackOffsetBytes")? == expected_offset,
+            "completion journal result-pack offsets are not contiguous"
+        );
+        expected_offset = expected_offset
+            .checked_add(unsigned(record, "resultPackLengthBytes")?)
+            .ok_or_else(|| anyhow!("result-pack byte count overflow"))?;
+    }
+    Ok(expected_offset)
 }
 
-/// Persist the O(T) inventory outside the receipt.  The receipt binds only a
-/// small self-hashed descriptor, so Python can pass it through without parsing
-/// candidate/result-scale material.
-fn write_result_inventory(
+/// Reconcile an interrupted append-only result pack with the durable journal.
+/// Bytes beyond the last committed journal row are an unacknowledged crash
+/// tail and may be truncated. Once the execution receipt exists, every byte is
+/// immutable and any length drift fails closed.
+fn reconcile_result_pack(
     paths: &DispatchPaths,
     journal: &CompletionJournal,
-) -> Result<ResultInventoryRoot> {
-    let staging = paths.sidecar_root.join(".result-inventory.staging");
-    if staging.exists() {
-        ensure_real_file(&staging, "stale result inventory staging file")?;
-        fs::remove_file(&staging).context("remove stale result inventory staging file")?;
+    committed: bool,
+) -> Result<u64> {
+    let expected = committed_result_pack_end(journal)?;
+    if !paths.result_pack.exists() {
+        ensure!(
+            expected == 0,
+            "completion journal commits a missing result pack"
+        );
+        return Ok(0);
+    }
+    ensure_real_file(&paths.result_pack, "gateway result pack")?;
+    let actual = fs::metadata(&paths.result_pack)?.len();
+    ensure!(
+        actual >= expected,
+        "gateway result pack is shorter than the durable completion journal"
+    );
+    if actual > expected {
+        ensure!(
+            !committed,
+            "committed gateway result pack has unbound trailing bytes"
+        );
+        let file = OpenOptions::new().write(true).open(&paths.result_pack)?;
+        file.set_len(expected)
+            .context("truncate uncommitted result-pack crash tail")?;
+        file.sync_all()
+            .context("fsync truncated result-pack crash tail")?;
+    }
+    Ok(expected)
+}
+
+fn read_result_blob(paths: &DispatchPaths, record: &Map<String, Value>) -> Result<Vec<u8>> {
+    let offset = unsigned(record, "resultPackOffsetBytes")?;
+    let length = usize::try_from(unsigned(record, "resultPackLengthBytes")?)?;
+    let mut file = File::open(&paths.result_pack)
+        .with_context(|| format!("open result pack: {}", paths.result_pack.display()))?;
+    let pack_size = file.metadata()?.len();
+    ensure!(
+        offset
+            .checked_add(length as u64)
+            .is_some_and(|end| end <= pack_size),
+        "completion record result-pack range is invalid"
+    );
+    file.seek(SeekFrom::Start(offset))?;
+    let mut blob = vec![0_u8; length];
+    file.read_exact(&mut blob)?;
+    ensure!(
+        sha256_prefixed(&blob) == sha_field(record, "resultBlobSha256")?,
+        "completion record result-pack blob identity drifted"
+    );
+    Ok(blob)
+}
+
+fn result_set_semantic_sha256(journal: &CompletionJournal) -> Result<String> {
+    let rows = journal
+        .iter()
+        .map(|(task_id, entry)| {
+            let record = object(&entry.record, "completion semantic result")?;
+            Ok(json!({
+                "taskId": task_id,
+                "taskSha256": entry.task_sha256,
+                "completionSha256": entry.completion_sha256,
+                "resultSemanticSha256": sha_field(record, "resultSemanticSha256")?,
+                "outcome": record.get("outcome").cloned().unwrap_or(Value::String("admitted".into())),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(canonical_sha256(&Value::Array(rows))?)
+}
+
+fn ensure_result_pack_exists(paths: &DispatchPaths) -> Result<()> {
+    if paths.result_pack.exists() {
+        ensure_real_file(&paths.result_pack, "gateway result pack")?;
+        return Ok(());
     }
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&staging)?;
-    let mut writer = BufWriter::new(file);
-    for (ordinal, (task_id, entry)) in journal.iter().enumerate() {
-        writer.write_all(&canonical_json_line(&result_inventory_entry(
-            ordinal as u64,
-            task_id,
-            entry,
-            paths,
-        )?)?)?;
-    }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    drop(writer);
-    let sha256 = sha_file(&staging)?;
-    let size_bytes = fs::metadata(&staging)?.len();
-    publish_staging_once(&staging, &paths.result_inventory)?;
-    let mut root = json!({
-        "schemaVersion": RESULT_INVENTORY_ROOT_SCHEMA,
-        "inventoryRelativePath": RESULT_INVENTORY_NAME,
-        "inventorySha256": sha256,
-        "inventorySizeBytes": size_bytes,
-        "inventoryCount": journal.len(),
-    });
-    let root_sha256 = canonical_sha256(&root)?;
-    root["resultInventoryRootSha256"] = Value::String(root_sha256.clone());
-    write_immutable_canonical(&paths.result_inventory_root, &root)?;
-    Ok(ResultInventoryRoot {
-        sha256: sha_field(object(&root, "result inventory root")?, "inventorySha256")?,
-        size_bytes,
-        count: journal.len() as u64,
-        root_sha256,
-    })
-}
-
-fn load_result_inventory(
-    paths: &DispatchPaths,
-    journal: &CompletionJournal,
-) -> Result<ResultInventoryRoot> {
-    let root_value = read_canonical_line(&paths.result_inventory_root, "result inventory root")?;
-    let root = object(&root_value, "result inventory root")?;
-    exact_keys(
-        root,
-        &[
-            "schemaVersion",
-            "inventoryRelativePath",
-            "inventorySha256",
-            "inventorySizeBytes",
-            "inventoryCount",
-            "resultInventoryRootSha256",
-        ],
-        "result inventory root",
-    )?;
-    let root_sha256 = sha_field(root, "resultInventoryRootSha256")?;
-    ensure!(
-        text(root, "schemaVersion")? == RESULT_INVENTORY_ROOT_SCHEMA
-            && text(root, "inventoryRelativePath")? == RESULT_INVENTORY_NAME
-            && canonical_sha256_without_object_field(&root_value, "resultInventoryRootSha256")?
-                == root_sha256,
-        "result inventory root identity drifted"
-    );
-    ensure_real_file(&paths.result_inventory, "result inventory")?;
-    ensure!(
-        sha_file(&paths.result_inventory)? == sha_field(root, "inventorySha256")?
-            && fs::metadata(&paths.result_inventory)?.len()
-                == unsigned(root, "inventorySizeBytes")?,
-        "result inventory bytes drifted"
-    );
-    let reader = BufReader::new(File::open(&paths.result_inventory)?);
-    let mut count = 0_u64;
-    let mut seen = BTreeSet::new();
-    for line in reader.lines() {
-        let line = line?;
-        ensure!(!line.is_empty(), "result inventory has an empty line");
-        let value: Value = serde_json::from_str(&line)?;
-        ensure!(
-            canonical_json_bytes(&value)? == line.as_bytes(),
-            "result inventory line is not canonical"
-        );
-        let map = object(&value, "result inventory entry")?;
-        exact_keys(
-            map,
-            &[
-                "schemaVersion",
-                "ordinal",
-                "taskId",
-                "taskSha256",
-                "completionSha256",
-                "resultBlobSha256",
-                "resultSemanticSha256",
-                "outcome",
-                "entrySha256",
-            ],
-            "result inventory entry",
-        )?;
-        let task_id = safe_identifier(field(map, "taskId")?, "result inventory task id")?;
-        ensure!(
-            text(map, "schemaVersion")? == RESULT_INVENTORY_ENTRY_SCHEMA
-                && unsigned(map, "ordinal")? == count
-                && canonical_sha256_without_object_field(&value, "entrySha256")?
-                    == sha_field(map, "entrySha256")?,
-            "result inventory entry identity drifted"
-        );
-        let journal_entry = journal
-            .get(&task_id)
-            .ok_or_else(|| anyhow!("result inventory task is absent from completion journal"))?;
-        let expected = result_inventory_entry(count, &task_id, journal_entry, paths)?;
-        ensure!(
-            value == expected,
-            "result inventory/journal binding drifted"
-        );
-        ensure!(
-            seen.insert(task_id),
-            "result inventory has duplicate task ids"
-        );
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("result inventory count overflow"))?;
-    }
-    ensure!(
-        count == journal.len() as u64 && count == unsigned(root, "inventoryCount")?,
-        "result inventory count drifted"
-    );
-    Ok(ResultInventoryRoot {
-        sha256: sha_field(root, "inventorySha256")?,
-        size_bytes: unsigned(root, "inventorySizeBytes")?,
-        count,
-        root_sha256,
-    })
-}
-
-fn completion_journal_semantic_sha256(journal: &CompletionJournal) -> Result<String> {
-    let mut rows = Vec::with_capacity(journal.len());
-    for entry in journal.values() {
-        let mut value = entry.to_value();
-        value
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("receipt completion journal entry must be an object"))?
-            .get_mut("record")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| anyhow!("receipt completion journal record is missing"))?
-            .remove("resultPath");
-        rows.push(value);
-    }
-    Ok(canonical_sha256(&Value::Array(rows))?)
-}
-
-fn checkpoint_semantic_sha256(index: &TaskIndex, journal: &CompletionJournal) -> Result<String> {
-    Ok(canonical_sha256(&json!({
-        "schemaVersion": CHECKPOINT_SCHEMA,
-        "authorityId": index.authority_id,
-        "taskMatrixSha256": index.task_matrix_sha256,
-        "completionJournalSemanticSha256": completion_journal_semantic_sha256(journal)?,
-    }))?)
+        .open(&paths.result_pack)
+        .with_context(|| format!("create result pack: {}", paths.result_pack.display()))?;
+    file.sync_all().context("fsync empty result pack")?;
+    Ok(())
 }
 
 fn commit_gateway_execution_receipt(
@@ -909,32 +798,30 @@ fn commit_gateway_execution_receipt(
     journal: &CompletionJournal,
 ) -> Result<GatewayExecutionReceipt> {
     ensure!(
-        journal.len() as u64 == index.task_count && paths.checkpoint.is_file(),
-        "gateway execution receipt requires complete journal and checkpoint"
+        journal.len() as u64 == index.task_count,
+        "gateway execution receipt requires every task completion"
     );
-    let inventory = write_result_inventory(paths, journal)?;
-    let completion_journal_semantic_sha256 = completion_journal_semantic_sha256(journal)?;
-    let checkpoint_semantic_sha256 = checkpoint_semantic_sha256(index, journal)?;
+    ensure_result_pack_exists(paths)?;
+    let result_pack_size_bytes = reconcile_result_pack(paths, journal, false)?;
     let semantic = json!({
         "schemaVersion": EXECUTION_RECEIPT_SCHEMA,
         "runtimeRoleSha256": gateway_runtime_role_sha256()?,
         "authorityId": index.authority_id,
         "taskMatrixSha256": index.task_matrix_sha256,
-        "sourceTaskManifestSha256": index.source_manifest_sha256,
+        "campaignInputCheckpointSha256": index.campaign_input_checkpoint_sha256,
+        "campaignTaskPackRawSha256": index.pack_sha256,
+        "campaignTaskPackSizeBytes": index.pack_size_bytes,
         "taskIndexRootSha256": index.root_sha256,
-        "completionJournalSemanticSha256": completion_journal_semantic_sha256,
-        "checkpointSemanticSha256": checkpoint_semantic_sha256,
         "taskCount": index.task_count,
         "completedTaskCount": journal.len(),
-        "resultInventoryRootSha256": inventory.root_sha256,
-        "resultInventorySha256": inventory.sha256,
-        "resultInventorySizeBytes": inventory.size_bytes,
-        "resultInventoryCount": inventory.count,
+        "resultSetSemanticSha256": result_set_semantic_sha256(journal)?,
     });
     let semantic_receipt_sha256 = canonical_sha256(&semantic)?;
     let mut value = semantic;
     value["completionJournalSha256"] = Value::String(sha_file(&paths.completion_journal)?);
-    value["checkpointSha256"] = Value::String(sha_file(&paths.checkpoint)?);
+    value["resultPackSha256"] = Value::String(sha_file(&paths.result_pack)?);
+    value["resultPackSizeBytes"] = Value::from(result_pack_size_bytes);
+    value["resultCount"] = Value::from(journal.len() as u64);
     value["semanticReceiptSha256"] = Value::String(semantic_receipt_sha256.clone());
     let receipt_sha256 = canonical_sha256(&value)?;
     value["receiptSha256"] = Value::String(receipt_sha256.clone());
@@ -949,7 +836,8 @@ fn load_gateway_execution_receipt(
     paths: &DispatchPaths,
     index: &TaskIndex,
     journal: &CompletionJournal,
-    created_sidecar: bool,
+    created_index: bool,
+    campaign_input_checkpoint_path: &Path,
 ) -> Result<Value> {
     let value = read_canonical_line(&paths.execution_receipt, "gateway execution receipt")?;
     let map = object(&value, "gateway execution receipt")?;
@@ -960,65 +848,56 @@ fn load_gateway_execution_receipt(
             "runtimeRoleSha256",
             "authorityId",
             "taskMatrixSha256",
-            "sourceTaskManifestSha256",
+            "campaignInputCheckpointSha256",
+            "campaignTaskPackRawSha256",
+            "campaignTaskPackSizeBytes",
             "taskIndexRootSha256",
-            "completionJournalSemanticSha256",
-            "checkpointSemanticSha256",
-            "completionJournalSha256",
-            "checkpointSha256",
             "taskCount",
             "completedTaskCount",
-            "resultInventoryRootSha256",
-            "resultInventorySha256",
-            "resultInventorySizeBytes",
-            "resultInventoryCount",
+            "resultSetSemanticSha256",
+            "completionJournalSha256",
+            "resultPackSha256",
+            "resultPackSizeBytes",
+            "resultCount",
             "semanticReceiptSha256",
             "receiptSha256",
         ],
         "gateway execution receipt",
     )?;
     let receipt_sha256 = sha_field(map, "receiptSha256")?;
+    let result_pack_size_bytes = reconcile_result_pack(paths, journal, true)?;
     ensure!(
         text(map, "schemaVersion")? == EXECUTION_RECEIPT_SCHEMA
             && canonical_sha256_without_object_field(&value, "receiptSha256")? == receipt_sha256
             && sha_field(map, "runtimeRoleSha256")? == gateway_runtime_role_sha256()?
             && sha_field(map, "authorityId")? == index.authority_id
             && sha_field(map, "taskMatrixSha256")? == index.task_matrix_sha256
-            && sha_field(map, "sourceTaskManifestSha256")? == index.source_manifest_sha256
+            && sha_field(map, "campaignInputCheckpointSha256")?
+                == index.campaign_input_checkpoint_sha256
+            && sha_field(map, "campaignTaskPackRawSha256")? == index.pack_sha256
+            && unsigned(map, "campaignTaskPackSizeBytes")? == index.pack_size_bytes
             && sha_field(map, "taskIndexRootSha256")? == index.root_sha256
-            && sha_field(map, "completionJournalSemanticSha256")?
-                == completion_journal_semantic_sha256(journal)?
-            && sha_field(map, "checkpointSemanticSha256")?
-                == checkpoint_semantic_sha256(index, journal)?
-            && sha_field(map, "completionJournalSha256")? == sha_file(&paths.completion_journal)?
-            && sha_field(map, "checkpointSha256")? == sha_file(&paths.checkpoint)?
             && unsigned(map, "taskCount")? == index.task_count
-            && unsigned(map, "completedTaskCount")? == journal.len() as u64,
+            && unsigned(map, "completedTaskCount")? == journal.len() as u64
+            && sha_field(map, "resultSetSemanticSha256")? == result_set_semantic_sha256(journal)?
+            && sha_field(map, "completionJournalSha256")? == sha_file(&paths.completion_journal)?
+            && sha_field(map, "resultPackSha256")? == sha_file(&paths.result_pack)?
+            && unsigned(map, "resultPackSizeBytes")? == result_pack_size_bytes
+            && unsigned(map, "resultCount")? == journal.len() as u64,
         "gateway execution receipt identity/output binding drifted"
-    );
-    let inventory = load_result_inventory(paths, journal)?;
-    ensure!(
-        sha_field(map, "resultInventoryRootSha256")? == inventory.root_sha256
-            && sha_field(map, "resultInventorySha256")? == inventory.sha256
-            && unsigned(map, "resultInventorySizeBytes")? == inventory.size_bytes
-            && unsigned(map, "resultInventoryCount")? == inventory.count,
-        "gateway receipt result inventory binding drifted"
     );
     let semantic = json!({
         "schemaVersion": EXECUTION_RECEIPT_SCHEMA,
         "runtimeRoleSha256": gateway_runtime_role_sha256()?,
         "authorityId": index.authority_id,
         "taskMatrixSha256": index.task_matrix_sha256,
-        "sourceTaskManifestSha256": index.source_manifest_sha256,
+        "campaignInputCheckpointSha256": index.campaign_input_checkpoint_sha256,
+        "campaignTaskPackRawSha256": index.pack_sha256,
+        "campaignTaskPackSizeBytes": index.pack_size_bytes,
         "taskIndexRootSha256": index.root_sha256,
-        "completionJournalSemanticSha256": sha_field(map, "completionJournalSemanticSha256")?,
-        "checkpointSemanticSha256": sha_field(map, "checkpointSemanticSha256")?,
         "taskCount": index.task_count,
         "completedTaskCount": journal.len(),
-        "resultInventoryRootSha256": inventory.root_sha256,
-        "resultInventorySha256": inventory.sha256,
-        "resultInventorySizeBytes": inventory.size_bytes,
-        "resultInventoryCount": inventory.count,
+        "resultSetSemanticSha256": result_set_semantic_sha256(journal)?,
     });
     ensure!(
         canonical_sha256(&semantic)? == sha_field(map, "semanticReceiptSha256")?,
@@ -1028,17 +907,19 @@ fn load_gateway_execution_receipt(
         "schemaVersion": DISPATCH_SCHEMA,
         "authorityId": index.authority_id,
         "taskMatrixSha256": index.task_matrix_sha256,
+        "campaignInputCheckpointSha256": index.campaign_input_checkpoint_sha256,
+        "campaignInputCheckpointPath": campaign_input_checkpoint_path,
         "taskCount": index.task_count,
         "completedTaskCount": journal.len(),
         "taskIndexRootSha256": index.root_sha256,
-        "checkpointPath": paths.checkpoint.to_string_lossy(),
+        "resultPackPath": paths.result_pack.to_string_lossy(),
         "sidecarRoot": paths.sidecar_root.to_string_lossy(),
-        "createdTaskSidecar": created_sidecar,
+        "createdTaskIndex": created_index,
         "executionReceiptSha256": receipt_sha256,
         "semanticExecutionReceiptSha256": sha_field(map, "semanticReceiptSha256")?,
         "executionReceiptPath": paths.execution_receipt.to_string_lossy(),
         // Telemetry is intentionally not a durable semantic claim.
-        "telemetry": GatewayDispatchTelemetry { task_count: index.task_count, completed_task_count: journal.len() as u64, checkpoint_compacted: true, ..Default::default() }.to_value(),
+        "telemetry": GatewayDispatchTelemetry { task_count: index.task_count, completed_task_count: journal.len() as u64, result_pack_committed: true, ..Default::default() }.to_value(),
     }))
 }
 
@@ -1047,8 +928,8 @@ struct TaskIndexEntry {
     ordinal: u64,
     task_id: String,
     task_sha256: String,
-    task_object_sha256: String,
-    relative_path: String,
+    offset_bytes: u64,
+    length_bytes: u64,
     entry_sha256: String,
 }
 
@@ -1057,19 +938,19 @@ impl TaskIndexEntry {
         ordinal: u64,
         task_id: String,
         task_sha256: String,
-        task_object_sha256: String,
+        offset_bytes: u64,
+        length_bytes: u64,
     ) -> Result<Self> {
-        let relative_path = format!("{TASK_OBJECT_DIR}/{task_id}.json");
         let mut value = json!({
             "schemaVersion": TASK_INDEX_ENTRY_SCHEMA,
             "ordinal": ordinal,
             "taskId": task_id,
             "taskSha256": task_sha256,
-            "taskObjectSha256": task_object_sha256,
-            "relativePath": relative_path,
+            "offsetBytes": offset_bytes,
+            "lengthBytes": length_bytes,
         });
         let entry_sha256 = canonical_sha256(&value)?;
-        value["entrySha256"] = Value::String(entry_sha256.clone());
+        value["entrySha256"] = Value::String(entry_sha256);
         Self::from_value(&value)
     }
 
@@ -1079,8 +960,8 @@ impl TaskIndexEntry {
             "ordinal": self.ordinal,
             "taskId": self.task_id,
             "taskSha256": self.task_sha256,
-            "taskObjectSha256": self.task_object_sha256,
-            "relativePath": self.relative_path,
+            "offsetBytes": self.offset_bytes,
+            "lengthBytes": self.length_bytes,
             "entrySha256": self.entry_sha256,
         })
     }
@@ -1094,8 +975,8 @@ impl TaskIndexEntry {
                 "ordinal",
                 "taskId",
                 "taskSha256",
-                "taskObjectSha256",
-                "relativePath",
+                "offsetBytes",
+                "lengthBytes",
                 "entrySha256",
             ],
             "task index entry",
@@ -1109,18 +990,14 @@ impl TaskIndexEntry {
             canonical_sha256_without_object_field(value, "entrySha256")? == entry_sha256,
             "task index entry self identity mismatch"
         );
-        let task_id = safe_identifier(field(map, "taskId")?, "task index task id")?;
-        let relative_path = text(map, "relativePath")?;
-        ensure!(
-            relative_path == format!("{TASK_OBJECT_DIR}/{task_id}.json"),
-            "task index entry path is unsafe or inconsistent"
-        );
+        let length_bytes = unsigned(map, "lengthBytes")?;
+        ensure!(length_bytes > 1, "task index entry length is invalid");
         Ok(Self {
             ordinal: unsigned(map, "ordinal")?,
-            task_id,
+            task_id: safe_identifier(field(map, "taskId")?, "task index task id")?,
             task_sha256: sha_field(map, "taskSha256")?,
-            task_object_sha256: sha_field(map, "taskObjectSha256")?,
-            relative_path,
+            offset_bytes: unsigned(map, "offsetBytes")?,
+            length_bytes,
             entry_sha256,
         })
     }
@@ -1128,29 +1005,32 @@ impl TaskIndexEntry {
 
 #[derive(Clone, Debug)]
 struct TaskIndex {
+    campaign_input_checkpoint_sha256: String,
+    task_pack_path: PathBuf,
     authority_id: String,
     task_matrix_sha256: String,
-    source_manifest_sha256: String,
     task_count: u64,
+    pack_sha256: String,
+    pack_size_bytes: u64,
     index_sha256: String,
     index_size_bytes: u64,
     root_sha256: String,
-    /// Compact per-task identities/path metadata only. Rich task values stay
-    /// in individual sidecar objects and are loaded one at a time.
     entries: BTreeMap<String, TaskIndexEntry>,
 }
 
 impl TaskIndex {
-    fn from_root_value(value: &Value) -> Result<Self> {
+    fn from_root_value(value: &Value, checkpoint: &V5CampaignInputCheckpoint) -> Result<Self> {
         let map = object(value, "task index root")?;
         exact_keys(
             map,
             &[
                 "schemaVersion",
+                "campaignInputCheckpointSha256",
                 "authorityId",
                 "taskMatrixSha256",
-                "sourceTaskManifestSha256",
                 "taskCount",
+                "campaignTaskPackRawSha256",
+                "campaignTaskPackSizeBytes",
                 "taskIndexRelativePath",
                 "taskIndexSha256",
                 "taskIndexSizeBytes",
@@ -1159,23 +1039,32 @@ impl TaskIndex {
             "task index root",
         )?;
         ensure!(
-            text(map, "schemaVersion")? == TASK_INDEX_SCHEMA,
-            "task index root schema is incompatible"
-        );
-        ensure!(
-            text(map, "taskIndexRelativePath")? == TASK_INDEX_NAME,
-            "task index root path is incompatible"
+            text(map, "schemaVersion")? == TASK_INDEX_SCHEMA
+                && text(map, "taskIndexRelativePath")? == TASK_INDEX_NAME,
+            "task index root schema/path is incompatible"
         );
         let root_sha256 = sha_field(map, "taskIndexRootSha256")?;
         ensure!(
             canonical_sha256_without_object_field(value, "taskIndexRootSha256")? == root_sha256,
             "task index root self identity mismatch"
         );
+        ensure!(
+            sha_field(map, "campaignInputCheckpointSha256")? == checkpoint.checkpoint_sha256
+                && sha_field(map, "authorityId")? == checkpoint.authority_id
+                && sha_field(map, "taskMatrixSha256")? == checkpoint.task_matrix_sha256
+                && unsigned(map, "taskCount")? == checkpoint.task_count
+                && sha_field(map, "campaignTaskPackRawSha256")? == checkpoint.task_pack_raw_sha256
+                && unsigned(map, "campaignTaskPackSizeBytes")? == checkpoint.task_pack_size_bytes,
+            "task index root campaign-input binding drifted"
+        );
         Ok(Self {
+            campaign_input_checkpoint_sha256: sha_field(map, "campaignInputCheckpointSha256")?,
+            task_pack_path: checkpoint.task_pack_path.clone(),
             authority_id: sha_field(map, "authorityId")?,
             task_matrix_sha256: sha_field(map, "taskMatrixSha256")?,
-            source_manifest_sha256: sha_field(map, "sourceTaskManifestSha256")?,
             task_count: unsigned(map, "taskCount")?,
+            pack_sha256: sha_field(map, "campaignTaskPackRawSha256")?,
+            pack_size_bytes: unsigned(map, "campaignTaskPackSizeBytes")?,
             index_sha256: sha_field(map, "taskIndexSha256")?,
             index_size_bytes: unsigned(map, "taskIndexSizeBytes")?,
             root_sha256,
@@ -1185,143 +1074,171 @@ impl TaskIndex {
 }
 
 fn open_or_build_task_index(
-    request: &GatewayDispatchRequest,
+    _request: &GatewayDispatchRequest,
     paths: &DispatchPaths,
+    checkpoint: &V5CampaignInputCheckpoint,
 ) -> Result<(TaskIndex, bool)> {
     if paths.task_index_root.exists() {
         ensure!(
             paths.task_index.is_file(),
-            "dispatcher task sidecar root commits a missing task index"
+            "dispatcher task index root commits a missing task index"
         );
-        let index = load_task_index(paths)?;
-        if request.task_manifest_path.exists() {
-            ensure!(
-                sha_file(&request.task_manifest_path)? == index.source_manifest_sha256,
-                "immutable task manifest bytes drifted from dispatcher sidecar"
-            );
-        } else {
-            ensure!(
-                matches!(request.mode, DispatchMode::Resume),
-                "fresh dispatcher run requires the immutable task manifest"
-            );
-        }
-        return Ok((index, false));
+        return load_task_index(paths, checkpoint).map(|index| (index, false));
     }
     if paths.task_index.exists() {
-        // An index without its immutable root can only be an interrupted first
-        // sidecar publication. No completed journal can bind to it yet, so
-        // rebuild from the task manifest while retaining/verifying individual
-        // immutable task objects.
         ensure_real_file(&paths.task_index, "interrupted task index")?;
         fs::remove_file(&paths.task_index).context("discard interrupted task index")?;
     }
-    ensure!(
-        matches!(request.mode, DispatchMode::Fresh | DispatchMode::Resume),
-        "dispatcher mode is invalid"
-    );
-    let index = build_task_index(&request.task_manifest_path, paths)?;
-    Ok((index, true))
+    build_task_index(checkpoint, paths).map(|index| (index, true))
 }
 
-fn build_task_index(task_manifest_path: &Path, paths: &DispatchPaths) -> Result<TaskIndex> {
-    let manifest_path = existing_file(task_manifest_path, "immutable task manifest")?;
-    let source_manifest_sha256 = sha_file(&manifest_path)?;
-    let staging = paths.sidecar_root.join(".task-index.staging");
-    if staging.exists() {
-        ensure_real_file(&staging, "stale task-index staging file")?;
-        fs::remove_file(&staging).context("remove stale task-index staging file")?;
+fn build_task_index(
+    checkpoint: &V5CampaignInputCheckpoint,
+    paths: &DispatchPaths,
+) -> Result<TaskIndex> {
+    let task_pack_path = existing_file(
+        &checkpoint.task_pack_path,
+        "immutable campaign-input task pack",
+    )?;
+    let index_staging = paths.sidecar_root.join(".task-index.staging");
+    if index_staging.exists() {
+        ensure_real_file(&index_staging, "stale task-index staging file")?;
+        fs::remove_file(&index_staging).context("remove stale task-index staging file")?;
     }
-    let index_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)
-        .context("create task-index staging file")?;
-    let mut writer = BufWriter::new(index_file);
-    let mut entries_seen = BTreeSet::new();
+    let mut index_writer = BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&index_staging)
+            .context("create task-index staging file")?,
+    );
+    let mut index_digest = Sha256::new();
+    let mut task_pack_digest = Sha256::new();
+    let mut matrix_digest = Sha256::new();
+    matrix_digest.update(b"[");
+    let mut index_size = 0_u64;
+    let mut pack_size = 0_u64;
     let mut entries = BTreeMap::new();
-    let mut entry_count = 0_u64;
-    let header = stream_task_manifest(&manifest_path, |task| {
-        let task_map = object(&task, "task manifest task")?;
-        let task_id = safe_identifier(field(task_map, "task_id")?, "task manifest task id")?;
+    let mut reader = BufReader::new(File::open(&task_pack_path).with_context(|| {
+        format!(
+            "open campaign-input task pack: {}",
+            task_pack_path.display()
+        )
+    })?);
+    let mut ordinal = 0_u64;
+    loop {
+        let mut line = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("stream campaign-input task-pack row")?;
+        if read == 0 {
+            break;
+        }
         ensure!(
-            entries_seen.insert(task_id.clone()),
-            "immutable task manifest has duplicate task ids"
+            line.len() > 1 && line.last() == Some(&b'\n'),
+            "campaign-input task-pack row is not canonical JSONL"
         );
+        let task: Value = serde_json::from_slice(&line[..line.len() - 1])
+            .context("parse campaign-input task-pack row")?;
+        ensure!(
+            canonical_json_line(&task)? == line,
+            "campaign-input task-pack row is not canonical JSONL"
+        );
+        let task_map = object(&task, "campaign-input task")?;
+        let task_id = safe_identifier(field(task_map, "task_id")?, "campaign-input task id")?;
         let task_sha256 = canonical_sha256(&task)?;
-        let task_object = task_object_value(&task, &task_sha256)?;
-        let task_object_sha256 =
-            sha_field(object(&task_object, "task object")?, "taskObjectSha256")?;
-        let task_object_path = paths.task_object_path(&task_id)?;
-        write_immutable_canonical(&task_object_path, &task_object)?;
-        let entry = TaskIndexEntry::new(entry_count, task_id, task_sha256, task_object_sha256)?;
-        writer.write_all(&canonical_json_line(&entry.to_value())?)?;
+        let length_bytes = line.len() as u64;
+        let entry = TaskIndexEntry::new(ordinal, task_id, task_sha256, pack_size, length_bytes)?;
+        let entry_bytes = canonical_json_line(&entry.to_value())?;
+        index_writer.write_all(&entry_bytes)?;
+        index_digest.update(&entry_bytes);
+        index_size = index_size
+            .checked_add(entry_bytes.len() as u64)
+            .ok_or_else(|| anyhow!("task index byte count overflow"))?;
+        task_pack_digest.update(&line);
+        if ordinal > 0 {
+            matrix_digest.update(b",");
+        }
+        matrix_digest.update(canonical_json_bytes(&task)?);
+        pack_size = pack_size
+            .checked_add(length_bytes)
+            .ok_or_else(|| anyhow!("campaign task-pack byte count overflow"))?;
         ensure!(
             entries.insert(entry.task_id.clone(), entry).is_none(),
-            "immutable task manifest task id is duplicated"
+            "campaign-input task pack repeats a task id"
         );
-        entry_count = entry_count
+        ordinal = ordinal
             .checked_add(1)
             .ok_or_else(|| anyhow!("task index entry count overflow"))?;
-        Ok(())
-    })?;
+    }
+    matrix_digest.update(b"]");
+    let task_pack_sha256 = digest_sha256_prefixed(task_pack_digest.finalize());
+    let task_matrix_sha256 = digest_sha256_prefixed(matrix_digest.finalize());
     ensure!(
-        header.schema_version == TASK_MANIFEST_SCHEMA,
-        "immutable task manifest schema is incompatible"
+        ordinal == checkpoint.task_count
+            && pack_size == checkpoint.task_pack_size_bytes
+            && task_pack_sha256 == checkpoint.task_pack_raw_sha256
+            && task_matrix_sha256 == checkpoint.task_matrix_sha256,
+        "campaign-input task-pack/checkpoint binding drifted"
     );
-    ensure!(
-        header.task_count == entry_count,
-        "immutable task manifest task count drifted"
-    );
-    writer.flush()?;
-    writer
+    index_writer.flush()?;
+    index_writer
         .get_ref()
         .sync_all()
-        .context("fsync task-index staging file")?;
-    drop(writer);
-    let index_sha256 = sha_file(&staging)?;
-    let index_size_bytes = fs::metadata(&staging)?.len();
+        .context("fsync task index")?;
+    drop(index_writer);
+    let index_sha256 = digest_sha256_prefixed(index_digest.finalize());
     let mut root_value = json!({
         "schemaVersion": TASK_INDEX_SCHEMA,
-        "authorityId": header.authority_id,
-        "taskMatrixSha256": header.task_matrix_sha256,
-        "sourceTaskManifestSha256": source_manifest_sha256,
-        "taskCount": header.task_count,
+        "campaignInputCheckpointSha256": checkpoint.checkpoint_sha256.clone(),
+        "authorityId": checkpoint.authority_id.clone(),
+        "taskMatrixSha256": checkpoint.task_matrix_sha256.clone(),
+        "campaignTaskPackRawSha256": checkpoint.task_pack_raw_sha256.clone(),
+        "campaignTaskPackSizeBytes": checkpoint.task_pack_size_bytes,
+        "taskCount": checkpoint.task_count,
         "taskIndexRelativePath": TASK_INDEX_NAME,
         "taskIndexSha256": index_sha256,
-        "taskIndexSizeBytes": index_size_bytes,
+        "taskIndexSizeBytes": index_size,
     });
     let root_sha256 = canonical_sha256(&root_value)?;
-    root_value["taskIndexRootSha256"] = Value::String(root_sha256.clone());
-    publish_staging_once(&staging, &paths.task_index)?;
+    root_value["taskIndexRootSha256"] = Value::String(root_sha256);
+    publish_staging_once(&index_staging, &paths.task_index)?;
     write_immutable_canonical(&paths.task_index_root, &root_value)?;
-    let mut index = TaskIndex::from_root_value(&root_value)?;
+    let mut index = TaskIndex::from_root_value(&root_value, checkpoint)?;
     index.entries = entries;
     Ok(index)
 }
 
-fn load_task_index(paths: &DispatchPaths) -> Result<TaskIndex> {
+fn load_task_index(
+    paths: &DispatchPaths,
+    checkpoint: &V5CampaignInputCheckpoint,
+) -> Result<TaskIndex> {
     let root_value = read_canonical_line(&paths.task_index_root, "task index root")?;
-    let mut index = TaskIndex::from_root_value(&root_value)?;
+    let mut index = TaskIndex::from_root_value(&root_value, checkpoint)?;
+    ensure_real_file(&index.task_pack_path, "campaign-input task pack")?;
+    ensure_real_file(&paths.task_index, "task index")?;
     ensure!(
-        fs::metadata(&paths.task_index)?.len() == index.index_size_bytes,
-        "task index byte count drifted"
+        fs::metadata(&index.task_pack_path)?.len() == index.pack_size_bytes
+            && sha_file(&index.task_pack_path)? == index.pack_sha256
+            && fs::metadata(&paths.task_index)?.len() == index.index_size_bytes
+            && sha_file(&paths.task_index)? == index.index_sha256,
+        "campaign task-pack/task-index byte identity drifted"
     );
-    ensure!(
-        sha_file(&paths.task_index)? == index.index_sha256,
-        "task index identity drifted"
-    );
-    let mut previous_ordinal = None;
+    let mut previous_end = 0_u64;
     let mut count = 0_u64;
     stream_task_index(paths, |entry| {
-        if let Some(previous) = previous_ordinal {
-            ensure!(
-                entry.ordinal == previous + 1,
-                "task index ordinals are not contiguous"
-            );
-        } else {
-            ensure!(entry.ordinal == 0, "task index must begin at ordinal zero");
-        }
-        previous_ordinal = Some(entry.ordinal);
+        ensure!(
+            entry.ordinal == count
+                && entry.offset_bytes == previous_end
+                && entry
+                    .offset_bytes
+                    .checked_add(entry.length_bytes)
+                    .is_some_and(|end| end <= index.pack_size_bytes),
+            "task index offsets/ordinals are not contiguous"
+        );
+        previous_end = previous_end
+            .checked_add(entry.length_bytes)
+            .ok_or_else(|| anyhow!("task-pack offset overflow"))?;
         ensure!(
             index.entries.insert(entry.task_id.clone(), entry).is_none(),
             "task index contains duplicate task ids"
@@ -1329,7 +1246,10 @@ fn load_task_index(paths: &DispatchPaths) -> Result<TaskIndex> {
         count += 1;
         Ok(())
     })?;
-    ensure!(count == index.task_count, "task index task count drifted");
+    ensure!(
+        count == index.task_count && previous_end == index.pack_size_bytes,
+        "task index task/pack size drifted"
+    );
     Ok(index)
 }
 
@@ -1355,271 +1275,39 @@ fn stream_task_index(
     Ok(())
 }
 
-fn task_object_value(task: &Value, task_sha256: &str) -> Result<Value> {
-    let mut object = json!({
-        "schemaVersion": TASK_OBJECT_SCHEMA,
-        "task": task,
-        "taskSha256": task_sha256,
-    });
-    let object_sha256 = canonical_sha256(&object)?;
-    object["taskObjectSha256"] = Value::String(object_sha256);
-    Ok(object)
-}
-
-fn load_task_object(paths: &DispatchPaths, entry: &TaskIndexEntry) -> Result<Value> {
-    let path = paths.task_object_path(&entry.task_id)?;
-    let value = read_canonical_line(&path, "task object")?;
-    let map = object(&value, "task object")?;
-    exact_keys(
-        map,
-        &["schemaVersion", "task", "taskSha256", "taskObjectSha256"],
-        "task object",
-    )?;
+fn load_task_object(index: &TaskIndex, entry: &TaskIndexEntry) -> Result<Value> {
+    let mut file = File::open(&index.task_pack_path).with_context(|| {
+        format!(
+            "open campaign task pack: {}",
+            index.task_pack_path.display()
+        )
+    })?;
+    let pack_size = fs::metadata(&index.task_pack_path)?.len();
     ensure!(
-        text(map, "schemaVersion")? == TASK_OBJECT_SCHEMA,
-        "task object schema is incompatible"
+        entry
+            .offset_bytes
+            .checked_add(entry.length_bytes)
+            .is_some_and(|end| end <= pack_size),
+        "task pack entry range is invalid"
     );
+    file.seek(SeekFrom::Start(entry.offset_bytes))?;
+    let mut bytes = vec![0_u8; entry.length_bytes as usize];
+    file.read_exact(&mut bytes)?;
     ensure!(
-        sha_field(map, "taskObjectSha256")? == entry.task_object_sha256
-            && canonical_sha256_without_object_field(&value, "taskObjectSha256")?
-                == entry.task_object_sha256,
-        "task object self identity drifted"
+        bytes.last() == Some(&b'\n'),
+        "task pack entry lacks canonical newline"
     );
-    let task = field(map, "task")?.clone();
+    let task: Value = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
     ensure!(
-        canonical_sha256(&task)? == entry.task_sha256
-            && sha_field(map, "taskSha256")? == entry.task_sha256,
-        "task object task identity drifted"
+        canonical_json_line(&task)? == bytes && canonical_sha256(&task)? == entry.task_sha256,
+        "task pack entry identity drifted"
     );
     let task_id = safe_identifier(
-        field(object(&task, "task object task")?, "task_id")?,
-        "task object task id",
+        field(object(&task, "task pack task")?, "task_id")?,
+        "task pack task id",
     )?;
-    ensure!(task_id == entry.task_id, "task object task id drifted");
+    ensure!(task_id == entry.task_id, "task pack task id drifted");
     Ok(task)
-}
-
-#[derive(Clone, Debug)]
-struct TaskManifestHeader {
-    schema_version: String,
-    authority_id: String,
-    task_matrix_sha256: String,
-    task_count: u64,
-}
-
-/// Deserialize just the manifest envelope while feeding each individual task
-/// to `on_task`. The `tasks` array is never materialized as a `Vec<Value>`.
-fn stream_task_manifest(
-    path: &Path,
-    on_task: impl FnMut(Value) -> Result<()>,
-) -> Result<TaskManifestHeader> {
-    let file =
-        File::open(path).with_context(|| format!("open task manifest: {}", path.display()))?;
-    let mut callback = on_task;
-    let mut state = TaskManifestStreamState {
-        callback: &mut callback,
-        schema_version: None,
-        authority_id: None,
-        task_matrix_sha256: None,
-        task_count: None,
-        seen: BTreeSet::new(),
-        task_hasher: {
-            let mut hasher = Sha256::new();
-            hasher.update(b"[");
-            hasher
-        },
-        seen_task_count: 0,
-    };
-    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
-    (&mut deserializer)
-        .deserialize_map(TaskManifestVisitor { state: &mut state })
-        .context("parse streaming task manifest")?;
-    deserializer
-        .end()
-        .context("task manifest has trailing data")?;
-    state.finish()
-}
-
-struct TaskManifestStreamState<'a, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    callback: &'a mut F,
-    schema_version: Option<String>,
-    authority_id: Option<String>,
-    task_matrix_sha256: Option<String>,
-    task_count: Option<u64>,
-    seen: BTreeSet<String>,
-    task_hasher: Sha256,
-    seen_task_count: u64,
-}
-
-impl<F> TaskManifestStreamState<'_, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    fn finish(&self) -> Result<TaskManifestHeader> {
-        let expected_keys: BTreeSet<String> = [
-            "authorityId",
-            "schemaVersion",
-            "taskCount",
-            "taskMatrixSha256",
-            "tasks",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect();
-        ensure!(
-            self.seen == expected_keys,
-            "immutable task manifest fields are not exact"
-        );
-        let schema_version = self
-            .schema_version
-            .clone()
-            .ok_or_else(|| anyhow!("task manifest lacks schemaVersion"))?;
-        let authority_id = self
-            .authority_id
-            .clone()
-            .ok_or_else(|| anyhow!("task manifest lacks authorityId"))?;
-        let task_matrix_sha256 = self
-            .task_matrix_sha256
-            .clone()
-            .ok_or_else(|| anyhow!("task manifest lacks taskMatrixSha256"))?;
-        let task_count = self
-            .task_count
-            .ok_or_else(|| anyhow!("task manifest lacks taskCount"))?;
-        ensure!(
-            task_count == self.seen_task_count,
-            "task manifest task count drifted"
-        );
-        let mut matrix_hasher = self.task_hasher.clone();
-        matrix_hasher.update(b"]");
-        let expected_matrix = digest_sha256_prefixed(matrix_hasher.finalize());
-        ensure!(
-            task_matrix_sha256 == expected_matrix,
-            "task manifest task matrix identity drifted"
-        );
-        Ok(TaskManifestHeader {
-            schema_version,
-            authority_id,
-            task_matrix_sha256,
-            task_count,
-        })
-    }
-}
-
-struct TaskManifestVisitor<'state, 'callback, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    state: &'state mut TaskManifestStreamState<'callback, F>,
-}
-
-impl<'de, F> Visitor<'de> for TaskManifestVisitor<'_, '_, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an immutable native task manifest object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        while let Some(key) = map.next_key::<String>()? {
-            if !self.state.seen.insert(key.clone()) {
-                return Err(de::Error::custom(format!("task manifest repeats {key}")));
-            }
-            match key.as_str() {
-                "schemaVersion" => {
-                    self.state.schema_version = Some(map.next_value::<String>()?);
-                }
-                "authorityId" => {
-                    self.state.authority_id = Some(map.next_value::<String>()?);
-                }
-                "taskMatrixSha256" => {
-                    self.state.task_matrix_sha256 = Some(map.next_value::<String>()?);
-                }
-                "taskCount" => {
-                    self.state.task_count = Some(map.next_value::<u64>()?);
-                }
-                "tasks" => {
-                    map.next_value_seed(TaskArraySeed {
-                        state: &mut *self.state,
-                    })?;
-                }
-                _ => {
-                    let _: IgnoredAny = map.next_value()?;
-                    return Err(de::Error::custom(format!(
-                        "task manifest has unexpected {key}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct TaskArraySeed<'state, 'callback, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    state: &'state mut TaskManifestStreamState<'callback, F>,
-}
-
-impl<'de, F> DeserializeSeed<'de> for TaskArraySeed<'_, '_, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(TaskArrayVisitor { state: self.state })
-    }
-}
-
-struct TaskArrayVisitor<'state, 'callback, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    state: &'state mut TaskManifestStreamState<'callback, F>,
-}
-
-impl<'de, F> Visitor<'de> for TaskArrayVisitor<'_, '_, F>
-where
-    F: FnMut(Value) -> Result<()>,
-{
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a streamed immutable task array")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while let Some(task) = sequence.next_element::<Value>()? {
-            let canonical = canonical_json_bytes(&task).map_err(de::Error::custom)?;
-            if self.state.seen_task_count > 0 {
-                self.state.task_hasher.update(b",");
-            }
-            self.state.task_hasher.update(&canonical);
-            (self.state.callback)(task).map_err(de::Error::custom)?;
-            self.state.seen_task_count = self
-                .state
-                .seen_task_count
-                .checked_add(1)
-                .ok_or_else(|| de::Error::custom("task manifest task count overflow"))?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1703,22 +1391,45 @@ type CompletionJournal = BTreeMap<String, CompletionJournalEntry>;
 
 fn load_completion_journal(paths: &DispatchPaths, index: &TaskIndex) -> Result<CompletionJournal> {
     if !paths.completion_journal.exists() {
+        reconcile_result_pack(paths, &BTreeMap::new(), false)?;
         return Ok(BTreeMap::new());
     }
     ensure_real_file(&paths.completion_journal, "completion journal")?;
-    let file = File::open(&paths.completion_journal)?;
-    let reader = BufReader::new(file);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.completion_journal)?;
+    let mut reader = BufReader::new(file);
     let mut journal = BTreeMap::new();
     let mut ordinal = 0_u64;
-    for (line_number, line) in reader.lines().enumerate() {
-        let line = line?;
-        ensure!(!line.is_empty(), "completion journal has an empty line");
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("parse completion journal line {}", line_number + 1))?;
+    let mut valid_bytes = 0_u64;
+    loop {
+        let mut line = Vec::new();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            ensure!(
+                !paths.execution_receipt.exists(),
+                "committed completion journal has a partial final row"
+            );
+            reader
+                .get_ref()
+                .set_len(valid_bytes)
+                .context("truncate incomplete completion-journal crash tail")?;
+            reader
+                .get_ref()
+                .sync_all()
+                .context("fsync truncated completion-journal crash tail")?;
+            break;
+        }
+        let value: Value = serde_json::from_slice(&line[..line.len() - 1])
+            .with_context(|| format!("parse completion journal row {}", ordinal + 1))?;
         ensure!(
-            canonical_json_bytes(&value)? == line.as_bytes(),
-            "completion journal line {} is not canonical JSON",
-            line_number + 1
+            canonical_json_line(&value)? == line,
+            "completion journal row {} is not canonical JSONL",
+            ordinal + 1
         );
         let entry = CompletionJournalEntry::from_value(&value)?;
         ensure!(
@@ -1730,7 +1441,6 @@ fn load_completion_journal(paths: &DispatchPaths, index: &TaskIndex) -> Result<C
             entry.task_sha256 == index_entry.task_sha256,
             "completion journal task identity drifted"
         );
-        validate_completion_record(paths, &index_entry, &entry.record)?;
         ensure!(
             journal.insert(entry.task_id.clone(), entry).is_none(),
             "completion journal contains duplicate task ids"
@@ -1738,29 +1448,78 @@ fn load_completion_journal(paths: &DispatchPaths, index: &TaskIndex) -> Result<C
         ordinal = ordinal
             .checked_add(1)
             .ok_or_else(|| anyhow!("completion journal ordinal overflow"))?;
+        valid_bytes = valid_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow!("completion journal byte count overflow"))?;
     }
     ensure!(
         journal.len() as u64 <= index.task_count,
         "completion journal exceeds immutable task count"
     );
+    reconcile_result_pack(paths, &journal, paths.execution_receipt.exists())?;
+    for entry in journal.values() {
+        let index_entry = find_index_entry(paths, index, &entry.task_id)?;
+        validate_completion_record(paths, index, &index_entry, &entry.record)?;
+    }
     Ok(journal)
 }
 
-fn append_completion_journal(
+#[derive(Clone, Debug)]
+struct PendingCompletion {
+    entry: CompletionJournalEntry,
+    blob: Vec<u8>,
+}
+
+fn commit_completion_batch(
     paths: &DispatchPaths,
     journal: &mut CompletionJournal,
-    entry: CompletionJournalEntry,
+    pending: Vec<PendingCompletion>,
 ) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut expected_offset = reconcile_result_pack(paths, journal, false)?;
+    let mut encoded_rows = Vec::with_capacity(pending.len());
+    for (index, item) in pending.iter().enumerate() {
+        ensure!(
+            item.entry.ordinal == journal.len() as u64 + index as u64,
+            "completion batch journal ordinals are not contiguous"
+        );
+        ensure!(
+            !journal.contains_key(&item.entry.task_id),
+            "completion batch repeats a durable task"
+        );
+        let record = object(&item.entry.record, "pending completion record")?;
+        ensure!(
+            unsigned(record, "resultPackOffsetBytes")? == expected_offset
+                && unsigned(record, "resultPackLengthBytes")? == item.blob.len() as u64
+                && sha256_prefixed(&item.blob) == sha_field(record, "resultBlobSha256")?,
+            "completion batch result-pack binding drifted"
+        );
+        expected_offset = expected_offset
+            .checked_add(item.blob.len() as u64)
+            .ok_or_else(|| anyhow!("result-pack byte count overflow"))?;
+        encoded_rows.push(canonical_json_line(&item.entry.to_value())?);
+    }
+
+    let mut pack = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.result_pack)
+        .with_context(|| format!("open result pack: {}", paths.result_pack.display()))?;
     ensure!(
-        !journal.contains_key(&entry.task_id),
-        "refusing to append a duplicate completion journal task"
+        pack.metadata()?.len() == committed_result_pack_end(journal)?,
+        "result pack changed before completion batch commit"
     );
-    let ordinal = journal.len() as u64;
-    ensure!(
-        entry.ordinal == ordinal,
-        "completion journal append ordinal drifted"
-    );
-    let mut file = OpenOptions::new()
+    for item in &pending {
+        pack.write_all(&item.blob)?;
+    }
+    pack.flush()?;
+    pack.sync_data()
+        .context("fsync result-pack completion batch")?;
+    drop(pack);
+
+    let mut journal_file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&paths.completion_journal)
@@ -1770,11 +1529,18 @@ fn append_completion_journal(
                 paths.completion_journal.display()
             )
         })?;
-    file.write_all(&canonical_json_line(&entry.to_value())?)?;
-    file.flush()?;
-    file.sync_data()
-        .context("fsync completion journal append")?;
-    journal.insert(entry.task_id.clone(), entry);
+    for row in &encoded_rows {
+        journal_file.write_all(row)?;
+    }
+    journal_file.flush()?;
+    journal_file
+        .sync_data()
+        .context("fsync completion-journal batch")?;
+    drop(journal_file);
+
+    for item in pending {
+        journal.insert(item.entry.task_id.clone(), item.entry);
+    }
     Ok(())
 }
 
@@ -1795,15 +1561,14 @@ fn find_index_entry(
     Ok(entry)
 }
 
-fn validate_completion_record(
-    paths: &DispatchPaths,
+fn validate_completion_record_shape(
+    index: &TaskIndex,
     entry: &TaskIndexEntry,
     record: &Value,
-) -> Result<()> {
+) -> Result<bool> {
     let record_map = object(record, "completion record")?;
     let mut expected: BTreeSet<&str> = [
         "resultSha256",
-        "resultPath",
         "candidateId",
         "resultCodec",
         "resultSemanticSha256",
@@ -1812,6 +1577,8 @@ fn validate_completion_record(
         "resultUncompressedSizeBytes",
         "resultBlobSha256",
         "resultBlobSizeBytes",
+        "resultPackOffsetBytes",
+        "resultPackLengthBytes",
     ]
     .into_iter()
     .collect();
@@ -1837,18 +1604,21 @@ fn validate_completion_record(
         "resultSemanticSizeBytes",
         "resultUncompressedSizeBytes",
         "resultBlobSizeBytes",
+        "resultPackOffsetBytes",
+        "resultPackLengthBytes",
     ] {
         unsigned(record_map, key)?;
     }
     ensure!(
+        unsigned(record_map, "resultPackLengthBytes")?
+            == unsigned(record_map, "resultBlobSizeBytes")?,
+        "completion record result-pack length drifted from blob length"
+    );
+    ensure!(
         text(record_map, "resultCodec")? == "gzip-json-v1",
         "completion record codec is incompatible"
     );
-    ensure!(
-        text(record_map, "resultPath")? == paths.result_path(&entry.task_id)?.to_string_lossy(),
-        "completion record result path drifted"
-    );
-    let task = load_task_object(paths, entry)?;
+    let task = load_task_object(index, entry)?;
     let task_payload = object(
         field(object(&task, "completion record task")?, "payload")?,
         "completion record task payload",
@@ -1864,8 +1634,19 @@ fn validate_completion_record(
             "completion record rejection code is incompatible"
         );
     }
-    let result_path = paths.result_path(&entry.task_id)?;
-    let (material, metadata) = read_gzip_json_value(&result_path)?;
+    Ok(rejected)
+}
+
+fn validate_completion_record(
+    paths: &DispatchPaths,
+    index: &TaskIndex,
+    entry: &TaskIndexEntry,
+    record: &Value,
+) -> Result<()> {
+    let rejected = validate_completion_record_shape(index, entry, record)?;
+    let record_map = object(record, "completion record")?;
+    let blob = read_result_blob(paths, record_map)?;
+    let (material, metadata) = decode_gzip_json_blob(&blob, "result-pack blob")?;
     ensure!(
         canonical_sha256(&material)? == sha_field(record_map, "resultSha256")?
             && metadata.semantic_sha256 == sha_field(record_map, "resultSemanticSha256")?
@@ -1877,6 +1658,7 @@ fn validate_completion_record(
             && metadata.blob_size_bytes == unsigned(record_map, "resultBlobSizeBytes")?,
         "completion record deterministic result representation drifted"
     );
+    let task = load_task_object(index, entry)?;
     let admission = admit_candidate_window_task_result(&task, &material)?;
     ensure!(
         (rejected && admission == CandidateWindowResultAdmission::Rejected)
@@ -1949,110 +1731,48 @@ fn encode_gzip_json(value: &Value) -> Result<(Vec<u8>, ResultCodecMetadata)> {
     ))
 }
 
-fn write_gzip_json_once(path: &Path, value: &Value) -> Result<ResultCodecMetadata> {
-    let (blob, metadata) = encode_gzip_json(value)?;
-    if path.exists() {
-        ensure!(
-            fs::read(path)? == blob,
-            "refusing to overwrite divergent immutable result blob: {}",
-            path.display()
-        );
-    } else {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("result path has no parent"))?;
-        let staging = parent.join(format!(
-            ".{}.{}.staging",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("result"),
-            std::process::id()
-        ));
-        if staging.exists() {
-            fs::remove_file(&staging).context("remove stale result staging file")?;
-        }
-        let mut staging_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .with_context(|| format!("create result staging file: {}", staging.display()))?;
-        staging_file.write_all(&blob)?;
-        staging_file.flush()?;
-        staging_file
-            .sync_all()
-            .context("fsync result staging file")?;
-        drop(staging_file);
-        match fs::hard_link(&staging, path) {
-            Ok(()) => {}
-            Err(error) if path.exists() => {
-                ensure!(
-                    fs::read(path)? == blob,
-                    "refusing to overwrite divergent immutable result blob: {}",
-                    path.display()
-                );
-                let _ = error;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("publish result: {}", path.display()));
-            }
-        }
-        fs::remove_file(&staging).context("remove result staging hard link")?;
-    }
-    let (_, verified) = read_gzip_json_value(path)?;
-    ensure!(
-        verified.semantic_sha256 == metadata.semantic_sha256
-            && verified.semantic_size_bytes == metadata.semantic_size_bytes
-            && verified.uncompressed_sha256 == metadata.uncompressed_sha256
-            && verified.uncompressed_size_bytes == metadata.uncompressed_size_bytes
-            && verified.blob_sha256 == metadata.blob_sha256
-            && verified.blob_size_bytes == metadata.blob_size_bytes,
-        "persisted deterministic result representation drifted"
-    );
-    Ok(metadata)
-}
-
-fn read_gzip_json_value(path: &Path) -> Result<(Value, ResultCodecMetadata)> {
-    let blob = fs::read(path).with_context(|| format!("read result blob: {}", path.display()))?;
-    let mut decoder = GzDecoder::new(blob.as_slice());
+fn decode_gzip_json_blob(blob: &[u8], label: &str) -> Result<(Value, ResultCodecMetadata)> {
+    let mut decoder = GzDecoder::new(blob);
     let mut uncompressed = Vec::new();
     decoder
         .read_to_end(&mut uncompressed)
-        .with_context(|| format!("inflate result blob: {}", path.display()))?;
+        .with_context(|| format!("inflate {label}"))?;
     let mut inner = decoder.into_inner();
     ensure!(
         inner.read(&mut [0_u8; 1])? == 0,
-        "result blob has trailing gzip bytes"
+        "{label} has trailing gzip bytes"
     );
-    let value: Value = serde_json::from_slice(&uncompressed)
-        .with_context(|| format!("parse result JSON: {}", path.display()))?;
+    let value: Value =
+        serde_json::from_slice(&uncompressed).with_context(|| format!("parse {label} JSON"))?;
     ensure!(
         python_pretty_json_line(&value, JsonNewline::Lf)? == uncompressed,
-        "result blob uncompressed JSON is not Python-compatible deterministic pretty JSON"
+        "{label} uncompressed JSON is not deterministic pretty JSON"
     );
     let (expected_blob, metadata) = encode_gzip_json(&value)?;
     ensure!(
         expected_blob == blob,
-        "result blob is not canonical deterministic gzip"
+        "{label} is not canonical deterministic gzip"
     );
     Ok((value, metadata))
 }
 
 fn completion_record(
-    paths: &DispatchPaths,
+    index: &TaskIndex,
     entry: &TaskIndexEntry,
     material: &Value,
-) -> Result<Value> {
-    let result_path = paths.result_path(&entry.task_id)?;
-    let metadata = write_gzip_json_once(&result_path, material)?;
-    let task = load_task_object(paths, entry)?;
+    result_pack_offset_bytes: u64,
+) -> Result<(Value, Vec<u8>)> {
+    let (blob, metadata) = encode_gzip_json(material)?;
+    let task = load_task_object(index, entry)?;
     let payload = object(
         field(object(&task, "completion record task")?, "payload")?,
         "completion record task payload",
     )?;
     let mut record = json!({
         "resultSha256": metadata.semantic_sha256,
-        "resultPath": result_path.to_string_lossy(),
         "candidateId": field(payload, "candidate_id")?,
+        "resultPackOffsetBytes": result_pack_offset_bytes,
+        "resultPackLengthBytes": metadata.blob_size_bytes,
     });
     let codec_field_value = metadata.record_fields();
     let codec_fields = object(&codec_field_value, "result codec fields")?;
@@ -2072,8 +1792,8 @@ fn completion_record(
         )?
         .clone();
     }
-    validate_completion_record(paths, entry, &record)?;
-    Ok(record)
+    validate_completion_record_shape(index, entry, &record)?;
+    Ok((record, blob))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2243,14 +1963,18 @@ fn write_failure_receipt_once(paths: &DispatchPaths, receipt: &FailureReceipt) -
     write_immutable_canonical(&paths.failure_path(&receipt.task_id)?, &receipt.to_value()?)
 }
 
-fn read_failure_receipt(paths: &DispatchPaths, entry: &TaskIndexEntry) -> Result<FailureReceipt> {
+fn read_failure_receipt(
+    paths: &DispatchPaths,
+    index: &TaskIndex,
+    entry: &TaskIndexEntry,
+) -> Result<FailureReceipt> {
     let value = read_canonical_line(&paths.failure_path(&entry.task_id)?, "failure receipt")?;
     let receipt = FailureReceipt::from_value(&value)?;
     ensure!(
         receipt.task_id == entry.task_id && receipt.task_sha256 == entry.task_sha256,
         "failure receipt task binding drifted"
     );
-    require_completion_routing(&load_task_object(paths, entry)?, &receipt.completion)?;
+    require_completion_routing(&load_task_object(index, entry)?, &receipt.completion)?;
     Ok(receipt)
 }
 
@@ -2335,6 +2059,8 @@ fn recover_durable_failures(
     journal: &mut CompletionJournal,
     telemetry: &mut GatewayDispatchTelemetry,
 ) -> Result<()> {
+    let mut pending = Vec::new();
+    let mut result_pack_offset = committed_result_pack_end(journal)?;
     for entry in index.entries.values() {
         if journal.contains_key(&entry.task_id) {
             continue;
@@ -2343,7 +2069,7 @@ fn recover_durable_failures(
         if !failure_path.exists() {
             continue;
         }
-        let receipt = read_failure_receipt(paths, entry)?;
+        let receipt = read_failure_receipt(paths, index, entry)?;
         let Some(classification) = receipt.classification else {
             bail!(
                 "previously acknowledged unclassified worker failure for {} requires operator review",
@@ -2354,24 +2080,26 @@ fn recover_durable_failures(
             .error
             .as_ref()
             .ok_or_else(|| anyhow!("deterministic failure receipt lacks worker error"))?;
-        let task = load_task_object(paths, entry)?;
+        let task = load_task_object(index, entry)?;
         let material = rejected_material(&task, &receipt.completion, classification, worker_error)?;
         ensure!(
             admit_candidate_window_task_result(&task, &material)?
                 == CandidateWindowResultAdmission::Rejected,
             "recovered deterministic failure did not produce an admitted rejection"
         );
-        let record = completion_record(paths, entry, &material)?;
-        append_completion_journal(
-            paths,
-            journal,
-            CompletionJournalEntry::new(
-                journal.len() as u64,
+        let (record, blob) = completion_record(index, entry, &material, result_pack_offset)?;
+        result_pack_offset = result_pack_offset
+            .checked_add(blob.len() as u64)
+            .ok_or_else(|| anyhow!("result-pack byte count overflow"))?;
+        pending.push(PendingCompletion {
+            entry: CompletionJournalEntry::new(
+                journal.len() as u64 + pending.len() as u64,
                 entry,
                 receipt.completion_sha256,
                 record,
             )?,
-        )?;
+            blob,
+        });
         telemetry.recovered_completion_count = telemetry
             .recovered_completion_count
             .checked_add(1)
@@ -2381,6 +2109,7 @@ fn recover_durable_failures(
             .checked_add(1)
             .ok_or_else(|| anyhow!("rejected completion count overflow"))?;
     }
+    commit_completion_batch(paths, journal, pending)?;
     telemetry.completed_task_count = journal.len() as u64;
     Ok(())
 }
@@ -2407,8 +2136,11 @@ fn drain_available_results(
         return Ok(0);
     }
     let mut leases = BTreeSet::new();
+    let mut pending = Vec::<PendingCompletion>::new();
+    let mut pending_semantics = BTreeMap::<String, String>::new();
     let mut fatal_after_ack = None::<String>;
     let mut completion_batch_bytes = 0_usize;
+    let mut result_pack_offset = committed_result_pack_end(journal)?;
     for completion in &completions {
         let size = canonical_json_bytes(completion)?.len();
         completion_batch_bytes = completion_batch_bytes
@@ -2419,17 +2151,53 @@ fn drain_available_results(
             "gateway completion exceeds configured response byte bound"
         );
         telemetry.peak_completion_bytes = telemetry.peak_completion_bytes.max(size);
-        match process_completion(paths, index, journal, completion, telemetry)? {
-            ProcessedCompletion::Durable { lease } => {
+        match prepare_completion(
+            paths,
+            index,
+            journal,
+            completion,
+            telemetry,
+            journal.len() as u64 + pending.len() as u64,
+            result_pack_offset,
+        )? {
+            PreparedCompletion::Duplicate { lease } => {
                 leases.insert(lease);
             }
-            ProcessedCompletion::FatalAfterReceipt { lease, detail } => {
+            PreparedCompletion::Pending { lease, completion } => {
+                let task_id = completion.entry.task_id.clone();
+                let semantic = sha_field(
+                    object(&completion.entry.record, "pending completion record")?,
+                    "resultSha256",
+                )?;
+                if let Some(previous) = pending_semantics.get(&task_id) {
+                    ensure!(
+                        previous == &semantic,
+                        "conflicting duplicate completion material in one gateway batch"
+                    );
+                    telemetry.duplicate_redelivery_count = telemetry
+                        .duplicate_redelivery_count
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("duplicate redelivery count overflow"))?;
+                    leases.insert(lease);
+                    continue;
+                }
+                result_pack_offset = result_pack_offset
+                    .checked_add(completion.blob.len() as u64)
+                    .ok_or_else(|| anyhow!("result-pack byte count overflow"))?;
+                pending_semantics.insert(task_id, semantic);
+                pending.push(completion);
+                leases.insert(lease);
+            }
+            PreparedCompletion::FatalAfterReceipt { lease, detail } => {
                 leases.insert(lease);
                 fatal_after_ack = Some(detail);
                 break;
             }
         }
     }
+    // One result-pack sync and one journal sync durably commit the whole
+    // delivery batch before any lease acknowledgement.
+    commit_completion_batch(paths, journal, pending)?;
     if !leases.is_empty() {
         let lease_ids: Vec<String> = leases.into_iter().collect();
         let acknowledged = maintenance.run(request, telemetry, "result acknowledgement", || {
@@ -2451,9 +2219,13 @@ fn drain_available_results(
     Ok(completions.len())
 }
 
-enum ProcessedCompletion {
-    Durable {
+enum PreparedCompletion {
+    Duplicate {
         lease: String,
+    },
+    Pending {
+        lease: String,
+        completion: PendingCompletion,
     },
     /// The exact failure receipt is already fsynced, so it is safe and
     /// necessary to acknowledge before surfacing the terminal controller
@@ -2464,17 +2236,19 @@ enum ProcessedCompletion {
     },
 }
 
-fn process_completion(
+fn prepare_completion(
     paths: &DispatchPaths,
     index: &TaskIndex,
-    journal: &mut CompletionJournal,
+    journal: &CompletionJournal,
     completion: &Value,
     telemetry: &mut GatewayDispatchTelemetry,
-) -> Result<ProcessedCompletion> {
+    ordinal: u64,
+    result_pack_offset: u64,
+) -> Result<PreparedCompletion> {
     let completion_map = object(completion, "gateway completion")?;
     let task_id = safe_identifier(field(completion_map, "task_id")?, "completion task id")?;
     let entry = find_index_entry(paths, index, &task_id)?;
-    let task = load_task_object(paths, &entry)?;
+    let task = load_task_object(index, &entry)?;
     require_completion_routing(&task, completion)?;
     let lease = safe_identifier(field(completion_map, "lease_id")?, "completion lease id")?;
     let completion_sha256 = canonical_sha256(completion)?;
@@ -2504,7 +2278,7 @@ fn process_completion(
         // acknowledgement. A crash now cannot silently resurrect this task.
         write_failure_receipt_once(paths, &receipt)?;
         let Some(classification) = receipt.classification else {
-            return Ok(ProcessedCompletion::FatalAfterReceipt {
+            return Ok(PreparedCompletion::FatalAfterReceipt {
                 lease,
                 detail: format!(
                     "worker completion failed for {} and is not a deterministic rejection",
@@ -2540,21 +2314,21 @@ fn process_completion(
             .duplicate_redelivery_count
             .checked_add(1)
             .ok_or_else(|| anyhow!("duplicate redelivery count overflow"))?;
-        return Ok(ProcessedCompletion::Durable { lease });
+        return Ok(PreparedCompletion::Duplicate { lease });
     }
-    let record = completion_record(paths, &entry, &material)?;
-    append_completion_journal(
-        paths,
-        journal,
-        CompletionJournalEntry::new(journal.len() as u64, &entry, completion_sha256, record)?,
-    )?;
-    Ok(ProcessedCompletion::Durable { lease })
+    let (record, blob) = completion_record(index, &entry, &material, result_pack_offset)?;
+    Ok(PreparedCompletion::Pending {
+        lease,
+        completion: PendingCompletion {
+            entry: CompletionJournalEntry::new(ordinal, &entry, completion_sha256, record)?,
+            blob,
+        },
+    })
 }
 
 fn enqueue_missing_tasks(
     client: &mut dyn GatewayClient,
     request: &GatewayDispatchRequest,
-    paths: &DispatchPaths,
     index: &TaskIndex,
     journal: &CompletionJournal,
     telemetry: &mut GatewayDispatchTelemetry,
@@ -2566,7 +2340,7 @@ fn enqueue_missing_tasks(
         if journal.contains_key(&entry.task_id) {
             continue;
         }
-        let task = load_task_object(paths, entry)?;
+        let task = load_task_object(index, entry)?;
         let task_bytes = canonical_json_bytes(&task)?;
         ensure!(
             task_bytes
@@ -2636,367 +2410,15 @@ fn enqueue_batch(
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct CheckpointOverview {
-    authority_id: String,
-    task_matrix_sha256: String,
-    completed_count: u64,
-    journal_count: u64,
-}
-
-fn validate_mode_and_checkpoint(
+fn validate_dispatch_mode(
     request: &GatewayDispatchRequest,
-    paths: &DispatchPaths,
-    index: &TaskIndex,
     journal: &CompletionJournal,
 ) -> Result<()> {
-    let Some(checkpoint) = read_checkpoint_overview_if_exists(&paths.checkpoint)? else {
-        ensure!(
-            !matches!(request.mode, DispatchMode::Fresh) || journal.is_empty(),
-            "fresh dispatcher run has an existing completion journal"
-        );
-        return Ok(());
-    };
-    ensure!(
-        checkpoint.authority_id == index.authority_id
-            && checkpoint.task_matrix_sha256 == index.task_matrix_sha256,
-        "existing checkpoint does not bind the immutable task matrix"
-    );
     if matches!(request.mode, DispatchMode::Fresh) {
         ensure!(
-            checkpoint.completed_count == 0 && checkpoint.journal_count == 0 && journal.is_empty(),
-            "fresh dispatcher run already has completed tasks"
+            journal.is_empty(),
+            "fresh dispatcher run already has durable task completions"
         );
-    } else if checkpoint.completed_count > 0 || checkpoint.journal_count > 0 {
-        ensure!(
-            checkpoint.completed_count == journal.len() as u64
-                && checkpoint.journal_count == journal.len() as u64,
-            "legacy checkpoint cannot be resumed without the matching native completion journal"
-        );
-    }
-    Ok(())
-}
-
-fn compact_legacy_checkpoint_once(
-    paths: &DispatchPaths,
-    index: &TaskIndex,
-    journal: &CompletionJournal,
-) -> Result<()> {
-    ensure!(
-        journal.len() as u64 == index.task_count,
-        "legacy checkpoint compaction requires every immutable task completion"
-    );
-    let staging = paths.sidecar_root.join(".checkpoint.staging");
-    if staging.exists() {
-        ensure_real_file(&staging, "stale checkpoint staging file")?;
-        fs::remove_file(&staging).context("remove stale checkpoint staging file")?;
-    }
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)
-        .context("create checkpoint staging file")?;
-    let mut writer = BufWriter::new(file);
-    write_legacy_checkpoint(&mut writer, paths, index, journal)?;
-    writer.flush()?;
-    writer
-        .get_ref()
-        .sync_all()
-        .context("fsync legacy checkpoint staging file")?;
-    drop(writer);
-    if paths.checkpoint.exists() {
-        if files_equal(&staging, &paths.checkpoint)? {
-            fs::remove_file(&staging)?;
-            return Ok(());
-        }
-        let existing = read_checkpoint_overview_if_exists(&paths.checkpoint)?
-            .ok_or_else(|| anyhow!("legacy checkpoint disappeared during compaction"))?;
-        ensure!(
-            existing.authority_id == index.authority_id
-                && existing.task_matrix_sha256 == index.task_matrix_sha256
-                && existing.completed_count == 0
-                && existing.journal_count == 0,
-            "refusing to overwrite divergent legacy checkpoint"
-        );
-        // The freezer owns the initial empty checkpoint. It is the one mutable
-        // legacy artifact this dispatcher is allowed to replace, exactly once,
-        // after all terminal durable journal entries exist.
-        fs::remove_file(&paths.checkpoint)?;
-    }
-    fs::rename(&staging, &paths.checkpoint)
-        .with_context(|| format!("publish legacy checkpoint: {}", paths.checkpoint.display()))?;
-    Ok(())
-}
-
-fn write_legacy_checkpoint(
-    writer: &mut impl Write,
-    paths: &DispatchPaths,
-    index: &TaskIndex,
-    journal: &CompletionJournal,
-) -> Result<()> {
-    // This is the exact Python sorted-key checkpoint layout, streamed rather
-    // than assembled as an O(T) `completed` map or O(T) journal vector.
-    writer.write_all(b"{\n  \"authorityId\": ")?;
-    write_pretty_scalar(writer, &Value::String(index.authority_id.clone()))?;
-    writer.write_all(b",\n  \"completed\": {")?;
-    let mut first = true;
-    for (task_id, entry) in journal {
-        if !first {
-            writer.write_all(b",")?;
-        }
-        first = false;
-        writer.write_all(b"\n    ")?;
-        write_pretty_scalar(writer, &Value::String(task_id.clone()))?;
-        writer.write_all(b": ")?;
-        write_nested_pretty(writer, &entry.record, 4)?;
-    }
-    if !journal.is_empty() {
-        writer.write_all(b"\n  ")?;
-    }
-    writer.write_all(b"},\n  \"journal\": [")?;
-    let file = File::open(&paths.completion_journal)?;
-    let reader = BufReader::new(file);
-    let mut expected_ordinal = 0_u64;
-    let mut first = true;
-    for line in reader.lines() {
-        let line = line?;
-        let value: Value = serde_json::from_str(&line)?;
-        let entry = CompletionJournalEntry::from_value(&value)?;
-        ensure!(
-            entry.ordinal == expected_ordinal,
-            "completion journal ordinal drifted during compaction"
-        );
-        expected_ordinal += 1;
-        if !first {
-            writer.write_all(b",")?;
-        }
-        first = false;
-        writer.write_all(b"\n    ")?;
-        let mut row = object(&entry.record, "completion journal record")?.clone();
-        row.insert("taskId".into(), Value::String(entry.task_id));
-        write_nested_pretty(writer, &Value::Object(row), 4)?;
-    }
-    ensure!(
-        expected_ordinal == index.task_count,
-        "completion journal task count drifted during compaction"
-    );
-    if index.task_count > 0 {
-        writer.write_all(b"\n  ")?;
-    }
-    writer.write_all(b"],\n  \"schemaVersion\": \"temporal_graph_candidate_window_checkpoint_v1\",\n  \"taskMatrixSha256\": ")?;
-    write_pretty_scalar(writer, &Value::String(index.task_matrix_sha256.clone()))?;
-    writer.write_all(b"\n}\n")?;
-    Ok(())
-}
-
-fn read_checkpoint_overview_if_exists(path: &Path) -> Result<Option<CheckpointOverview>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    ensure_real_file(path, "legacy checkpoint")?;
-    let file = File::open(path)?;
-    let mut state = CheckpointStreamState::default();
-    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
-    (&mut deserializer)
-        .deserialize_map(CheckpointVisitor { state: &mut state })
-        .context("parse legacy checkpoint overview")?;
-    deserializer
-        .end()
-        .context("legacy checkpoint has trailing data")?;
-    Ok(Some(state.finish()?))
-}
-
-#[derive(Default)]
-struct CheckpointStreamState {
-    schema_version: Option<String>,
-    authority_id: Option<String>,
-    task_matrix_sha256: Option<String>,
-    completed_count: Option<u64>,
-    journal_count: Option<u64>,
-    seen: BTreeSet<String>,
-}
-
-impl CheckpointStreamState {
-    fn finish(self) -> Result<CheckpointOverview> {
-        let expected: BTreeSet<String> = [
-            "authorityId",
-            "completed",
-            "journal",
-            "schemaVersion",
-            "taskMatrixSha256",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect();
-        ensure!(
-            self.seen == expected,
-            "legacy checkpoint fields are not exact"
-        );
-        ensure!(
-            self.schema_version.as_deref() == Some(CHECKPOINT_SCHEMA),
-            "legacy checkpoint schema is incompatible"
-        );
-        Ok(CheckpointOverview {
-            authority_id: self
-                .authority_id
-                .ok_or_else(|| anyhow!("legacy checkpoint lacks authorityId"))?,
-            task_matrix_sha256: self
-                .task_matrix_sha256
-                .ok_or_else(|| anyhow!("legacy checkpoint lacks taskMatrixSha256"))?,
-            completed_count: self
-                .completed_count
-                .ok_or_else(|| anyhow!("legacy checkpoint lacks completed"))?,
-            journal_count: self
-                .journal_count
-                .ok_or_else(|| anyhow!("legacy checkpoint lacks journal"))?,
-        })
-    }
-}
-
-struct CheckpointVisitor<'a> {
-    state: &'a mut CheckpointStreamState,
-}
-
-impl<'de> Visitor<'de> for CheckpointVisitor<'_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a legacy candidate-window checkpoint object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        while let Some(key) = map.next_key::<String>()? {
-            if !self.state.seen.insert(key.clone()) {
-                return Err(de::Error::custom(format!(
-                    "legacy checkpoint repeats {key}"
-                )));
-            }
-            match key.as_str() {
-                "schemaVersion" => self.state.schema_version = Some(map.next_value::<String>()?),
-                "authorityId" => self.state.authority_id = Some(map.next_value::<String>()?),
-                "taskMatrixSha256" => {
-                    self.state.task_matrix_sha256 = Some(map.next_value::<String>()?)
-                }
-                "completed" => {
-                    self.state.completed_count = Some(map.next_value_seed(CountMapSeed)?);
-                }
-                "journal" => {
-                    self.state.journal_count = Some(map.next_value_seed(CountSeqSeed)?);
-                }
-                _ => {
-                    let _: IgnoredAny = map.next_value()?;
-                    return Err(de::Error::custom(format!(
-                        "legacy checkpoint has unexpected {key}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct CountMapSeed;
-
-impl<'de> DeserializeSeed<'de> for CountMapSeed {
-    type Value = u64;
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_map(CountMapVisitor)
-    }
-}
-
-struct CountMapVisitor;
-
-impl<'de> Visitor<'de> for CountMapVisitor {
-    type Value = u64;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a checkpoint completed object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut count = 0_u64;
-        let mut last = None::<String>;
-        while let Some(key) = map.next_key::<String>()? {
-            safe_identifier_value(&key, "checkpoint completed task id")
-                .map_err(de::Error::custom)?;
-            if let Some(previous) = &last
-                && key <= *previous
-            {
-                return Err(de::Error::custom(
-                    "checkpoint completed task ids are not canonical",
-                ));
-            }
-            let _: IgnoredAny = map.next_value()?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| de::Error::custom("checkpoint completed count overflow"))?;
-            last = Some(key);
-        }
-        Ok(count)
-    }
-}
-
-struct CountSeqSeed;
-
-impl<'de> DeserializeSeed<'de> for CountSeqSeed {
-    type Value = u64;
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(CountSeqVisitor)
-    }
-}
-
-struct CountSeqVisitor;
-
-impl<'de> Visitor<'de> for CountSeqVisitor {
-    type Value = u64;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a checkpoint journal array")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut count = 0_u64;
-        while sequence.next_element::<IgnoredAny>()?.is_some() {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| de::Error::custom("checkpoint journal count overflow"))?;
-        }
-        Ok(count)
-    }
-}
-
-fn write_pretty_scalar(writer: &mut impl Write, value: &Value) -> Result<()> {
-    let bytes = python_pretty_json_line(value, JsonNewline::Lf)?;
-    writer.write_all(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
-    Ok(())
-}
-
-fn write_nested_pretty(writer: &mut impl Write, value: &Value, base_indent: usize) -> Result<()> {
-    let bytes = python_pretty_json_line(value, JsonNewline::Lf)?;
-    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    for (line_index, line) in body.split(|byte| *byte == b'\n').enumerate() {
-        if line_index > 0 {
-            writer.write_all(b"\n")?;
-            writer.write_all(&vec![b' '; base_indent])?;
-        }
-        writer.write_all(line)?;
     }
     Ok(())
 }
@@ -3226,6 +2648,7 @@ mod tests {
         net::{TcpListener, TcpStream},
         sync::{Arc, Mutex},
     };
+    use temporal_qd_contract::CONTRACT_VERSION;
 
     use tempfile::TempDir;
 
@@ -3537,28 +2960,84 @@ mod tests {
 
     fn write_fixture_manifest(root: &Path, tasks: &[Value]) -> Result<PathBuf> {
         let matrix = canonical_sha256(&Value::Array(tasks.to_vec()))?;
-        let manifest = json!({
-            "authorityId":AUTHORITY,
-            "schemaVersion":TASK_MANIFEST_SCHEMA,
-            "taskCount":tasks.len(),
-            "taskMatrixSha256":matrix,
-            "tasks":tasks,
+        let screening_root = root.join("screening-run");
+        fs::create_dir_all(&screening_root)?;
+        let path = screening_root.join("tasks.jsonl");
+        let mut task_pack = Vec::new();
+        for task in tasks {
+            task_pack.extend(canonical_json_line(task)?);
+        }
+        fs::write(&path, task_pack)?;
+        let candidates = tasks
+            .iter()
+            .map(|task| {
+                let task = object(task, "fixture task")?;
+                Ok(json!({"candidateId":text(task,"lane_id")?}))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut cohort = json!({
+            "schemaVersion":"temporal_qd_rotating_cohort_population_v1",
+            "generationIndex":1,
+            "panelId":"panel-a",
+            "cohortRole":"proposal_current_panel",
+            "rotatingEvidenceSha256":SHA_A,
+            "candidateCount":tasks.len(),
+            "candidates":candidates,
+            "proposalPopulation":true,
         });
-        let path = root.join("task-manifest.json");
-        fs::write(&path, python_pretty_json_line(&manifest, JsonNewline::Lf)?)?;
+        cohort["populationSha256"] = Value::String(canonical_sha256(&cohort)?);
+        let cohort_path = root.join("cohort-population.json");
         fs::write(
-            root.join(CHECKPOINT_NAME),
-            python_pretty_json_line(
-                &json!({
-                    "schemaVersion":CHECKPOINT_SCHEMA,
-                    "authorityId":AUTHORITY,
-                    "taskMatrixSha256":matrix,
-                    "completed":{},"journal":[]
-                }),
-                JsonNewline::Lf,
-            )?,
+            &cohort_path,
+            python_pretty_json_line(&cohort, JsonNewline::Lf)?,
         )?;
-        Ok(path)
+        let manifest_bytes = fs::metadata(&path)?.len();
+        let cohort_bytes = fs::metadata(&cohort_path)?.len();
+        let mut campaign_input = json!({
+            "schemaVersion":"temporal_qd_v5_campaign_input_checkpoint_v1",
+            "contractVersion":CONTRACT_VERSION,
+            "manifestSha256":SHA_A,
+            "nativeRuntimeAuthoritySha256":SHA_B,
+            "generationIndex":1,
+            "campaignRole":"proposal_current_panel",
+            "panelId":"panel-a",
+            "authorityId":AUTHORITY,
+            "campaignSha256":SHA_C,
+            "evaluationIdentitySha256":SHA_A,
+            "taskMatrixSha256":matrix,
+            "candidateCount":tasks.len(),
+            "windowCount":1,
+            "taskCount":tasks.len(),
+            "tasks":{
+                "relativePath":"screening-run/tasks.jsonl",
+                "rawSha256":sha_file(&path)?,
+                "sizeBytes":manifest_bytes,
+                "recordCount":tasks.len(),
+                "taskMatrixSha256":matrix,
+            },
+            "cohortPopulation":{
+                "relativePath":"cohort-population.json",
+                "rawSha256":sha_file(&cohort_path)?,
+                "sizeBytes":cohort_bytes,
+                "populationSha256":cohort["populationSha256"],
+            },
+            "sourceInputs":{
+                "evaluationPopulationRawSha256":SHA_A,
+                "templatePreparationSha256":SHA_B,
+                "constructionCatalogSha256":SHA_C,
+                "preparationSha256":AUTHORITY,
+            },
+            "artifactMetrics":{
+                "payloadFileCount":2,
+                "payloadBytes":manifest_bytes + cohort_bytes,
+                "taskPackBytes":manifest_bytes,
+                "cohortPopulationBytes":cohort_bytes,
+            },
+        });
+        campaign_input["checkpointSha256"] = Value::String(canonical_sha256(&campaign_input)?);
+        let campaign_input_path = root.join("campaign-input-checkpoint.json");
+        fs::write(&campaign_input_path, canonical_json_line(&campaign_input)?)?;
+        Ok(campaign_input_path)
     }
 
     fn worker_material(task: &Value) -> Result<Value> {
@@ -3791,10 +3270,8 @@ mod tests {
                 .join(COMPLETION_JOURNAL_NAME)
                 .is_file()
         );
-        // The task-object/index sidecar is the restart authority after its
-        // source manifest was already consumed; Resume fails closed on a
-        // present-but-tampered manifest but does not need the source file.
-        fs::remove_file(&manifest)?;
+        // Resume reopens the same committed campaign-input checkpoint.  Its
+        // two payloads remain the immutable campaign boundary.
 
         let mut resumed = FakeLocalGateway::new(
             root,
@@ -3816,20 +3293,20 @@ mod tests {
         assert_eq!(result["completedTaskCount"], json!(3));
         assert_eq!(result["telemetry"]["duplicateRedeliveryCount"], json!(1));
         assert_eq!(result["telemetry"]["rejectedCompletionCount"], json!(1));
-        let checkpoint_raw = fs::read(root.join(CHECKPOINT_NAME))?;
-        let checkpoint: Value = serde_json::from_slice(&checkpoint_raw)?;
+        let journal_path = root.join(SIDECAR_DIR).join(COMPLETION_JOURNAL_NAME);
+        let rejected = fs::read_to_string(&journal_path)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|row| row["taskId"] == json!("fixture-task-b"))
+            .ok_or_else(|| anyhow!("rejected fixture task is absent from result journal"))?;
+        assert_eq!(rejected["record"]["outcome"], json!("rejected"));
         assert_eq!(
-            checkpoint_raw,
-            python_pretty_json_line(&checkpoint, JsonNewline::Lf)?
-        );
-        assert_eq!(
-            checkpoint["completed"]["fixture-task-b"]["outcome"],
-            json!("rejected")
-        );
-        assert_eq!(
-            checkpoint["completed"]["fixture-task-b"]["rejectionCode"],
+            rejected["record"]["rejectionCode"],
             json!("aligned_scoring_warmup_insufficient")
         );
+        assert!(root.join(SIDECAR_DIR).join(RESULT_PACK_NAME).is_file());
         assert!(
             root.join(FAILURES_DIR)
                 .join("fixture-task-b.json")
@@ -3903,8 +3380,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_receipt_resumes_without_source_reopen_and_rejects_checkpoint_tamper() -> Result<()>
-    {
+    fn committed_receipt_resumes_without_source_reopen_and_rejects_pack_tamper() -> Result<()> {
         let directory = TempDir::new()?;
         let root = directory.path();
         let tasks = vec![task("fixture-receipt-task", "candidate_receipt")];
@@ -3923,7 +3399,6 @@ mod tests {
                 .is_file()
         );
         assert!(committed.get("executionReceiptSha256").is_some());
-        fs::remove_file(&manifest)?;
         let mut resumed = FakeLocalGateway::new(root, Vec::<Value>::new());
         let recovered = execute_gateway_dispatch_with_client(
             &request(&manifest, root, DispatchMode::Resume),
@@ -3934,10 +3409,10 @@ mod tests {
             committed["executionReceiptSha256"]
         );
         assert_eq!(resumed.max_enqueue_batch, 0);
-        let checkpoint = root.join(CHECKPOINT_NAME);
-        let mut tampered = fs::read(&checkpoint)?;
+        let result_pack = root.join(SIDECAR_DIR).join(RESULT_PACK_NAME);
+        let mut tampered = fs::read(&result_pack)?;
         tampered.push(b' ');
-        fs::write(&checkpoint, tampered)?;
+        fs::write(&result_pack, tampered)?;
         assert!(
             execute_gateway_dispatch_with_client(
                 &request(&manifest, root, DispatchMode::Resume),
@@ -3949,24 +3424,20 @@ mod tests {
     }
 
     #[test]
-    fn v2_inventory_is_receipt_bounded_and_rejects_sidecar_attacks() -> Result<()> {
+    fn packed_results_are_receipt_bounded_and_reject_byte_drift() -> Result<()> {
         let directory = TempDir::new()?;
         let root = directory.path();
         let tasks: Vec<Value> = (0..128)
-            .map(|ordinal| task(&format!("inventory-{ordinal:03}"), &format!("c-{ordinal}")))
+            .map(|ordinal| task(&format!("packed-{ordinal:03}"), &format!("c-{ordinal}")))
             .collect();
         let manifest = write_fixture_manifest(root, &tasks)?;
         let completions: Result<Vec<_>> = tasks
             .iter()
             .enumerate()
-            .map(|(ordinal, task)| warmup_failure_completion(task, &format!("lease-{ordinal}")))
+            .map(|(ordinal, task)| successful_completion(task, &format!("lease-{ordinal}")))
             .collect();
         let mut gateway = FakeLocalGateway::new(root, completions?);
         let mut dispatch_request = request(&manifest, root, DispatchMode::Fresh);
-        // This witness durably fsyncs 128 terminal rows and their compact
-        // inventory.  The shared three-second single-task fixture budget is
-        // too tight on Windows when antivirus or another workspace test owns
-        // the volume; production uses a 900-second completion budget.
         dispatch_request.timeout = Duration::from_secs(30);
         dispatch_request.enqueue_batch_size = 16;
         dispatch_request.result_batch_size = 16;
@@ -3975,29 +3446,26 @@ mod tests {
         let receipt_path = sidecar.join(EXECUTION_RECEIPT_NAME);
         let receipt = read_canonical_line(&receipt_path, "test receipt")?;
         assert_eq!(receipt["schemaVersion"], EXECUTION_RECEIPT_SCHEMA);
-        assert!(receipt.get("resultInventory").is_none());
-        assert_eq!(receipt["resultInventoryCount"], json!(128));
+        assert_eq!(receipt["resultCount"], json!(128));
+        assert!(receipt.get("resultInventoryRootSha256").is_none());
+        assert!(receipt["resultPackSizeBytes"].as_u64().unwrap_or(0) > 0);
         assert!(fs::metadata(&receipt_path)?.len() < 4_096);
-        assert!(sidecar.join(RESULT_INVENTORY_NAME).is_file());
         assert_eq!(result["telemetry"]["peakLiveCompletionBatch"], json!(16));
-        fs::remove_file(&manifest)?;
+        assert_eq!(result["telemetry"]["resultPackCommitted"], json!(true));
+        assert_eq!(
+            fs::read_dir(&sidecar)?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .len(),
+            5,
+            "gateway sidecar should remain constant-size regardless of task count"
+        );
+        assert!(!root.join("results").exists());
 
-        let inventory = sidecar.join(RESULT_INVENTORY_NAME);
-        let inventory_bytes = fs::read(&inventory)?;
-        fs::remove_file(&inventory)?;
+        let pack = sidecar.join(RESULT_PACK_NAME);
+        let pack_bytes = fs::read(&pack)?;
         let mut resumed = FakeLocalGateway::new(root, Vec::<Value>::new());
-        assert!(
-            execute_gateway_dispatch_with_client(
-                &request(&manifest, root, DispatchMode::Resume),
-                &mut resumed
-            )
-            .is_err()
-        );
-        fs::write(&inventory, &inventory_bytes)?;
 
-        let mut reordered: Vec<&[u8]> = inventory_bytes.split_inclusive(|b| *b == b'\n').collect();
-        reordered.swap(0, 1);
-        fs::write(&inventory, reordered.concat())?;
+        fs::remove_file(&pack)?;
         assert!(
             execute_gateway_dispatch_with_client(
                 &request(&manifest, root, DispatchMode::Resume),
@@ -4005,17 +3473,11 @@ mod tests {
             )
             .is_err()
         );
-        fs::write(&inventory, &inventory_bytes)?;
+        fs::write(&pack, &pack_bytes)?;
 
-        fs::write(
-            &inventory,
-            [
-                inventory_bytes.clone(),
-                inventory_bytes[..inventory_bytes.iter().position(|b| *b == b'\n').unwrap() + 1]
-                    .to_vec(),
-            ]
-            .concat(),
-        )?;
+        let mut trailing = pack_bytes.clone();
+        trailing.push(0);
+        fs::write(&pack, trailing)?;
         assert!(
             execute_gateway_dispatch_with_client(
                 &request(&manifest, root, DispatchMode::Resume),
@@ -4023,7 +3485,19 @@ mod tests {
             )
             .is_err()
         );
-        fs::write(&inventory, &inventory_bytes)?;
+        fs::write(&pack, &pack_bytes)?;
+
+        let mut changed = pack_bytes.clone();
+        changed[0] ^= 1;
+        fs::write(&pack, changed)?;
+        assert!(
+            execute_gateway_dispatch_with_client(
+                &request(&manifest, root, DispatchMode::Resume),
+                &mut resumed
+            )
+            .is_err()
+        );
+        fs::write(&pack, &pack_bytes)?;
 
         let receipt_bytes = fs::read(&receipt_path)?;
         let mut foreign: Value = serde_json::from_slice(&receipt_bytes)?;

@@ -21,16 +21,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        bail!("usage: temporal-qd-campaign-seal (--manifest|--build-source-manifest) PATH");
+    if args.len() != 3 || args[1] != "--campaign-output-manifest" {
+        bail!("usage: temporal-qd-campaign-seal --campaign-output-manifest PATH");
     }
-    let result = match args[1].as_str() {
-        "--manifest" => temporal_qd_campaign_seal::execute_manifest(Path::new(&args[2]))?,
-        "--build-source-manifest" => {
-            temporal_qd_campaign_seal::build_source_manifest(Path::new(&args[2]))?
-        }
-        _ => bail!("usage: temporal-qd-campaign-seal (--manifest|--build-source-manifest) PATH"),
-    };
+    let result = temporal_qd_campaign_seal::execute_campaign_output_manifest(Path::new(&args[2]))?;
     println!("{}", temporal_qd_contract::canonical_json(&result)?);
     Ok(())
 }

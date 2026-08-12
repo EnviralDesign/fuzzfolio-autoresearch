@@ -22,7 +22,8 @@ from .temporal_qd_evaluation_population import raw_file_sha256
 NATIVE_CAMPAIGN_MANIFEST_SCHEMA = "temporal_qd_native_campaign_task_matrix_manifest_v1"
 NATIVE_CAMPAIGN_RESULT_SCHEMA = "temporal_qd_native_campaign_task_matrix_result_v1"
 NATIVE_V5_FREEZE_MANIFEST_SCHEMA = "temporal_qd_v5_native_campaign_freeze_manifest_v2"
-NATIVE_V5_FREEZE_RESULT_SCHEMA = "temporal_qd_v5_native_campaign_freeze_result_v1"
+NATIVE_V5_CAMPAIGN_INPUT_RESULT_SCHEMA = "temporal_qd_v5_campaign_input_result_v1"
+NATIVE_V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA = "temporal_qd_v5_campaign_input_checkpoint_v1"
 NATIVE_V5_LADDER_FREEZE_MANIFEST_SCHEMA = "temporal_qd_v5_native_evidence_ladder_freeze_manifest_v2"
 NATIVE_V5_LADDER_FREEZE_RESULT_SCHEMA = "temporal_qd_v5_native_evidence_ladder_freeze_result_v1"
 NATIVE_V5_LADDER_ARCHIVE_FREEZE_MANIFEST_SCHEMA = (
@@ -180,111 +181,184 @@ def _v3_ladder_archive_freeze_manifest_sha256(manifest: Mapping[str, Any]) -> st
     return canonical_sha256(semantic)
 
 
-def _validate_v5_freeze_receipts(root: Path, manifest: Mapping[str, Any], result: Mapping[str, Any]) -> None:
-    """Fail closed on the durable v2 commit, independently of stdout telemetry."""
+def _validate_v5_campaign_input_checkpoint(
+    root: Path,
+    manifest: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the compact campaign-input commit without rescanning payloads."""
 
-    def read(name: str) -> dict[str, Any]:
-        return _read_current_v5_compact_json(
-            root / name,
-            name=f"native v5 freeze {name}",
-        )
-
-    def exact(value: Mapping[str, Any], keys: set[str], name: str) -> None:
-        if set(value) != keys:
-            raise TemporalDiscoveryContractError(f"native v5 freeze {name} fields drifted")
-
-    def self_hash(value: Mapping[str, Any], field: str, name: str) -> None:
-        supplied = value.get(field)
-        if not isinstance(supplied, str) or canonical_sha256(
-            {key: item for key, item in value.items() if key != field}
-        ) != supplied:
-            raise TemporalDiscoveryContractError(f"native v5 freeze {name} identity drifted")
-
-    transaction = read("native-freeze-transaction.json")
-    receipt = read("native-freeze-receipt.json")
-    exact(
-        transaction,
-        {
-            "schemaVersion", "manifestSha256", "nativeRuntimeAuthoritySha256",
-            "evaluationPopulationRawSha256", "cohortPopulationSha256",
-            "templatePreparationSha256", "constructionCatalogSha256", "preparationSha256",
-            "authorityId", "evaluationIdentitySha256", "campaignSha256", "taskMatrixSha256",
-            "candidateCount", "windowCount", "taskCount", "campaignRole", "outputInventory",
-            "transactionSha256",
-        },
-        "transaction",
+    checkpoint_path = _require_regular_file(
+        root / "campaign-input-checkpoint.json",
+        name="native v5 campaign-input checkpoint",
     )
-    if transaction.get("schemaVersion") != "temporal_qd_v5_native_campaign_freeze_transaction_v2":
-        raise TemporalDiscoveryContractError("native v5 freeze transaction schema drifted")
-    self_hash(transaction, "transactionSha256", "transaction")
-    exact(
-        receipt,
-        {
-            "schemaVersion", "manifestSha256", "nativeRuntimeAuthoritySha256",
-            "transactionSha256", "campaignSha256", "authorityId", "evaluationIdentitySha256",
-            "taskMatrixSha256", "taskCount", "outputInventory", "semanticReceiptSha256",
-            "receiptSha256",
-        },
-        "receipt",
+    checkpoint = _read_current_v5_compact_json(
+        checkpoint_path,
+        name="native v5 campaign-input checkpoint",
     )
-    if receipt.get("schemaVersion") != "temporal_qd_v5_native_campaign_freeze_receipt_v1":
-        raise TemporalDiscoveryContractError("native v5 freeze receipt schema drifted")
-    self_hash(receipt, "receiptSha256", "receipt")
-    if (
-        receipt.get("manifestSha256") != manifest.get("manifestSha256")
-        or receipt.get("nativeRuntimeAuthoritySha256") != manifest.get("nativeRuntimeAuthoritySha256")
-        or receipt.get("transactionSha256") != transaction.get("transactionSha256")
-    ):
-        raise TemporalDiscoveryContractError("native v5 freeze receipt input/runtime binding drifted")
-    semantic = {
-        "schemaVersion": receipt["schemaVersion"],
-        "manifestSha256": receipt["manifestSha256"],
-        "nativeRuntimeAuthoritySha256": receipt["nativeRuntimeAuthoritySha256"],
-        "campaignSha256": receipt["campaignSha256"],
-        "authorityId": receipt["authorityId"],
-        "evaluationIdentitySha256": receipt["evaluationIdentitySha256"],
-        "taskMatrixSha256": receipt["taskMatrixSha256"],
-        "taskCount": receipt["taskCount"],
+    expected = {
+        "schemaVersion",
+        "contractVersion",
+        "manifestSha256",
+        "nativeRuntimeAuthoritySha256",
+        "generationIndex",
+        "campaignRole",
+        "panelId",
+        "authorityId",
+        "campaignSha256",
+        "evaluationIdentitySha256",
+        "taskMatrixSha256",
+        "candidateCount",
+        "windowCount",
+        "taskCount",
+        "taskManifest",
+        "cohortPopulation",
+        "sourceInputs",
+        "artifactMetrics",
+        "checkpointSha256",
     }
-    if canonical_sha256(semantic) != receipt.get("semanticReceiptSha256"):
-        raise TemporalDiscoveryContractError("native v5 freeze receipt semantic identity drifted")
-    # The freezer's inventories intentionally include candidate-bearing
-    # population/task artifacts.  Rust wrote and authenticated those bytes
-    # before publishing this receipt.  The Python control plane admits only
-    # the bounded descriptor rows here; reopening or rehashing every entry
-    # would recreate an O(N) fallback outside the native transaction.
-    for inventory, allowed in (
-        (transaction.get("outputInventory"), {
-            "cohort-population.json", "preparation.json", "authority.json", "evaluation-identity.json",
-            "campaign.json", "screening-run/authority.json", "screening-run/task-manifest.json",
-            "screening-run/checkpoint.json", "native-freeze-result.json",
-        }),
-        (receipt.get("outputInventory"), {
-            "cohort-population.json", "preparation.json", "authority.json", "evaluation-identity.json",
-            "campaign.json", "screening-run/authority.json", "screening-run/task-manifest.json",
-            "screening-run/checkpoint.json", "native-freeze-result.json", "native-freeze-transaction.json",
-        }),
+    if set(checkpoint) != expected:
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input checkpoint fields drifted"
+        )
+    if (
+        checkpoint.get("schemaVersion")
+        != NATIVE_V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA
+        or checkpoint.get("contractVersion") != "temporal_qd_native_foundation_v1"
+        or checkpoint.get("checkpointSha256")
+        != canonical_sha256(
+            {
+                key: value
+                for key, value in checkpoint.items()
+                if key != "checkpointSha256"
+            }
+        )
+        or checkpoint.get("manifestSha256") != manifest.get("manifestSha256")
+        or checkpoint.get("nativeRuntimeAuthoritySha256")
+        != manifest.get("nativeRuntimeAuthoritySha256")
     ):
-        if not isinstance(inventory, list) or {row.get("relativePath") for row in inventory if isinstance(row, dict)} != allowed:
-            raise TemporalDiscoveryContractError("native v5 freeze output inventory drifted")
-        for row in inventory:
-            if not isinstance(row, dict) or set(row) != {"relativePath", "rawSha256"}:
-                raise TemporalDiscoveryContractError("native v5 freeze output inventory fields drifted")
-            relative = row["relativePath"]
-            if not isinstance(relative, str) or relative not in allowed or ".." in Path(relative).parts:
-                raise TemporalDiscoveryContractError("native v5 freeze output inventory path is unsafe")
-            supplied = row["rawSha256"]
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input checkpoint identity drifted"
+        )
+    candidate_count = checkpoint.get("candidateCount")
+    window_count = checkpoint.get("windowCount")
+    task_count = checkpoint.get("taskCount")
+    if (
+        isinstance(candidate_count, bool)
+        or not isinstance(candidate_count, int)
+        or isinstance(window_count, bool)
+        or not isinstance(window_count, int)
+        or isinstance(task_count, bool)
+        or not isinstance(task_count, int)
+        or candidate_count * window_count != task_count
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input task cardinality drifted"
+        )
+    descriptors = (
+        (
+            checkpoint.get("taskManifest"),
+            "screening-run/task-manifest.json",
+            "taskMatrixSha256",
+            checkpoint.get("taskMatrixSha256"),
+        ),
+        (
+            checkpoint.get("cohortPopulation"),
+            "cohort-population.json",
+            "populationSha256",
+            checkpoint.get("cohortPopulation", {}).get("populationSha256")
+            if isinstance(checkpoint.get("cohortPopulation"), Mapping)
+            else None,
+        ),
+    )
+    payload_bytes = 0
+    for raw, relative, semantic_field, semantic_sha in descriptors:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "relativePath",
+            "rawSha256",
+            "sizeBytes",
+            semantic_field,
+        }:
+            raise TemporalDiscoveryContractError(
+                "native v5 campaign-input payload descriptor drifted"
+            )
+        if raw.get("relativePath") != relative or raw.get(semantic_field) != semantic_sha:
+            raise TemporalDiscoveryContractError(
+                "native v5 campaign-input payload binding drifted"
+            )
+        for value in (raw.get("rawSha256"), semantic_sha):
             if (
-                not isinstance(supplied, str)
-                or len(supplied) != 71
-                or not supplied.startswith("sha256:")
-                or any(character not in "0123456789abcdef" for character in supplied[7:])
+                not isinstance(value, str)
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in value[7:])
             ):
                 raise TemporalDiscoveryContractError(
-                    "native v5 freeze output inventory identity is invalid"
+                    "native v5 campaign-input payload identity is invalid"
                 )
-    if any(result.get(key) != receipt.get(key) for key in ("campaignSha256", "authorityId", "evaluationIdentitySha256", "taskMatrixSha256", "taskCount")):
-        raise TemporalDiscoveryContractError("native v5 freeze stdout result receipt binding drifted")
+        path = _require_regular_file(root / relative, name=f"campaign-input {relative}")
+        size = raw.get("sizeBytes")
+        if isinstance(size, bool) or not isinstance(size, int) or path.stat().st_size != size:
+            raise TemporalDiscoveryContractError(
+                "native v5 campaign-input payload size drifted"
+            )
+        payload_bytes += size
+    source_inputs = checkpoint.get("sourceInputs")
+    if not isinstance(source_inputs, Mapping) or set(source_inputs) != {
+        "evaluationPopulationRawSha256",
+        "templatePreparationSha256",
+        "constructionCatalogSha256",
+        "preparationSha256",
+    }:
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input source binding drifted"
+        )
+    if (
+        source_inputs.get("evaluationPopulationRawSha256")
+        != manifest.get("evaluationPopulationSha256")
+        or source_inputs.get("templatePreparationSha256")
+        != manifest.get("templatePreparationSha256")
+        or source_inputs.get("constructionCatalogSha256")
+        != manifest.get("constructionCatalogSha256")
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input immutable source identity drifted"
+        )
+    metrics = checkpoint.get("artifactMetrics")
+    if (
+        not isinstance(metrics, Mapping)
+        or metrics.get("payloadFileCount") != 2
+        or metrics.get("payloadBytes") != payload_bytes
+        or metrics.get("taskManifestBytes")
+        != checkpoint["taskManifest"]["sizeBytes"]
+        or metrics.get("cohortPopulationBytes")
+        != checkpoint["cohortPopulation"]["sizeBytes"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input artifact metrics drifted"
+        )
+    for key in (
+        "campaignSha256",
+        "authorityId",
+        "evaluationIdentitySha256",
+        "taskMatrixSha256",
+        "candidateCount",
+        "windowCount",
+        "taskCount",
+        "campaignRole",
+        "panelId",
+        "cohortPopulationSha256",
+        "checkpointSha256",
+    ):
+        if key in result and result.get(key) != (
+            checkpoint["cohortPopulation"]["populationSha256"]
+            if key == "cohortPopulationSha256"
+            else checkpoint.get(key)
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 campaign-input stdout/checkpoint binding drifted"
+            )
+    return dict(checkpoint)
 
 
 def _repo_root() -> Path:
@@ -645,12 +719,16 @@ def freeze_qd_v5_campaign_native(
         result = json.loads(completed.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TemporalDiscoveryContractError("Rust-native v5 campaign freeze emitted invalid JSON") from exc
-    expected_schema = NATIVE_V5_LADDER_FREEZE_RESULT_SCHEMA if ladder else NATIVE_V5_FREEZE_RESULT_SCHEMA
+    expected_schema = (
+        NATIVE_V5_LADDER_FREEZE_RESULT_SCHEMA
+        if ladder
+        else NATIVE_V5_CAMPAIGN_INPUT_RESULT_SCHEMA
+    )
     if not isinstance(result, dict) or result.get("schemaVersion") != expected_schema:
         raise TemporalDiscoveryContractError("Rust-native v5 campaign-freeze result schema drifted")
     if result.get("outputRoot") != str(root):
         raise TemporalDiscoveryContractError("Rust-native v5 campaign-freeze output binding drifted")
-    _validate_v5_freeze_receipts(root, manifest, result)
+    _validate_v5_campaign_input_checkpoint(root, manifest, result)
     if raw_file_sha256(binary) != binary_sha256:
         raise TemporalDiscoveryContractError(
             "Rust-native v5 campaign-freeze binary changed during execution"

@@ -23,7 +23,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut task_manifest = None::<PathBuf>;
+    let mut campaign_input_checkpoint = None::<PathBuf>;
     let mut output_root = None::<PathBuf>;
     let mut gateway_url = None::<String>;
     let mut token = None::<String>;
@@ -46,8 +46,11 @@ fn run() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))
         };
         match argument.as_str() {
-            "--task-manifest" => {
-                task_manifest = Some(PathBuf::from(value("--task-manifest", &mut args)?))
+            "--campaign-input-checkpoint" => {
+                campaign_input_checkpoint = Some(PathBuf::from(value(
+                    "--campaign-input-checkpoint",
+                    &mut args,
+                )?))
             }
             "--output-root" => {
                 output_root = Some(PathBuf::from(value("--output-root", &mut args)?))
@@ -135,7 +138,8 @@ fn run() -> Result<()> {
         (Some(_), Some(_)) => unreachable!(),
     };
     let mut request = GatewayDispatchRequest::bounded(
-        task_manifest.ok_or_else(|| anyhow::anyhow!("--task-manifest is required"))?,
+        campaign_input_checkpoint
+            .ok_or_else(|| anyhow::anyhow!("--campaign-input-checkpoint is required"))?,
         output_root.ok_or_else(|| anyhow::anyhow!("--output-root is required"))?,
         mode.ok_or_else(|| anyhow::anyhow!("exactly one of --fresh or --resume is required"))?,
     );
@@ -176,7 +180,7 @@ fn parse<T: std::str::FromStr>(value: &str, label: &str) -> Result<T> {
 
 fn print_usage() {
     println!(
-        "usage: temporal-qd-gateway-dispatch --task-manifest PATH --output-root PATH --gateway-url URL (--fresh|--resume) [--gateway-token TOKEN | --gateway-token-file PATH] [--timeout-seconds N] [--request-timeout-seconds N] [--poll-interval-millis N] [--enqueue-batch-size N] [--result-batch-size N] [--max-request-bytes N] [--max-response-bytes N] [--maintenance-probe-interval-millis N] [--maintenance-timeout-seconds N]"
+        "usage: temporal-qd-gateway-dispatch --campaign-input-checkpoint PATH --output-root PATH --gateway-url URL (--fresh|--resume) [--gateway-token TOKEN | --gateway-token-file PATH] [--timeout-seconds N] [--request-timeout-seconds N] [--poll-interval-millis N] [--enqueue-batch-size N] [--result-batch-size N] [--max-request-bytes N] [--max-response-bytes N] [--maintenance-probe-interval-millis N] [--maintenance-timeout-seconds N]"
     );
 }
 

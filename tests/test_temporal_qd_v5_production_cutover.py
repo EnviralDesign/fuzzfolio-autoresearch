@@ -812,6 +812,9 @@ def test_native_v5_campaign_round_chains_only_native_receipts(
         assert kwargs["cohort_selection_path"] is None
         return {
             "outputRoot": str(kwargs["output_root"]),
+            "checkpointPath": str(
+                Path(kwargs["output_root"]) / "campaign-input-checkpoint.json"
+            ),
             "cohortPopulationRawSha256": _sha("cohort-population"),
             "cohortPopulationSha256": _sha("cohort-population-semantic"),
         }
@@ -820,58 +823,57 @@ def test_native_v5_campaign_round_chains_only_native_receipts(
         calls.append("dispatch")
         assert kwargs["mode"] == "fresh"
         assert kwargs["output_root"] == tmp_path / "campaign" / "gateway-dispatch"
-        assert kwargs["task_manifest_path"] == (
-            tmp_path / "campaign" / "screening-run" / "task-manifest.json"
-        )
-        return {"outputRoot": str(kwargs["output_root"])}
-
-    def source(**kwargs: Any) -> dict[str, Any]:
-        calls.append("source")
-        return {"sourcePath": str(tmp_path / "source.json")}
-
-    def seal(**kwargs: Any) -> dict[str, Any]:
-        calls.append("seal")
-        assert kwargs["evaluation_population_path"] == (
-            tmp_path / "campaign" / "cohort-population.json"
-        )
-        assert kwargs["evaluation_population_sha256"] == _sha(
-            "cohort-population-semantic"
+        assert kwargs["campaign_input_checkpoint_path"] == (
+            tmp_path / "campaign" / "campaign-input-checkpoint.json"
         )
         return {
-            "campaignSeal": {"campaignSealSha256": _sha("seal")},
-            "generationTailTransaction": {"transactionSha256": _sha("transaction")},
-            "tailAuthorityReceipt": {
-                "receiptPath": str(tmp_path / "tail-authority.json"),
-                "receiptSha256": _sha("tail-authority"),
-            },
-            "directionalTailAuthority": {
-                "receiptPath": str(tmp_path / "directional-tail-authority.json"),
-                "receiptSha256": _sha("directional-tail-authority"),
-            },
-            "tailResultIndex": {"tailResultIndexSha256": _sha("tail-index")},
+            "outputRoot": str(kwargs["output_root"]),
+            "receiptPath": str(
+                kwargs["output_root"]
+                / ".native-gateway-dispatch"
+                / "execution-receipt.json"
+            ),
         }
 
-    def sidecar(**kwargs: Any) -> dict[str, Any]:
-        calls.append("sidecar")
-        assert kwargs["panel_input"]["campaignRole"] == "proposal_current_panel"
-        return {"candidatePanelBundles": {"descriptorSha256": _sha("bundles")}}
-
-    def receipt(**kwargs: Any) -> dict[str, Any]:
-        calls.append("receipt")
+    def output(**kwargs: Any) -> dict[str, Any]:
+        calls.append("output")
+        assert kwargs["campaign_input_checkpoint_path"] == (
+            tmp_path / "campaign" / "campaign-input-checkpoint.json"
+        )
+        assert kwargs["gateway_execution_receipt_path"] == (
+            tmp_path
+            / "campaign"
+            / "gateway-dispatch"
+            / ".native-gateway-dispatch"
+            / "execution-receipt.json"
+        )
+        assert kwargs["output_root"] == tmp_path / "campaign" / "campaign-output"
         assert kwargs["cohort_source"] == {
             "kind": "proposal_evaluation_population",
             "sourceSemanticSha256": _sha("evaluation"),
             "candidateCount": 1,
             "selectionSha256": None,
         }
-        return {"receiptPath": str(tmp_path / "receipt.json")}
+        checkpoint_path = kwargs["output_root"] / "campaign-output-checkpoint.json"
+        checkpoint = {
+            "schemaVersion": control.CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA,
+            "receiptSha256": _sha("campaign-output"),
+        }
+        return {
+            "checkpoint": checkpoint,
+            "checkpointPath": str(checkpoint_path),
+            "result": {
+                "campaignSeal": {"campaignSealSha256": _sha("seal")},
+                "directionalTailAuthority": {
+                    "tailAuthoritySha256": _sha("directional-tail-authority")
+                },
+                "tailResultIndex": {"tailResultIndexSha256": _sha("tail-index")},
+            },
+        }
 
     monkeypatch.setattr(supervisor, "run_native_v5_campaign_freeze", freeze)
     monkeypatch.setattr(supervisor, "run_native_gateway_dispatch", dispatch)
-    monkeypatch.setattr(supervisor, "build_native_campaign_seal_source", source)
-    monkeypatch.setattr(supervisor, "run_native_campaign_seal", seal)
-    monkeypatch.setattr(supervisor, "build_native_panel_bundle_sidecar", sidecar)
-    monkeypatch.setattr(supervisor, "build_native_rotating_campaign_receipt", receipt)
+    monkeypatch.setattr(supervisor, "run_native_campaign_output", output)
 
     handoff = supervisor._run_native_v5_campaign_round(
         runtime_authority={"opaque": "runtime"},
@@ -891,8 +893,13 @@ def test_native_v5_campaign_round_chains_only_native_receipts(
         gateway_token=None,
     )
 
-    assert calls == ["freeze", "dispatch", "source", "seal", "sidecar", "receipt"]
-    assert handoff["campaignReceipt"]["receiptPath"].endswith("receipt.json")
+    assert calls == ["freeze", "dispatch", "output"]
+    assert handoff["campaignReceipt"]["receiptPath"].endswith(
+        "campaign-output-checkpoint.json"
+    )
+    assert "sourceBuild" not in handoff
+    assert "campaignSeal" not in handoff
+    assert "panelBundleSidecar" not in handoff
 
 
 def test_current_v5_postproposal_rejects_missing_native_authority_without_python_fallback(
@@ -1082,13 +1089,16 @@ def test_current_v5_postproposal_chain_uses_only_native_receipts_and_resumes(
         receipt_path = root / f"{len(calls)}-campaign-receipt.json"
         campaign_receipt_paths.append(receipt_path)
         return {
-            "campaignSeal": {
-                "campaignSeal": {"campaignSealSha256": _sha("campaign-seal")},
-                "directionalTailAuthority": {
-                    "receiptPath": str(root / "directional-tail-authority.json"),
-                    "receiptSha256": _sha("tail-authority"),
+            "campaignOutput": {
+                "result": {
+                    "campaignSeal": {"campaignSealSha256": _sha("campaign-seal")},
+                    "directionalTailAuthority": {
+                        "receiptPath": str(root / "directional-tail-authority.json"),
+                        "receiptSha256": _sha("tail-authority"),
+                    },
+                    "tailResultIndex": {"tailResultIndexSha256": _sha("tail-index")},
                 },
-                "tailResultIndex": {"tailResultIndexSha256": _sha("tail-index")},
+                "checkpointPath": str(receipt_path),
             },
             "campaignReceipt": {"receiptPath": str(receipt_path)},
         }

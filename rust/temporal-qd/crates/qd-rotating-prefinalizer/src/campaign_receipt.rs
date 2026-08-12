@@ -8,6 +8,7 @@ use temporal_qd_contract::{
 };
 pub const INPUT_SCHEMA: &str = "temporal_qd_v5_rotating_campaign_receipt_input_v2";
 pub const RECEIPT_SCHEMA: &str = "temporal_qd_v5_rotating_campaign_receipt_v2";
+pub const OUTPUT_CHECKPOINT_SCHEMA: &str = "temporal_qd_v5_campaign_output_checkpoint_v1";
 
 pub fn build_to_path(input_path: &Path, output_path: &Path) -> Result<Value> {
     let raw = fs::read(input_path).context("read campaign receipt input")?;
@@ -36,6 +37,14 @@ pub fn build_to_path(input_path: &Path, output_path: &Path) -> Result<Value> {
 /// Re-validates a committed receipt without consulting worker raw results.
 /// This is the admission boundary used by the chained prefinalizer manifests.
 pub fn validate_receipt(value: &Value) -> Result<()> {
+    match text(value, "schemaVersion")? {
+        RECEIPT_SCHEMA => validate_v2_receipt(value),
+        OUTPUT_CHECKPOINT_SCHEMA => validate_output_checkpoint(value),
+        _ => anyhow::bail!("campaign receipt schema is incompatible"),
+    }
+}
+
+fn validate_v2_receipt(value: &Value) -> Result<()> {
     let m = object(value, "campaign receipt")?;
     exact_keys(
         m,
@@ -129,6 +138,225 @@ pub fn validate_receipt(value: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+fn validate_output_checkpoint(value: &Value) -> Result<()> {
+    let m = object(value, "campaign-output checkpoint")?;
+    exact_keys(
+        m,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "generationIndex",
+            "campaignRole",
+            "panelId",
+            "rotatingEvidenceSha256",
+            "cohortSource",
+            "campaignInput",
+            "campaignSeal",
+            "campaignSealDocument",
+            "evaluatedMembers",
+            "candidatePanelBundles",
+            "semanticReceiptSha256",
+            "manifestSha256",
+            "runtimeAuthoritySha256",
+            "gatewayReceiptSha256",
+            "gatewaySemanticReceiptSha256",
+            "executionBindings",
+            "receiptSha256",
+        ],
+        "campaign-output checkpoint",
+    )?;
+    ensure!(
+        text(value, "schemaVersion")? == OUTPUT_CHECKPOINT_SCHEMA
+            && text(value, "contractVersion")? == CONTRACT_VERSION
+            && unsigned(value, "generationIndex")? > 0
+            && matches!(
+                text(value, "campaignRole")?,
+                "proposal_current_panel" | "retained_parent_current_panel" | "prior_panel_backfill"
+            ),
+        "campaign-output checkpoint schema/version/role is invalid"
+    );
+    for field in [
+        "rotatingEvidenceSha256",
+        "semanticReceiptSha256",
+        "manifestSha256",
+        "runtimeAuthoritySha256",
+        "gatewayReceiptSha256",
+        "gatewaySemanticReceiptSha256",
+        "receiptSha256",
+    ] {
+        sha(value, field)?;
+    }
+    let cohort = member(value, "cohortSource")?;
+    let cohort_map = object(cohort, "campaign-output cohort source")?;
+    exact_keys(
+        cohort_map,
+        &[
+            "kind",
+            "sourceSemanticSha256",
+            "candidateCount",
+            "selectionSha256",
+        ],
+        "campaign-output cohort source",
+    )?;
+    let proposal = text(cohort, "kind")? == "proposal_evaluation_population";
+    ensure!(
+        proposal || text(cohort, "kind")? == "sealed_cohort_selection",
+        "campaign-output cohort source kind is invalid"
+    );
+    sha(cohort, "sourceSemanticSha256")?;
+    unsigned(cohort, "candidateCount")?;
+    if proposal {
+        ensure!(
+            member(cohort, "selectionSha256")?.is_null(),
+            "proposal cohort source cannot name a selection"
+        );
+    } else {
+        sha(cohort, "selectionSha256")?;
+    }
+
+    let campaign_input = member(value, "campaignInput")?;
+    exact_keys(
+        object(campaign_input, "campaign-input checkpoint summary")?,
+        &[
+            "checkpointSha256",
+            "cohortPopulationSha256",
+            "authorityId",
+            "evaluationIdentitySha256",
+            "campaignSha256",
+            "taskMatrixSha256",
+            "candidateCount",
+            "windowCount",
+            "taskCount",
+        ],
+        "campaign-input checkpoint summary",
+    )?;
+    for field in [
+        "checkpointSha256",
+        "cohortPopulationSha256",
+        "authorityId",
+        "evaluationIdentitySha256",
+        "campaignSha256",
+        "taskMatrixSha256",
+    ] {
+        sha(campaign_input, field)?;
+    }
+    for field in ["candidateCount", "windowCount", "taskCount"] {
+        unsigned(campaign_input, field)?;
+    }
+
+    let campaign_seal = member(value, "campaignSeal")?;
+    exact_keys(
+        object(campaign_seal, "campaign-output seal summary")?,
+        &[
+            "directionalTailAuthoritySha256",
+            "campaignSealSha256",
+            "tailResultIndexSha256",
+            "tailTransactionSha256",
+        ],
+        "campaign-output seal summary",
+    )?;
+    for field in [
+        "directionalTailAuthoritySha256",
+        "campaignSealSha256",
+        "tailResultIndexSha256",
+        "tailTransactionSha256",
+    ] {
+        sha(campaign_seal, field)?;
+    }
+    let campaign_seal_document = member(value, "campaignSealDocument")?;
+    ensure!(
+        text(campaign_seal_document, "schemaVersion")? == "temporal_qd_campaign_seal_v1"
+            && canonical_sha256_without_object_field(campaign_seal_document, "campaignSealSha256",)?
+                == sha(campaign_seal_document, "campaignSealSha256")?
+            && sha(campaign_seal_document, "campaignSealSha256")?
+                == sha(campaign_seal, "campaignSealSha256")?,
+        "campaign-output campaign seal document drifted"
+    );
+
+    for key in ["evaluatedMembers", "candidatePanelBundles"] {
+        let descriptor = member(value, key)?;
+        exact_keys(
+            object(descriptor, key)?,
+            &["rawSha256", "sizeBytes", "recordCount", "rowSchema"],
+            key,
+        )?;
+        sha(descriptor, "rawSha256")?;
+        unsigned(descriptor, "sizeBytes")?;
+        unsigned(descriptor, "recordCount")?;
+    }
+    ensure!(
+        text(member(value, "evaluatedMembers")?, "rowSchema")? == "temporal_qd_evaluated_member_v1"
+            && text(member(value, "candidatePanelBundles")?, "rowSchema")?
+                == "temporal_qd_candidate_panel_evidence_bundle_v1",
+        "campaign-output row schema drifted"
+    );
+
+    let mut semantic = json!({
+        "schemaVersion": OUTPUT_CHECKPOINT_SCHEMA,
+        "contractVersion": CONTRACT_VERSION,
+        "generationIndex": unsigned(value, "generationIndex")?,
+        "campaignRole": text(value, "campaignRole")?,
+        "panelId": text(value, "panelId")?,
+        "rotatingEvidenceSha256": sha(value, "rotatingEvidenceSha256")?,
+        "cohortSource": cohort,
+        "campaignInput": campaign_input,
+        "campaignSeal": campaign_seal,
+        "campaignSealDocument": campaign_seal_document,
+        "evaluatedMembers": member(value, "evaluatedMembers")?,
+        "candidatePanelBundles": member(value, "candidatePanelBundles")?,
+    });
+    ensure!(
+        canonical_sha256(&semantic)? == sha(value, "semanticReceiptSha256")?,
+        "campaign-output semantic receipt hash drifted"
+    );
+
+    let execution = member(value, "executionBindings")?;
+    let execution_map = object(execution, "campaign-output execution bindings")?;
+    exact_keys(
+        execution_map,
+        &[
+            "campaignInputCheckpoint",
+            "gatewayExecutionReceipt",
+            "tailResultIndex",
+            "evaluatedMembersJsonl",
+            "candidatePanelBundlesJsonl",
+        ],
+        "campaign-output execution bindings",
+    )?;
+    for key in execution_map.keys() {
+        let descriptor = member(execution, key)?;
+        exact_keys(
+            object(descriptor, "campaign-output execution descriptor")?,
+            &["path", "rawSha256", "sizeBytes"],
+            "campaign-output execution descriptor",
+        )?;
+        ensure!(
+            Path::new(text(descriptor, "path")?).is_absolute(),
+            "campaign-output execution descriptor path must be absolute"
+        );
+        sha(descriptor, "rawSha256")?;
+        unsigned(descriptor, "sizeBytes")?;
+    }
+
+    let full = semantic.as_object_mut().expect("semantic receipt object");
+    for field in [
+        "semanticReceiptSha256",
+        "manifestSha256",
+        "runtimeAuthoritySha256",
+        "gatewayReceiptSha256",
+        "gatewaySemanticReceiptSha256",
+        "executionBindings",
+    ] {
+        full.insert(field.into(), member(value, field)?.clone());
+    }
+    ensure!(
+        canonical_sha256(&semantic)? == sha(value, "receiptSha256")?,
+        "campaign-output checkpoint hash drifted"
+    );
+    Ok(())
+}
+
 pub fn build(input: &Value) -> Result<Value> {
     let m = object(input, "campaign receipt input")?;
     exact_keys(

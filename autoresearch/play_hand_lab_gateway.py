@@ -139,6 +139,7 @@ def _is_lake_window_request(error: str) -> bool:
         "window-attestations" in normalized
         or "fuzzfoliodatalake" in normalized
         or "market data lake" in normalized
+        or "lake maintenance" in normalized
     )
 
 
@@ -1063,6 +1064,24 @@ class PlayHandLabGateway:
         self.ack_results([str(result.get("lease_id") or "") for result in results])
         return results
 
+    def lake_maintenance_status(self) -> dict[str, Any] | None:
+        """Return the single shared lake-maintenance state for coordinators."""
+
+        with self._lock:
+            now = _now()
+            if self._lake_retry_reason is None:
+                return None
+            return {
+                "error": "lake_maintenance",
+                "retry_after_seconds": max(
+                    self._lake_retry_not_before - now,
+                    self.config.no_work_retry_after_seconds,
+                ),
+                "retry_reason": self._lake_retry_reason,
+                "circuit_state": self._lake_circuit_state_locked(now),
+                "probe_task_id": self._lake_probe_task_id,
+            }
+
     def read_results(self, limit: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
             self._maintain_lifecycle_locked(_now())
@@ -1436,7 +1455,14 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             raw_limit = query.get("limit", [None])[0]
             limit = int(raw_limit) if raw_limit not in {None, ""} else None
-            self._write_json({"results": self.server.gateway.read_results(limit=limit)})
+            results = self.server.gateway.read_results(limit=limit)
+            maintenance = (
+                None if results else self.server.gateway.lake_maintenance_status()
+            )
+            if maintenance is not None:
+                self._write_json(maintenance, status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self._write_json({"results": results})
             return
         self._write_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -1844,7 +1870,12 @@ class LabGatewayAsgiApp:
             if method == "GET" and path == "/results":
                 raw_limit = query.get("limit", [None])[0]
                 limit = int(raw_limit) if raw_limit not in {None, ""} else None
-                await self._send_json(send, {"results": self.gateway.read_results(limit=limit)})
+                results = self.gateway.read_results(limit=limit)
+                maintenance = None if results else self.gateway.lake_maintenance_status()
+                if maintenance is not None:
+                    await self._send_json(send, maintenance, status=503)
+                    return
+                await self._send_json(send, {"results": results})
                 return
 
             payload = await self._read_json(receive)

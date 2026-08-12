@@ -622,6 +622,61 @@ def test_lab_gateway_lake_recovery_allows_one_probe_before_reopening() -> None:
     assert normal["lake_health_probe"] is False
 
 
+def test_lab_gateway_results_endpoint_reports_shared_lake_maintenance() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(lake_mutation_retry_after_seconds=30.0)
+    )
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=2,
+        )
+    )
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    gateway.fail(
+        "worker-1",
+        claim["lease_id"],
+        error="409 Client Error from market data lake window-attestations",
+        retryable=True,
+    )
+
+    server = build_lab_gateway_http_server(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        gateway=gateway,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    headers = {"Authorization": "Bearer secret"}
+    try:
+        paused = requests.get(f"{base_url}/results", headers=headers, timeout=5)
+        assert paused.status_code == 503
+        assert paused.json()["error"] == "lake_maintenance"
+        assert paused.json()["circuit_state"] == "cooldown"
+
+        gateway._lake_retry_not_before = time.monotonic() - 0.001
+        gateway._tasks["task-1"].available_at = time.monotonic() - 0.001
+        probe = gateway.claim("worker-1")
+        gateway.complete(
+            "worker-1",
+            probe["lease_id"],
+            result={"status": "success", "score": 1.0},
+        )
+        recovered = requests.get(f"{base_url}/results", headers=headers, timeout=5)
+        assert recovered.status_code == 200
+        assert recovered.json()["results"][0]["result"]["score"] == 1.0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
     gateway = PlayHandLabGateway()
     server = build_lab_gateway_http_server(

@@ -116,9 +116,6 @@ from .temporal_qd_v5_control_plane import (
     GENERATION_STATE_APPLICATION_SIDECAR_SCHEMA,
     GENERATION_STATE_PATCH_SCHEMA,
     TemporalQDV5ControlPlaneError,
-    build_native_campaign_seal_source,
-    build_native_panel_bundle_sidecar,
-    build_native_rotating_campaign_receipt,
     build_native_v5_prefinalizer_base_manifest,
     build_native_v5_prefinalizer_resume_manifest,
     certify_native_v5_initial_archive,
@@ -127,7 +124,7 @@ from .temporal_qd_v5_control_plane import (
     assemble_native_v5_funnel_reduction_source,
     extract_native_v5_evolved_attempt_chain,
     extract_native_v5_g0_selected_attempts,
-    run_native_campaign_seal,
+    run_native_campaign_output,
     run_native_gateway_dispatch,
     run_native_v5_campaign_freeze,
     run_native_v5_generation_finalizer,
@@ -1856,12 +1853,8 @@ def _run_native_v5_campaign_round(
     # layout.  `exist_ok` only permits restart of the same receipt-last
     # transaction; all control documents below remain write-once.
     campaign_root.mkdir(parents=True, exist_ok=True)
-    source_root = campaign_root / "campaign-seal-source"
-    source_root.mkdir(parents=True, exist_ok=True)
-    sidecar_root = campaign_root / "panel-bundle-sidecar"
-    sidecar_root.mkdir(parents=True, exist_ok=True)
-    receipt_root = campaign_root / "rotating-campaign-receipt"
-    receipt_root.mkdir(parents=True, exist_ok=True)
+    campaign_output_root = campaign_root / "campaign-output"
+    campaign_output_root.mkdir(parents=True, exist_ok=True)
     # The freezer seals its own empty screening-run checkpoint.  Gateway
     # completion compacts a mutable checkpoint, so it must publish beneath a
     # distinct operational root rather than mutate the freezer's receipt
@@ -1892,7 +1885,7 @@ def _run_native_v5_campaign_round(
         )
         gateway = run_native_gateway_dispatch(
             runtime_authority=runtime_authority,
-            task_manifest_path=campaign_root / "screening-run" / "task-manifest.json",
+            campaign_input_checkpoint_path=Path(str(freeze["checkpointPath"])),
             output_root=gateway_root,
             gateway_url=str(evaluation["gatewayUrl"]),
             mode="resume" if gateway_receipt.exists() else "fresh",
@@ -1905,62 +1898,21 @@ def _run_native_v5_campaign_round(
                 evaluation.get("enqueueBatchSize"), name="enqueue batch size"
             ),
         )
-        source = build_native_campaign_seal_source(
+        campaign_output = run_native_campaign_output(
             runtime_authority=runtime_authority,
-            freezer_root=Path(str(freeze["outputRoot"])),
-            gateway_output_root=Path(str(gateway["outputRoot"])),
-            source_root=source_root,
-            funnel_projection_included=True,
-            timeout_seconds=timeout_seconds,
-        )
-        seal = run_native_campaign_seal(
-            runtime_authority=runtime_authority,
-            source_build=source,
-            # The native freezer owns the role-specific cohort population.
-            # In particular, retained/backfill rows may not exist in the
-            # proposal evaluation population.  The tail reducer reopens this
-            # exact receipt-inventoried artifact; Python never decodes it.
-            evaluation_population_path=(
-                Path(str(freeze["outputRoot"])) / "cohort-population.json"
-            ),
-            evaluation_population_sha256=str(freeze["cohortPopulationSha256"]),
-            output_root=campaign_root,
-            generation_index=generation_index,
-            minimum_total_trades=numeric["minimumTotalTrades"],
-            minimum_trades_per_window=numeric["minimumTradesPerWindow"],
-            cap_trades=numeric["capTrades"],
-            provisional_limit=provisional_limit,
-            timeout_seconds=timeout_seconds,
-        )
-        panel_input = {
-            "schemaVersion": "temporal_qd_v5_rotating_panel_bundle_input_v2",
-            "contractVersion": "temporal_qd_native_foundation_v1",
-            "generationIndex": generation_index,
-            "campaignRole": campaign_role,
-            "campaignSeal": seal["campaignSeal"],
-            "tailAuthority": seal["tailAuthorityReceipt"],
-            "tailResultIndex": seal["tailResultIndex"],
-            "directionalTailAuthority": seal["directionalTailAuthority"],
-            "rotatingEvidence": dict(rotating),
-            "panel": expected_panel,
-        }
-        sidecar = build_native_panel_bundle_sidecar(
-            runtime_authority=runtime_authority,
-            panel_input=panel_input,
-            output_root=sidecar_root,
-            timeout_seconds=timeout_seconds,
-        )
-        receipt = build_native_rotating_campaign_receipt(
-            runtime_authority=runtime_authority,
-            campaign_freeze=freeze,
-            campaign_seal=seal,
-            panel_bundle_sidecar=sidecar,
-            output_root=receipt_root,
+            campaign_input_checkpoint_path=Path(str(freeze["checkpointPath"])),
+            gateway_execution_receipt_path=Path(str(gateway["receiptPath"])),
+            output_root=campaign_output_root,
             generation_index=generation_index,
             campaign_role=campaign_role,
             panel_id=panel_id,
             rotating_evidence_sha256=str(rotating.get("rotatingEvidenceSha256") or ""),
+            panel=expected_panel,
             cohort_source=cohort_source,
+            minimum_total_trades=numeric["minimumTotalTrades"],
+            minimum_trades_per_window=numeric["minimumTradesPerWindow"],
+            cap_trades=numeric["capTrades"],
+            provisional_limit=provisional_limit,
             timeout_seconds=timeout_seconds,
         )
     except TemporalQDV5ControlPlaneError as exc:
@@ -1968,10 +1920,11 @@ def _run_native_v5_campaign_round(
     return {
         "campaignFreeze": freeze,
         "gatewayDispatch": gateway,
-        "sourceBuild": source,
-        "campaignSeal": seal,
-        "panelBundleSidecar": sidecar,
-        "campaignReceipt": receipt,
+        "campaignOutput": campaign_output,
+        "campaignReceipt": {
+            "receipt": campaign_output["checkpoint"],
+            "receiptPath": campaign_output["checkpointPath"],
+        },
     }
 
 
@@ -2213,9 +2166,13 @@ def _complete_native_v5_generation(
             proposal_attempt_authority=extraction["proposalAttemptAuthority"],
             generation_index=generation_index,
             evaluation_panel=current_panel,
-            campaign_seal=proposal_campaign["campaignSeal"]["campaignSeal"],
-            tail_authority=proposal_campaign["campaignSeal"]["directionalTailAuthority"],
-            tail_result_index=proposal_campaign["campaignSeal"]["tailResultIndex"],
+            campaign_seal=proposal_campaign["campaignOutput"]["result"]["campaignSeal"],
+            tail_authority=proposal_campaign["campaignOutput"]["result"][
+                "directionalTailAuthority"
+            ],
+            tail_result_index=proposal_campaign["campaignOutput"]["result"][
+                "tailResultIndex"
+            ],
             minimum_total_trades=int(policy["minimumTotalTrades"]),
             minimum_trades_per_window=int(policy["minimumTradesPerWindow"]),
             output_root=(generation_root / "prefinalizer" / "funnel-reduction"),

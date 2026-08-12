@@ -302,14 +302,19 @@ def _evolved_v3_adapter(
 
 
 def _gateway_receipt(
-    *, root: Path, task_manifest: Path, task_count: int = 1
+    *,
+    root: Path,
+    task_manifest: Path,
+    campaign_input_checkpoint: Path,
+    task_count: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    checkpoint = root / "checkpoint.json"
-    journal = root / ".native-gateway-dispatch" / "completion-journal.jsonl"
-    checkpoint_sha, _ = _write(checkpoint, {"completed": {"task-0": {}}})
-    journal.parent.mkdir(parents=True, exist_ok=True)
-    journal.write_bytes(b'{"taskId":"task-0"}\n')
-    journal_sha = _sha(journal.read_bytes())
+    sidecar = root / ".native-gateway-dispatch"
+    journal = sidecar / "completion-journal.jsonl"
+    result_pack = sidecar / "results.pack"
+    sidecar.mkdir(parents=True, exist_ok=True)
+    journal.write_bytes(b"")
+    result_pack.write_bytes(b"")
+    campaign_input = json.loads(campaign_input_checkpoint.read_text(encoding="utf-8"))
     runtime_role = canonical_sha256(
         {
             "schemaVersion": "temporal_qd_native_gateway_runtime_role_v1",
@@ -317,56 +322,112 @@ def _gateway_receipt(
             "binaryRole": "temporal-qd-gateway-dispatch",
         }
     )
+    result_set = canonical_sha256([])
     receipt = {
         "schemaVersion": control.GATEWAY_RECEIPT_SCHEMA,
         "runtimeRoleSha256": runtime_role,
-        "authorityId": _sha("gateway-authority"),
-        "taskMatrixSha256": _sha("task-matrix"),
-        "sourceTaskManifestSha256": _sha(task_manifest.read_bytes()),
+        "authorityId": campaign_input["authorityId"],
+        "taskMatrixSha256": campaign_input["taskMatrixSha256"],
+        "campaignInputCheckpointSha256": campaign_input["checkpointSha256"],
+        "campaignTaskPackRawSha256": campaign_input["tasks"]["rawSha256"],
+        "campaignTaskPackSizeBytes": campaign_input["tasks"]["sizeBytes"],
         "taskIndexRootSha256": _sha("task-index"),
-        "completionJournalSemanticSha256": _sha("journal-semantic"),
-        "checkpointSemanticSha256": _sha("checkpoint-semantic"),
-        "completionJournalSha256": journal_sha,
-        "checkpointSha256": checkpoint_sha,
         "taskCount": task_count,
         "completedTaskCount": task_count,
-        "resultInventoryRootSha256": _sha("result-inventory-root"),
-        "resultInventorySha256": _sha("result-inventory"),
-        "resultInventorySizeBytes": 0,
-        "resultInventoryCount": task_count,
+        "resultSetSemanticSha256": result_set,
+        "completionJournalSha256": _sha(journal.read_bytes()),
+        "resultPackSha256": _sha(result_pack.read_bytes()),
+        "resultPackSizeBytes": 0,
+        "resultCount": task_count,
     }
-    semantic = {
-        key: receipt[key]
-        for key in receipt
-        if key
-        not in {
-            "completionJournalSha256",
-            "checkpointSha256",
-            "semanticReceiptSha256",
-            "receiptSha256",
-        }
-    }
-    receipt["semanticReceiptSha256"] = canonical_sha256(semantic)
+    semantic_fields = (
+        "schemaVersion",
+        "runtimeRoleSha256",
+        "authorityId",
+        "taskMatrixSha256",
+        "campaignInputCheckpointSha256",
+        "campaignTaskPackRawSha256",
+        "campaignTaskPackSizeBytes",
+        "taskIndexRootSha256",
+        "taskCount",
+        "completedTaskCount",
+        "resultSetSemanticSha256",
+    )
+    receipt["semanticReceiptSha256"] = canonical_sha256(
+        {key: receipt[key] for key in semantic_fields}
+    )
     receipt["receiptSha256"] = canonical_sha256(receipt)
-    _write(root / ".native-gateway-dispatch" / "execution-receipt.json", receipt)
+    _write(sidecar / "execution-receipt.json", receipt)
     result = {
         "schemaVersion": control.GATEWAY_RESULT_SCHEMA,
         "authorityId": receipt["authorityId"],
         "taskMatrixSha256": receipt["taskMatrixSha256"],
+        "campaignInputCheckpointSha256": receipt["campaignInputCheckpointSha256"],
+        "campaignInputCheckpointPath": str(campaign_input_checkpoint),
         "taskCount": task_count,
         "completedTaskCount": task_count,
         "taskIndexRootSha256": receipt["taskIndexRootSha256"],
-        "checkpointPath": str(checkpoint),
-        "sidecarRoot": str(root / ".native-gateway-dispatch"),
-        "createdTaskSidecar": False,
+        "resultPackPath": str(result_pack),
+        "sidecarRoot": str(sidecar),
+        "createdTaskIndex": False,
         "executionReceiptSha256": receipt["receiptSha256"],
         "semanticExecutionReceiptSha256": receipt["semanticReceiptSha256"],
-        "executionReceiptPath": str(
-            root / ".native-gateway-dispatch" / "execution-receipt.json"
-        ),
+        "executionReceiptPath": str(sidecar / "execution-receipt.json"),
         "telemetry": {},
     }
     return receipt, result
+
+
+def _campaign_input_checkpoint(
+    path: Path,
+    task_manifest: Path,
+    *,
+    task_count: int = 1,
+) -> dict[str, Any]:
+    value = {
+        "schemaVersion": "temporal_qd_v5_campaign_input_checkpoint_v1",
+        "contractVersion": control.CONTRACT_VERSION,
+        "manifestSha256": _sha("campaign-input-manifest"),
+        "nativeRuntimeAuthoritySha256": _sha("campaign-input-runtime"),
+        "generationIndex": 1,
+        "campaignRole": "proposal_current_panel",
+        "panelId": "panel-1",
+        "authorityId": _sha("gateway-authority"),
+        "campaignSha256": _sha("campaign"),
+        "evaluationIdentitySha256": _sha("evaluation"),
+        "taskMatrixSha256": _sha("task-matrix"),
+        "candidateCount": task_count,
+        "windowCount": 1,
+        "taskCount": task_count,
+        "tasks": {
+            "relativePath": str(task_manifest.name),
+            "rawSha256": _sha(task_manifest.read_bytes()),
+            "sizeBytes": task_manifest.stat().st_size,
+            "recordCount": task_count,
+            "taskMatrixSha256": _sha("task-matrix"),
+        },
+        "cohortPopulation": {
+            "relativePath": "cohort-population.json",
+            "rawSha256": _sha("cohort-raw"),
+            "sizeBytes": 1,
+            "populationSha256": _sha("cohort"),
+        },
+        "sourceInputs": {
+            "evaluationPopulationRawSha256": _sha("evaluation-raw"),
+            "templatePreparationSha256": _sha("template"),
+            "constructionCatalogSha256": _sha("catalog"),
+            "preparationSha256": _sha("preparation"),
+        },
+        "artifactMetrics": {
+            "payloadFileCount": 2,
+            "payloadBytes": task_manifest.stat().st_size + 1,
+            "taskPackBytes": task_manifest.stat().st_size,
+            "cohortPopulationBytes": 1,
+        },
+    }
+    value["checkpointSha256"] = canonical_sha256(value)
+    _write(path, value)
+    return value
 
 
 def test_gateway_dispatch_requires_a_pinned_binary_and_receipt(
@@ -375,20 +436,24 @@ def test_gateway_dispatch_requires_a_pinned_binary_and_receipt(
     runtime = _runtime(tmp_path)
     task_manifest = tmp_path / "tasks.json"
     _write(task_manifest, {"schemaVersion": "fixture"})
+    campaign_input_checkpoint = tmp_path / "campaign-input-checkpoint.json"
+    _campaign_input_checkpoint(campaign_input_checkpoint, task_manifest)
     output_root = tmp_path / "gateway"
     calls: list[tuple[str, ...]] = []
 
     def fake_run(**kwargs: Any) -> dict[str, Any]:
         calls.append(tuple(kwargs["command"]))
         _receipt, result = _gateway_receipt(
-            root=output_root.resolve(), task_manifest=task_manifest.resolve()
+            root=output_root.resolve(),
+            task_manifest=task_manifest.resolve(),
+            campaign_input_checkpoint=campaign_input_checkpoint.resolve(),
         )
         return result
 
     monkeypatch.setattr(control, "_run_pinned", fake_run)
     result = control.run_native_gateway_dispatch(
         runtime_authority=runtime,
-        task_manifest_path=task_manifest.resolve(),
+        campaign_input_checkpoint_path=campaign_input_checkpoint.resolve(),
         output_root=output_root.resolve(),
         gateway_url="http://127.0.0.1:47831",
         mode="fresh",
@@ -410,7 +475,7 @@ def test_gateway_dispatch_requires_a_pinned_binary_and_receipt(
     with pytest.raises(control.TemporalQDV5ControlPlaneError, match="role set"):
         control.run_native_gateway_dispatch(
             runtime_authority=tampered,
-            task_manifest_path=task_manifest.resolve(),
+            campaign_input_checkpoint_path=campaign_input_checkpoint.resolve(),
             output_root=(tmp_path / "blocked").resolve(),
             gateway_url="http://127.0.0.1:47831",
             mode="fresh",
@@ -1974,331 +2039,174 @@ def test_native_v5_finalizer_reopens_only_commit_descriptors(
         )
 
 
-def test_campaign_source_builder_uses_fixed_native_receipt_paths(
+
+def test_campaign_output_checkpoint_replaces_source_seal_sidecar_and_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _runtime(tmp_path)
-    freezer_root = tmp_path / "freezer"
-    gateway_root = tmp_path / "gateway"
-    task_manifest = freezer_root / "screening-run" / "task-manifest.json"
-    _write(task_manifest, {"tasks": []})
-    freezer_receipt = _self_hashed({"schemaVersion": "fixture-freeze"}, "receiptSha256")
-    _write(freezer_root / "native-freeze-receipt.json", freezer_receipt)
-    gateway_receipt, _gateway_result = _gateway_receipt(
-        root=gateway_root.resolve(), task_manifest=task_manifest.resolve(), task_count=0
-    )
-
-    def fake_run(**kwargs: Any) -> dict[str, Any]:
-        command = kwargs["command"]
-        manifest_path = Path(command[-1])
-        manifest = control._read_canonical_object(manifest_path, name="fixture source manifest")
-        source_path = Path(manifest["sourcePath"])
-        source = _self_hashed(
-            {"schemaVersion": "fixture-source", "authorityId": _sha("authority")},
-            "sourceSha256",
-        )
-        _write(source_path, source)
-        receipt = _self_hashed(
-            {
-                "schemaVersion": control.CAMPAIGN_SOURCE_BUILD_RECEIPT_SCHEMA,
-                "manifestSha256": manifest["manifestSha256"],
-                "freezerReceiptSha256": freezer_receipt["receiptSha256"],
-                "gatewayReceiptSha256": gateway_receipt["receiptSha256"],
-                "sourceSha256": source["sourceSha256"],
-                "authorityId": source["authorityId"],
-                "taskMatrixSha256": _sha("task-matrix"),
-                "taskCount": 0,
-                "sourcePath": str(source_path),
-            },
-            "receiptSha256",
-        )
-        _write(source_path.parent / "source-build-receipt.json", receipt)
-        return {
-            "schemaVersion": control.CAMPAIGN_SOURCE_BUILD_RESULT_SCHEMA,
-            "sourcePath": str(source_path),
-            "sourceSha256": source["sourceSha256"],
-            "receiptPath": str(source_path.parent / "source-build-receipt.json"),
-            "authorityId": source["authorityId"],
-            "taskMatrixSha256": receipt["taskMatrixSha256"],
-            "taskCount": 0,
-            "receiptSha256": receipt["receiptSha256"],
-        }
-
-    monkeypatch.setattr(control, "_run_pinned", fake_run)
-    result = control.build_native_campaign_seal_source(
-        runtime_authority=runtime,
-        freezer_root=freezer_root.resolve(),
-        gateway_output_root=gateway_root.resolve(),
-        source_root=(tmp_path / "source").resolve(),
-    )
-    assert Path(result["sourcePath"]).parent == (tmp_path / "source").resolve()
-    assert result["manifest"]["sourcePath"] == result["sourcePath"]
-
-    _write_pretty(freezer_root / "native-freeze-receipt.json", freezer_receipt)
-    (tmp_path / "pretty-rewrite-source").mkdir()
-    with pytest.raises(
-        control.TemporalQDV5ControlPlaneError,
-        match="native v5 freezer receipt must be canonical JSON plus LF",
-    ):
-        control.build_native_campaign_seal_source(
-            runtime_authority=runtime,
-            freezer_root=freezer_root.resolve(),
-            gateway_output_root=gateway_root.resolve(),
-            source_root=(tmp_path / "pretty-rewrite-source").resolve(),
-        )
-
-
-def test_rotating_campaign_receipt_binds_only_native_descriptors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runtime = _runtime(tmp_path)
-    freeze_root = (tmp_path / "freeze").resolve()
-    seal_root = (tmp_path / "seal").resolve()
+    input_root = (tmp_path / "campaign-input").resolve()
     gateway_root = (tmp_path / "gateway").resolve()
-    sidecar_root = (tmp_path / "sidecar").resolve()
-    role = "proposal_current_panel"
-    panel = "panel-1"
-    rotating = _sha("rotating")
-    manifest = {
-        "manifestSha256": _sha("freeze-manifest"),
-        "campaignRole": role,
-        "panelId": panel,
-    }
-    transaction = _self_hashed(
-        {
-            "schemaVersion": "temporal_qd_v5_native_campaign_freeze_transaction_v2",
-            "manifestSha256": manifest["manifestSha256"],
-            "campaignRole": role,
-            "cohortPopulationSha256": _sha("cohort"),
-            "preparationSha256": _sha("preparation"),
-            "authorityId": _sha("authority"),
-            "evaluationIdentitySha256": _sha("evaluation"),
-            "campaignSha256": _sha("campaign"),
-            "taskMatrixSha256": _sha("task-matrix"),
-            "candidateCount": 2,
-            "windowCount": 1,
-            "taskCount": 2,
-        },
-        "transactionSha256",
-    )
-    _write(freeze_root / ".native-v5-campaign-freeze-manifest.json", manifest)
-    _write(freeze_root / "native-freeze-transaction.json", transaction)
-    for relative in control._NATIVE_V5_FREEZE_RECEIPT_INVENTORY_PATHS:
-        path = freeze_root / relative
-        if relative == "native-freeze-transaction.json":
-            # The receipt inventory includes the immutable transaction we
-            # already wrote above; do not replace it with a fixture payload.
-            continue
-        if path.suffix == ".jsonl":
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b'{"fixture":"native"}\n')
-        else:
-            _write(path, {"fixture": relative})
-    freeze_inventory = [
-        {
-            "relativePath": relative,
-            "rawSha256": _sha((freeze_root / relative).read_bytes()),
-        }
-        for relative in control._NATIVE_V5_FREEZE_RECEIPT_INVENTORY_PATHS
-    ]
-    freeze_receipt = _self_hashed(
-        {
-            "manifestSha256": manifest["manifestSha256"],
-            "transactionSha256": transaction["transactionSha256"],
-            "outputInventory": freeze_inventory,
-        },
-        "receiptSha256",
-    )
-    _write(freeze_root / "native-freeze-receipt.json", freeze_receipt)
-    gateway_receipt, _gateway_result = _gateway_receipt(
-        root=gateway_root,
-        task_manifest=(freeze_root / "screening-run" / "task-manifest.json"),
-        task_count=1,
-    )
+    output_root = (tmp_path / "campaign-output").resolve()
+    for root in (input_root, gateway_root, output_root):
+        root.mkdir(parents=True, exist_ok=True)
 
-    tail_index = seal_root / "tail-result-index-v4.json"
-    _write(tail_index, {"tail": "index"})
-    tail_index_sha = _sha("tail-index-semantic")
-    directional_tail_authority = control.build_v5_directional_tail_authority(
-        runtime_authority_sha256=runtime["authoritySha256"], generation_index=1
-    )
-    campaign_seal = _self_hashed(
-        {"tailResultIndex": {"sha256": tail_index_sha}}, "campaignSealSha256"
-    )
-    tail_transaction = _self_hashed({}, "transactionSha256")
-    _write(seal_root / "campaign-seal-result.json", campaign_seal)
-    _write(seal_root / "generation-tail-transaction-result.json", tail_transaction)
-    members = seal_root / "evaluated-members.jsonl"
-    members.parent.mkdir(parents=True, exist_ok=True)
-    members.write_bytes(b'{"member":"native"}\n')
-    evaluated = {
-        "path": "evaluated-members.jsonl",
-        "rawSha256": _sha(members.read_bytes()),
-        "sizeBytes": members.stat().st_size,
-        "recordCount": 1,
+    campaign_input = {
+        "schemaVersion": "temporal_qd_v5_campaign_input_checkpoint_v1",
+        "generationIndex": 1,
+        "campaignRole": "proposal_current_panel",
+        "panelId": "panel-1",
+        "authorityId": _sha("authority"),
+        "evaluationIdentitySha256": _sha("evaluation"),
+        "campaignSha256": _sha("campaign"),
+        "taskMatrixSha256": _sha("tasks"),
+        "candidateCount": 2,
+        "windowCount": 1,
+        "taskCount": 2,
+        "cohortPopulation": {"populationSha256": _sha("population")},
     }
+    campaign_input["checkpointSha256"] = canonical_sha256(campaign_input)
+    input_path = input_root / "campaign-input-checkpoint.json"
+    _write(input_path, campaign_input)
 
-    bundles_path = sidecar_root / "candidate-panel-bundles.jsonl"
-    bundles_path.parent.mkdir(parents=True, exist_ok=True)
-    bundles_path.write_bytes(b'{"bundle":"native"}\n')
-    bundles = _self_hashed(
-        {
-            "schemaVersion": control.PANEL_SIDECAR_DESCRIPTOR_SCHEMA,
-            "path": str(bundles_path),
-            "rawSha256": _sha(bundles_path.read_bytes()),
-            "sizeBytes": bundles_path.stat().st_size,
-            "recordCount": 1,
-            "rowSchema": "temporal_qd_candidate_panel_evidence_bundle_v1",
-        },
-        "descriptorSha256",
-    )
-    sidecar_receipt = _self_hashed(
-        {
-            "schemaVersion": control.PANEL_SIDECAR_RECEIPT_SCHEMA,
-            "inputSha256": _sha("panel-input"),
-            "panelReceiptSha256": _sha("panel-receipt"),
-            "campaignSealSha256": campaign_seal["campaignSealSha256"],
-            "tailAuthoritySha256": directional_tail_authority["tailAuthoritySha256"],
-            "candidatePanelBundles": bundles,
-        },
-        "receiptSha256",
-    )
-    sidecar_result = _self_hashed(
-        {
-            "schemaVersion": control.PANEL_SIDECAR_RESULT_SCHEMA,
-            "inputSha256": sidecar_receipt["inputSha256"],
-            "receiptSha256": sidecar_receipt["receiptSha256"],
-            "candidatePanelBundles": bundles,
-        },
-        "resultSha256",
-    )
-    campaign_seal_descriptor = {
-        "path": "campaign-seal-result.json",
-        "rawSha256": _sha((seal_root / "campaign-seal-result.json").read_bytes()),
-        "sizeBytes": (seal_root / "campaign-seal-result.json").stat().st_size,
-        "campaignSealSha256": campaign_seal["campaignSealSha256"],
+    gateway_receipt = {
+        "schemaVersion": control.GATEWAY_RECEIPT_SCHEMA,
+        "campaignInputCheckpointSha256": campaign_input["checkpointSha256"],
+        "taskMatrixSha256": campaign_input["taskMatrixSha256"],
+        "taskCount": 2,
+        "completedTaskCount": 2,
+        "resultCount": 2,
+        "semanticReceiptSha256": _sha("gateway-semantic"),
     }
-    tail_transaction_descriptor = {
-        "path": "generation-tail-transaction-result.json",
-        "rawSha256": _sha(
-            (seal_root / "generation-tail-transaction-result.json").read_bytes()
-        ),
-        "sizeBytes": (
-            seal_root / "generation-tail-transaction-result.json"
-        ).stat().st_size,
-        "transactionSha256": tail_transaction["transactionSha256"],
+    gateway_receipt["receiptSha256"] = canonical_sha256(gateway_receipt)
+    gateway_path = gateway_root / "execution-receipt.json"
+    _write(gateway_path, gateway_receipt)
+
+    cohort_source = {
+        "kind": "proposal_evaluation_population",
+        "sourceSemanticSha256": _sha("evaluation-source"),
+        "candidateCount": 2,
+        "selectionSha256": None,
     }
-    campaign_seal_handoff = {
-        "outputRoot": str(seal_root),
-        "directionalTailAuthority": directional_tail_authority,
-        "campaignSeal": campaign_seal,
-        "campaignSealDescriptor": campaign_seal_descriptor,
-        "generationTailTransaction": tail_transaction_descriptor,
-        "tailResultIndex": {
-            "path": str(tail_index.resolve()),
-            "relativePath": "tail-result-index-v4.json",
-            "rawSha256": _sha(tail_index.read_bytes()),
-            "sizeBytes": tail_index.stat().st_size,
-            "tailResultIndexSha256": tail_index_sha,
-        },
-        "tailAuthorityReceiptDocument": {"evaluatedMembers": evaluated},
-        "sourceBuild": {
-            "gatewayOutputRoot": str(gateway_root),
-            "gatewayReceipt": gateway_receipt,
-        },
-    }
-    freeze_handoff = {
-        "outputRoot": str(freeze_root),
-        "manifest": manifest,
-        "manifestPath": str(
-            (freeze_root / ".native-v5-campaign-freeze-manifest.json").resolve()
-        ),
-        "transaction": transaction,
-        "transactionPath": str((freeze_root / "native-freeze-transaction.json").resolve()),
-        "receipt": freeze_receipt,
-    }
-    sidecar_handoff = {
-        "result": sidecar_result,
-        "receipt": sidecar_receipt,
-        "candidatePanelBundles": bundles,
-    }
+    rotating_sha = _sha("rotating")
 
     def fake_run(**kwargs: Any) -> dict[str, Any]:
         command = kwargs["command"]
-        input_value = control._read_canonical_object(
-            Path(command[-2]), name="fixture campaign receipt input"
+        assert command[-2] == "--campaign-output-manifest"
+        manifest_path = Path(command[-1])
+        manifest = control._read_canonical_object(
+            manifest_path, name="fixture campaign-output manifest"
+        )
+        assert manifest["campaignInputCheckpointPath"] == str(input_path)
+        assert manifest["gatewayExecutionReceiptPath"] == str(gateway_path)
+
+        campaign_seal_document = _self_hashed(
+            {"schemaVersion": control.CAMPAIGN_SEAL_SCHEMA},
+            "campaignSealSha256",
         )
         semantic = {
-            "schemaVersion": control.CAMPAIGN_RECEIPT_SCHEMA,
+            "schemaVersion": control.CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA,
             "contractVersion": control.CONTRACT_VERSION,
-            **{
-                field: input_value[field]
-                for field in (
-                    "generationIndex",
-                    "campaignRole",
-                    "panelId",
-                    "rotatingEvidenceSha256",
-                    "cohortSource",
-                    "campaignFreeze",
-                    "campaignSeal",
-                    "evaluatedMembers",
-                    "candidatePanelBundles",
-                )
+            "generationIndex": 1,
+            "campaignRole": "proposal_current_panel",
+            "panelId": "panel-1",
+            "rotatingEvidenceSha256": rotating_sha,
+            "cohortSource": cohort_source,
+            "campaignInput": {
+                "checkpointSha256": campaign_input["checkpointSha256"],
+                "cohortPopulationSha256": _sha("population"),
+                "authorityId": campaign_input["authorityId"],
+                "evaluationIdentitySha256": campaign_input[
+                    "evaluationIdentitySha256"
+                ],
+                "campaignSha256": campaign_input["campaignSha256"],
+                "taskMatrixSha256": campaign_input["taskMatrixSha256"],
+                "candidateCount": 2,
+                "windowCount": 1,
+                "taskCount": 2,
+            },
+            "campaignSeal": {
+                "directionalTailAuthoritySha256": _sha("tail-authority"),
+                "campaignSealSha256": campaign_seal_document[
+                    "campaignSealSha256"
+                ],
+                "tailResultIndexSha256": _sha("tail-index"),
+                "tailTransactionSha256": _sha("tail-transaction"),
+            },
+            "campaignSealDocument": campaign_seal_document,
+            "evaluatedMembers": {
+                "rawSha256": _sha("members"),
+                "sizeBytes": 20,
+                "recordCount": 2,
+                "rowSchema": "temporal_qd_evaluated_member_v1",
+            },
+            "candidatePanelBundles": {
+                "rawSha256": _sha("bundles"),
+                "sizeBytes": 30,
+                "recordCount": 2,
+                "rowSchema": "temporal_qd_candidate_panel_evidence_bundle_v1",
             },
         }
-        receipt = {
+        checkpoint = {
             **semantic,
             "semanticReceiptSha256": canonical_sha256(semantic),
-            "runtimeAuthoritySha256": input_value["runtimeAuthoritySha256"],
-            "executionBindings": input_value["executionBindings"],
+            "manifestSha256": manifest["manifestSha256"],
+            "runtimeAuthoritySha256": runtime["authoritySha256"],
+            "gatewayReceiptSha256": gateway_receipt["receiptSha256"],
+            "gatewaySemanticReceiptSha256": gateway_receipt[
+                "semanticReceiptSha256"
+            ],
+            "executionBindings": {
+                "campaignInputCheckpoint": {},
+                "gatewayExecutionReceipt": {},
+                "tailResultIndex": {},
+                "evaluatedMembersJsonl": {},
+                "candidatePanelBundlesJsonl": {},
+            },
         }
-        receipt["receiptSha256"] = canonical_sha256(receipt)
-        _write(Path(command[-1]), receipt)
-        return receipt
+        checkpoint["receiptSha256"] = canonical_sha256(checkpoint)
+        checkpoint_path = output_root / "campaign-output-checkpoint.json"
+        _write(checkpoint_path, checkpoint)
+        return {
+            "schemaVersion": control.CAMPAIGN_OUTPUT_RESULT_SCHEMA,
+            "restart": False,
+            "checkpointPath": str(checkpoint_path),
+            "checkpointSha256": checkpoint["receiptSha256"],
+            "generationIndex": 1,
+            "campaignRole": "proposal_current_panel",
+            "panelId": "panel-1",
+            "taskCount": 2,
+            "evaluatedMemberCount": 2,
+            "panelBundleCount": 2,
+            "semanticReceiptSha256": checkpoint["semanticReceiptSha256"],
+            "receiptSha256": checkpoint["receiptSha256"],
+            "campaignSeal": campaign_seal_document,
+            "directionalTailAuthority": {
+                "tailAuthoritySha256": _sha("tail-authority")
+            },
+            "tailResultIndex": {"tailResultIndexSha256": _sha("tail-index")},
+            "artifactMetrics": {"durableFileCount": 5, "durableBytes": 50},
+        }
 
     monkeypatch.setattr(control, "_run_pinned", fake_run)
-    candidate_scale_paths = {
-        members.resolve(),
-        bundles_path.resolve(),
-        (freeze_root / "screening-run" / "task-manifest.json").resolve(),
-        (gateway_root / "checkpoint.json").resolve(),
-        (gateway_root / ".native-gateway-dispatch" / "completion-journal.jsonl").resolve(),
-    }
-    original_raw_file_sha256 = control.raw_file_sha256
-
-    def reject_candidate_scale_hash(path: Path | str) -> str:
-        if Path(path).resolve() in candidate_scale_paths:
-            pytest.fail(f"campaign receipt rehashed candidate/task payload: {path}")
-        return original_raw_file_sha256(path)
-
-    monkeypatch.setattr(control, "raw_file_sha256", reject_candidate_scale_hash)
-    built = control.build_native_rotating_campaign_receipt(
+    result = control.run_native_campaign_output(
         runtime_authority=runtime,
-        campaign_freeze=freeze_handoff,
-        campaign_seal=campaign_seal_handoff,
-        panel_bundle_sidecar=sidecar_handoff,
-        output_root=(tmp_path / "receipt").resolve(),
+        campaign_input_checkpoint_path=input_path,
+        gateway_execution_receipt_path=gateway_path,
+        output_root=output_root,
         generation_index=1,
-        campaign_role=role,
-        panel_id=panel,
-        rotating_evidence_sha256=rotating,
-        cohort_source={
-            "kind": "proposal_evaluation_population",
-            "sourceSemanticSha256": _sha("evaluation-population"),
-            "candidateCount": 2,
-            "selectionSha256": None,
-        },
+        campaign_role="proposal_current_panel",
+        panel_id="panel-1",
+        rotating_evidence_sha256=rotating_sha,
+        panel={"panelId": "panel-1"},
+        cohort_source=cohort_source,
+        minimum_total_trades=1,
+        minimum_trades_per_window=1,
+        cap_trades=100,
+        provisional_limit=16,
     )
-    assert built["receipt"]["candidatePanelBundles"] == {
-        key: bundles[key]
-        for key in ("rawSha256", "sizeBytes", "recordCount", "rowSchema")
-    }
-    assert set(built["input"]["candidatePanelBundles"]) == {
-        "rawSha256",
-        "sizeBytes",
-        "recordCount",
-        "rowSchema",
-    }
+    assert result["receiptPath"] == result["checkpointPath"]
+    assert result["receipt"] == result["checkpoint"]
+    assert result["result"]["artifactMetrics"]["durableFileCount"] == 5
 
 
 def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
@@ -2462,11 +2370,48 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             )
         _write(output_root / "native-freeze-transaction.json", native_transaction)
         _write(output_root / "native-freeze-receipt.json", native_receipt)
+        campaign_input = _self_hashed(
+            {
+                "schemaVersion": "temporal_qd_v5_campaign_input_checkpoint_v1",
+                "campaignSha256": native_transaction["campaignSha256"],
+                "authorityId": native_transaction["authorityId"],
+                "evaluationIdentitySha256": native_transaction[
+                    "evaluationIdentitySha256"
+                ],
+                "taskMatrixSha256": native_transaction["taskMatrixSha256"],
+                "taskCount": native_transaction["taskCount"],
+                "taskManifest": {
+                    "relativePath": "screening-run/task-manifest.json",
+                    "rawSha256": _sha("task-manifest-raw"),
+                },
+                "cohortPopulation": {
+                    "populationSha256": native_transaction[
+                        "cohortPopulationSha256"
+                    ],
+                    "rawSha256": _sha("cohort-population-raw"),
+                },
+            },
+            "checkpointSha256",
+        )
+        committed_checkpoint_sha = campaign_input["checkpointSha256"]
+        if tamper["target"] == "checkpoint":
+            campaign_input["campaignSha256"] = _sha("forged-campaign")
+            campaign_input = _self_hashed(
+                {
+                    key: value
+                    for key, value in campaign_input.items()
+                    if key != "checkpointSha256"
+                },
+                "checkpointSha256",
+            )
+        _write(output_root / "campaign-input-checkpoint.json", campaign_input)
 
         common = {
             "manifestSha256": manifest["manifestSha256"],
             "archiveAuthorityKind": archive_authority["kind"],
             "archiveAuthorityReceiptSha256": archive_authority["receiptSha256"],
+            "validationFreezeReceiptSha256": None,
+            "validationTailAuthoritySha256": None,
             "archiveSha256": archive_sha,
             "archiveRawSha256": archive_file_sha,
             "archiveSizeBytes": 17,
@@ -2476,7 +2421,7 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             "selectionSha256": _sha("selection"),
             "projectionRawSha256": _sha("selection-rows"),
             "cohortPopulationSha256": native_transaction["cohortPopulationSha256"],
-            "nativeFreezeReceiptSha256": native_receipt["receiptSha256"],
+            "campaignInputCheckpointSha256": committed_checkpoint_sha,
             "campaignSha256": native_transaction["campaignSha256"],
             "authorityId": native_transaction["authorityId"],
             "evaluationIdentitySha256": native_transaction["evaluationIdentitySha256"],
@@ -2556,10 +2501,8 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
         panel_id="panel-validation",
     )
     assert handoff["receipt"]["receiptSha256"]
-    assert handoff["nativeFreezeReceipt"]["receiptSha256"]
-    assert handoff["cohortPopulationRawSha256"] == _sha(
-        "native-receipt:cohort-population.json"
-    )
+    assert handoff["checkpoint"]["checkpointSha256"]
+    assert handoff["cohortPopulationRawSha256"] == _sha("cohort-population-raw")
     assert not (tmp_path / "finalizer" / "archive.json").exists()
     assert not (root / "cohort-selection.jsonl").exists()
 
@@ -2583,8 +2526,10 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             panel_id="panel-validation",
         )
 
-    tamper["target"] = "nested_inventory"
-    with pytest.raises(control.TemporalQDV5ControlPlaneError, match="inventory path"):
+    tamper["target"] = "checkpoint"
+    with pytest.raises(
+        control.TemporalQDV5ControlPlaneError, match="campaign-input checkpoint drifted"
+    ):
         control.run_native_v5_evidence_ladder_archive_freeze(
             runtime_authority=runtime,
             archive_authority=archive_authority,
