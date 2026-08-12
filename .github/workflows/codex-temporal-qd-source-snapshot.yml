@@ -32,3 +32,5 @@ jobs:
           path: ${{ runner.temp }}/temporal-qd-source.tar.gz
           retention-days: 1
           if-no-files-found: error
+
+# Temporary exact-head refresh for the Tranche 2 cloud workspace.
