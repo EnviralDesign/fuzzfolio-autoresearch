@@ -22,12 +22,12 @@ jobs:
 
       - name: Package source tree
         shell: bash
-        run: tar --exclude=.git --exclude=target --exclude=.venv -czf temporal-qd-source.tar.gz .
+        run: tar --exclude=.git --exclude=target --exclude=.venv -czf "$RUNNER_TEMP/temporal-qd-source.tar.gz" .
 
       - name: Upload source snapshot
         uses: actions/upload-artifact@v4
         with:
           name: temporal-qd-source-${{ github.event.pull_request.head.sha || github.sha }}
-          path: temporal-qd-source.tar.gz
+          path: ${{ runner.temp }}/temporal-qd-source.tar.gz
           retention-days: 1
           if-no-files-found: error
