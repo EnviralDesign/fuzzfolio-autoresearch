@@ -1650,7 +1650,9 @@ impl V5G0TransactionResult {
             "transactionSha256",
         ];
         if fields.len() != expected.len() || expected.iter().any(|key| !fields.contains_key(*key)) {
-            return Err(contract("v5 G0 transaction checkpoint fields are not exact"));
+            return Err(contract(
+                "v5 G0 transaction checkpoint fields are not exact",
+            ));
         }
         if required(value, "schemaVersion", "v5 G0 transaction checkpoint")?.as_str()
             != Some(V5_G0_TRANSACTION_SCHEMA)
@@ -1741,13 +1743,9 @@ impl V5G0TransactionResult {
             max_attempts: required(value, "maxAttempts", "v5 G0 transaction checkpoint")?
                 .as_u64()
                 .ok_or_else(|| contract("v5 G0 transaction maximum attempts is invalid"))?,
-            evaluation_width: required(
-                value,
-                "evaluationWidth",
-                "v5 G0 transaction checkpoint",
-            )?
-            .as_u64()
-            .ok_or_else(|| contract("v5 G0 transaction evaluation width is invalid"))?,
+            evaluation_width: required(value, "evaluationWidth", "v5 G0 transaction checkpoint")?
+                .as_u64()
+                .ok_or_else(|| contract("v5 G0 transaction evaluation width is invalid"))?,
             // The thread cap is deliberately excluded from semantic identity.
             thread_cap: 1,
             target_reached: required(value, "targetReached", "v5 G0 transaction checkpoint")?

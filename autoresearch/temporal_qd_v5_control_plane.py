@@ -4469,6 +4469,8 @@ def run_native_gateway_dispatch(
     result_batch_size: int = 1,
     max_request_bytes: int = 64 * 1024 * 1024,
     max_response_bytes: int = 64 * 1024 * 1024,
+    maintenance_probe_interval_millis: int = 30_000,
+    maintenance_timeout_seconds: int = 12 * 60 * 60,
 ) -> dict[str, Any]:
     """Dispatch one sealed task matrix through the compact v2 receipt.
 
@@ -4494,6 +4496,8 @@ def run_native_gateway_dispatch(
         "result batch": result_batch_size,
         "maximum request bytes": max_request_bytes,
         "maximum response bytes": max_response_bytes,
+        "maintenance probe interval": maintenance_probe_interval_millis,
+        "maintenance timeout": maintenance_timeout_seconds,
     }
     for name, value in values.items():
         _positive(value, name=name)
@@ -4526,6 +4530,10 @@ def run_native_gateway_dispatch(
         str(max_request_bytes),
         "--max-response-bytes",
         str(max_response_bytes),
+        "--maintenance-probe-interval-millis",
+        str(maintenance_probe_interval_millis),
+        "--maintenance-timeout-seconds",
+        str(maintenance_timeout_seconds),
     ]
     if gateway_token is not None:
         if not isinstance(gateway_token, str) or not gateway_token:

@@ -10,6 +10,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error as StdError,
     fmt,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Read, Write},
@@ -88,6 +89,13 @@ pub struct GatewayDispatchRequest {
     pub result_batch_size: usize,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
+    /// Delay between the single shared dependency-health probes while the
+    /// gateway reports lake maintenance. No task is re-enqueued during this
+    /// interval and the pause is excluded from the scientific wait budget.
+    pub maintenance_probe_interval: Duration,
+    /// Upper bound for one continuous infrastructure-maintenance pause. This
+    /// is independent from the candidate-window completion timeout.
+    pub maintenance_timeout: Duration,
 }
 
 impl GatewayDispatchRequest {
@@ -106,6 +114,8 @@ impl GatewayDispatchRequest {
             result_batch_size: 128,
             max_request_bytes: MAX_HTTP_BYTES,
             max_response_bytes: MAX_HTTP_BYTES,
+            maintenance_probe_interval: Duration::from_secs(30),
+            maintenance_timeout: Duration::from_secs(12 * 60 * 60),
         }
     }
 
@@ -125,6 +135,14 @@ impl GatewayDispatchRequest {
         ensure!(
             self.poll_interval >= Duration::from_millis(10),
             "dispatcher poll interval must be at least 10 milliseconds"
+        );
+        ensure!(
+            self.maintenance_probe_interval >= Duration::from_millis(10),
+            "maintenance probe interval must be at least 10 milliseconds"
+        );
+        ensure!(
+            self.maintenance_timeout >= self.maintenance_probe_interval,
+            "maintenance timeout must cover at least one probe interval"
         );
         ensure!(
             (1..=MAX_SAFE_BATCH).contains(&self.enqueue_batch_size),
@@ -183,6 +201,10 @@ pub struct GatewayDispatchTelemetry {
     pub peak_live_completion_batch: usize,
     pub peak_completion_bytes: usize,
     pub checkpoint_compacted: bool,
+    pub maintenance_activations: u64,
+    pub maintenance_probe_count: u64,
+    pub maintenance_pause_millis: u64,
+    pub infrastructure_availability_events: u64,
 }
 
 impl GatewayDispatchTelemetry {
@@ -202,6 +224,10 @@ impl GatewayDispatchTelemetry {
             "peakLiveCompletionBatch": self.peak_live_completion_batch,
             "peakCompletionBytes": self.peak_completion_bytes,
             "checkpointCompacted": self.checkpoint_compacted,
+            "maintenanceActivations": self.maintenance_activations,
+            "maintenanceProbeCount": self.maintenance_probe_count,
+            "maintenancePauseMillis": self.maintenance_pause_millis,
+            "infrastructureAvailabilityEvents": self.infrastructure_availability_events,
         })
     }
 }
@@ -296,6 +322,120 @@ impl HttpGatewayClient {
     }
 }
 
+#[derive(Debug)]
+struct GatewayMaintenance {
+    endpoint: String,
+    status: StatusCode,
+    retry_after: Option<Duration>,
+}
+
+impl fmt::Display for GatewayMaintenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "gateway {} is unavailable for shared maintenance (HTTP {})",
+            self.endpoint, self.status
+        )
+    }
+}
+
+impl StdError for GatewayMaintenance {}
+
+fn maintenance_error(error: &anyhow::Error) -> Option<&GatewayMaintenance> {
+    error.downcast_ref::<GatewayMaintenance>()
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceGate {
+    active_since: Option<Instant>,
+    total_pause: Duration,
+}
+
+impl MaintenanceGate {
+    fn run<T>(
+        &mut self,
+        request: &GatewayDispatchRequest,
+        telemetry: &mut GatewayDispatchTelemetry,
+        operation: &str,
+        mut attempt: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        loop {
+            match attempt() {
+                Ok(value) => {
+                    self.close(telemetry)?;
+                    return Ok(value);
+                }
+                Err(error) => {
+                    let Some(maintenance) = maintenance_error(&error) else {
+                        return Err(error);
+                    };
+                    telemetry.infrastructure_availability_events = telemetry
+                        .infrastructure_availability_events
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("infrastructure availability event overflow"))?;
+                    if self.active_since.is_none() {
+                        self.active_since = Some(Instant::now());
+                        telemetry.maintenance_activations = telemetry
+                            .maintenance_activations
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("maintenance activation count overflow"))?;
+                    } else {
+                        telemetry.maintenance_probe_count = telemetry
+                            .maintenance_probe_count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("maintenance probe count overflow"))?;
+                    }
+                    let active = self
+                        .active_since
+                        .expect("maintenance gate was opened before measuring pause");
+                    let elapsed = active.elapsed();
+                    ensure!(
+                        elapsed < request.maintenance_timeout,
+                        "gateway {operation} remained in shared maintenance longer than {:?}",
+                        request.maintenance_timeout
+                    );
+                    let remaining = request.maintenance_timeout.saturating_sub(elapsed);
+                    let requested_delay = maintenance
+                        .retry_after
+                        .unwrap_or(request.maintenance_probe_interval)
+                        .max(request.maintenance_probe_interval);
+                    let delay = requested_delay.min(remaining);
+                    ensure!(
+                        !delay.is_zero(),
+                        "gateway {operation} remained in shared maintenance longer than {:?}",
+                        request.maintenance_timeout
+                    );
+                    thread::sleep(delay);
+                }
+            }
+        }
+    }
+
+    fn close(&mut self, telemetry: &mut GatewayDispatchTelemetry) -> Result<()> {
+        let Some(started) = self.active_since.take() else {
+            return Ok(());
+        };
+        let pause = started.elapsed();
+        self.total_pause = self
+            .total_pause
+            .checked_add(pause)
+            .ok_or_else(|| anyhow!("maintenance pause duration overflow"))?;
+        let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        telemetry.maintenance_pause_millis = telemetry
+            .maintenance_pause_millis
+            .checked_add(millis)
+            .ok_or_else(|| anyhow!("maintenance pause telemetry overflow"))?;
+        Ok(())
+    }
+
+    fn paused_duration(&self) -> Duration {
+        self.total_pause.saturating_add(
+            self.active_since
+                .map_or(Duration::ZERO, |started| started.elapsed()),
+        )
+    }
+}
+
 impl GatewayClient for HttpGatewayClient {
     fn enqueue_tasks(&mut self, tasks: &[Value]) -> Result<Value> {
         self.post_json("tasks", json!({"tasks": tasks}))
@@ -326,6 +466,23 @@ fn parse_http_json(
     endpoint: &str,
 ) -> Result<Value> {
     let status = response.status();
+    if matches!(
+        status,
+        StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Err(GatewayMaintenance {
+            endpoint: endpoint.to_owned(),
+            status,
+            retry_after,
+        }
+        .into());
+    }
     if status != StatusCode::OK {
         bail!("gateway {endpoint} returned HTTP {status}");
     }
@@ -388,6 +545,7 @@ pub fn execute_gateway_dispatch_with_client(
         completed_task_count: journal.len() as u64,
         ..Default::default()
     };
+    let mut maintenance = MaintenanceGate::default();
 
     // A deterministic failure could have been acknowledged before the process
     // reached its completion journal append. Recover it from its independent
@@ -403,16 +561,30 @@ pub fn execute_gateway_dispatch_with_client(
         &index,
         &mut journal,
         &mut telemetry,
+        &mut maintenance,
     )?;
 
-    enqueue_missing_tasks(client, request, &paths, &index, &journal, &mut telemetry)?;
-    // Match the established controller semantics: materializing/validating a
-    // bounded task sidecar and submitting its batches are setup work; timeout
-    // measures the wait for gateway terminal completions.
-    let deadline = Instant::now() + request.timeout;
+    enqueue_missing_tasks(
+        client,
+        request,
+        &paths,
+        &index,
+        &journal,
+        &mut telemetry,
+        &mut maintenance,
+    )?;
+    // Only productive completion-wait time consumes the scientific timeout.
+    // A shared dependency outage has its own explicit maintenance bound and
+    // never burns task attempts or forces a supervisor restart.
+    let wait_started = Instant::now();
+    let maintenance_before_wait = maintenance.paused_duration();
     while journal.len() as u64 != index.task_count {
+        let maintenance_in_wait = maintenance
+            .paused_duration()
+            .saturating_sub(maintenance_before_wait);
+        let productive_elapsed = wait_started.elapsed().saturating_sub(maintenance_in_wait);
         ensure!(
-            Instant::now() < deadline,
+            productive_elapsed < request.timeout,
             "timed out waiting for gateway candidate-window completions"
         );
         let consumed = drain_available_results(
@@ -422,6 +594,7 @@ pub fn execute_gateway_dispatch_with_client(
             &index,
             &mut journal,
             &mut telemetry,
+            &mut maintenance,
         )?;
         if consumed == 0 {
             thread::sleep(request.poll_interval);
@@ -2219,8 +2392,11 @@ fn drain_available_results(
     index: &TaskIndex,
     journal: &mut CompletionJournal,
     telemetry: &mut GatewayDispatchTelemetry,
+    maintenance: &mut MaintenanceGate,
 ) -> Result<usize> {
-    let completions = client.read_results(request.result_batch_size)?;
+    let completions = maintenance.run(request, telemetry, "result probe", || {
+        client.read_results(request.result_batch_size)
+    })?;
     ensure!(
         completions.len() <= request.result_batch_size,
         "gateway client exceeded configured completion batch bound"
@@ -2256,7 +2432,9 @@ fn drain_available_results(
     }
     if !leases.is_empty() {
         let lease_ids: Vec<String> = leases.into_iter().collect();
-        let acknowledged = client.ack_results(&lease_ids)?;
+        let acknowledged = maintenance.run(request, telemetry, "result acknowledgement", || {
+            client.ack_results(&lease_ids)
+        })?;
         ensure!(
             acknowledged == lease_ids.len() as u64,
             "gateway did not acknowledge the exact durable completion lease batch"
@@ -2380,6 +2558,7 @@ fn enqueue_missing_tasks(
     index: &TaskIndex,
     journal: &CompletionJournal,
     telemetry: &mut GatewayDispatchTelemetry,
+    maintenance: &mut MaintenanceGate,
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(request.enqueue_batch_size);
     let mut batch_payload_bytes = 12_usize; // `{"tasks":[]}` framing.
@@ -2404,7 +2583,7 @@ fn enqueue_missing_tasks(
                     .and_then(|size| size.checked_add(task_bytes.len()))
                     .is_none_or(|size| size > request.max_request_bytes))
         {
-            enqueue_batch(client, &batch, request.mode, telemetry)?;
+            enqueue_batch(client, &batch, request, telemetry, maintenance)?;
             batch.clear();
             batch_payload_bytes = 12;
         }
@@ -2416,7 +2595,7 @@ fn enqueue_missing_tasks(
         telemetry.peak_live_task_batch = telemetry.peak_live_task_batch.max(batch.len());
     }
     if !batch.is_empty() {
-        enqueue_batch(client, &batch, request.mode, telemetry)?;
+        enqueue_batch(client, &batch, request, telemetry, maintenance)?;
     }
     Ok(())
 }
@@ -2424,10 +2603,13 @@ fn enqueue_missing_tasks(
 fn enqueue_batch(
     client: &mut dyn GatewayClient,
     tasks: &[Value],
-    mode: DispatchMode,
+    request: &GatewayDispatchRequest,
     telemetry: &mut GatewayDispatchTelemetry,
+    maintenance: &mut MaintenanceGate,
 ) -> Result<()> {
-    let receipt = client.enqueue_tasks(tasks)?;
+    let receipt = maintenance.run(request, telemetry, "task enqueue", || {
+        client.enqueue_tasks(tasks)
+    })?;
     let receipt_map = object(&receipt, "gateway enqueue receipt")?;
     let expected = tasks.len() as u64;
     let submitted = unsigned(receipt_map, "submitted")?;
@@ -2437,7 +2619,7 @@ fn enqueue_batch(
         submitted == expected && enqueued <= expected && rejected == expected - enqueued,
         "gateway enqueue receipt does not bind the exact pending task batch"
     );
-    if matches!(mode, DispatchMode::Fresh) {
+    if matches!(request.mode, DispatchMode::Fresh) {
         ensure!(
             enqueued == expected,
             "fresh dispatcher run requires every pending task to be newly enqueued"
@@ -3063,6 +3245,9 @@ mod tests {
         max_enqueue_batch: usize,
         max_read_limit: usize,
         acknowledgement_calls: u64,
+        maintenance_reads_remaining: usize,
+        maintenance_enqueues_remaining: usize,
+        maintenance_acks_remaining: usize,
     }
 
     impl FakeLocalGateway {
@@ -3077,12 +3262,24 @@ mod tests {
                 max_enqueue_batch: 0,
                 max_read_limit: 0,
                 acknowledgement_calls: 0,
+                maintenance_reads_remaining: 0,
+                maintenance_enqueues_remaining: 0,
+                maintenance_acks_remaining: 0,
             }
         }
     }
 
     impl GatewayClient for FakeLocalGateway {
         fn enqueue_tasks(&mut self, tasks: &[Value]) -> Result<Value> {
+            if self.maintenance_enqueues_remaining > 0 {
+                self.maintenance_enqueues_remaining -= 1;
+                return Err(GatewayMaintenance {
+                    endpoint: "tasks".into(),
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    retry_after: None,
+                }
+                .into());
+            }
             self.max_enqueue_batch = self.max_enqueue_batch.max(tasks.len());
             let mut accepted = 0_u64;
             for task in tasks {
@@ -3104,11 +3301,29 @@ mod tests {
         }
 
         fn read_results(&mut self, limit: usize) -> Result<Vec<Value>> {
+            if self.maintenance_reads_remaining > 0 {
+                self.maintenance_reads_remaining -= 1;
+                return Err(GatewayMaintenance {
+                    endpoint: "results".into(),
+                    status: StatusCode::CONFLICT,
+                    retry_after: None,
+                }
+                .into());
+            }
             self.max_read_limit = self.max_read_limit.max(limit);
             Ok(self.results.iter().take(limit).cloned().collect())
         }
 
         fn ack_results(&mut self, lease_ids: &[String]) -> Result<u64> {
+            if self.maintenance_acks_remaining > 0 {
+                self.maintenance_acks_remaining -= 1;
+                return Err(GatewayMaintenance {
+                    endpoint: "results/ack".into(),
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    retry_after: None,
+                }
+                .into());
+            }
             self.acknowledgement_calls += 1;
             self.saw_durable_journal_before_ack =
                 self.journal_path.is_file() && fs::metadata(&self.journal_path)?.len() > 0;
@@ -3490,7 +3705,63 @@ mod tests {
         request.result_batch_size = 1;
         request.max_request_bytes = 1024 * 1024;
         request.max_response_bytes = 1024 * 1024;
+        request.maintenance_probe_interval = Duration::from_millis(10);
+        request.maintenance_timeout = Duration::from_secs(1);
         request
+    }
+
+    #[test]
+    fn shared_maintenance_gate_collapses_each_outage_and_preserves_durable_completion() -> Result<()>
+    {
+        let directory = TempDir::new()?;
+        let root = directory.path();
+        let tasks = vec![task("maintenance-task", "maintenance-candidate")];
+        let manifest = write_fixture_manifest(root, &tasks)?;
+        let mut gateway = FakeLocalGateway::new(
+            root,
+            [warmup_failure_completion(&tasks[0], "maintenance-lease")?],
+        );
+        gateway.maintenance_reads_remaining = 2;
+        gateway.maintenance_acks_remaining = 2;
+        let result = execute_gateway_dispatch_with_client(
+            &request(&manifest, root, DispatchMode::Fresh),
+            &mut gateway,
+        )?;
+        assert_eq!(result["completedTaskCount"], json!(1));
+        assert_eq!(result["telemetry"]["maintenanceActivations"], json!(2));
+        assert_eq!(result["telemetry"]["maintenanceProbeCount"], json!(2));
+        assert_eq!(
+            result["telemetry"]["infrastructureAvailabilityEvents"],
+            json!(4)
+        );
+        assert!(
+            result["telemetry"]["maintenancePauseMillis"]
+                .as_u64()
+                .is_some_and(|millis| millis >= 40)
+        );
+        assert_eq!(result["telemetry"]["enqueuedTaskCount"], json!(0));
+        assert!(gateway.saw_durable_journal_before_ack);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_pause_has_a_separate_timeout_from_scientific_wait() -> Result<()> {
+        let directory = TempDir::new()?;
+        let root = directory.path();
+        let tasks = vec![task("maintenance-timeout", "maintenance-candidate")];
+        let manifest = write_fixture_manifest(root, &tasks)?;
+        let mut gateway = FakeLocalGateway::new(root, Vec::<Value>::new());
+        gateway.maintenance_reads_remaining = 100;
+        let mut dispatch = request(&manifest, root, DispatchMode::Fresh);
+        dispatch.timeout = Duration::from_secs(1);
+        dispatch.maintenance_timeout = Duration::from_millis(35);
+        let error = execute_gateway_dispatch_with_client(&dispatch, &mut gateway)
+            .expect_err("continuous maintenance must respect its own bound");
+        assert!(
+            format!("{error:#}").contains("shared maintenance"),
+            "unexpected maintenance error: {error:#}"
+        );
+        Ok(())
     }
 
     #[test]

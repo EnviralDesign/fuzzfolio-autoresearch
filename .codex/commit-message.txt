@@ -1,1 +1,0 @@
-Collapse gateway maintenance retry storms
