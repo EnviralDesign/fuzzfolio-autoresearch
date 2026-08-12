@@ -3319,6 +3319,7 @@ def run_native_v5_generation_finalizer(
     runtime_authority: Mapping[str, Any],
     manifest_path: Path | str,
     timeout_seconds: int = 600,
+    committed_restart_only: bool = False,
 ) -> dict[str, Any]:
     """Commit a v2 native finalization boundary and validate only its receipts.
 
@@ -3365,13 +3366,45 @@ def run_native_v5_generation_finalizer(
     # ``source.json`` is candidate-scale and deliberately opaque here.  Rust
     # authenticates it before fresh execution and can restart from the compact
     # commit after it is gone.  Python binds only the manifest's source root.
-    binary = pinned_runtime_binary(runtime_authority=authority, role="generationFinalizer")
-    execution = _run_pinned(
-        runtime_authority=authority,
-        role="generationFinalizer",
-        command=[str(binary), str(path)],
-        timeout_seconds=timeout_seconds,
-    )
+    if committed_restart_only:
+        # A completed generation is already sealed by the self-hashed compact
+        # commit and state-application sidecar.  Reopening that boundary must
+        # not require the historical executable bytes to remain installed at
+        # their original operational path.  The common validation below still
+        # reauthenticates the manifest, commit, compact record/patch, output
+        # descriptors, and sidecar before admitting the generation.
+        committed = _self_hashed(
+            _read_canonical_object(
+                root / "generation-commit.json",
+                name="native v5 committed generation commit",
+            ),
+            field="commitSha256",
+            name="native v5 committed generation commit",
+        )
+        execution = {
+            "schemaVersion": FINALIZER_EXECUTION_SCHEMA,
+            "status": "committed",
+            "sourceSha256": source_sha256,
+            "manifestSha256": manifest["manifestSha256"],
+            "generationIndex": committed.get("generationIndex"),
+            "auxiliaryPlanSha256": committed.get("auxiliaryPlanSha256"),
+            "commitSha256": committed.get("commitSha256"),
+            "restart": True,
+            "restartValidation": "compact_commit_and_output_hashes",
+            "rawResultReads": 0,
+            "elapsedMilliseconds": 0,
+            "commit": committed,
+        }
+    else:
+        binary = pinned_runtime_binary(
+            runtime_authority=authority, role="generationFinalizer"
+        )
+        execution = _run_pinned(
+            runtime_authority=authority,
+            role="generationFinalizer",
+            command=[str(binary), str(path)],
+            timeout_seconds=timeout_seconds,
+        )
     expected_execution_fields = {
         "schemaVersion",
         "status",

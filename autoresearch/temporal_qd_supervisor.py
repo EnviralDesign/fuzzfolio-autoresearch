@@ -5737,6 +5737,7 @@ def _admit_completed_generations_native_v5(
                 runtime_authority=runtime_authority,
                 manifest_path=_native_finalization_root(root, generation_index)
                 / "manifest.json",
+                committed_restart_only=True,
             )
         except TemporalQDV5ControlPlaneError as exc:
             raise TemporalDiscoveryContractError(str(exc)) from exc
