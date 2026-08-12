@@ -12,6 +12,7 @@ from scripts.temporal_qd_runtime_oracle_fixture import (
     RUNTIME_MANIFEST_SCHEMA,
     TRANSCRIPT_SCHEMA,
     _generator_source_identity,
+    _portable_source_sha256,
     materialize_runtime_oracle_fixture,
 )
 
@@ -69,3 +70,9 @@ def test_committed_runtime_oracle_bundle_is_compact_and_identity_bound() -> None
     assert fixture["transcriptSha256"] == canonical_sha256(transcript)
     assert fixture["generatorSourceIdentity"] == _generator_source_identity()
     assert fixture["cases"]["sameSideCrossoverRejected"]["operation"]["disposition"] == "operation_rejected"
+
+
+def test_generator_source_identity_is_checkout_line_ending_independent() -> None:
+    assert _portable_source_sha256(b"alpha\nbeta\n") == _portable_source_sha256(
+        b"alpha\r\nbeta\r\n"
+    )

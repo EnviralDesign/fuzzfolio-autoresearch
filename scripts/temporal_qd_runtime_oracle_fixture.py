@@ -87,10 +87,15 @@ def _write(path: Path, value: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n", encoding="utf-8", newline="\n")
 
 
+def _portable_source_sha256(raw: bytes) -> str:
+    """Hash source semantics independently of Git's CRLF checkout policy."""
+    return "sha256:" + hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _generator_source_identity() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1]
     files = {
-        relative: "sha256:" + hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        relative: _portable_source_sha256((root / relative).read_bytes())
         for relative in GENERATOR_SOURCE_FILES
     }
     value = {
