@@ -12,7 +12,11 @@ fn fixture(root: &Path) {
 fn fixture_count(root: &Path, count: usize) {
     let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../.venv/Scripts/python.exe")
+            .join(if cfg!(windows) {
+                "../../../../.venv/Scripts/python.exe"
+            } else {
+                "../../../../.venv/bin/python"
+            })
             .into_os_string()
     });
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))

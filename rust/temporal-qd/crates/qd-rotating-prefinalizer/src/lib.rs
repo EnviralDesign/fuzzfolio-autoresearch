@@ -7,7 +7,6 @@
 //! results and it never falls back to Python over a population or panel matrix.
 
 #![recursion_limit = "256"]
-
 pub mod campaign_receipt;
 pub mod core_receipt;
 pub mod funnel_source;
@@ -242,7 +241,7 @@ fn prepare(input: &Value, root: &Path) -> Result<Prepared> {
     let cohort = cohort(
         &proposal,
         &parents,
-        &rotating_sha,
+        rotating_sha,
         generation_index,
         &current_panel,
     )?;
@@ -291,11 +290,11 @@ fn prepare(input: &Value, root: &Path) -> Result<Prepared> {
             pending_parent_ids.clone(),
             parent_projection,
             source_bindings(input)?,
-            &rotating_sha,
+            rotating_sha,
         )?;
         let mut plan = task_plan(
             generation_index,
-            &rotating_sha,
+            rotating_sha,
             &current_panel,
             "retained_parent_current_panel",
             pending_parent_ids,
@@ -325,7 +324,7 @@ fn prepare(input: &Value, root: &Path) -> Result<Prepared> {
         .iter()
         .map(|v| text(v, "candidateId").map(str::to_owned))
         .collect::<Result<BTreeSet<_>>>()?;
-    let available = collect_bundles(input, &selected, &required_panels, &rotating_sha)?;
+    let available = collect_bundles(input, &selected, &required_panels, rotating_sha)?;
     let current_missing = selected
         .iter()
         .filter(|candidate| {
@@ -341,7 +340,7 @@ fn prepare(input: &Value, root: &Path) -> Result<Prepared> {
         // boundary, never an excuse to relabel it as a prior-panel backfill.
         let plan = task_plan(
             generation_index,
-            &rotating_sha,
+            rotating_sha,
             &current_panel,
             "await_current_panel_bundle_receipt",
             Vec::new(),
@@ -396,12 +395,12 @@ fn prepare(input: &Value, root: &Path) -> Result<Prepared> {
                 candidate_ids.clone(),
                 selected_descriptor.clone(),
                 source_bindings(input)?,
-                &rotating_sha,
+                rotating_sha,
             )?);
         }
         let mut plan = task_plan(
             generation_index,
-            &rotating_sha,
+            rotating_sha,
             &current_panel,
             "prior_panel_backfill",
             Vec::new(),
@@ -421,7 +420,7 @@ fn prepare(input: &Value, root: &Path) -> Result<Prepared> {
 
     let plan = task_plan(
         generation_index,
-        &rotating_sha,
+        rotating_sha,
         &current_panel,
         "complete",
         Vec::new(),
@@ -539,7 +538,7 @@ fn publish_cohort_selection(
     });
     add_hash(&mut selection, "selectionSha256")?;
     publish_once(root.join(&filename), &selection)?;
-    Ok(descriptor(&filename, &selection, "selectionSha256")?)
+    descriptor(&filename, &selection, "selectionSha256")
 }
 
 fn projection_descriptor(descriptor: &Value, root: &Path) -> Result<Value> {

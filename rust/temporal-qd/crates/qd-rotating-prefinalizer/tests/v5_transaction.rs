@@ -77,11 +77,19 @@ fn funnel_pair(
     fs::create_dir_all(&output).unwrap();
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/build_v5_funnel_oracle_fixture.py");
-    let python = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(4)
-        .expect("repository root")
-        .join(".venv/Scripts/python.exe");
+    let python = std::env::var_os("PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(4)
+                .expect("repository root")
+                .join(if cfg!(windows) {
+                    ".venv/Scripts/python.exe"
+                } else {
+                    ".venv/bin/python"
+                })
+        });
     let status = Command::new(python)
         .arg(script)
         .arg(&output)

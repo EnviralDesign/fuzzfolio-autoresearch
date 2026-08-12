@@ -12,6 +12,11 @@
 //! donor when applicable), carries a frozen authority hash, and is rejected
 //! rather than reinterpreted when any of those facts drift.
 
+// This module is also compiled directly by the external contract fixture. It
+// deliberately exposes the complete sealed operator surface, including paths
+// that are only selected by particular authority fixtures.
+#![allow(dead_code)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -949,7 +954,7 @@ fn sorted_values(mut rows: Vec<Value>) -> Result<Vec<Value>> {
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
 
-fn normalize_rows_by_id(rows: &mut Vec<Value>, kind: &str) -> Result<()> {
+fn normalize_rows_by_id(rows: &mut [Value], kind: &str) -> Result<()> {
     rows.sort_by(|left, right| {
         let key = if kind == "indicator" {
             indicator_id(left).unwrap_or_default()
@@ -2367,7 +2372,7 @@ fn validate_v5_operator_program_detail(program: &Value) -> Result<()> {
         *declared.entry(("event".to_owned(), id)).or_default() += 1;
     }
     let mut used_indicators = BTreeSet::new();
-    for ((kind, id), _) in &declared {
+    for (kind, id) in declared.keys() {
         if kind == "indicator" {
             used_indicators.insert(id.clone());
         }
@@ -3221,8 +3226,7 @@ fn evidence_lookback_choices_from_indicator_policy(indicator_policy: &Value) -> 
         .collect::<Result<Vec<_>>>()?;
     choices.sort_unstable();
     choices.dedup();
-    if choices.is_empty() || choices.len() != rows.len() || choices.iter().any(|value| *value == 0)
-    {
+    if choices.is_empty() || choices.len() != rows.len() || choices.contains(&0) {
         return Err(invalid(
             "v5 operator evidence lookback policy is not a nonempty sorted unique positive domain",
         ));
@@ -3609,7 +3613,7 @@ fn source_catalog_matches(authority: &V5OperatorAuthority, item: &Value) -> Resu
     let Some(source) = authority.catalog_entries().get(id) else {
         return Ok(false);
     };
-    catalog_meta_matches(meta, required(&source, "meta", "catalog indicator")?)
+    catalog_meta_matches(meta, required(source, "meta", "catalog indicator")?)
 }
 
 fn canonical_eq(left: &Value, right: &Value) -> Result<bool> {
@@ -4032,10 +4036,7 @@ fn validate_generated_cooldown_closure(program: &Value) -> Result<()> {
             allowed.insert(format!("e_{}", row_id(&edge, "management edge")?));
         }
     }
-    for owner in node_rows(program)?
-        .into_iter()
-        .chain(edge_rows(program)?.into_iter())
-    {
+    for owner in node_rows(program)?.into_iter().chain(edge_rows(program)?) {
         let guard = required(&owner, "guard", "guard owner")?;
         let mut walked = Vec::new();
         guard_walk(guard, Vec::new(), &mut walked)?;
@@ -4359,8 +4360,7 @@ fn period_choices(meta: &Value, config: &Value) -> Result<Vec<Value>> {
         marks.sort_by(|left, right| left.0.total_cmp(&right.0));
         let fast = marks
             .iter()
-            .filter(|(value, _)| *value < nominal_number)
-            .last()
+            .rfind(|(value, _)| *value < nominal_number)
             .map(|(_, value)| *value)
             .unwrap_or(minimum);
         let slow = marks
@@ -4697,9 +4697,9 @@ fn resource_constructions(program: &Value, authority: &V5OperatorAuthority) -> R
                         if rest == 0 || candidate[index] < 0.25 {
                             continue;
                         }
-                        for other in 0..candidate.len() {
+                        for (other, weight) in candidate.iter_mut().enumerate() {
                             if other != index {
-                                candidate[other] -= delta / rest as f64;
+                                *weight -= delta / rest as f64;
                             }
                         }
                         if candidate.iter().any(|value| *value < 0.25) {
@@ -6104,7 +6104,7 @@ fn policy_f64_rows(policy: &Value, key: &str) -> Result<Vec<f64>> {
     let mut values = Vec::new();
     for row in rows {
         let value = finite_number(row, "initial protection value")?;
-        if value <= 0.0 || values.iter().any(|existing: &f64| *existing == value) {
+        if value <= 0.0 || values.contains(&value) {
             return Err(invalid(
                 "initial protection policy values must be positive and unique",
             ));
@@ -6242,7 +6242,7 @@ fn validate_initial_protection_policy(value: &Value) -> Result<Value> {
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    if total.iter().any(|weight| *weight == 0) || total.iter().sum::<u64>() != 100 {
+    if total.contains(&0) || total.iter().sum::<u64>() != 100 {
         return Err(invalid(
             "initial protection mutation class weights must be positive and sum to 100",
         ));
@@ -6934,7 +6934,7 @@ fn temporal_transform(program: &Value, construction: &Value) -> Result<(Value, V
         ),
         ("ownerKind", Value::String(owner_kind)),
         ("ownerId", Value::String(owner_id)),
-        ("guardPath", array(path.into_iter())),
+        ("guardPath", array(path)),
         ("beforeGuardSha256", Value::String(sha(before)?)),
         ("afterGuardSha256", Value::String(sha(after)?)),
         (

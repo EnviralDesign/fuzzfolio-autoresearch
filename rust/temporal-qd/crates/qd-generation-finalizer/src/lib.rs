@@ -1549,8 +1549,7 @@ fn direction_selection_eligible(behavior: &Value, policy: &Value) -> Result<bool
     if (long_acceptable && short_harmful) || (short_acceptable && long_harmful) {
         return Ok(false);
     }
-    Ok((long_acceptable && short_acceptable)
-        || (long_acceptable && !short_supported)
+    Ok(long_acceptable && (short_acceptable || !short_supported)
         || (short_acceptable && !long_supported))
 }
 

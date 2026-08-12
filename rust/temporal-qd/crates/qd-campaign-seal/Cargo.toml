@@ -13,6 +13,8 @@ flate2.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 temporal-qd-contract = { path = "../qd-contract" }
+temporal-qd-campaign-freeze = { path = "../qd-campaign-freeze" }
+temporal-qd-rotating-prefinalizer = { path = "../qd-rotating-prefinalizer" }
 temporal-qd-tail-reducer = { path = "../qd-tail-reducer" }
 
 [target.'cfg(windows)'.dependencies]

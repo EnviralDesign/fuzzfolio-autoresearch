@@ -23,7 +23,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut task_manifest = None::<PathBuf>;
+    let mut campaign_input_checkpoint = None::<PathBuf>;
     let mut output_root = None::<PathBuf>;
     let mut gateway_url = None::<String>;
     let mut token = None::<String>;
@@ -36,6 +36,8 @@ fn run() -> Result<()> {
     let mut result_batch_size = 128_usize;
     let mut max_request_bytes = 64 * 1024 * 1024_usize;
     let mut max_response_bytes = 64 * 1024 * 1024_usize;
+    let mut maintenance_probe_interval_millis = 30_000_u64;
+    let mut maintenance_timeout_seconds = 12 * 60 * 60_u64;
 
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -44,8 +46,11 @@ fn run() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))
         };
         match argument.as_str() {
-            "--task-manifest" => {
-                task_manifest = Some(PathBuf::from(value("--task-manifest", &mut args)?))
+            "--campaign-input-checkpoint" => {
+                campaign_input_checkpoint = Some(PathBuf::from(value(
+                    "--campaign-input-checkpoint",
+                    &mut args,
+                )?))
             }
             "--output-root" => {
                 output_root = Some(PathBuf::from(value("--output-root", &mut args)?))
@@ -96,6 +101,18 @@ fn run() -> Result<()> {
                     "maximum response bytes",
                 )?
             }
+            "--maintenance-probe-interval-millis" => {
+                maintenance_probe_interval_millis = parse(
+                    &value("--maintenance-probe-interval-millis", &mut args)?,
+                    "maintenance probe interval milliseconds",
+                )?
+            }
+            "--maintenance-timeout-seconds" => {
+                maintenance_timeout_seconds = parse(
+                    &value("--maintenance-timeout-seconds", &mut args)?,
+                    "maintenance timeout seconds",
+                )?
+            }
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
@@ -121,7 +138,8 @@ fn run() -> Result<()> {
         (Some(_), Some(_)) => unreachable!(),
     };
     let mut request = GatewayDispatchRequest::bounded(
-        task_manifest.ok_or_else(|| anyhow::anyhow!("--task-manifest is required"))?,
+        campaign_input_checkpoint
+            .ok_or_else(|| anyhow::anyhow!("--campaign-input-checkpoint is required"))?,
         output_root.ok_or_else(|| anyhow::anyhow!("--output-root is required"))?,
         mode.ok_or_else(|| anyhow::anyhow!("exactly one of --fresh or --resume is required"))?,
     );
@@ -131,6 +149,8 @@ fn run() -> Result<()> {
     request.result_batch_size = result_batch_size;
     request.max_request_bytes = max_request_bytes;
     request.max_response_bytes = max_response_bytes;
+    request.maintenance_probe_interval = Duration::from_millis(maintenance_probe_interval_millis);
+    request.maintenance_timeout = Duration::from_secs(maintenance_timeout_seconds);
     let mut runtime = GatewayRuntimeOptions::new(
         gateway_url.ok_or_else(|| anyhow::anyhow!("--gateway-url is required"))?,
         token,
@@ -160,7 +180,7 @@ fn parse<T: std::str::FromStr>(value: &str, label: &str) -> Result<T> {
 
 fn print_usage() {
     println!(
-        "usage: temporal-qd-gateway-dispatch --task-manifest PATH --output-root PATH --gateway-url URL (--fresh|--resume) [--gateway-token TOKEN | --gateway-token-file PATH] [--timeout-seconds N] [--request-timeout-seconds N] [--poll-interval-millis N] [--enqueue-batch-size N] [--result-batch-size N] [--max-request-bytes N] [--max-response-bytes N]"
+        "usage: temporal-qd-gateway-dispatch --campaign-input-checkpoint PATH --output-root PATH --gateway-url URL (--fresh|--resume) [--gateway-token TOKEN | --gateway-token-file PATH] [--timeout-seconds N] [--request-timeout-seconds N] [--poll-interval-millis N] [--enqueue-batch-size N] [--result-batch-size N] [--max-request-bytes N] [--max-response-bytes N] [--maintenance-probe-interval-millis N] [--maintenance-timeout-seconds N]"
     );
 }
 

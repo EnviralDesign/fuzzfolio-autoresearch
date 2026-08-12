@@ -3,122 +3,103 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
-use temporal_qd_campaign_seal::{MANIFEST_SCHEMA, OPERATION, TRANSACTION_PATH};
+use temporal_qd_campaign_seal::{
+    CAMPAIGN_OUTPUT_CHECKPOINT_PATH, CAMPAIGN_OUTPUT_MANIFEST_PATH,
+    CAMPAIGN_OUTPUT_MANIFEST_SCHEMA, CAMPAIGN_OUTPUT_OPERATION,
+};
 use temporal_qd_contract::{CONTRACT_VERSION, canonical_json_line, canonical_sha256};
 
 const HASH: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-#[test]
-fn python_production_manifest_reaches_real_campaign_seal_parser() {
-    let root = tempdir().unwrap();
-    let mut tail_authority = json!({
-        "schemaVersion": "temporal_qd_v5_directional_tail_authority_v1",
-        "generationIndex": 1,
-        "runtimeAuthoritySha256": HASH,
-        "tailResultIndexSchema": "temporal_qd_tail_result_index_v4",
-        "tailResultEntrySchema": "temporal_qd_tail_result_index_entry_v4",
-        "rawRotatingProvenanceSchema": "temporal_qd_v5_raw_rotating_provenance_v1",
-    });
-    let tail_authority_sha = canonical_sha256(&tail_authority).unwrap();
-    tail_authority["tailAuthoritySha256"] = Value::String(tail_authority_sha);
+fn write_manifest(root: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let input_path = root.join("campaign-input-checkpoint.json");
+    let gateway_path = root.join("gateway-execution-receipt.json");
+    fs::write(&input_path, b"{}\n").unwrap();
+    fs::write(&gateway_path, b"{}\n").unwrap();
     let mut manifest = json!({
-        "schemaVersion": MANIFEST_SCHEMA,
+        "schemaVersion": CAMPAIGN_OUTPUT_MANIFEST_SCHEMA,
         "contractVersion": CONTRACT_VERSION,
-        "operation": OPERATION,
+        "operation": CAMPAIGN_OUTPUT_OPERATION,
         "runtimeAuthoritySha256": HASH,
-        "sourcePath": root.path().join("absent-source.json").to_string_lossy(),
-        "sourceSha256": HASH,
-        "evaluationPopulationPath": root.path().join("absent-evaluation.json").to_string_lossy(),
-        "evaluationPopulationSha256": HASH,
+        "campaignInputCheckpointPath": input_path.canonicalize().unwrap(),
+        "campaignInputCheckpointSha256": HASH,
+        "gatewayExecutionReceiptPath": gateway_path.canonicalize().unwrap(),
+        "gatewayExecutionReceiptSha256": HASH,
         "generationIndex": 1,
+        "campaignRole": "proposal_current_panel",
+        "panelId": "panel-a",
+        "rotatingEvidenceSha256": HASH,
+        "panel": {"panelId": "panel-a"},
+        "cohortSource": {
+            "kind": "proposal_evaluation_population",
+            "sourceSemanticSha256": HASH,
+            "candidateCount": 1,
+            "selectionSha256": Value::Null,
+        },
         "minimumTotalTrades": 8,
         "minimumTradesPerWindow": 4,
         "capTrades": 20,
         "provisionalLimit": 128,
-        "directionalTailAuthority": tail_authority,
-        "resultPath": TRANSACTION_PATH,
+        "resultPath": CAMPAIGN_OUTPUT_CHECKPOINT_PATH,
     });
     let identity = canonical_sha256(&manifest).unwrap();
     manifest
         .as_object_mut()
         .unwrap()
         .insert("manifestSha256".into(), Value::String(identity));
-    let manifest_path = root.path().join("manifest.json");
-    fs::write(&manifest_path, canonical_json_line(&manifest).unwrap()).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_temporal-qd-campaign-seal"))
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("campaign seal source"), "{stderr}");
-    assert!(!stderr.contains("fields are not exact"), "{stderr}");
-    assert!(!stderr.contains("lacks runtime authority"), "{stderr}");
+    let path = root.join(file_name);
+    fs::write(&path, canonical_json_line(&manifest).unwrap()).unwrap();
+    path
 }
 
 #[test]
-fn directional_v5_authority_is_manifest_bound_and_tamper_fails_before_source_open() {
+fn campaign_output_manifest_reaches_the_checkpoint_input_boundary() {
     let root = tempdir().unwrap();
-    let tail_authority_body = json!({
-        "schemaVersion": "temporal_qd_v5_directional_tail_authority_v1",
-        "generationIndex": 1,
-        "runtimeAuthoritySha256": HASH,
-        "tailResultIndexSchema": "temporal_qd_tail_result_index_v4",
-        "tailResultEntrySchema": "temporal_qd_tail_result_index_entry_v4",
-        "rawRotatingProvenanceSchema": "temporal_qd_v5_raw_rotating_provenance_v1",
-    });
-    let mut tail_authority = tail_authority_body;
-    let tail_authority_sha = canonical_sha256(&tail_authority).unwrap();
-    tail_authority.as_object_mut().unwrap().insert(
-        "tailAuthoritySha256".into(),
-        Value::String(tail_authority_sha),
-    );
-    let mut manifest = json!({
-        "schemaVersion": MANIFEST_SCHEMA, "contractVersion": CONTRACT_VERSION,
-        "operation": OPERATION, "runtimeAuthoritySha256": HASH,
-        "sourcePath": root.path().join("absent-source.json").to_string_lossy(),
-        "sourceSha256": HASH,
-        "evaluationPopulationPath": root.path().join("absent-evaluation.json").to_string_lossy(),
-        "evaluationPopulationSha256": HASH, "generationIndex": 1,
-        "minimumTotalTrades": 8, "minimumTradesPerWindow": 4, "capTrades": 20,
-        "provisionalLimit": 128, "directionalTailAuthority": tail_authority,
-        "resultPath": TRANSACTION_PATH,
-    });
-    let manifest_sha = canonical_sha256(&manifest).unwrap();
-    manifest
-        .as_object_mut()
-        .unwrap()
-        .insert("manifestSha256".into(), Value::String(manifest_sha));
-    let manifest_path = root.path().join("manifest-v4.json");
-    fs::write(&manifest_path, canonical_json_line(&manifest).unwrap()).unwrap();
+    let manifest_path = write_manifest(root.path(), CAMPAIGN_OUTPUT_MANIFEST_PATH);
     let output = Command::new(env!("CARGO_BIN_EXE_temporal-qd-campaign-seal"))
-        .arg("--manifest")
+        .arg("--campaign-output-manifest")
         .arg(&manifest_path)
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("campaign seal source"), "{stderr}");
+    assert!(stderr.contains("campaign-input checkpoint"), "{stderr}");
+    assert!(!stderr.contains("campaign seal source"), "{stderr}");
+    assert!(!stderr.contains("usage:"), "{stderr}");
+}
 
-    let mut tampered = manifest;
-    tampered["directionalTailAuthority"]["tailResultEntrySchema"] =
-        Value::String("temporal_qd_tail_result_index_entry_v3".to_owned());
-    tampered.as_object_mut().unwrap().remove("manifestSha256");
-    let tampered_sha = canonical_sha256(&tampered).unwrap();
-    tampered
-        .as_object_mut()
-        .unwrap()
-        .insert("manifestSha256".into(), Value::String(tampered_sha));
-    fs::write(&manifest_path, canonical_json_line(&tampered).unwrap()).unwrap();
+#[test]
+fn retired_campaign_seal_cli_modes_are_rejected() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("unused.json");
+    fs::write(&path, b"{}\n").unwrap();
+    for retired in ["--manifest", "--build-source-manifest"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_temporal-qd-campaign-seal"))
+            .arg(retired)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("usage: temporal-qd-campaign-seal --campaign-output-manifest PATH"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn campaign_output_manifest_filename_is_fixed() {
+    let root = tempdir().unwrap();
+    let manifest_path = write_manifest(root.path(), "manifest.json");
     let output = Command::new(env!("CARGO_BIN_EXE_temporal-qd-campaign-seal"))
-        .arg("--manifest")
+        .arg("--campaign-output-manifest")
         .arg(&manifest_path)
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("directional tail authority contract")
+        String::from_utf8_lossy(&output.stderr)
+            .contains("campaign-output manifest path is not fixed")
     );
 }

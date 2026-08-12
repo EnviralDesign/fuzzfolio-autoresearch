@@ -1,0 +1,4 @@
+# Versioned authority and receipt builders intentionally expose their audited
+# wire fields at the call site. Keep the lint active, but use a threshold that
+# fits the largest current contract instead of Clippy's generic default of 7.
+too-many-arguments-threshold = 14

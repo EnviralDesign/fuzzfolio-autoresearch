@@ -550,6 +550,131 @@ def test_lab_gateway_lake_retry_stops_claiming_unrelated_tasks() -> None:
     resumed = gateway.claim("worker-2")
     assert resumed["status"] == "leased"
     assert resumed["task_id"] == "task-1"
+    assert resumed["lake_health_probe"] is True
+
+
+def test_lab_gateway_lake_recovery_allows_one_probe_before_reopening() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(lake_mutation_retry_after_seconds=30.0)
+    )
+    for index in range(4):
+        gateway.enqueue(
+            LabTask(
+                task_id=f"task-{index}",
+                lane_id="lane-1",
+                attempt_id=f"attempt-{index}",
+                max_attempts=1,
+            )
+        )
+        gateway.register_worker(f"worker-{index}")
+
+    first = gateway.claim("worker-0")
+    gateway.fail(
+        "worker-0",
+        first["lease_id"],
+        error=(
+            "LazyLakeCacheError: Remote market data lake window attestation "
+            "conflict; retry after the mutation completes"
+        ),
+        retryable=True,
+    )
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
+
+    probe = gateway.claim("worker-1")
+    blocked = gateway.claim("worker-2")
+    assert probe["status"] == "leased"
+    assert probe["lake_health_probe"] is True
+    assert blocked == {
+        "status": "no_work",
+        "retry_after_seconds": gateway.config.no_work_retry_after_seconds,
+        "reason": "lake_health_probe_in_flight",
+        "retry_reason": "mutation",
+        "probe_task_id": probe["task_id"],
+    }
+
+    gateway.fail(
+        "worker-1",
+        probe["lease_id"],
+        error="503 Service Unavailable from market data lake window-attestations",
+        retryable=True,
+    )
+    failed_probe_snapshot = gateway.snapshot()
+    assert failed_probe_snapshot["lake_circuit_state"] == "cooldown"
+    assert failed_probe_snapshot["metrics"]["lake_circuit_breaker_activations"] == 1
+    assert failed_probe_snapshot["metrics"]["lake_circuit_breaker_probe_failures"] == 1
+    assert failed_probe_snapshot["metrics"]["lake_circuit_breaker_collapsed_failures"] == 1
+
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
+    recovery_probe = gateway.claim("worker-2")
+    gateway.complete(
+        "worker-2",
+        recovery_probe["lease_id"],
+        result={"status": "success"},
+    )
+    recovered = gateway.snapshot()
+    assert recovered["lake_circuit_state"] == "closed"
+    assert recovered["lake_retry_reason"] is None
+    assert recovered["metrics"]["lake_circuit_breaker_probe_claims"] == 2
+    assert recovered["metrics"]["lake_circuit_breaker_recoveries"] == 1
+
+    normal = gateway.claim("worker-3")
+    assert normal["status"] == "leased"
+    assert normal["lake_health_probe"] is False
+
+
+def test_lab_gateway_results_endpoint_reports_shared_lake_maintenance() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(lake_mutation_retry_after_seconds=30.0)
+    )
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=2,
+        )
+    )
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    gateway.fail(
+        "worker-1",
+        claim["lease_id"],
+        error="409 Client Error from market data lake window-attestations",
+        retryable=True,
+    )
+
+    server = build_lab_gateway_http_server(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        gateway=gateway,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    headers = {"Authorization": "Bearer secret"}
+    try:
+        paused = requests.get(f"{base_url}/results", headers=headers, timeout=5)
+        assert paused.status_code == 503
+        assert paused.json()["error"] == "lake_maintenance"
+        assert paused.json()["circuit_state"] == "cooldown"
+
+        gateway._lake_retry_not_before = time.monotonic() - 0.001
+        gateway._tasks["task-1"].available_at = time.monotonic() - 0.001
+        probe = gateway.claim("worker-1")
+        gateway.complete(
+            "worker-1",
+            probe["lease_id"],
+            result={"status": "success", "score": 1.0},
+        )
+        recovered = requests.get(f"{base_url}/results", headers=headers, timeout=5)
+        assert recovered.status_code == 200
+        assert recovered.json()["results"][0]["result"]["score"] == 1.0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:

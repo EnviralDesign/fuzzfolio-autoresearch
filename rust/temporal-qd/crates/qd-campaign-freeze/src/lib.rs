@@ -15,7 +15,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use temporal_qd_contract::{
-    JsonNewline, canonical_json_bytes, canonical_json_line, canonical_sha256,
+    CONTRACT_VERSION, JsonNewline, canonical_json_bytes, canonical_json_line, canonical_sha256,
     canonical_sha256_without_object_field, python_pretty_json_line,
 };
 
@@ -63,8 +63,11 @@ const JOB_SCHEMA: &str = "temporal_graph_candidate_window_job_v1";
 const TASK_CAPABILITY: &str = "temporal_graph_candidate_window_v1";
 const BIDIRECTIONAL_CAPABILITY: &str = "temporal_graph_bidirectional_replay_v1";
 const ATTRIBUTION_CAPABILITY: &str = "temporal_candidate_behavior_attribution_v1";
-const V5_FREEZE_TRANSACTION_SCHEMA: &str = "temporal_qd_v5_native_campaign_freeze_transaction_v2";
-const V5_FREEZE_RECEIPT_SCHEMA: &str = "temporal_qd_v5_native_campaign_freeze_receipt_v1";
+pub const V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA: &str = "temporal_qd_v5_campaign_input_checkpoint_v1";
+pub const V5_CAMPAIGN_INPUT_RESULT_SCHEMA: &str = "temporal_qd_v5_campaign_input_result_v1";
+pub const V5_CAMPAIGN_INPUT_CHECKPOINT_PATH: &str = "campaign-input-checkpoint.json";
+pub const V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH: &str = "screening-run/tasks.jsonl";
+pub const V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH: &str = "cohort-population.json";
 const V5_RUNTIME_AUTHORITY_SCHEMA: &str = "temporal_qd_native_campaign_freeze_runtime_authority_v1";
 pub const COHORT_SELECTION_SCHEMA: &str = "temporal_qd_rotating_cohort_selection_v1";
 pub const COHORT_PROJECTION_ROW_SCHEMA: &str = "temporal_qd_rotating_candidate_projection_row_v1";
@@ -73,6 +76,348 @@ pub const NON_PROPOSAL_TASK_SELECTION_SCHEMA: &str =
 pub const NON_PROPOSAL_TASK_SELECTION_RECEIPT_SCHEMA: &str =
     "temporal_qd_v5_non_proposal_task_selection_receipt_v2";
 pub const ROTATING_COHORT_POPULATION_SCHEMA: &str = "temporal_qd_rotating_cohort_population_v1";
+
+#[derive(Clone, Debug)]
+pub struct V5CampaignInputCheckpoint {
+    pub value: Value,
+    pub root: PathBuf,
+    pub manifest_sha256: String,
+    pub native_runtime_authority_sha256: String,
+    pub generation_index: u64,
+    pub campaign_role: String,
+    pub panel_id: String,
+    pub authority_id: String,
+    pub campaign_sha256: String,
+    pub evaluation_identity_sha256: String,
+    pub task_matrix_sha256: String,
+    pub candidate_count: u64,
+    pub window_count: u64,
+    pub task_count: u64,
+    pub cohort_population_sha256: String,
+    pub checkpoint_sha256: String,
+    pub task_pack_path: PathBuf,
+    pub task_pack_raw_sha256: String,
+    pub task_pack_size_bytes: u64,
+    pub cohort_population_path: PathBuf,
+    pub cohort_population_raw_sha256: String,
+    pub cohort_population_size_bytes: u64,
+}
+
+/// Open the one durable campaign-input boundary used by gateway dispatch and
+/// campaign reduction.  The checkpoint authenticates only the two
+/// candidate-scale payloads that remain necessary: the task matrix and the
+/// role-specific cohort population.
+pub fn open_v5_campaign_input_checkpoint(path: &Path) -> Result<V5CampaignInputCheckpoint> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("open campaign-input checkpoint: {}", path.display()))?;
+    ensure!(path.is_file(), "campaign-input checkpoint is not a file");
+    ensure!(
+        !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+        "campaign-input checkpoint symlink is forbidden"
+    );
+    let root = path
+        .parent()
+        .ok_or_else(|| anyhow!("campaign-input checkpoint has no parent"))?
+        .to_path_buf();
+    let value = read_canonical_json_line(&path, "campaign-input checkpoint")?;
+    let map = object(&value, "campaign-input checkpoint")?;
+    exact_keys(
+        map,
+        &[
+            "schemaVersion",
+            "contractVersion",
+            "manifestSha256",
+            "nativeRuntimeAuthoritySha256",
+            "generationIndex",
+            "campaignRole",
+            "panelId",
+            "authorityId",
+            "campaignSha256",
+            "evaluationIdentitySha256",
+            "taskMatrixSha256",
+            "candidateCount",
+            "windowCount",
+            "taskCount",
+            "tasks",
+            "cohortPopulation",
+            "sourceInputs",
+            "artifactMetrics",
+            "checkpointSha256",
+        ],
+        "campaign-input checkpoint",
+    )?;
+    ensure!(
+        string(map, "schemaVersion")? == V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA
+            && string(map, "contractVersion")? == CONTRACT_VERSION,
+        "campaign-input checkpoint schema/version is incompatible"
+    );
+    let checkpoint_sha256 = string(map, "checkpointSha256")?.to_owned();
+    require_sha(&checkpoint_sha256, "campaign-input checkpoint SHA-256")?;
+    ensure!(
+        canonical_sha256_without_object_field(&value, "checkpointSha256")? == checkpoint_sha256,
+        "campaign-input checkpoint identity drifted"
+    );
+    let generation_index = map
+        .get("generationIndex")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("campaign-input generation index is invalid"))?;
+    let candidate_count = map
+        .get("candidateCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("campaign-input candidate count is invalid"))?;
+    let window_count = map
+        .get("windowCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("campaign-input window count is invalid"))?;
+    let task_count = map
+        .get("taskCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("campaign-input task count is invalid"))?;
+    ensure!(
+        candidate_count
+            .checked_mul(window_count)
+            .is_some_and(|expected| expected == task_count),
+        "campaign-input task cardinality drifted"
+    );
+    let task_pack_path = validate_campaign_input_artifact(
+        &root,
+        map.get("tasks")
+            .ok_or_else(|| anyhow!("campaign-input task-pack descriptor is missing"))?,
+        V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH,
+        "taskMatrixSha256",
+        string(map, "taskMatrixSha256")?,
+        "campaign-input task pack",
+    )?;
+    let task_pack_descriptor = object(
+        map.get("tasks")
+            .ok_or_else(|| anyhow!("campaign-input task-pack descriptor is missing"))?,
+        "campaign-input task-pack descriptor",
+    )?;
+    let task_pack_raw_sha256 = string(task_pack_descriptor, "rawSha256")?.to_owned();
+    let task_pack_size_bytes = task_pack_descriptor
+        .get("sizeBytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("campaign-input task-pack size is invalid"))?;
+    ensure!(
+        task_pack_descriptor
+            .get("recordCount")
+            .and_then(Value::as_u64)
+            == Some(task_count),
+        "campaign-input task-pack record count drifted"
+    );
+    let cohort_population_descriptor = object(
+        map.get("cohortPopulation")
+            .ok_or_else(|| anyhow!("campaign-input cohort descriptor is missing"))?,
+        "campaign-input cohort descriptor",
+    )?;
+    let cohort_population_raw_sha256 =
+        string(cohort_population_descriptor, "rawSha256")?.to_owned();
+    let cohort_population_size_bytes = cohort_population_descriptor
+        .get("sizeBytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("campaign-input cohort size is invalid"))?;
+    let cohort_population_sha256 = string(
+        object(
+            map.get("cohortPopulation")
+                .ok_or_else(|| anyhow!("campaign-input cohort descriptor is missing"))?,
+            "campaign-input cohort descriptor",
+        )?,
+        "populationSha256",
+    )?
+    .to_owned();
+    let cohort_population_path = validate_campaign_input_artifact(
+        &root,
+        map.get("cohortPopulation")
+            .ok_or_else(|| anyhow!("campaign-input cohort descriptor is missing"))?,
+        V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH,
+        "populationSha256",
+        &cohort_population_sha256,
+        "campaign-input cohort population",
+    )?;
+    let cohort_population =
+        read_pretty_json(&cohort_population_path, "campaign-input cohort population")?;
+    let cohort_map = object(&cohort_population, "campaign-input cohort population")?;
+    ensure!(
+        string(cohort_map, "schemaVersion")? == ROTATING_COHORT_POPULATION_SCHEMA
+            && string(cohort_map, "populationSha256")? == cohort_population_sha256
+            && canonical_sha256_without_object_field(&cohort_population, "populationSha256")?
+                == cohort_population_sha256
+            && cohort_map.get("candidateCount").and_then(Value::as_u64) == Some(candidate_count),
+        "campaign-input cohort population binding drifted"
+    );
+    let source_inputs = object(
+        map.get("sourceInputs")
+            .ok_or_else(|| anyhow!("campaign-input source inputs are missing"))?,
+        "campaign-input source inputs",
+    )?;
+    exact_keys(
+        source_inputs,
+        &[
+            "evaluationPopulationRawSha256",
+            "templatePreparationSha256",
+            "constructionCatalogSha256",
+            "preparationSha256",
+        ],
+        "campaign-input source inputs",
+    )?;
+    for field in [
+        "evaluationPopulationRawSha256",
+        "templatePreparationSha256",
+        "constructionCatalogSha256",
+        "preparationSha256",
+    ] {
+        require_sha(string(source_inputs, field)?, field)?;
+    }
+    let artifact_metrics = object(
+        map.get("artifactMetrics")
+            .ok_or_else(|| anyhow!("campaign-input artifact metrics are missing"))?,
+        "campaign-input artifact metrics",
+    )?;
+    exact_keys(
+        artifact_metrics,
+        &[
+            "payloadFileCount",
+            "payloadBytes",
+            "taskPackBytes",
+            "cohortPopulationBytes",
+        ],
+        "campaign-input artifact metrics",
+    )?;
+    let task_pack_bytes = fs::metadata(&task_pack_path)?.len();
+    let cohort_population_bytes = fs::metadata(&cohort_population_path)?.len();
+    ensure!(
+        artifact_metrics
+            .get("payloadFileCount")
+            .and_then(Value::as_u64)
+            == Some(2)
+            && artifact_metrics
+                .get("taskPackBytes")
+                .and_then(Value::as_u64)
+                == Some(task_pack_bytes)
+            && artifact_metrics
+                .get("cohortPopulationBytes")
+                .and_then(Value::as_u64)
+                == Some(cohort_population_bytes)
+            && artifact_metrics.get("payloadBytes").and_then(Value::as_u64)
+                == task_pack_bytes.checked_add(cohort_population_bytes),
+        "campaign-input artifact metrics drifted"
+    );
+    let manifest_sha256 = string(map, "manifestSha256")?.to_owned();
+    let native_runtime_authority_sha256 = string(map, "nativeRuntimeAuthoritySha256")?.to_owned();
+    let campaign_role = string(map, "campaignRole")?.to_owned();
+    let panel_id = string(map, "panelId")?.to_owned();
+    let authority_id = string(map, "authorityId")?.to_owned();
+    let campaign_sha256 = string(map, "campaignSha256")?.to_owned();
+    let evaluation_identity_sha256 = string(map, "evaluationIdentitySha256")?.to_owned();
+    let task_matrix_sha256 = string(map, "taskMatrixSha256")?.to_owned();
+    Ok(V5CampaignInputCheckpoint {
+        value,
+        root,
+        manifest_sha256,
+        native_runtime_authority_sha256,
+        generation_index,
+        campaign_role,
+        panel_id,
+        authority_id,
+        campaign_sha256,
+        evaluation_identity_sha256,
+        task_matrix_sha256,
+        candidate_count,
+        window_count,
+        task_count,
+        cohort_population_sha256,
+        checkpoint_sha256,
+        task_pack_path,
+        task_pack_raw_sha256,
+        task_pack_size_bytes,
+        cohort_population_path,
+        cohort_population_raw_sha256,
+        cohort_population_size_bytes,
+    })
+}
+
+fn v5_campaign_input_result(checkpoint: &V5CampaignInputCheckpoint, restart: bool) -> Value {
+    let artifact_metrics = checkpoint
+        .value
+        .get("artifactMetrics")
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "schemaVersion": V5_CAMPAIGN_INPUT_RESULT_SCHEMA,
+        "checkpointPath": checkpoint.root.join(V5_CAMPAIGN_INPUT_CHECKPOINT_PATH),
+        "checkpointSha256": checkpoint.checkpoint_sha256.clone(),
+        "campaignSha256": checkpoint.campaign_sha256.clone(),
+        "authorityId": checkpoint.authority_id.clone(),
+        "taskMatrixSha256": checkpoint.task_matrix_sha256.clone(),
+        "candidateCount": checkpoint.candidate_count,
+        "windowCount": checkpoint.window_count,
+        "taskCount": checkpoint.task_count,
+        "campaignRole": checkpoint.campaign_role.clone(),
+        "panelId": checkpoint.panel_id.clone(),
+        "evaluationIdentitySha256": checkpoint.evaluation_identity_sha256.clone(),
+        "cohortPopulationSha256": checkpoint.cohort_population_sha256.clone(),
+        "outputRoot": checkpoint.root.clone(),
+        "restart": restart,
+        "artifactMetrics": artifact_metrics,
+    })
+}
+
+fn validate_campaign_input_artifact(
+    root: &Path,
+    descriptor: &Value,
+    expected_relative: &str,
+    semantic_field: &str,
+    semantic_sha256: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let map = object(descriptor, label)?;
+    let expected = if semantic_field == "taskMatrixSha256" {
+        vec![
+            "relativePath",
+            "rawSha256",
+            "sizeBytes",
+            "recordCount",
+            semantic_field,
+        ]
+    } else {
+        vec!["relativePath", "rawSha256", "sizeBytes", semantic_field]
+    };
+    exact_keys(map, &expected, label)?;
+    ensure!(
+        string(map, "relativePath")? == expected_relative
+            && string(map, semantic_field)? == semantic_sha256,
+        "{label} semantic/path binding drifted"
+    );
+    require_sha(string(map, "rawSha256")?, label)?;
+    require_sha(semantic_sha256, label)?;
+    let relative = Path::new(expected_relative);
+    ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "{label} relative path is unsafe"
+    );
+    let path = root.join(relative);
+    ensure!(path.is_file(), "{label} is missing");
+    ensure!(
+        !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+        "{label} symlink is forbidden"
+    );
+    ensure!(
+        fs::metadata(&path)?.len()
+            == map
+                .get("sizeBytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("{label} size is invalid"))?
+            && file_sha256(&path)? == string(map, "rawSha256")?,
+        "{label} byte identity drifted"
+    );
+    Ok(path)
+}
+
 const REQUIRED_CAPABILITIES: [&str; 8] = [
     TASK_CAPABILITY,
     BIDIRECTIONAL_CAPABILITY,
@@ -144,7 +489,7 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     )?;
     Ok(json!({
         "schemaVersion": RESULT_SCHEMA, "authorityId": authority_id,
-        "taskMatrixSha256": generated.task_matrix_sha256, "candidateCount": generated.candidate_count,
+        "taskMatrixSha256": generated.task_matrix_sha256.clone(), "candidateCount": generated.candidate_count,
         "windowCount": generated.window_count, "taskCount": generated.task_count,
         // Preserve the manifest spelling.  Windows `canonicalize` prepends a
         // `\\?\\` device namespace, which would make the bridge's otherwise
@@ -245,6 +590,89 @@ fn stream_task_manifest(
         task_matrix_sha256,
         candidate_count: candidates.len(),
         window_count: windows.len(),
+        task_count: count,
+        bytes,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct GeneratedTaskPack {
+    task_matrix_sha256: String,
+    raw_sha256: String,
+    task_count: usize,
+    bytes: u64,
+}
+
+/// Current-v5 task payload.  Tasks are written once as canonical JSONL so the
+/// gateway can index and dispatch the committed payload directly; it no longer
+/// copies the complete matrix into a second task-object or task-pack tree.
+fn stream_v5_task_pack(
+    authority: &Map<String, Value>,
+    authority_id: &str,
+    root: &Path,
+    attribution: Option<&Value>,
+) -> Result<GeneratedTaskPack> {
+    let candidates = array(authority, "candidates")?;
+    let windows = array(authority, "developmentWindows")?;
+    ensure!(
+        !candidates.is_empty() && !windows.is_empty(),
+        "campaign authority needs candidates and windows"
+    );
+    let expected = candidates
+        .len()
+        .checked_mul(windows.len())
+        .ok_or_else(|| anyhow!("campaign task count overflow"))?;
+    let staging = root.join(".native-task-pack.staging");
+    if staging.exists() {
+        fs::remove_file(&staging).context("remove stale private task-pack staging")?;
+    }
+    let mut out = BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?,
+    );
+    let mut raw_hasher = Sha256::new();
+    let mut matrix_hasher = Sha256::new();
+    matrix_hasher.update(b"[");
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for candidate in candidates {
+        let candidate = object(candidate, "campaign authority candidate")?;
+        for window in windows {
+            let task = build_task(
+                authority,
+                authority_id,
+                candidate,
+                object(window, "campaign authority window")?,
+                attribution,
+            )?;
+            let canonical = canonical_json_bytes(&task)?;
+            let line = canonical_json_line(&task)?;
+            if count > 0 {
+                matrix_hasher.update(b",");
+            }
+            matrix_hasher.update(&canonical);
+            raw_hasher.update(&line);
+            out.write_all(&line)?;
+            bytes = bytes
+                .checked_add(line.len() as u64)
+                .ok_or_else(|| anyhow!("campaign task-pack byte count overflow"))?;
+            count += 1;
+        }
+    }
+    matrix_hasher.update(b"]");
+    ensure!(count == expected, "campaign task-pack count drifted");
+    out.flush()?;
+    out.get_ref()
+        .sync_all()
+        .context("fsync campaign task pack")?;
+    drop(out);
+    let destination = root.join("tasks.jsonl");
+    write_once_from_staging(&destination, &staging)?;
+    Ok(GeneratedTaskPack {
+        task_matrix_sha256: prefixed(matrix_hasher.finalize()),
+        raw_sha256: prefixed(raw_hasher.finalize()),
         task_count: count,
         bytes,
     })
@@ -3160,17 +3588,9 @@ fn v3_ladder_inventory(root: &Path, include_transaction: bool) -> Result<Value> 
         "ladder-archive-population.json",
         "cohort-selection.json",
         "cohort-selection.jsonl",
-        "cohort-population.json",
-        "preparation.json",
-        "authority.json",
-        "evaluation-identity.json",
-        "campaign.json",
-        "screening-run/authority.json",
-        "screening-run/task-manifest.json",
-        "screening-run/checkpoint.json",
-        "native-freeze-result.json",
-        "native-freeze-transaction.json",
-        "native-freeze-receipt.json",
+        V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH,
+        V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH,
+        V5_CAMPAIGN_INPUT_CHECKPOINT_PATH,
         "ladder-freeze-result.json",
     ];
     if include_transaction {
@@ -3216,21 +3636,16 @@ fn write_v3_ladder_freeze_commit(
         object(&cohort, "v3 ladder cohort population")?,
         "populationSha256",
     )?;
-    let native_receipt = read_pretty_json(
-        &root.join("native-freeze-receipt.json"),
-        "native v5 receipt",
-    )?;
-    let native_receipt_sha = string(
-        object(&native_receipt, "native v5 receipt")?,
-        "receiptSha256",
-    )?;
+    let campaign_input =
+        open_v5_campaign_input_checkpoint(&root.join(V5_CAMPAIGN_INPUT_CHECKPOINT_PATH))?;
+    let campaign_input_checkpoint_sha = campaign_input.checkpoint_sha256.as_str();
     let mut transaction = json!({
         "schemaVersion":V5_LADDER_ARCHIVE_FREEZE_TRANSACTION_SCHEMA,"manifestSha256":manifest_sha,
         "archiveAuthorityKind":authority.kind,"archiveAuthorityReceiptSha256":authority.receipt_sha256,
         "validationFreezeReceiptSha256":authority.validation_freeze_receipt_sha256,"validationTailAuthoritySha256":authority.validation_tail_authority_sha256,
         "archiveSha256":authority.archive_sha256,"archiveRawSha256":authority.archive_raw_sha256,"archiveSizeBytes":authority.archive_size_bytes,
         "ladderStage":stage,"ladderCandidateLimit":limit,"ladderAuthoritySha256":ladder_authority_sha,"selectionSha256":string(selection_map,"selectionSha256")?,"projectionRawSha256":projection_sha,
-        "cohortPopulationSha256":cohort_sha,"nativeFreezeReceiptSha256":native_receipt_sha,
+        "cohortPopulationSha256":cohort_sha,"campaignInputCheckpointSha256":campaign_input_checkpoint_sha,
         "campaignSha256":native.get("campaignSha256").cloned().unwrap_or(Value::Null),"authorityId":native.get("authorityId").cloned().unwrap_or(Value::Null),
         "evaluationIdentitySha256":native.get("evaluationIdentitySha256").cloned().unwrap_or(Value::Null),"taskMatrixSha256":native.get("taskMatrixSha256").cloned().unwrap_or(Value::Null),"taskCount":native.get("taskCount").cloned().unwrap_or(Value::Null),
         "outputInventory":v3_ladder_inventory(root, false)?,
@@ -3243,7 +3658,7 @@ fn write_v3_ladder_freeze_commit(
         "validationFreezeReceiptSha256":authority.validation_freeze_receipt_sha256,"validationTailAuthoritySha256":authority.validation_tail_authority_sha256,
         "archiveSha256":authority.archive_sha256,"archiveRawSha256":authority.archive_raw_sha256,"archiveSizeBytes":authority.archive_size_bytes,
         "ladderStage":stage,"ladderCandidateLimit":limit,"ladderAuthoritySha256":ladder_authority_sha,"selectionSha256":string(selection_map,"selectionSha256")?,"projectionRawSha256":projection_sha,
-        "cohortPopulationSha256":cohort_sha,"nativeFreezeReceiptSha256":native_receipt_sha,"campaignSha256":native.get("campaignSha256").cloned().unwrap_or(Value::Null),"authorityId":native.get("authorityId").cloned().unwrap_or(Value::Null),
+        "cohortPopulationSha256":cohort_sha,"campaignInputCheckpointSha256":campaign_input_checkpoint_sha,"campaignSha256":native.get("campaignSha256").cloned().unwrap_or(Value::Null),"authorityId":native.get("authorityId").cloned().unwrap_or(Value::Null),
         "evaluationIdentitySha256":native.get("evaluationIdentitySha256").cloned().unwrap_or(Value::Null),"taskMatrixSha256":native.get("taskMatrixSha256").cloned().unwrap_or(Value::Null),"taskCount":native.get("taskCount").cloned().unwrap_or(Value::Null),
         "outputInventory":v3_ladder_inventory(root, true)?,
     });
@@ -3280,7 +3695,7 @@ fn reopen_v3_ladder_freeze(
             "selectionSha256",
             "projectionRawSha256",
             "cohortPopulationSha256",
-            "nativeFreezeReceiptSha256",
+            "campaignInputCheckpointSha256",
             "campaignSha256",
             "authorityId",
             "evaluationIdentitySha256",
@@ -3322,7 +3737,7 @@ fn reopen_v3_ladder_freeze(
             "selectionSha256",
             "projectionRawSha256",
             "cohortPopulationSha256",
-            "nativeFreezeReceiptSha256",
+            "campaignInputCheckpointSha256",
             "campaignSha256",
             "authorityId",
             "evaluationIdentitySha256",
@@ -3343,8 +3758,15 @@ fn reopen_v3_ladder_freeze(
             && tx.get("validationTailAuthoritySha256") == map.get("validationTailAuthoritySha256")
             && tx.get("archiveAuthorityReceiptSha256") == map.get("archiveAuthorityReceiptSha256")
             && tx.get("taskMatrixSha256") == map.get("taskMatrixSha256")
-            && tx.get("cohortPopulationSha256") == map.get("cohortPopulationSha256"),
+            && tx.get("cohortPopulationSha256") == map.get("cohortPopulationSha256")
+            && tx.get("campaignInputCheckpointSha256") == map.get("campaignInputCheckpointSha256"),
         "v3 ladder freeze transaction identity/output binding drifted"
+    );
+    let campaign_input =
+        open_v5_campaign_input_checkpoint(&root.join(V5_CAMPAIGN_INPUT_CHECKPOINT_PATH))?;
+    ensure!(
+        string(map, "campaignInputCheckpointSha256")? == campaign_input.checkpoint_sha256,
+        "v3 ladder campaign-input checkpoint binding drifted"
     );
     let stage = ladder_stage_and_bindings(spec, false)?;
     let authority = object(
@@ -3563,10 +3985,9 @@ fn execute_v5_ladder_freeze_manifest(spec: &Map<String, Value>) -> Result<Value>
         return finish_ladder_delegation(delegated, stage, archive_sha);
     }
     ensure!(
-        fs::symlink_metadata(&archive_path)?
+        !fs::symlink_metadata(&archive_path)?
             .file_type()
             .is_symlink()
-            == false
             && fs::metadata(&archive_path)?.is_file()
             && fs::metadata(&archive_path)?.len() == archive_size
             && file_sha256(&archive_path)? == archive_raw_sha,
@@ -3988,12 +4409,16 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
     )?;
     let root = PathBuf::from(string(spec, "outputRoot")?);
     fs::create_dir_all(&root).context("create v5 campaign root")?;
-    if root.join("native-freeze-receipt.json").exists() {
-        return load_existing_v5_freeze_receipt(
-            &root,
-            &manifest_sha,
-            string(spec, "nativeRuntimeAuthoritySha256")?,
+    let checkpoint_path = root.join(V5_CAMPAIGN_INPUT_CHECKPOINT_PATH);
+    if checkpoint_path.exists() {
+        let checkpoint = open_v5_campaign_input_checkpoint(&checkpoint_path)?;
+        ensure!(
+            checkpoint.manifest_sha256 == manifest_sha
+                && checkpoint.native_runtime_authority_sha256
+                    == string(spec, "nativeRuntimeAuthoritySha256")?,
+            "campaign-input checkpoint manifest/runtime binding drifted"
         );
+        return Ok(v5_campaign_input_result(&checkpoint, true));
     }
     let commit = string(spec, "executionEngineCommit")?
         .trim()
@@ -4203,12 +4628,9 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
             })
             .collect::<Vec<_>>();
         finite.push(json!({"candidateId":id,"sourceProfile":profile,"sourceProfileSha256":profile_sha,"instrument":instrument,"timeframe":timeframe,"barLimit":bar_limit,"windowInputs":preparation_inputs}));
-        let profile = object(
-            &finite.last().expect("finite candidate"),
-            "finite candidate",
-        )?
-        .get("sourceProfile")
-        .expect("profile");
+        let profile = object(finite.last().expect("finite candidate"), "finite candidate")?
+            .get("sourceProfile")
+            .expect("profile");
         let canonical_identity = panel_scoped_identity(
             candidate,
             &evidence_context,
@@ -4261,24 +4683,19 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
         Value::String(identity_sha.clone()),
     );
 
-    write_once_pretty(&root.join("preparation.json"), &preparation)?;
-    write_once_pretty(&root.join("authority.json"), &authority)?;
-    write_once_pretty(&root.join("evaluation-identity.json"), &identity)?;
     let screening_root = root.join("screening-run");
     fs::create_dir_all(&screening_root).context("create v5 screening-run root")?;
-    let generated = stream_task_manifest(
+    let generated = stream_v5_task_pack(
         authority_map,
         string(authority_map, "authorityId")?,
         &screening_root,
         Some(behavior),
     )?;
-    write_once_pretty(&screening_root.join("authority.json"), &authority)?;
-    write_or_verify_checkpoint(
-        &screening_root.join("checkpoint.json"),
-        string(authority_map, "authorityId")?,
-        &generated.task_matrix_sha256,
-    )?;
-    let mut campaign = json!({"schemaVersion":"temporal_qd_screening_campaign_v3","generationIndex":generation,"populationSha256":population_sha,"constructionCatalog":catalog_identity,"preparationSha256":canonical_sha256(&preparation)?,"authorityId":string(authority_map, "authorityId")?,"taskMatrixSha256":generated.task_matrix_sha256,"candidateCount":source_candidates.len(),"windowCount":windows.len(),"taskCount":task_count,"campaignRole":role,"proposalPopulation":proposal_population,"evaluationIdentitySha256":identity_sha,"marketEvidenceScope":"predeclared_development_windows_only","reservedEvidencePermitted":false,"rotatingEvidenceSha256":rotating_sha,"panelId":panel_id,"archivePolicyAuthority":archive,"behaviorAttributionRequirement":behavior});
+    ensure!(
+        generated.task_count == task_count,
+        "campaign task-pack cardinality drifted from the frozen cohort"
+    );
+    let mut campaign = json!({"schemaVersion":"temporal_qd_screening_campaign_v3","generationIndex":generation,"populationSha256":population_sha,"constructionCatalog":catalog_identity,"preparationSha256":canonical_sha256(&preparation)? ,"authorityId":string(authority_map, "authorityId")?,"taskMatrixSha256":generated.task_matrix_sha256.clone(),"candidateCount":source_candidates.len(),"windowCount":windows.len(),"taskCount":task_count,"campaignRole":role,"proposalPopulation":proposal_population,"evaluationIdentitySha256":identity_sha,"marketEvidenceScope":"predeclared_development_windows_only","reservedEvidencePermitted":false,"rotatingEvidenceSha256":rotating_sha,"panelId":panel_id,"archivePolicyAuthority":archive,"behaviorAttributionRequirement":behavior});
     if let Some(value) = identity.get("evaluationPopulationSha256") {
         campaign
             .as_object_mut()
@@ -4292,37 +4709,65 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
             .insert("bidirectionalPairPolicy".into(), value.clone());
     }
     let campaign_sha = canonical_sha256(&campaign)?;
-    campaign
-        .as_object_mut()
-        .expect("campaign")
-        .insert("campaignSha256".into(), Value::String(campaign_sha.clone()));
-    write_once_pretty(&root.join("campaign.json"), &campaign)?;
-    // The human-readable result is not the commit marker.  It is published
-    // before the transaction so the final receipt can inventory it.
-    let result = json!({"schemaVersion":V5_FREEZE_RESULT_SCHEMA,"campaignSha256":campaign_sha,"authorityId":string(authority_map, "authorityId")?,"taskMatrixSha256":generated.task_matrix_sha256,"candidateCount":source_candidates.len(),"windowCount":windows.len(),"taskCount":task_count,"campaignRole":role,"evaluationIdentitySha256":identity_sha,"outputRoot":root.to_string_lossy(),"telemetry":{"schemaVersion":"temporal_qd_v5_native_campaign_freeze_telemetry_v1","peakLiveCandidates":source_candidates.len(),"peakLiveTasks":1,"taskMatrixEncodedBytes":generated.bytes,"materialization":"native_population_cohort_rotation_authority_stream_v1"}});
-    write_once_current_v5_compact_json(&root.join("native-freeze-result.json"), &result)?;
-    let transaction_inventory = v5_freeze_inventory(&root, false)?;
-    let mut transaction = json!({"schemaVersion":V5_FREEZE_TRANSACTION_SCHEMA,"manifestSha256":manifest_sha,"nativeRuntimeAuthoritySha256":string(spec, "nativeRuntimeAuthoritySha256")?,"evaluationPopulationRawSha256":evaluation_sha,"cohortPopulationSha256":string(object(&cohort, "cohort")?, "populationSha256")?,"templatePreparationSha256":string(spec, "templatePreparationSha256")?,"constructionCatalogSha256":string(spec, "constructionCatalogSha256")?,"preparationSha256":canonical_sha256(&preparation)?,"authorityId":string(authority_map, "authorityId")?,"evaluationIdentitySha256":identity_sha,"campaignSha256":campaign_sha,"taskMatrixSha256":generated.task_matrix_sha256,"candidateCount":source_candidates.len(),"windowCount":windows.len(),"taskCount":task_count,"campaignRole":role,"outputInventory":transaction_inventory});
-    let transaction_sha = canonical_sha256(&transaction)?;
-    transaction.as_object_mut().expect("transaction").insert(
-        "transactionSha256".into(),
-        Value::String(transaction_sha.clone()),
+    let task_pack_path = root.join(V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH);
+    let cohort_population_path = root.join(V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH);
+    let task_pack_bytes = fs::metadata(&task_pack_path)?.len();
+    ensure!(
+        task_pack_bytes == generated.bytes && file_sha256(&task_pack_path)? == generated.raw_sha256,
+        "campaign task-pack byte identity drifted before checkpoint commit"
     );
-    write_once_current_v5_compact_json(&root.join("native-freeze-transaction.json"), &transaction)?;
-    // Receipt-last is the sole completion marker.  On restart it proves the
-    // manifest/runtime identity and every immutable output before sources are
-    // consulted again.
-    let receipt_inventory = v5_freeze_inventory(&root, true)?;
-    let semantic_receipt = json!({"schemaVersion":V5_FREEZE_RECEIPT_SCHEMA,"manifestSha256":manifest_sha,"nativeRuntimeAuthoritySha256":string(spec, "nativeRuntimeAuthoritySha256")?,"campaignSha256":campaign_sha,"authorityId":string(authority_map, "authorityId")?,"evaluationIdentitySha256":identity_sha,"taskMatrixSha256":generated.task_matrix_sha256,"taskCount":task_count});
-    let semantic_receipt_sha = canonical_sha256(&semantic_receipt)?;
-    let mut receipt = json!({"schemaVersion":V5_FREEZE_RECEIPT_SCHEMA,"manifestSha256":manifest_sha,"nativeRuntimeAuthoritySha256":string(spec, "nativeRuntimeAuthoritySha256")?,"transactionSha256":transaction_sha,"campaignSha256":campaign_sha,"authorityId":string(authority_map, "authorityId")?,"evaluationIdentitySha256":identity_sha,"taskMatrixSha256":generated.task_matrix_sha256,"taskCount":task_count,"outputInventory":receipt_inventory,"semanticReceiptSha256":semantic_receipt_sha});
-    let receipt_sha = canonical_sha256(&receipt)?;
-    receipt
+    let cohort_population_bytes = fs::metadata(&cohort_population_path)?.len();
+    let cohort_population_sha256 =
+        string(object(&cohort, "cohort")?, "populationSha256")?.to_owned();
+    let mut checkpoint = json!({
+        "schemaVersion": V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA,
+        "contractVersion": CONTRACT_VERSION,
+        "manifestSha256": manifest_sha,
+        "nativeRuntimeAuthoritySha256": string(spec, "nativeRuntimeAuthoritySha256")?,
+        "generationIndex": generation,
+        "campaignRole": role,
+        "panelId": panel_id,
+        "authorityId": string(authority_map, "authorityId")?,
+        "campaignSha256": campaign_sha,
+        "evaluationIdentitySha256": identity_sha,
+        "taskMatrixSha256": generated.task_matrix_sha256.clone(),
+        "candidateCount": source_candidates.len(),
+        "windowCount": windows.len(),
+        "taskCount": task_count,
+        "tasks": {
+            "relativePath": V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH,
+            "rawSha256": generated.raw_sha256.clone(),
+            "sizeBytes": task_pack_bytes,
+            "recordCount": generated.task_count,
+            "taskMatrixSha256": generated.task_matrix_sha256.clone(),
+        },
+        "cohortPopulation": {
+            "relativePath": V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH,
+            "rawSha256": file_sha256(&cohort_population_path)?,
+            "sizeBytes": cohort_population_bytes,
+            "populationSha256": cohort_population_sha256,
+        },
+        "sourceInputs": {
+            "evaluationPopulationRawSha256": evaluation_sha,
+            "templatePreparationSha256": string(spec, "templatePreparationSha256")?,
+            "constructionCatalogSha256": string(spec, "constructionCatalogSha256")?,
+            "preparationSha256": canonical_sha256(&preparation)?,
+        },
+        "artifactMetrics": {
+            "payloadFileCount": 2,
+            "payloadBytes": task_pack_bytes + cohort_population_bytes,
+            "taskPackBytes": task_pack_bytes,
+            "cohortPopulationBytes": cohort_population_bytes,
+        },
+    });
+    let checkpoint_sha256 = canonical_sha256(&checkpoint)?;
+    checkpoint
         .as_object_mut()
-        .expect("receipt")
-        .insert("receiptSha256".into(), Value::String(receipt_sha));
-    write_once_current_v5_compact_json(&root.join("native-freeze-receipt.json"), &receipt)?;
-    Ok(result)
+        .expect("campaign-input checkpoint")
+        .insert("checkpointSha256".into(), Value::String(checkpoint_sha256));
+    write_once_current_v5_compact_json(&checkpoint_path, &checkpoint)?;
+    let checkpoint = open_v5_campaign_input_checkpoint(&checkpoint_path)?;
+    Ok(v5_campaign_input_result(&checkpoint, false))
 }
 
 /// Historical ladder paths retain their Python-pretty document ABI.  Current
@@ -4731,133 +5176,6 @@ fn validate_v5_runtime_authority(value: &Value) -> Result<()> {
     require_sha(string(map, "binarySha256")?, "v5 native binary sha")
 }
 
-fn v5_freeze_inventory(root: &Path, include_transaction: bool) -> Result<Value> {
-    let mut relative = vec![
-        "cohort-population.json",
-        "preparation.json",
-        "authority.json",
-        "evaluation-identity.json",
-        "campaign.json",
-        "screening-run/authority.json",
-        "screening-run/task-manifest.json",
-        "screening-run/checkpoint.json",
-        "native-freeze-result.json",
-    ];
-    if include_transaction {
-        relative.push("native-freeze-transaction.json");
-    }
-    let mut rows = Vec::with_capacity(relative.len());
-    for path in relative {
-        let full = root.join(path);
-        ensure!(
-            full.is_file(),
-            "v5 freeze output inventory is missing {path}"
-        );
-        rows.push(json!({"relativePath":path,"rawSha256":file_sha256(&full)?}));
-    }
-    Ok(Value::Array(rows))
-}
-
-fn load_existing_v5_freeze_receipt(
-    root: &Path,
-    manifest_sha: &str,
-    runtime_authority_sha: &str,
-) -> Result<Value> {
-    let receipt = read_canonical_json_line(
-        &root.join("native-freeze-receipt.json"),
-        "v5 freeze receipt",
-    )?;
-    let map = object(&receipt, "v5 freeze receipt")?;
-    exact_keys(
-        map,
-        &[
-            "schemaVersion",
-            "manifestSha256",
-            "nativeRuntimeAuthoritySha256",
-            "transactionSha256",
-            "campaignSha256",
-            "authorityId",
-            "evaluationIdentitySha256",
-            "taskMatrixSha256",
-            "taskCount",
-            "outputInventory",
-            "semanticReceiptSha256",
-            "receiptSha256",
-        ],
-        "v5 freeze receipt",
-    )?;
-    ensure!(
-        string(map, "schemaVersion")? == V5_FREEZE_RECEIPT_SCHEMA
-            && string(map, "manifestSha256")? == manifest_sha
-            && string(map, "nativeRuntimeAuthoritySha256")? == runtime_authority_sha
-            && canonical_sha256_without_object_field(&receipt, "receiptSha256")?
-                == string(map, "receiptSha256")?,
-        "v5 freeze receipt identity/runtime binding drifted"
-    );
-    let expected_inventory = v5_freeze_inventory(root, true)?;
-    ensure!(
-        map.get("outputInventory") == Some(&expected_inventory),
-        "v5 freeze receipt output inventory drifted"
-    );
-    let semantic_receipt = json!({"schemaVersion":V5_FREEZE_RECEIPT_SCHEMA,"manifestSha256":manifest_sha,"nativeRuntimeAuthoritySha256":runtime_authority_sha,"campaignSha256":map.get("campaignSha256").cloned().unwrap_or(Value::Null),"authorityId":map.get("authorityId").cloned().unwrap_or(Value::Null),"evaluationIdentitySha256":map.get("evaluationIdentitySha256").cloned().unwrap_or(Value::Null),"taskMatrixSha256":map.get("taskMatrixSha256").cloned().unwrap_or(Value::Null),"taskCount":map.get("taskCount").cloned().unwrap_or(Value::Null)});
-    ensure!(
-        canonical_sha256(&semantic_receipt)? == string(map, "semanticReceiptSha256")?,
-        "v5 freeze receipt semantic identity drifted"
-    );
-    let transaction = read_canonical_json_line(
-        &root.join("native-freeze-transaction.json"),
-        "v5 freeze transaction",
-    )?;
-    let transaction_map = object(&transaction, "v5 freeze transaction")?;
-    exact_keys(
-        transaction_map,
-        &[
-            "schemaVersion",
-            "manifestSha256",
-            "nativeRuntimeAuthoritySha256",
-            "evaluationPopulationRawSha256",
-            "cohortPopulationSha256",
-            "templatePreparationSha256",
-            "constructionCatalogSha256",
-            "preparationSha256",
-            "authorityId",
-            "evaluationIdentitySha256",
-            "campaignSha256",
-            "taskMatrixSha256",
-            "candidateCount",
-            "windowCount",
-            "taskCount",
-            "campaignRole",
-            "outputInventory",
-            "transactionSha256",
-        ],
-        "v5 freeze transaction",
-    )?;
-    ensure!(
-        string(transaction_map, "schemaVersion")? == V5_FREEZE_TRANSACTION_SCHEMA
-            && string(transaction_map, "manifestSha256")? == manifest_sha
-            && string(transaction_map, "nativeRuntimeAuthoritySha256")? == runtime_authority_sha
-            && canonical_sha256_without_object_field(&transaction, "transactionSha256")?
-                == string(transaction_map, "transactionSha256")?
-            && string(map, "transactionSha256")? == string(transaction_map, "transactionSha256")?
-            && transaction_map.get("outputInventory") == Some(&v5_freeze_inventory(root, false)?),
-        "v5 freeze transaction identity/output binding drifted"
-    );
-    let result =
-        read_canonical_json_line(&root.join("native-freeze-result.json"), "v5 freeze result")?;
-    let result_map = object(&result, "v5 freeze result")?;
-    ensure!(
-        string(result_map, "schemaVersion")? == V5_FREEZE_RESULT_SCHEMA
-            && result_map.get("campaignSha256") == map.get("campaignSha256")
-            && result_map.get("authorityId") == map.get("authorityId")
-            && result_map.get("evaluationIdentitySha256") == map.get("evaluationIdentitySha256")
-            && result_map.get("taskMatrixSha256") == map.get("taskMatrixSha256")
-            && result_map.get("taskCount") == map.get("taskCount"),
-        "v5 freeze result receipt binding drifted"
-    );
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5126,10 +5444,12 @@ mod tests {
     }
 
     #[test]
-    fn current_v5_compact_control_outputs_are_restart_safe_and_reject_pretty_legacy_spelling()
+    fn current_v5_campaign_input_checkpoint_is_compact_restart_safe_and_tamper_evident()
     -> Result<()> {
         let root = tempfile::tempdir()?;
         let root_path = root.path();
+        let screening = root_path.join("screening-run");
+        fs::create_dir_all(&screening)?;
         let manifest_sha = test_sha("manifest");
         let runtime_sha = test_sha("runtime");
         let campaign_sha = test_sha("campaign");
@@ -5137,123 +5457,99 @@ mod tests {
         let identity_sha = test_sha("evaluation-identity");
         let task_matrix_sha = test_sha("task-matrix");
 
-        // These remain Python-compatible campaign artifacts. The transaction
-        // inventories their raw bytes but Python never reparses them as the
-        // compact v5 control ABI.
-        for relative in [
-            "cohort-population.json",
+        let task_pack_path = screening.join("tasks.jsonl");
+        fs::write(
+            &task_pack_path,
+            canonical_json_line(&json!({"taskId":"task-1"}))?,
+        )?;
+
+        let mut cohort = json!({
+            "schemaVersion": ROTATING_COHORT_POPULATION_SCHEMA,
+            "generationIndex": 1,
+            "panelId": "panel-a",
+            "cohortRole": "proposal_current_panel",
+            "rotatingEvidenceSha256": test_sha("rotating"),
+            "candidateCount": 1,
+            "candidates": [{"candidateId": "candidate-a"}],
+            "proposalPopulation": true,
+        });
+        let cohort_sha = canonical_sha256(&cohort)?;
+        cohort["populationSha256"] = Value::String(cohort_sha.clone());
+        let cohort_path = root_path.join("cohort-population.json");
+        write_once_pretty(&cohort_path, &cohort)?;
+
+        let task_bytes = fs::metadata(&task_pack_path)?.len();
+        let cohort_bytes = fs::metadata(&cohort_path)?.len();
+        let mut checkpoint = json!({
+            "schemaVersion": V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA,
+            "contractVersion": CONTRACT_VERSION,
+            "manifestSha256": manifest_sha,
+            "nativeRuntimeAuthoritySha256": runtime_sha,
+            "generationIndex": 1,
+            "campaignRole": "proposal_current_panel",
+            "panelId": "panel-a",
+            "authorityId": authority_id,
+            "campaignSha256": campaign_sha,
+            "evaluationIdentitySha256": identity_sha,
+            "taskMatrixSha256": task_matrix_sha,
+            "candidateCount": 1,
+            "windowCount": 1,
+            "taskCount": 1,
+            "tasks": {
+                "relativePath": V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH,
+                "rawSha256": file_sha256(&task_pack_path)?,
+                "sizeBytes": task_bytes,
+                "recordCount": 1,
+                "taskMatrixSha256": task_matrix_sha,
+            },
+            "cohortPopulation": {
+                "relativePath": V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH,
+                "rawSha256": file_sha256(&cohort_path)?,
+                "sizeBytes": cohort_bytes,
+                "populationSha256": cohort_sha,
+            },
+            "sourceInputs": {
+                "evaluationPopulationRawSha256": test_sha("evaluation-raw"),
+                "templatePreparationSha256": test_sha("template"),
+                "constructionCatalogSha256": test_sha("catalog"),
+                "preparationSha256": test_sha("preparation"),
+            },
+            "artifactMetrics": {
+                "payloadFileCount": 2,
+                "payloadBytes": task_bytes + cohort_bytes,
+                "taskPackBytes": task_bytes,
+                "cohortPopulationBytes": cohort_bytes,
+            },
+        });
+        checkpoint["checkpointSha256"] = Value::String(canonical_sha256(&checkpoint)?);
+        let checkpoint_path = root_path.join(V5_CAMPAIGN_INPUT_CHECKPOINT_PATH);
+        write_once_current_v5_compact_json(&checkpoint_path, &checkpoint)?;
+
+        let opened = open_v5_campaign_input_checkpoint(&checkpoint_path)?;
+        assert_eq!(opened.checkpoint_sha256, checkpoint["checkpointSha256"]);
+        assert_eq!(opened.task_count, 1);
+        assert_eq!(opened.candidate_count, 1);
+        let result = v5_campaign_input_result(&opened, true);
+        assert_eq!(result["restart"], true);
+        assert_eq!(result["artifactMetrics"]["payloadFileCount"], 2);
+        for retired in [
             "preparation.json",
             "authority.json",
             "evaluation-identity.json",
             "campaign.json",
             "screening-run/authority.json",
-            "screening-run/task-manifest.json",
             "screening-run/checkpoint.json",
-        ] {
-            let path = root_path.join(relative);
-            fs::create_dir_all(path.parent().expect("output parent"))?;
-            write_once_pretty(&path, &json!({"artifact": relative}))?;
-        }
-        let result = json!({
-            "schemaVersion": V5_FREEZE_RESULT_SCHEMA,
-            "campaignSha256": campaign_sha,
-            "authorityId": authority_id,
-            "taskMatrixSha256": task_matrix_sha,
-            "candidateCount": 1,
-            "windowCount": 1,
-            "taskCount": 1,
-            "campaignRole": "proposal_current_panel",
-            "evaluationIdentitySha256": identity_sha,
-            "outputRoot": root_path.to_string_lossy(),
-            "telemetry": {"schemaVersion": "temporal_qd_v5_native_campaign_freeze_telemetry_v1"},
-        });
-        write_once_current_v5_compact_json(&root_path.join("native-freeze-result.json"), &result)?;
-
-        let transaction_inventory = v5_freeze_inventory(root_path, false)?;
-        let mut transaction = json!({
-            "schemaVersion": V5_FREEZE_TRANSACTION_SCHEMA,
-            "manifestSha256": manifest_sha,
-            "nativeRuntimeAuthoritySha256": runtime_sha,
-            "evaluationPopulationRawSha256": test_sha("evaluation-raw"),
-            "cohortPopulationSha256": test_sha("cohort"),
-            "templatePreparationSha256": test_sha("template"),
-            "constructionCatalogSha256": test_sha("catalog"),
-            "preparationSha256": test_sha("preparation"),
-            "authorityId": authority_id,
-            "evaluationIdentitySha256": identity_sha,
-            "campaignSha256": campaign_sha,
-            "taskMatrixSha256": task_matrix_sha,
-            "candidateCount": 1,
-            "windowCount": 1,
-            "taskCount": 1,
-            "campaignRole": "proposal_current_panel",
-            "outputInventory": transaction_inventory,
-        });
-        transaction["transactionSha256"] = Value::String(canonical_sha256_without_object_field(
-            &transaction,
-            "transactionSha256",
-        )?);
-        write_once_current_v5_compact_json(
-            &root_path.join("native-freeze-transaction.json"),
-            &transaction,
-        )?;
-
-        let semantic_receipt = json!({
-            "schemaVersion": V5_FREEZE_RECEIPT_SCHEMA,
-            "manifestSha256": manifest_sha,
-            "nativeRuntimeAuthoritySha256": runtime_sha,
-            "campaignSha256": campaign_sha,
-            "authorityId": authority_id,
-            "evaluationIdentitySha256": identity_sha,
-            "taskMatrixSha256": task_matrix_sha,
-            "taskCount": 1,
-        });
-        let mut receipt = json!({
-            "schemaVersion": V5_FREEZE_RECEIPT_SCHEMA,
-            "manifestSha256": manifest_sha,
-            "nativeRuntimeAuthoritySha256": runtime_sha,
-            "transactionSha256": transaction["transactionSha256"],
-            "campaignSha256": campaign_sha,
-            "authorityId": authority_id,
-            "evaluationIdentitySha256": identity_sha,
-            "taskMatrixSha256": task_matrix_sha,
-            "taskCount": 1,
-            "outputInventory": v5_freeze_inventory(root_path, true)?,
-            "semanticReceiptSha256": canonical_sha256(&semantic_receipt)?,
-        });
-        receipt["receiptSha256"] = Value::String(canonical_sha256_without_object_field(
-            &receipt,
-            "receiptSha256",
-        )?);
-        write_once_current_v5_compact_json(
-            &root_path.join("native-freeze-receipt.json"),
-            &receipt,
-        )?;
-
-        // Receipt-last restart validates the exact compact bytes and every
-        // inventory root without consulting a former source input.
-        assert_eq!(
-            load_existing_v5_freeze_receipt(root_path, &manifest_sha, &runtime_sha)?,
-            result
-        );
-        for relative in [
             "native-freeze-result.json",
             "native-freeze-transaction.json",
             "native-freeze-receipt.json",
         ] {
-            let raw = fs::read(root_path.join(relative))?;
-            let value: Value = serde_json::from_slice(&raw)?;
-            assert_eq!(raw, canonical_json_line(&value)?);
+            assert!(!root_path.join(retired).exists());
         }
 
-        let legacy_pretty = root_path.join("legacy-pretty-transaction.json");
-        write_once_pretty(&legacy_pretty, &transaction)?;
-        assert!(
-            read_canonical_json_line(&legacy_pretty, "legacy v5 transaction")
-                .unwrap_err()
-                .to_string()
-                .contains("canonical JSON followed by LF")
-        );
+        let mut tampered = checkpoint;
+        tampered["taskCount"] = Value::from(2_u64);
+        write_once_current_v5_compact_json(&root_path.join("tampered.json"), &tampered)?;
+        assert!(open_v5_campaign_input_checkpoint(&root_path.join("tampered.json")).is_err());
         Ok(())
     }
 

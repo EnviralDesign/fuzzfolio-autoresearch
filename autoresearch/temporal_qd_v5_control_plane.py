@@ -59,32 +59,14 @@ from .temporal_qd_v5_native import (
 
 CONTRACT_VERSION = "temporal_qd_native_foundation_v1"
 RUNTIME_AUTHORITY_SCHEMA = "temporal_qd_native_finalization_runtime_authority_v1"
-GATEWAY_RECEIPT_SCHEMA = "temporal_qd_native_gateway_execution_receipt_v2"
+GATEWAY_RECEIPT_SCHEMA = "temporal_qd_native_gateway_execution_receipt_v3"
 GATEWAY_RESULT_SCHEMA = "temporal_qd_native_gateway_dispatch_result_v1"
-CAMPAIGN_SOURCE_BUILD_MANIFEST_SCHEMA = (
-    "temporal_qd_campaign_seal_source_build_manifest_v1"
-)
-CAMPAIGN_SOURCE_BUILD_RESULT_SCHEMA = "temporal_qd_campaign_seal_source_build_result_v1"
-CAMPAIGN_SOURCE_BUILD_RECEIPT_SCHEMA = "temporal_qd_campaign_seal_source_build_receipt_v1"
-CAMPAIGN_SEAL_EXECUTION_SCHEMA = "temporal_qd_campaign_seal_execution_v2"
-CAMPAIGN_SEAL_EXECUTION_RECEIPT_SCHEMA = (
-    "temporal_qd_campaign_seal_execution_receipt_v2"
-)
 CAMPAIGN_SEAL_SCHEMA = "temporal_qd_campaign_seal_v1"
-TAIL_TRANSACTION_SCHEMA = "temporal_qd_generation_tail_transaction_v1"
-TAIL_RESULT_SCHEMA = "temporal_qd_native_tail_reduction_result_v1"
 TAIL_AUTHORITY_RECEIPT_SCHEMA = "temporal_qd_tail_authority_receipt_v1"
-PANEL_SIDECAR_RESULT_SCHEMA = (
-    "temporal_qd_v5_candidate_panel_bundle_sidecar_result_v1"
-)
-PANEL_SIDECAR_RECEIPT_SCHEMA = (
-    "temporal_qd_v5_candidate_panel_bundle_sidecar_receipt_v1"
-)
-PANEL_SIDECAR_DESCRIPTOR_SCHEMA = (
-    "temporal_qd_v5_candidate_panel_bundle_sidecar_descriptor_v1"
-)
-CAMPAIGN_RECEIPT_INPUT_SCHEMA = "temporal_qd_v5_rotating_campaign_receipt_input_v2"
 CAMPAIGN_RECEIPT_SCHEMA = "temporal_qd_v5_rotating_campaign_receipt_v2"
+CAMPAIGN_OUTPUT_MANIFEST_SCHEMA = "temporal_qd_v5_campaign_output_manifest_v1"
+CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA = "temporal_qd_v5_campaign_output_checkpoint_v1"
+CAMPAIGN_OUTPUT_RESULT_SCHEMA = "temporal_qd_v5_campaign_output_result_v1"
 PREFINALIZER_EXECUTION_SCHEMA = "temporal_qd_v5_rotating_prefinalizer_execution_v2"
 PREFINALIZER_EXECUTION_RECEIPT_SCHEMA = (
     "temporal_qd_v5_rotating_prefinalizer_execution_receipt_v2"
@@ -2641,7 +2623,10 @@ def build_native_v5_prefinalizer_base_manifest(
         field="receiptSha256",
         name="native v5 proposal campaign receipt",
     )
-    if proposal_receipt.get("schemaVersion") != CAMPAIGN_RECEIPT_SCHEMA:
+    if proposal_receipt.get("schemaVersion") not in {
+        CAMPAIGN_RECEIPT_SCHEMA,
+        CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA,
+    }:
         raise TemporalQDV5ControlPlaneError("native v5 proposal campaign receipt schema drifted")
     parent_binding = _native_v5_archive_binding(
         previous_parent_archive_binding, name="native v5 previous parent archive"
@@ -2970,7 +2955,8 @@ def build_native_v5_prefinalizer_resume_manifest(
         )
         pair = (str(receipt.get("campaignRole")), str(receipt.get("panelId")))
         if (
-            receipt.get("schemaVersion") != CAMPAIGN_RECEIPT_SCHEMA
+            receipt.get("schemaVersion")
+            not in {CAMPAIGN_RECEIPT_SCHEMA, CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA}
             or receipt.get("generationIndex") != base.get("generationIndex")
             or not pair[0]
             or not pair[1]
@@ -3728,7 +3714,7 @@ def run_native_v5_campaign_freeze(
     expected_schema = (
         "temporal_qd_v5_native_evidence_ladder_freeze_result_v1"
         if reduction_result is not None
-        else "temporal_qd_v5_native_campaign_freeze_result_v1"
+        else "temporal_qd_v5_campaign_input_result_v1"
     )
     if result.get("schemaVersion") != expected_schema or result.get("outputRoot") != str(root):
         raise TemporalQDV5ControlPlaneError("native v5 campaign freeze result drifted")
@@ -3736,50 +3722,130 @@ def run_native_v5_campaign_freeze(
         root / ".native-v5-campaign-freeze-manifest.json",
         name="native v5 campaign freeze manifest",
     )
-    transaction_path = _real_path(
-        root / "native-freeze-transaction.json",
-        name="native v5 campaign freeze transaction",
-    )
-    receipt_path = _real_path(
-        root / "native-freeze-receipt.json", name="native v5 campaign freeze receipt"
+    checkpoint_path = _real_path(
+        root / "campaign-input-checkpoint.json",
+        name="native v5 campaign-input checkpoint",
     )
     manifest = _read_json_object(manifest_path, name="native v5 campaign freeze manifest")
-    transaction = _self_hashed(
+    checkpoint = _self_hashed(
         _read_canonical_object(
-            transaction_path, name="native v5 campaign freeze transaction"
+            checkpoint_path, name="native v5 campaign-input checkpoint"
         ),
-        field="transactionSha256",
-        name="native v5 campaign freeze transaction",
+        field="checkpointSha256",
+        name="native v5 campaign-input checkpoint",
     )
-    receipt = _self_hashed(
-        _read_canonical_object(
-            receipt_path, name="native v5 campaign freeze receipt"
-        ),
-        field="receiptSha256",
-        name="native v5 campaign freeze receipt",
+    expected_checkpoint_fields = {
+        "schemaVersion",
+        "contractVersion",
+        "manifestSha256",
+        "nativeRuntimeAuthoritySha256",
+        "generationIndex",
+        "campaignRole",
+        "panelId",
+        "authorityId",
+        "campaignSha256",
+        "evaluationIdentitySha256",
+        "taskMatrixSha256",
+        "candidateCount",
+        "windowCount",
+        "taskCount",
+        "taskManifest",
+        "cohortPopulation",
+        "sourceInputs",
+        "artifactMetrics",
+        "checkpointSha256",
+    }
+    task_manifest = _mapping(
+        checkpoint.get("taskManifest"), name="native v5 task-manifest descriptor"
+    )
+    cohort_population = _mapping(
+        checkpoint.get("cohortPopulation"),
+        name="native v5 cohort-population descriptor",
+    )
+    source_inputs = _mapping(
+        checkpoint.get("sourceInputs"), name="native v5 campaign source inputs"
+    )
+    artifact_metrics = _mapping(
+        checkpoint.get("artifactMetrics"), name="native v5 campaign artifact metrics"
     )
     if (
-        transaction.get("schemaVersion")
-        != "temporal_qd_v5_native_campaign_freeze_transaction_v2"
-        or receipt.get("schemaVersion")
-        != "temporal_qd_v5_native_campaign_freeze_receipt_v1"
-        or transaction.get("manifestSha256") != manifest.get("manifestSha256")
-        or receipt.get("manifestSha256") != manifest.get("manifestSha256")
-        or receipt.get("transactionSha256") != transaction.get("transactionSha256")
-        or receipt.get("nativeRuntimeAuthoritySha256")
+        set(checkpoint) != expected_checkpoint_fields
+        or checkpoint.get("schemaVersion")
+        != "temporal_qd_v5_campaign_input_checkpoint_v1"
+        or checkpoint.get("contractVersion") != "temporal_qd_native_foundation_v1"
+        or checkpoint.get("manifestSha256") != manifest.get("manifestSha256")
+        or checkpoint.get("nativeRuntimeAuthoritySha256")
         != manifest.get("nativeRuntimeAuthoritySha256")
-        or result.get("campaignSha256") != receipt.get("campaignSha256")
-        or result.get("taskMatrixSha256") != receipt.get("taskMatrixSha256")
-        or result.get("taskCount") != receipt.get("taskCount")
-        or transaction.get("evaluationPopulationRawSha256")
+        or checkpoint.get("campaignRole") != campaign_role
+        or checkpoint.get("panelId") != panel_id
+        or checkpoint.get("candidateCount") * checkpoint.get("windowCount")
+        != checkpoint.get("taskCount")
+        or task_manifest.get("relativePath") != "screening-run/task-manifest.json"
+        or task_manifest.get("taskMatrixSha256")
+        != checkpoint.get("taskMatrixSha256")
+        or cohort_population.get("relativePath") != "cohort-population.json"
+        or source_inputs.get("evaluationPopulationRawSha256")
         != supplied_evaluation_raw_sha256
-        or transaction.get("templatePreparationSha256") != supplied_template_sha256
-        or transaction.get("constructionCatalogSha256") != supplied_catalog_sha256
+        or source_inputs.get("templatePreparationSha256") != supplied_template_sha256
+        or source_inputs.get("constructionCatalogSha256") != supplied_catalog_sha256
+        or artifact_metrics.get("payloadFileCount") != 2
+        or artifact_metrics.get("taskManifestBytes") != task_manifest.get("sizeBytes")
+        or artifact_metrics.get("cohortPopulationBytes")
+        != cohort_population.get("sizeBytes")
+        or artifact_metrics.get("payloadBytes")
+        != task_manifest.get("sizeBytes") + cohort_population.get("sizeBytes")
     ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign freeze receipt drifted")
-    # The campaign-freeze bridge freezes a role-specific authority.  Bind it
-    # to the immutable supervisor runtime binary so a substituted freezer
-    # cannot be smuggled through a valid-looking local receipt.
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-input checkpoint drifted"
+        )
+    for field in (
+        "checkpointSha256",
+        "campaignSha256",
+        "authorityId",
+        "evaluationIdentitySha256",
+        "taskMatrixSha256",
+    ):
+        _sha(checkpoint.get(field), name=f"native v5 campaign input {field}")
+    for descriptor, semantic_field in (
+        (task_manifest, "taskMatrixSha256"),
+        (cohort_population, "populationSha256"),
+    ):
+        if set(descriptor) != {
+            "relativePath",
+            "rawSha256",
+            "sizeBytes",
+            semantic_field,
+        }:
+            raise TemporalQDV5ControlPlaneError(
+                "native v5 campaign-input descriptor schema drifted"
+            )
+        _sha(descriptor.get("rawSha256"), name="native v5 campaign payload raw identity")
+        _sha(descriptor.get(semantic_field), name="native v5 campaign payload semantic identity")
+        _nonnegative(descriptor.get("sizeBytes"), name="native v5 campaign payload size")
+    if any(
+        result.get(key)
+        != (
+            cohort_population.get("populationSha256")
+            if key == "cohortPopulationSha256"
+            else checkpoint.get(key)
+        )
+        for key in (
+            "checkpointSha256",
+            "campaignSha256",
+            "authorityId",
+            "taskMatrixSha256",
+            "candidateCount",
+            "windowCount",
+            "taskCount",
+            "campaignRole",
+            "panelId",
+            "evaluationIdentitySha256",
+            "cohortPopulationSha256",
+        )
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-input result/checkpoint binding drifted"
+        )
     freeze_runtime = _mapping(
         manifest.get("nativeRuntimeAuthority"), name="native v5 campaign runtime"
     )
@@ -3793,34 +3859,18 @@ def run_native_v5_campaign_freeze(
     ).get("fileSha256"):
         raise TemporalQDV5ControlPlaneError("native v5 campaign freezer changed")
 
-    cohort_population_raw_sha256: str | None = None
-    if reduction_result is None:
-        receipt_inventory = _validate_native_v5_ladder_inventory(
-            receipt.get("outputInventory"),
-            expected_paths=_NATIVE_V5_FREEZE_RECEIPT_INVENTORY_PATHS,
-            name="native v5 campaign freeze receipt",
-        )
-        cohort_population_raw_sha256 = next(
-            row["rawSha256"]
-            for row in receipt_inventory
-            if row["relativePath"] == "cohort-population.json"
-        )
-
     return {
         "result": result,
         "outputRoot": str(root),
         "manifest": manifest,
         "manifestPath": str(manifest_path),
-        "transaction": transaction,
-        "transactionPath": str(transaction_path),
-        "receipt": receipt,
-        "receiptPath": str(receipt_path),
-        "cohortPopulationSha256": transaction.get("cohortPopulationSha256"),
-        **(
-            {"cohortPopulationRawSha256": cohort_population_raw_sha256}
-            if cohort_population_raw_sha256 is not None
-            else {}
-        ),
+        "checkpoint": checkpoint,
+        "checkpointPath": str(checkpoint_path),
+        "cohortPopulationSha256": cohort_population.get("populationSha256"),
+        "cohortPopulationRawSha256": cohort_population.get("rawSha256"),
+        "taskManifestPath": str(root / task_manifest["relativePath"]),
+        "taskManifestRawSha256": task_manifest.get("rawSha256"),
+        "artifactMetrics": dict(artifact_metrics),
     }
 
 
@@ -3829,22 +3879,16 @@ _NATIVE_V5_LADDER_TRANSACTION_INVENTORY_PATHS = (
     "cohort-selection.json",
     "cohort-selection.jsonl",
     "cohort-population.json",
-    "preparation.json",
-    "authority.json",
-    "evaluation-identity.json",
-    "campaign.json",
-    "screening-run/authority.json",
     "screening-run/task-manifest.json",
-    "screening-run/checkpoint.json",
-    "native-freeze-result.json",
-    "native-freeze-transaction.json",
-    "native-freeze-receipt.json",
+    "campaign-input-checkpoint.json",
     "ladder-freeze-result.json",
 )
 _NATIVE_V5_LADDER_RECEIPT_INVENTORY_PATHS = (
     *_NATIVE_V5_LADDER_TRANSACTION_INVENTORY_PATHS,
     "ladder-freeze-transaction.json",
 )
+# Read-only compatibility for completed ladder/source-build evidence.  Current
+# campaign construction no longer writes this fragmented inventory.
 _NATIVE_V5_FREEZE_TRANSACTION_INVENTORY_PATHS = (
     "cohort-population.json",
     "preparation.json",
@@ -4228,6 +4272,8 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "manifestSha256",
         "archiveAuthorityKind",
         "archiveAuthorityReceiptSha256",
+        "validationFreezeReceiptSha256",
+        "validationTailAuthoritySha256",
         "archiveSha256",
         "archiveRawSha256",
         "archiveSizeBytes",
@@ -4237,7 +4283,7 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "selectionSha256",
         "projectionRawSha256",
         "cohortPopulationSha256",
-        "nativeFreezeReceiptSha256",
+        "campaignInputCheckpointSha256",
         "campaignSha256",
         "authorityId",
         "evaluationIdentitySha256",
@@ -4252,6 +4298,8 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "transactionSha256",
         "archiveAuthorityKind",
         "archiveAuthorityReceiptSha256",
+        "validationFreezeReceiptSha256",
+        "validationTailAuthoritySha256",
         "archiveSha256",
         "archiveRawSha256",
         "archiveSizeBytes",
@@ -4261,7 +4309,7 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "selectionSha256",
         "projectionRawSha256",
         "cohortPopulationSha256",
-        "nativeFreezeReceiptSha256",
+        "campaignInputCheckpointSha256",
         "campaignSha256",
         "authorityId",
         "evaluationIdentitySha256",
@@ -4295,6 +4343,8 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "manifestSha256",
         "archiveAuthorityKind",
         "archiveAuthorityReceiptSha256",
+        "validationFreezeReceiptSha256",
+        "validationTailAuthoritySha256",
         "archiveSha256",
         "archiveRawSha256",
         "archiveSizeBytes",
@@ -4304,7 +4354,7 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "selectionSha256",
         "projectionRawSha256",
         "cohortPopulationSha256",
-        "nativeFreezeReceiptSha256",
+        "campaignInputCheckpointSha256",
         "campaignSha256",
         "authorityId",
         "evaluationIdentitySha256",
@@ -4333,7 +4383,7 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "selectionSha256",
         "projectionRawSha256",
         "cohortPopulationSha256",
-        "nativeFreezeReceiptSha256",
+        "campaignInputCheckpointSha256",
         "campaignSha256",
         "evaluationIdentitySha256",
         "taskMatrixSha256",
@@ -4341,92 +4391,46 @@ def run_native_v5_evidence_ladder_archive_freeze(
         _sha(receipt.get(field), name=f"native v5 ladder {field}")
     _nonnegative(receipt.get("archiveSizeBytes"), name="native v5 ladder archive size")
     _positive(receipt.get("taskCount"), name="native v5 ladder task count")
-    native_transaction = _self_hashed(
-        _read_bounded_canonical_object(
-            root / "native-freeze-transaction.json",
-            name="native v5 nested freeze transaction",
-        ),
-        field="transactionSha256",
-        name="native v5 nested freeze transaction",
+    campaign_input_path = _real_path(
+        root / "campaign-input-checkpoint.json",
+        name="native v5 ladder campaign-input checkpoint",
     )
-    native_receipt = _self_hashed(
+    campaign_input = _self_hashed(
         _read_bounded_canonical_object(
-            root / "native-freeze-receipt.json",
-            name="native v5 nested freeze receipt",
+            campaign_input_path,
+            name="native v5 ladder campaign-input checkpoint",
         ),
-        field="receiptSha256",
-        name="native v5 nested freeze receipt",
+        field="checkpointSha256",
+        name="native v5 ladder campaign-input checkpoint",
     )
-    expected_native_transaction = {
-        "schemaVersion",
-        "manifestSha256",
-        "nativeRuntimeAuthoritySha256",
-        "evaluationPopulationRawSha256",
-        "cohortPopulationSha256",
-        "templatePreparationSha256",
-        "constructionCatalogSha256",
-        "preparationSha256",
-        "authorityId",
-        "evaluationIdentitySha256",
-        "campaignSha256",
-        "taskMatrixSha256",
-        "candidateCount",
-        "windowCount",
-        "taskCount",
-        "campaignRole",
-        "outputInventory",
-        "transactionSha256",
-    }
-    expected_native_receipt = {
-        "schemaVersion",
-        "manifestSha256",
-        "nativeRuntimeAuthoritySha256",
-        "transactionSha256",
-        "campaignSha256",
-        "authorityId",
-        "evaluationIdentitySha256",
-        "taskMatrixSha256",
-        "taskCount",
-        "outputInventory",
-        "semanticReceiptSha256",
-        "receiptSha256",
-    }
+    task_manifest_descriptor = _mapping(
+        campaign_input.get("taskManifest"),
+        name="native v5 ladder task-manifest descriptor",
+    )
+    cohort_descriptor = _mapping(
+        campaign_input.get("cohortPopulation"),
+        name="native v5 ladder cohort descriptor",
+    )
     if (
-        set(native_transaction) != expected_native_transaction
-        or native_transaction.get("schemaVersion")
-        != "temporal_qd_v5_native_campaign_freeze_transaction_v2"
-        or set(native_receipt) != expected_native_receipt
-        or native_receipt.get("schemaVersion")
-        != "temporal_qd_v5_native_campaign_freeze_receipt_v1"
-        or native_receipt.get("transactionSha256")
-        != native_transaction.get("transactionSha256")
-        or native_receipt.get("receiptSha256")
-        != receipt.get("nativeFreezeReceiptSha256")
+        campaign_input.get("schemaVersion")
+        != "temporal_qd_v5_campaign_input_checkpoint_v1"
+        or campaign_input.get("checkpointSha256")
+        != receipt.get("campaignInputCheckpointSha256")
+        or campaign_input.get("campaignSha256") != receipt.get("campaignSha256")
+        or campaign_input.get("authorityId") != receipt.get("authorityId")
+        or campaign_input.get("evaluationIdentitySha256")
+        != receipt.get("evaluationIdentitySha256")
+        or campaign_input.get("taskMatrixSha256")
+        != receipt.get("taskMatrixSha256")
+        or campaign_input.get("taskCount") != receipt.get("taskCount")
+        or cohort_descriptor.get("populationSha256")
+        != receipt.get("cohortPopulationSha256")
+        or task_manifest_descriptor.get("relativePath")
+        != "screening-run/task-manifest.json"
     ):
-        raise TemporalQDV5ControlPlaneError("native v5 nested freeze receipt drifted")
-    _validate_native_v5_ladder_inventory(
-        native_transaction.get("outputInventory"),
-        expected_paths=_NATIVE_V5_FREEZE_TRANSACTION_INVENTORY_PATHS,
-        name="native v5 nested freeze transaction",
-    )
-    native_receipt_inventory = _validate_native_v5_ladder_inventory(
-        native_receipt.get("outputInventory"),
-        expected_paths=_NATIVE_V5_FREEZE_RECEIPT_INVENTORY_PATHS,
-        name="native v5 nested freeze receipt",
-    )
-    nested_fields = (
-        "cohortPopulationSha256",
-        "authorityId",
-        "evaluationIdentitySha256",
-        "campaignSha256",
-        "taskMatrixSha256",
-        "taskCount",
-    )
-    if any(
-        native_transaction.get(field) != receipt.get(field)
-        for field in nested_fields
-    ) or any(native_receipt.get(field) != receipt.get(field) for field in nested_fields[1:]):
-        raise TemporalQDV5ControlPlaneError("native v5 nested freeze binding drifted")
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder campaign-input checkpoint drifted"
+        )
     if generation != archive_receipt.get("generationIndex"):
         raise TemporalQDV5ControlPlaneError("native v5 ladder archive generation drifted")
     return {
@@ -4438,26 +4442,20 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "transactionPath": str(transaction_path),
         "receipt": receipt,
         "receiptPath": str(receipt_path),
-        "nativeFreezeReceipt": native_receipt,
-        "nativeFreezeReceiptPath": str(root / "native-freeze-receipt.json"),
+        "checkpoint": campaign_input,
+        "checkpointPath": str(campaign_input_path),
         "generationIndex": generation,
         "cohortPopulationPath": str(root / "cohort-population.json"),
-        # This identity comes exclusively from the receipt-authenticated
-        # inventory.  The next Rust stage reopens the population; Python must
-        # not read or hash its candidate-bearing bytes.
-        "cohortPopulationRawSha256": next(
-            row["rawSha256"]
-            for row in native_receipt_inventory
-            if row["relativePath"] == "cohort-population.json"
-        ),
-        "taskManifestPath": str(root / "screening-run" / "task-manifest.json"),
+        "cohortPopulationRawSha256": cohort_descriptor.get("rawSha256"),
+        "taskManifestPath": str(root / task_manifest_descriptor["relativePath"]),
+        "taskManifestRawSha256": task_manifest_descriptor.get("rawSha256"),
     }
 
 
 def run_native_gateway_dispatch(
     *,
     runtime_authority: Mapping[str, Any],
-    task_manifest_path: Path | str,
+    campaign_input_checkpoint_path: Path | str,
     output_root: Path | str,
     gateway_url: str,
     mode: str,
@@ -4469,19 +4467,33 @@ def run_native_gateway_dispatch(
     result_batch_size: int = 1,
     max_request_bytes: int = 64 * 1024 * 1024,
     max_response_bytes: int = 64 * 1024 * 1024,
+    maintenance_probe_interval_millis: int = 30_000,
+    maintenance_timeout_seconds: int = 12 * 60 * 60,
 ) -> dict[str, Any]:
-    """Dispatch one sealed task matrix through the compact v2 receipt.
+    """Dispatch one campaign-input checkpoint into one packed result stream.
 
-    The receipt deliberately summarizes the result-inventory sidecar.  Python
-    must not reopen that sidecar, the task manifest, checkpoint, or completion
-    journal: the pinned dispatcher validates their bytes before it publishes
-    the bounded receipt.  Candidate-window result payloads can individually
-    approach the gateway response cap, so the production default drains one
-    durable result per response while retaining batched task enqueue.
+    The dispatcher owns the task index, append-only result pack, completion
+    journal, and one receipt-last commit. Python validates only that compact
+    receipt and never reopens candidate-window payloads.
     """
 
     authority = _validate_runtime_authority(runtime_authority)
-    task_manifest = _real_path(task_manifest_path, name="native v5 gateway task manifest")
+    campaign_input_checkpoint = _real_path(
+        campaign_input_checkpoint_path,
+        name="native v5 gateway campaign-input checkpoint",
+    )
+    campaign_input = _self_hashed(
+        _read_bounded_canonical_object(
+            campaign_input_checkpoint,
+            name="native v5 gateway campaign-input checkpoint",
+        ),
+        field="checkpointSha256",
+        name="native v5 gateway campaign-input checkpoint",
+    )
+    if campaign_input.get("schemaVersion") != "temporal_qd_v5_campaign_input_checkpoint_v1":
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 gateway campaign-input checkpoint schema drifted"
+        )
     root = _real_directory(output_root, name="native v5 gateway output root")
     if not isinstance(gateway_url, str) or not gateway_url:
         raise TemporalQDV5ControlPlaneError("native v5 gateway URL is invalid")
@@ -4494,10 +4506,14 @@ def run_native_gateway_dispatch(
         "result batch": result_batch_size,
         "maximum request bytes": max_request_bytes,
         "maximum response bytes": max_response_bytes,
+        "maintenance probe interval": maintenance_probe_interval_millis,
+        "maintenance timeout": maintenance_timeout_seconds,
     }
     for name, value in values.items():
         _positive(value, name=name)
-    receipt_path = root / ".native-gateway-dispatch" / "execution-receipt.json"
+    sidecar_root = root / ".native-gateway-dispatch"
+    receipt_path = sidecar_root / "execution-receipt.json"
+    result_pack_path = sidecar_root / "results.pack"
     if mode == "fresh" and receipt_path.exists():
         raise TemporalQDV5ControlPlaneError(
             "native v5 gateway fresh dispatch found an immutable execution receipt"
@@ -4505,8 +4521,8 @@ def run_native_gateway_dispatch(
     binary = pinned_runtime_binary(runtime_authority=authority, role="gatewayDispatch")
     command = [
         str(binary),
-        "--task-manifest",
-        str(task_manifest),
+        "--campaign-input-checkpoint",
+        str(campaign_input_checkpoint),
         "--output-root",
         str(root),
         "--gateway-url",
@@ -4526,6 +4542,10 @@ def run_native_gateway_dispatch(
         str(max_request_bytes),
         "--max-response-bytes",
         str(max_response_bytes),
+        "--maintenance-probe-interval-millis",
+        str(maintenance_probe_interval_millis),
+        "--maintenance-timeout-seconds",
+        str(maintenance_timeout_seconds),
     ]
     if gateway_token is not None:
         if not isinstance(gateway_token, str) or not gateway_token:
@@ -4538,16 +4558,27 @@ def run_native_gateway_dispatch(
         timeout_seconds=_positive(timeout_seconds, name="gateway timeout"),
     )
     expected_result = {
-        "schemaVersion", "authorityId", "taskMatrixSha256", "taskCount",
-        "completedTaskCount", "taskIndexRootSha256", "checkpointPath",
-        "sidecarRoot", "createdTaskSidecar", "executionReceiptSha256",
-        "semanticExecutionReceiptSha256", "executionReceiptPath", "telemetry",
+        "schemaVersion",
+        "authorityId",
+        "taskMatrixSha256",
+        "campaignInputCheckpointSha256",
+        "campaignInputCheckpointPath",
+        "taskCount",
+        "completedTaskCount",
+        "taskIndexRootSha256",
+        "resultPackPath",
+        "sidecarRoot",
+        "createdTaskIndex",
+        "executionReceiptSha256",
+        "semanticExecutionReceiptSha256",
+        "executionReceiptPath",
+        "telemetry",
     }
     if (
         set(result) != expected_result
         or result.get("schemaVersion") != GATEWAY_RESULT_SCHEMA
         or not isinstance(result.get("telemetry"), Mapping)
-        or not isinstance(result.get("createdTaskSidecar"), bool)
+        or not isinstance(result.get("createdTaskIndex"), bool)
     ):
         raise TemporalQDV5ControlPlaneError("native v5 gateway result schema drifted")
     receipt = _self_hashed(
@@ -4558,22 +4589,38 @@ def run_native_gateway_dispatch(
         name="native v5 gateway receipt",
     )
     expected_receipt = {
-        "schemaVersion", "runtimeRoleSha256", "authorityId", "taskMatrixSha256",
-        "sourceTaskManifestSha256", "taskIndexRootSha256",
-        "completionJournalSemanticSha256", "checkpointSemanticSha256",
-        "taskCount", "completedTaskCount", "resultInventoryRootSha256",
-        "resultInventorySha256", "resultInventorySizeBytes", "resultInventoryCount",
-        "completionJournalSha256", "checkpointSha256", "semanticReceiptSha256",
+        "schemaVersion",
+        "runtimeRoleSha256",
+        "authorityId",
+        "taskMatrixSha256",
+        "campaignInputCheckpointSha256",
+        "campaignTaskPackRawSha256",
+        "campaignTaskPackSizeBytes",
+        "taskIndexRootSha256",
+        "taskCount",
+        "completedTaskCount",
+        "resultSetSemanticSha256",
+        "completionJournalSha256",
+        "resultPackSha256",
+        "resultPackSizeBytes",
+        "resultCount",
+        "semanticReceiptSha256",
         "receiptSha256",
     }
     if set(receipt) != expected_receipt or receipt.get("schemaVersion") != GATEWAY_RECEIPT_SCHEMA:
         raise TemporalQDV5ControlPlaneError("native v5 gateway receipt schema drifted")
     semantic_fields = (
-        "schemaVersion", "runtimeRoleSha256", "authorityId", "taskMatrixSha256",
-        "sourceTaskManifestSha256", "taskIndexRootSha256",
-        "completionJournalSemanticSha256", "checkpointSemanticSha256",
-        "taskCount", "completedTaskCount", "resultInventoryRootSha256",
-        "resultInventorySha256", "resultInventorySizeBytes", "resultInventoryCount",
+        "schemaVersion",
+        "runtimeRoleSha256",
+        "authorityId",
+        "taskMatrixSha256",
+        "campaignInputCheckpointSha256",
+        "campaignTaskPackRawSha256",
+        "campaignTaskPackSizeBytes",
+        "taskIndexRootSha256",
+        "taskCount",
+        "completedTaskCount",
+        "resultSetSemanticSha256",
     )
     semantic = {key: receipt[key] for key in semantic_fields}
     if canonical_sha256(semantic) != _sha(
@@ -4581,15 +4628,23 @@ def run_native_gateway_dispatch(
     ):
         raise TemporalQDV5ControlPlaneError("native v5 gateway semantic receipt drifted")
     for field in (
-        "runtimeRoleSha256", "taskMatrixSha256", "sourceTaskManifestSha256",
-        "taskIndexRootSha256", "completionJournalSemanticSha256",
-        "checkpointSemanticSha256", "resultInventoryRootSha256",
-        "resultInventorySha256", "completionJournalSha256", "checkpointSha256",
+        "runtimeRoleSha256",
+        "authorityId",
+        "taskMatrixSha256",
+        "campaignInputCheckpointSha256",
+        "campaignTaskPackRawSha256",
+        "taskIndexRootSha256",
+        "resultSetSemanticSha256",
+        "completionJournalSha256",
+        "resultPackSha256",
     ):
         _sha(receipt.get(field), name=f"native v5 gateway {field}")
     for field in (
-        "taskCount", "completedTaskCount", "resultInventorySizeBytes",
-        "resultInventoryCount",
+        "campaignTaskPackSizeBytes",
+        "taskCount",
+        "completedTaskCount",
+        "resultPackSizeBytes",
+        "resultCount",
     ):
         _nonnegative(receipt.get(field), name=f"native v5 gateway {field}")
     runtime_role = canonical_sha256(
@@ -4599,14 +4654,30 @@ def run_native_gateway_dispatch(
             "binaryRole": "temporal-qd-gateway-dispatch",
         }
     )
+    task_descriptor = _mapping(
+        campaign_input.get("tasks"), name="native v5 campaign-input task pack"
+    )
     if (
         receipt["runtimeRoleSha256"] != runtime_role
         or receipt["taskCount"] != receipt["completedTaskCount"]
+        or receipt["taskCount"] != receipt["resultCount"]
+        or receipt["campaignInputCheckpointSha256"]
+        != campaign_input.get("checkpointSha256")
+        or receipt["authorityId"] != campaign_input.get("authorityId")
+        or receipt["taskMatrixSha256"] != campaign_input.get("taskMatrixSha256")
+        or receipt["taskCount"] != campaign_input.get("taskCount")
+        or receipt["campaignTaskPackRawSha256"] != task_descriptor.get("rawSha256")
+        or receipt["campaignTaskPackSizeBytes"] != task_descriptor.get("sizeBytes")
         or result["authorityId"] != receipt["authorityId"]
         or result["taskMatrixSha256"] != receipt["taskMatrixSha256"]
+        or result["campaignInputCheckpointSha256"]
+        != receipt["campaignInputCheckpointSha256"]
+        or result["campaignInputCheckpointPath"] != str(campaign_input_checkpoint)
         or result["taskIndexRootSha256"] != receipt["taskIndexRootSha256"]
         or result["taskCount"] != receipt["taskCount"]
         or result["completedTaskCount"] != receipt["completedTaskCount"]
+        or result["resultPackPath"] != str(result_pack_path)
+        or result["sidecarRoot"] != str(sidecar_root)
         or result["executionReceiptSha256"] != receipt["receiptSha256"]
         or result["semanticExecutionReceiptSha256"] != receipt["semanticReceiptSha256"]
         or result["executionReceiptPath"] != str(receipt_path)
@@ -4616,141 +4687,292 @@ def run_native_gateway_dispatch(
         "result": result,
         "receipt": receipt,
         "receiptPath": str(receipt_path),
+        "resultPackPath": str(result_pack_path),
         "outputRoot": str(root),
-        "checkpointPath": str(result["checkpointPath"]),
+        "campaignInputCheckpoint": campaign_input,
+        "campaignInputCheckpointPath": str(campaign_input_checkpoint),
     }
 
 
-def build_native_campaign_seal_source(
+
+def run_native_campaign_output(
     *,
     runtime_authority: Mapping[str, Any],
-    freezer_root: Path | str,
-    gateway_output_root: Path | str,
-    source_root: Path | str,
-    funnel_projection_included: bool = True,
-    timeout_seconds: int = 300,
+    campaign_input_checkpoint_path: Path | str,
+    gateway_execution_receipt_path: Path | str,
+    output_root: Path | str,
+    generation_index: int,
+    campaign_role: str,
+    panel_id: str,
+    rotating_evidence_sha256: str,
+    panel: Mapping[str, Any],
+    cohort_source: Mapping[str, Any],
+    minimum_total_trades: int,
+    minimum_trades_per_window: int,
+    cap_trades: int,
+    provisional_limit: int,
+    timeout_seconds: int = 900,
 ) -> dict[str, Any]:
-    """Join freezer and gateway through compact receipts only.
+    """Commit one campaign-output checkpoint from one input and gateway receipt.
 
-    ``campaign-seal-source.json`` is deliberately candidate-scale.  Its
-    receipt carries the one semantic root needed by campaign-seal, so Python
-    neither opens nor hashes the source on fresh execution or restart.
+    This replaces campaign source build, campaign seal publication, panel
+    sidecar publication, and rotating campaign receipt assembly. Python writes
+    one bounded manifest and accepts one bounded receipt-last checkpoint; all
+    candidate/result-scale material stays in Rust-owned packs and JSONL files.
     """
 
     authority = _validate_runtime_authority(runtime_authority)
-    freezer = _real_directory(freezer_root, name="native v5 freezer root")
-    gateway_root = _real_directory(gateway_output_root, name="native v5 gateway root")
-    destination = _real_directory(source_root, name="native v5 campaign source root")
-    task_manifest = _real_path(
-        freezer / "screening-run" / "task-manifest.json",
-        name="native v5 freezer task manifest",
+    input_path = _real_path(
+        campaign_input_checkpoint_path,
+        name="native v5 campaign-input checkpoint",
     )
-    freezer_receipt_path = _real_path(
-        freezer / "native-freeze-receipt.json", name="native v5 freezer receipt"
-    )
-    gateway_receipt_path = _real_path(
-        gateway_root / ".native-gateway-dispatch" / "execution-receipt.json",
-        name="native v5 gateway receipt",
-    )
-    freezer_receipt = _self_hashed(
+    campaign_input = _self_hashed(
         _read_bounded_canonical_object(
-            freezer_receipt_path, name="native v5 freezer receipt"
+            input_path, name="native v5 campaign-input checkpoint"
         ),
-        field="receiptSha256",
-        name="native v5 freezer receipt",
+        field="checkpointSha256",
+        name="native v5 campaign-input checkpoint",
+    )
+    if campaign_input.get("schemaVersion") != "temporal_qd_v5_campaign_input_checkpoint_v1":
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-input checkpoint schema drifted"
+        )
+    gateway_path = _real_path(
+        gateway_execution_receipt_path,
+        name="native v5 gateway execution receipt",
     )
     gateway_receipt = _self_hashed(
         _read_bounded_canonical_object(
-            gateway_receipt_path, name="native v5 gateway receipt"
+            gateway_path, name="native v5 gateway execution receipt"
         ),
         field="receiptSha256",
-        name="native v5 gateway receipt",
+        name="native v5 gateway execution receipt",
     )
     if gateway_receipt.get("schemaVersion") != GATEWAY_RECEIPT_SCHEMA:
-        raise TemporalQDV5ControlPlaneError("native v5 gateway receipt schema drifted")
-    source_path = destination / "campaign-seal-source.json"
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 gateway execution receipt schema drifted"
+        )
+    root = _real_directory(output_root, name="native v5 campaign-output root")
+    generation = _positive(generation_index, name="native v5 campaign-output generation")
+    if campaign_role not in {
+        "proposal_current_panel",
+        "retained_parent_current_panel",
+        "prior_panel_backfill",
+    }:
+        raise TemporalQDV5ControlPlaneError("native v5 campaign-output role is invalid")
+    if not isinstance(panel_id, str) or not panel_id:
+        raise TemporalQDV5ControlPlaneError("native v5 campaign-output panel id is invalid")
+    panel_value = dict(_mapping(panel, name="native v5 campaign-output panel"))
+    if panel_value.get("panelId") != panel_id:
+        raise TemporalQDV5ControlPlaneError("native v5 campaign-output panel binding drifted")
+    cohort = dict(_mapping(cohort_source, name="native v5 campaign cohort source"))
+    if set(cohort) != {
+        "kind",
+        "sourceSemanticSha256",
+        "candidateCount",
+        "selectionSha256",
+    } or cohort.get("kind") not in {
+        "proposal_evaluation_population",
+        "sealed_cohort_selection",
+    }:
+        raise TemporalQDV5ControlPlaneError("native v5 campaign cohort source drifted")
+    cohort["sourceSemanticSha256"] = _sha(
+        cohort.get("sourceSemanticSha256"), name="native v5 cohort source identity"
+    )
+    cohort["candidateCount"] = _positive(
+        cohort.get("candidateCount"), name="native v5 cohort candidate count"
+    )
+    if cohort["kind"] == "proposal_evaluation_population":
+        if cohort.get("selectionSha256") is not None:
+            raise TemporalQDV5ControlPlaneError(
+                "native v5 proposal cohort cannot name a selection"
+            )
+    else:
+        cohort["selectionSha256"] = _sha(
+            cohort.get("selectionSha256"), name="native v5 cohort selection identity"
+        )
+    numeric = {
+        "minimum total trades": minimum_total_trades,
+        "minimum trades per window": minimum_trades_per_window,
+        "cap trades": cap_trades,
+        "provisional limit": provisional_limit,
+    }
+    for name, value in numeric.items():
+        _nonnegative(value, name=f"native v5 campaign-output {name}")
+    if provisional_limit < 1:
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-output provisional limit must be positive"
+        )
+    if (
+        campaign_input.get("generationIndex") != generation
+        or campaign_input.get("campaignRole") != campaign_role
+        or campaign_input.get("panelId") != panel_id
+        or campaign_input.get("candidateCount") != cohort["candidateCount"]
+        or gateway_receipt.get("campaignInputCheckpointSha256")
+        != campaign_input.get("checkpointSha256")
+        or gateway_receipt.get("taskMatrixSha256")
+        != campaign_input.get("taskMatrixSha256")
+        or gateway_receipt.get("taskCount") != campaign_input.get("taskCount")
+        or gateway_receipt.get("completedTaskCount") != campaign_input.get("taskCount")
+        or gateway_receipt.get("resultCount") != campaign_input.get("taskCount")
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-output input/gateway binding drifted"
+        )
     manifest = {
-        "schemaVersion": CAMPAIGN_SOURCE_BUILD_MANIFEST_SCHEMA,
-        "taskManifestPath": str(task_manifest),
-        "freezerReceiptPath": str(freezer_receipt_path),
-        "gatewayOutputRoot": str(gateway_root),
-        "gatewayReceiptPath": str(gateway_receipt_path),
-        "sourcePath": str(source_path),
-        "funnelProjectionIncluded": bool(funnel_projection_included),
+        "schemaVersion": CAMPAIGN_OUTPUT_MANIFEST_SCHEMA,
+        "contractVersion": CONTRACT_VERSION,
+        "operation": "commit_campaign_output_checkpoint",
+        "runtimeAuthoritySha256": authority["authoritySha256"],
+        "campaignInputCheckpointPath": str(input_path),
+        "campaignInputCheckpointSha256": campaign_input["checkpointSha256"],
+        "gatewayExecutionReceiptPath": str(gateway_path),
+        "gatewayExecutionReceiptSha256": gateway_receipt["receiptSha256"],
+        "generationIndex": generation,
+        "campaignRole": campaign_role,
+        "panelId": panel_id,
+        "rotatingEvidenceSha256": _sha(
+            rotating_evidence_sha256,
+            name="native v5 rotating evidence identity",
+        ),
+        "panel": panel_value,
+        "cohortSource": cohort,
+        "minimumTotalTrades": minimum_total_trades,
+        "minimumTradesPerWindow": minimum_trades_per_window,
+        "capTrades": cap_trades,
+        "provisionalLimit": provisional_limit,
+        "resultPath": "campaign-output-checkpoint.json",
     }
     manifest["manifestSha256"] = canonical_sha256(manifest)
     manifest_path = _write_canonical_once(
-        destination / "source-build-manifest.json",
+        root / "campaign-output-manifest.json",
         manifest,
-        name="native v5 campaign source-build manifest",
+        name="native v5 campaign-output manifest",
     )
     binary = pinned_runtime_binary(runtime_authority=authority, role="campaignSeal")
     result = _run_pinned(
         runtime_authority=authority,
         role="campaignSeal",
-        command=[str(binary), "--build-source-manifest", str(manifest_path)],
-        timeout_seconds=timeout_seconds,
+        command=[str(binary), "--campaign-output-manifest", str(manifest_path)],
+        timeout_seconds=_positive(timeout_seconds, name="campaign-output timeout"),
     )
-    expected = {
-        "schemaVersion", "sourcePath", "sourceSha256", "receiptPath", "receiptSha256",
-        "authorityId", "taskMatrixSha256", "taskCount",
+    expected_result = {
+        "schemaVersion",
+        "restart",
+        "checkpointPath",
+        "checkpointSha256",
+        "generationIndex",
+        "campaignRole",
+        "panelId",
+        "taskCount",
+        "evaluatedMemberCount",
+        "panelBundleCount",
+        "semanticReceiptSha256",
+        "receiptSha256",
+        "campaignSeal",
+        "directionalTailAuthority",
+        "tailResultIndex",
+        "artifactMetrics",
     }
     if (
-        set(result) != expected
-        or result.get("schemaVersion") != CAMPAIGN_SOURCE_BUILD_RESULT_SCHEMA
+        set(result) != expected_result
+        or result.get("schemaVersion") != CAMPAIGN_OUTPUT_RESULT_SCHEMA
+        or not isinstance(result.get("restart"), bool)
+        or not isinstance(result.get("artifactMetrics"), Mapping)
     ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign source-build result schema drifted")
-    receipt_path = destination / "source-build-receipt.json"
-    receipt = _self_hashed(
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-output result schema drifted"
+        )
+    checkpoint_path = _real_path(
+        result.get("checkpointPath"), name="native v5 campaign-output checkpoint"
+    )
+    checkpoint = _self_hashed(
         _read_bounded_canonical_object(
-            receipt_path, name="native v5 campaign source-build receipt"
+            checkpoint_path, name="native v5 campaign-output checkpoint"
         ),
         field="receiptSha256",
-        name="native v5 campaign source-build receipt",
+        name="native v5 campaign-output checkpoint",
     )
-    receipt_expected = {
-        "schemaVersion", "manifestSha256", "freezerReceiptSha256", "gatewayReceiptSha256",
-        "sourceSha256", "authorityId", "taskMatrixSha256", "taskCount", "sourcePath",
+    expected_checkpoint = {
+        "schemaVersion",
+        "contractVersion",
+        "generationIndex",
+        "campaignRole",
+        "panelId",
+        "rotatingEvidenceSha256",
+        "cohortSource",
+        "campaignInput",
+        "campaignSeal",
+        "campaignSealDocument",
+        "evaluatedMembers",
+        "candidatePanelBundles",
+        "semanticReceiptSha256",
+        "manifestSha256",
+        "runtimeAuthoritySha256",
+        "gatewayReceiptSha256",
+        "gatewaySemanticReceiptSha256",
+        "executionBindings",
         "receiptSha256",
     }
     if (
-        set(receipt) != receipt_expected
-        or receipt.get("schemaVersion") != CAMPAIGN_SOURCE_BUILD_RECEIPT_SCHEMA
+        set(checkpoint) != expected_checkpoint
+        or checkpoint.get("schemaVersion") != CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA
+        or checkpoint.get("contractVersion") != CONTRACT_VERSION
+        or checkpoint.get("manifestSha256") != manifest["manifestSha256"]
+        or checkpoint.get("runtimeAuthoritySha256") != authority["authoritySha256"]
+        or checkpoint.get("gatewayReceiptSha256") != gateway_receipt["receiptSha256"]
+        or checkpoint.get("gatewaySemanticReceiptSha256")
+        != gateway_receipt["semanticReceiptSha256"]
+        or checkpoint.get("generationIndex") != generation
+        or checkpoint.get("campaignRole") != campaign_role
+        or checkpoint.get("panelId") != panel_id
+        or checkpoint.get("cohortSource") != cohort
+        or result.get("checkpointSha256") != checkpoint["receiptSha256"]
+        or result.get("generationIndex") != generation
+        or result.get("campaignRole") != campaign_role
+        or result.get("panelId") != panel_id
+        or result.get("taskCount") != campaign_input.get("taskCount")
+        or result.get("evaluatedMemberCount") != cohort["candidateCount"]
+        or result.get("panelBundleCount") != cohort["candidateCount"]
+        or result.get("semanticReceiptSha256")
+        != checkpoint["semanticReceiptSha256"]
+        or result.get("receiptSha256") != checkpoint["receiptSha256"]
+        or result.get("campaignSeal") != checkpoint["campaignSealDocument"]
     ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign source-build receipt schema drifted")
-    for field in (
-        "manifestSha256", "freezerReceiptSha256", "gatewayReceiptSha256", "sourceSha256",
-        "taskMatrixSha256", "receiptSha256",
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-output checkpoint binding drifted"
+        )
+    semantic_fields = (
+        "schemaVersion",
+        "contractVersion",
+        "generationIndex",
+        "campaignRole",
+        "panelId",
+        "rotatingEvidenceSha256",
+        "cohortSource",
+        "campaignInput",
+        "campaignSeal",
+        "campaignSealDocument",
+        "evaluatedMembers",
+        "candidatePanelBundles",
+    )
+    if canonical_sha256({key: checkpoint[key] for key in semantic_fields}) != _sha(
+        checkpoint.get("semanticReceiptSha256"),
+        name="native v5 campaign-output semantic receipt",
     ):
-        _sha(receipt.get(field), name=f"native v5 campaign source-build {field}")
-    _nonnegative(receipt.get("taskCount"), name="native v5 campaign source-build task count")
-    if (
-        result["sourcePath"] != str(source_path)
-        or result["receiptPath"] != str(receipt_path)
-        or receipt["manifestSha256"] != manifest["manifestSha256"]
-        or receipt["freezerReceiptSha256"] != freezer_receipt["receiptSha256"]
-        or receipt["gatewayReceiptSha256"] != gateway_receipt["receiptSha256"]
-        or result["sourceSha256"] != receipt["sourceSha256"]
-        or result["authorityId"] != receipt["authorityId"]
-        or result["taskMatrixSha256"] != receipt["taskMatrixSha256"]
-        or result["taskCount"] != receipt["taskCount"]
-        or result["receiptSha256"] != receipt["receiptSha256"]
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign source-build binding drifted")
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 campaign-output semantic receipt drifted"
+        )
     return {
         "manifest": manifest,
         "manifestPath": str(manifest_path),
         "result": result,
-        "receipt": receipt,
-        "receiptPath": str(receipt_path),
-        "sourcePath": str(source_path),
-        "sourceSha256": receipt["sourceSha256"],
-        "freezerRoot": str(freezer),
-        "freezerReceipt": freezer_receipt,
-        "gatewayOutputRoot": str(gateway_root),
-        "gatewayReceipt": gateway_receipt,
+        "checkpoint": checkpoint,
+        "checkpointPath": str(checkpoint_path),
+        "receipt": checkpoint,
+        "receiptPath": str(checkpoint_path),
+        "outputRoot": str(root),
     }
-
 
 def _validated_native_v5_tail_authority_receipt(
     *,
@@ -5121,854 +5343,9 @@ def run_native_v5_archive_reducer(
     }
 
 
-def run_native_campaign_seal(
-    *,
-    runtime_authority: Mapping[str, Any],
-    source_build: Mapping[str, Any],
-    evaluation_population_path: Path | str,
-    output_root: Path | str,
-    generation_index: int,
-    minimum_total_trades: int,
-    minimum_trades_per_window: int,
-    cap_trades: int,
-    provisional_limit: int,
-    evaluation_population_sha256: str,
-    tail_authority_only: bool = False,
-    timeout_seconds: int = 900,
-) -> dict[str, Any]:
-    """Seal through the receipt-only v2 execution boundary.
-
-    The former v1 return carried a candidate-bearing tail transaction and
-    prompted Python to parse/hash the v4 index and evaluated-members JSONL.
-    Current v5 accepts only the compact execution receipt; Rust reopens every
-    payload named by it when the next native stage needs one.
-    """
-
-    if tail_authority_only:
-        raise TemporalQDV5ControlPlaneError(
-            "current native v5 rejects the retired tail_authority_only seal route"
-        )
-    authority = _validate_runtime_authority(runtime_authority)
-    source = _mapping(source_build, name="native v5 source-build handoff")
-    source_result = _mapping(
-        source.get("result"), name="native v5 campaign source-build result"
-    )
-    source_receipt = _self_hashed(
-        _mapping(source.get("receipt"), name="native v5 campaign source-build receipt"),
-        field="receiptSha256",
-        name="native v5 campaign source-build receipt",
-    )
-    expected_source_result = {
-        "schemaVersion", "sourcePath", "sourceSha256", "receiptPath", "receiptSha256",
-        "authorityId", "taskMatrixSha256", "taskCount",
-    }
-    if (
-        set(source_result) != expected_source_result
-        or source_result.get("schemaVersion") != CAMPAIGN_SOURCE_BUILD_RESULT_SCHEMA
-        or source_result.get("sourcePath") != source.get("sourcePath")
-        or source_result.get("sourceSha256") != source_receipt.get("sourceSha256")
-        or source_result.get("receiptSha256") != source_receipt.get("receiptSha256")
-        or source_result.get("receiptPath") != source.get("receiptPath")
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign source-build handoff drifted")
-    source_path_value = source_result.get("sourcePath")
-    if not isinstance(source_path_value, str) or not Path(source_path_value).is_absolute():
-        raise TemporalQDV5ControlPlaneError("native v5 campaign source path is invalid")
-    source_sha256 = _sha(
-        source_result.get("sourceSha256"), name="native v5 campaign source identity"
-    )
-    evaluation_value = evaluation_population_path
-    evaluation = Path(evaluation_value)
-    if not evaluation.is_absolute():
-        raise TemporalQDV5ControlPlaneError("native v5 evaluation population path is invalid")
-    evaluation = Path(os.path.abspath(str(evaluation)))
-    # The freezer authenticated this candidate-bearing population.  The seal
-    # transaction reopens it; Python receives only that inventory root.
-    evaluation_sha256 = _sha(
-        evaluation_population_sha256,
-        name="native v5 receipt-bound evaluation population identity",
-    )
-    root = _real_directory(output_root, name="native v5 campaign seal root")
-    generation = _positive(generation_index, name="native v5 generation index")
-    numeric = {
-        "minimum total trades": minimum_total_trades,
-        "minimum trades per window": minimum_trades_per_window,
-        "cap trades": cap_trades,
-        "provisional limit": provisional_limit,
-    }
-    for name, value in numeric.items():
-        _nonnegative(value, name=name)
-    if provisional_limit < 1:
-        raise TemporalQDV5ControlPlaneError("native v5 provisional limit must be positive")
-    directional_tail_authority = validate_v5_directional_tail_authority(
-        build_v5_directional_tail_authority(
-            runtime_authority_sha256=_sha(
-                authority["authoritySha256"], name="native v5 runtime authority"
-            ),
-            generation_index=generation,
-        ),
-        runtime_authority_sha256=authority["authoritySha256"],
-        generation_index=generation,
-    )
-    manifest = {
-        "schemaVersion": "temporal_qd_campaign_seal_manifest_v1",
-        "contractVersion": CONTRACT_VERSION,
-        "operation": "seal_completed_task_matrix_and_reduce_tail",
-        "runtimeAuthoritySha256": authority["authoritySha256"],
-        "sourcePath": str(source_path_value),
-        "sourceSha256": source_sha256,
-        "evaluationPopulationPath": str(evaluation),
-        "evaluationPopulationSha256": evaluation_sha256,
-        "generationIndex": generation,
-        "minimumTotalTrades": minimum_total_trades,
-        "minimumTradesPerWindow": minimum_trades_per_window,
-        "capTrades": cap_trades,
-        "provisionalLimit": provisional_limit,
-        "directionalTailAuthority": directional_tail_authority,
-        "resultPath": "generation-tail-transaction-result.json",
-    }
-    manifest["manifestSha256"] = canonical_sha256(manifest)
-    manifest_path = _write_canonical_once(
-        root / "campaign-seal-manifest.json", manifest, name="native v5 campaign seal manifest"
-    )
-    binary = pinned_runtime_binary(runtime_authority=authority, role="campaignSeal")
-    execution = _run_pinned(
-        runtime_authority=authority,
-        role="campaignSeal",
-        command=[str(binary), "--manifest", str(manifest_path)],
-        timeout_seconds=timeout_seconds,
-    )
-    if (
-        set(execution)
-        != {"schemaVersion", "restartedFromCommittedReceipt", "receipt", "runtimeMetrics"}
-        or execution.get("schemaVersion") != CAMPAIGN_SEAL_EXECUTION_SCHEMA
-        or not isinstance(execution.get("restartedFromCommittedReceipt"), bool)
-        or not isinstance(execution.get("runtimeMetrics"), Mapping)
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign seal execution schema drifted")
-    execution_receipt_path = root / "campaign-seal-execution-receipt.json"
-    execution_receipt = _self_hashed(
-        _read_bounded_canonical_object(
-            execution_receipt_path, name="native v5 campaign seal execution receipt"
-        ),
-        field="receiptSha256",
-        name="native v5 campaign seal execution receipt",
-    )
-    expected_execution_receipt = {
-        "schemaVersion", "contractVersion", "manifestSha256", "runtimeAuthoritySha256",
-        "sourceSha256", "campaignSeal", "generationTailTransaction", "tailResultIndex",
-        "tailAuthority", "receiptSha256",
-    }
-    if (
-        set(execution_receipt) != expected_execution_receipt
-        or execution_receipt.get("schemaVersion") != CAMPAIGN_SEAL_EXECUTION_RECEIPT_SCHEMA
-        or execution_receipt.get("contractVersion") != CONTRACT_VERSION
-        or execution_receipt.get("manifestSha256") != manifest["manifestSha256"]
-        or execution_receipt.get("runtimeAuthoritySha256") != authority["authoritySha256"]
-        or execution_receipt.get("sourceSha256") != source_sha256
-    ):
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 campaign seal execution receipt drifted"
-        )
-    stdout_receipt = _mapping(
-        execution.get("receipt"), name="native v5 campaign seal stdout receipt"
-    )
-    if set(stdout_receipt) != {"receiptPath", "receiptSha256"} or (
-        not native_v5_transport_path_matches(
-            stdout_receipt.get("receiptPath"), execution_receipt_path
-        )
-        or stdout_receipt.get("receiptSha256") != execution_receipt["receiptSha256"]
-    ):
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 campaign seal stdout receipt binding drifted"
-        )
-
-    def artifact(
-        value: object, *, name: str, path: str, semantic_field: str
-    ) -> dict[str, Any]:
-        descriptor = _mapping(value, name=f"native v5 {name} descriptor")
-        expected = {"path", "rawSha256", "sizeBytes", semantic_field}
-        if set(descriptor) != expected or descriptor.get("path") != path:
-            raise TemporalQDV5ControlPlaneError(
-                f"native v5 {name} descriptor schema drifted"
-            )
-        _sha(descriptor.get("rawSha256"), name=f"native v5 {name} raw identity")
-        _sha(descriptor.get(semantic_field), name=f"native v5 {name} identity")
-        _nonnegative(descriptor.get("sizeBytes"), name=f"native v5 {name} byte length")
-        return descriptor
-
-    campaign_seal_descriptor = artifact(
-        execution_receipt.get("campaignSeal"),
-        name="campaign seal",
-        path="campaign-seal-result.json",
-        semantic_field="campaignSealSha256",
-    )
-    transaction_descriptor = artifact(
-        execution_receipt.get("generationTailTransaction"),
-        name="tail transaction",
-        path="generation-tail-transaction-result.json",
-        semantic_field="transactionSha256",
-    )
-    index_descriptor = artifact(
-        execution_receipt.get("tailResultIndex"),
-        name="tail result index",
-        path="tail-result-index-v4.json",
-        semantic_field="tailResultIndexSha256",
-    )
-    tail_reference = _mapping(
-        execution_receipt.get("tailAuthority"), name="native v5 tail authority receipt reference"
-    )
-    if (
-        set(tail_reference) != {"receiptPath", "receiptSha256"}
-        or tail_reference.get("receiptPath") != "tail-authority.json"
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 tail authority receipt reference drifted")
-    tail_reference_sha256 = _sha(
-        tail_reference.get("receiptSha256"), name="native v5 tail authority receipt identity"
-    )
-    # A campaign seal is a bounded control document.  Its self-hash and the
-    # receipt descriptor bind the native funnel/panel inputs, while Rust owns
-    # raw-byte checks for every candidate-scale tail sibling.
-    campaign_seal = _self_hashed(
-        _read_bounded_canonical_object(
-            root / "campaign-seal-result.json", name="native v5 campaign seal"
-        ),
-        field="campaignSealSha256",
-        name="native v5 campaign seal",
-    )
-    if (
-        campaign_seal.get("schemaVersion") != CAMPAIGN_SEAL_SCHEMA
-        or campaign_seal.get("manifestSha256") != manifest["manifestSha256"]
-        or campaign_seal.get("campaignSealSha256")
-        != campaign_seal_descriptor["campaignSealSha256"]
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign seal binding drifted")
-    tail_authority_receipt, tail_authority_document = (
-        _validated_native_v5_tail_authority_receipt(
-            receipt_path=root / "tail-authority.json",
-            receipt_sha256=tail_reference_sha256,
-            runtime_authority_sha256=authority["authoritySha256"],
-            generation_index=generation,
-        )
-    )
-    if (
-        tail_authority_document.get("tailResultIndexSha256")
-        != index_descriptor["tailResultIndexSha256"]
-    ):
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 tail authority/index binding drifted"
-        )
-    return {
-        "sourceBuild": source,
-        "manifest": manifest,
-        "manifestPath": str(manifest_path),
-        "execution": execution,
-        "executionReceipt": execution_receipt,
-        "executionReceiptPath": str(execution_receipt_path),
-        "campaignSeal": campaign_seal,
-        "campaignSealDescriptor": campaign_seal_descriptor,
-        "directionalTailAuthority": directional_tail_authority,
-        "tailAuthorityReceipt": tail_authority_receipt,
-        "tailAuthorityReceiptDocument": tail_authority_document,
-        "generationTailTransaction": transaction_descriptor,
-        "tailResultIndex": {
-            "path": str(root / "tail-result-index-v4.json"),
-            "relativePath": "tail-result-index-v4.json",
-            "rawSha256": index_descriptor["rawSha256"],
-            "sizeBytes": index_descriptor["sizeBytes"],
-            "tailResultIndexSha256": index_descriptor["tailResultIndexSha256"],
-        },
-        "outputRoot": str(root),
-    }
-
-
-def build_native_panel_bundle_sidecar(
-    *,
-    runtime_authority: Mapping[str, Any],
-    panel_input: Mapping[str, Any],
-    output_root: Path | str,
-    timeout_seconds: int = 300,
-) -> dict[str, Any]:
-    """Have Rust materialize sealed bundle JSONL; Python never serializes rows."""
-
-    root = _real_directory(output_root, name="native v5 panel bundle root")
-    input_value = _mapping(panel_input, name="native v5 panel bundle input")
-    expected_input_fields = {
-        "schemaVersion",
-        "contractVersion",
-        "generationIndex",
-        "campaignRole",
-        "campaignSeal",
-        "tailAuthority",
-        "tailResultIndex",
-        "directionalTailAuthority",
-        "rotatingEvidence",
-        "panel",
-    }
-    if (
-        set(input_value) != expected_input_fields
-        or input_value.get("schemaVersion")
-        != "temporal_qd_v5_rotating_panel_bundle_input_v2"
-        or input_value.get("contractVersion") != CONTRACT_VERSION
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 panel bundle input schema drifted")
-    if "inputSha256" in input_value:
-        raise TemporalQDV5ControlPlaneError("native v5 panel bundle input already has an identity")
-    input_value["inputSha256"] = canonical_sha256(input_value)
-    input_path = _write_canonical_once(
-        root / "panel-bundle-input.json", input_value, name="native v5 panel bundle input"
-    )
-    sidecar_path = root / "candidate-panel-bundles.jsonl"
-    receipt_path = root / "candidate-panel-bundles-receipt.json"
-    binary = pinned_runtime_binary(runtime_authority=runtime_authority, role="rotatingPrefinalizer")
-    result = _run_pinned(
-        runtime_authority=runtime_authority,
-        role="rotatingPrefinalizer",
-        command=[
-            str(binary), "build-panel-bundle-sidecar", str(input_path), str(sidecar_path), str(receipt_path)
-        ],
-        timeout_seconds=timeout_seconds,
-    )
-    expected = {"schemaVersion", "inputSha256", "receiptSha256", "candidatePanelBundles", "resultSha256"}
-    if set(result) != expected or result.get("schemaVersion") != PANEL_SIDECAR_RESULT_SCHEMA:
-        raise TemporalQDV5ControlPlaneError("native v5 panel sidecar result schema drifted")
-    _self_hashed(result, field="resultSha256", name="native v5 panel sidecar result")
-    if result["inputSha256"] != input_value["inputSha256"]:
-        raise TemporalQDV5ControlPlaneError("native v5 panel sidecar input binding drifted")
-    receipt = _self_hashed(
-        _read_canonical_object(receipt_path, name="native v5 panel sidecar receipt"),
-        field="receiptSha256",
-        name="native v5 panel sidecar receipt",
-    )
-    expected_receipt = {
-        "schemaVersion",
-        "inputSha256",
-        "panelReceiptSha256",
-        "campaignSealSha256",
-        "tailAuthoritySha256",
-        "candidatePanelBundles",
-        "receiptSha256",
-    }
-    if (
-        set(receipt) != expected_receipt
-        or receipt.get("schemaVersion") != PANEL_SIDECAR_RECEIPT_SCHEMA
-        or receipt.get("receiptSha256") != result["receiptSha256"]
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 panel sidecar receipt drifted")
-    descriptor = _self_hashed(
-        _mapping(result.get("candidatePanelBundles"), name="native v5 panel sidecar descriptor"),
-        field="descriptorSha256",
-        name="native v5 panel sidecar descriptor",
-    )
-    if (
-        descriptor.get("schemaVersion") != PANEL_SIDECAR_DESCRIPTOR_SCHEMA
-        or descriptor.get("path") != str(sidecar_path)
-        or descriptor.get("rowSchema") != "temporal_qd_candidate_panel_evidence_bundle_v1"
-        or receipt.get("candidatePanelBundles") != descriptor
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 panel sidecar descriptor drifted")
-    _sha(descriptor.get("rawSha256"), name="native v5 panel sidecar raw identity")
-    _nonnegative(descriptor.get("sizeBytes"), name="native v5 panel sidecar byte length")
-    _nonnegative(descriptor.get("recordCount"), name="native v5 panel sidecar record count")
-    return {
-        "input": input_value,
-        "inputPath": str(input_path),
-        "result": result,
-        "receipt": receipt,
-        "receiptPath": str(receipt_path),
-        "candidatePanelBundles": descriptor,
-    }
-
-
-def _receipt_bound_execution_descriptor(
-    *, path: Path | str, raw_sha256: object, name: str
-) -> dict[str, Any]:
-    """Project a Rust receipt's raw identity without rehashing its payload.
-
-    Campaign-receipt v2 predates the compact descriptor transport and still
-    wants a byte length.  A metadata probe is sufficient for that legacy
-    field; Python must never reproduce its raw SHA from a task, journal, tail
-    member stream, or panel bundle.
-    """
-
-    checked = _real_path(path, name=name)
-    return {
-        "path": str(checked),
-        "rawSha256": _sha(raw_sha256, name=f"{name} raw identity"),
-        "sizeBytes": checked.stat().st_size,
-    }
-
-
-def _campaign_execution_bindings(
-    *,
-    freeze: Mapping[str, Any],
-    seal: Mapping[str, Any],
-    sidecar: Mapping[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Return v2 execution descriptors without reopening candidate payloads.
-
-    Every candidate-bearing raw SHA originates in a Rust freezer/gateway/seal
-    receipt.  This bridge only combines those compact roots with fixed paths;
-    Rust's campaign receipt validator owns the later byte reauthentication.
-    """
-
-    freeze_root = _real_directory(
-        freeze.get("outputRoot"), name="native v5 campaign freeze output root"
-    )
-    freeze_receipt = _self_hashed(
-        _mapping(freeze.get("receipt"), name="native v5 campaign freeze receipt"),
-        field="receiptSha256",
-        name="native v5 campaign freeze receipt",
-    )
-    inventory_rows = _validate_native_v5_ladder_inventory(
-        freeze_receipt.get("outputInventory"),
-        expected_paths=_NATIVE_V5_FREEZE_RECEIPT_INVENTORY_PATHS,
-        name="native v5 campaign freeze receipt",
-    )
-    inventory = {str(row["relativePath"]): row["rawSha256"] for row in inventory_rows}
-    source_build = _mapping(
-        seal.get("sourceBuild"), name="native v5 campaign seal source-build handoff"
-    )
-    gateway_root = _real_directory(
-        source_build.get("gatewayOutputRoot"), name="native v5 gateway output root"
-    )
-    gateway_receipt = _self_hashed(
-        _mapping(
-            source_build.get("gatewayReceipt"),
-            name="native v5 gateway execution receipt",
-        ),
-        field="receiptSha256",
-        name="native v5 gateway execution receipt",
-    )
-    if gateway_receipt.get("schemaVersion") != GATEWAY_RECEIPT_SCHEMA:
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 campaign gateway receipt schema drifted"
-        )
-    seal_root = _real_directory(
-        seal.get("outputRoot"), name="native v5 campaign seal output root"
-    )
-    campaign_seal = _mapping(
-        seal.get("campaignSealDescriptor"), name="native v5 campaign seal descriptor"
-    )
-    tail_transaction = _mapping(
-        seal.get("generationTailTransaction"), name="native v5 tail transaction descriptor"
-    )
-    tail_index = _mapping(seal.get("tailResultIndex"), name="native v5 tail index")
-    tail_receipt = _mapping(
-        seal.get("tailAuthorityReceiptDocument"),
-        name="native v5 tail-authority receipt",
-    )
-    evaluated_members = _mapping(
-        tail_receipt.get("evaluatedMembers"),
-        name="native v5 receipt-bound evaluated members",
-    )
-    bundles = _mapping(
-        sidecar.get("candidatePanelBundles"), name="native v5 panel sidecar descriptor"
-    )
-
-    def sealed_artifact(
-        descriptor: Mapping[str, Any], *, path: Path, semantic_field: str, name: str
-    ) -> dict[str, Any]:
-        expected = {"path", "rawSha256", "sizeBytes", semantic_field}
-        if set(descriptor) != expected or descriptor.get("path") != path.name:
-            raise TemporalQDV5ControlPlaneError(f"{name} descriptor schema drifted")
-        _sha(descriptor.get(semantic_field), name=f"{name} identity")
-        return {
-            "path": str(path),
-            "rawSha256": _sha(descriptor.get("rawSha256"), name=f"{name} raw identity"),
-            "sizeBytes": _nonnegative(descriptor.get("sizeBytes"), name=f"{name} byte length"),
-        }
-
-    if set(tail_index) != {
-        "path", "relativePath", "rawSha256", "sizeBytes", "tailResultIndexSha256"
-    } or tail_index.get("relativePath") != "tail-result-index-v4.json":
-        raise TemporalQDV5ControlPlaneError("native v5 tail index descriptor schema drifted")
-    if set(evaluated_members) != {"path", "rawSha256", "sizeBytes", "recordCount"} or (
-        evaluated_members.get("path") != "evaluated-members.jsonl"
-    ):
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 evaluated-member descriptor schema drifted"
-        )
-    if set(bundles) != {
-        "schemaVersion", "path", "rawSha256", "sizeBytes", "recordCount", "rowSchema", "descriptorSha256"
-    }:
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 panel-bundle descriptor schema drifted"
-        )
-    _self_hashed(
-        bundles,
-        field="descriptorSha256",
-        name="native v5 panel-bundle descriptor",
-    )
-
-    return {
-        # These are small control documents, so a direct canonical descriptor
-        # is appropriate.  Everything below is candidate/task-scale and takes
-        # its raw identity solely from its native receipt.
-        "freezeManifest": _descriptor(
-            _real_path(freeze.get("manifestPath"), name="native v5 freeze manifest")
-        ),
-        "freezeTransaction": _descriptor(
-            _real_path(freeze.get("transactionPath"), name="native v5 freeze transaction")
-        ),
-        "campaign": _receipt_bound_execution_descriptor(
-            path=freeze_root / "campaign.json",
-            raw_sha256=inventory["campaign.json"],
-            name="native v5 freeze campaign",
-        ),
-        "taskManifest": _receipt_bound_execution_descriptor(
-            path=freeze_root / "screening-run" / "task-manifest.json",
-            raw_sha256=inventory["screening-run/task-manifest.json"],
-            name="native v5 freezer task manifest",
-        ),
-        "evaluationIdentity": _receipt_bound_execution_descriptor(
-            path=freeze_root / "evaluation-identity.json",
-            raw_sha256=inventory["evaluation-identity.json"],
-            name="native v5 freeze evaluation identity",
-        ),
-        "gatewayCompletion": _receipt_bound_execution_descriptor(
-            path=gateway_root / ".native-gateway-dispatch" / "completion-journal.jsonl",
-            raw_sha256=gateway_receipt.get("completionJournalSha256"),
-            name="native v5 gateway completion journal",
-        ),
-        "checkpoint": _receipt_bound_execution_descriptor(
-            path=gateway_root / "checkpoint.json",
-            raw_sha256=gateway_receipt.get("checkpointSha256"),
-            name="native v5 gateway checkpoint",
-        ),
-        "campaignSeal": sealed_artifact(
-            campaign_seal,
-            path=seal_root / "campaign-seal-result.json",
-            semantic_field="campaignSealSha256",
-            name="native v5 campaign seal",
-        ),
-        "tailResultIndex": {
-            "path": str(Path(str(tail_index["path"])).resolve()),
-            "rawSha256": _sha(tail_index.get("rawSha256"), name="native v5 tail index raw identity"),
-            "sizeBytes": _nonnegative(tail_index.get("sizeBytes"), name="native v5 tail index byte length"),
-        },
-        "tailTransaction": sealed_artifact(
-            tail_transaction,
-            path=seal_root / "generation-tail-transaction-result.json",
-            semantic_field="transactionSha256",
-            name="native v5 tail transaction",
-        ),
-        "evaluatedMembersJsonl": _receipt_bound_execution_descriptor(
-            path=seal_root / "evaluated-members.jsonl",
-            raw_sha256=evaluated_members.get("rawSha256"),
-            name="native v5 evaluated-member JSONL",
-        ),
-        "candidatePanelBundlesJsonl": _receipt_bound_execution_descriptor(
-            path=bundles.get("path"),
-            raw_sha256=bundles.get("rawSha256"),
-            name="native v5 panel-bundle JSONL",
-        ),
-    }
-
-
-def build_native_rotating_campaign_receipt(
-    *,
-    runtime_authority: Mapping[str, Any],
-    campaign_freeze: Mapping[str, Any],
-    campaign_seal: Mapping[str, Any],
-    panel_bundle_sidecar: Mapping[str, Any],
-    output_root: Path | str,
-    generation_index: int,
-    campaign_role: str,
-    panel_id: str,
-    rotating_evidence_sha256: str,
-    cohort_source: Mapping[str, Any],
-    timeout_seconds: int = 300,
-) -> dict[str, Any]:
-    """Build a v2 rotating campaign receipt from native receipts/descriptors.
-
-    It is intentionally a compact join: no JSONL row is decoded, and no
-    candidate array is accepted from Python.  Rust validates all execution
-    bindings before committing the receipt, then future resumes use that
-    receipt without reopening gateway raw results.
-    """
-
-    authority = _validate_runtime_authority(runtime_authority)
-    freeze = _mapping(campaign_freeze, name="native v5 campaign freeze handoff")
-    freeze_root = _real_directory(
-        freeze.get("outputRoot"), name="native v5 campaign freeze output root"
-    )
-    freeze_manifest = _mapping(freeze.get("manifest"), name="native v5 campaign manifest")
-    freeze_transaction = _self_hashed(
-        _mapping(freeze.get("transaction"), name="native v5 campaign transaction"),
-        field="transactionSha256",
-        name="native v5 campaign transaction",
-    )
-    freeze_receipt = _self_hashed(
-        _mapping(freeze.get("receipt"), name="native v5 campaign freeze receipt"),
-        field="receiptSha256",
-        name="native v5 campaign freeze receipt",
-    )
-    seal = _mapping(campaign_seal, name="native v5 campaign seal handoff")
-    sidecar = _mapping(panel_bundle_sidecar, name="native v5 panel sidecar handoff")
-    sidecar_result = _self_hashed(
-        _mapping(sidecar.get("result"), name="native v5 panel sidecar result"),
-        field="resultSha256",
-        name="native v5 panel sidecar result",
-    )
-    sidecar_receipt = _self_hashed(
-        _mapping(sidecar.get("receipt"), name="native v5 panel sidecar receipt"),
-        field="receiptSha256",
-        name="native v5 panel sidecar receipt",
-    )
-    generation = _positive(generation_index, name="native v5 campaign generation index")
-    if campaign_role not in {
-        "proposal_current_panel",
-        "retained_parent_current_panel",
-        "prior_panel_backfill",
-    } or not isinstance(panel_id, str) or not panel_id:
-        raise TemporalQDV5ControlPlaneError("native v5 campaign role/panel is invalid")
-    rotating_sha = _sha(
-        rotating_evidence_sha256, name="native v5 rotating evidence identity"
-    )
-    cohort = _mapping(cohort_source, name="native v5 campaign cohort source")
-    if set(cohort) != {
-        "kind",
-        "sourceSemanticSha256",
-        "candidateCount",
-        "selectionSha256",
-    }:
-        raise TemporalQDV5ControlPlaneError("native v5 campaign cohort source drifted")
-    kind = cohort.get("kind")
-    if kind not in {"proposal_evaluation_population", "sealed_cohort_selection"}:
-        raise TemporalQDV5ControlPlaneError("native v5 campaign cohort kind is invalid")
-    cohort["sourceSemanticSha256"] = _sha(
-        cohort.get("sourceSemanticSha256"), name="native v5 cohort source identity"
-    )
-    cohort["candidateCount"] = _positive(
-        cohort.get("candidateCount"), name="native v5 cohort candidate count"
-    )
-    if kind == "proposal_evaluation_population":
-        if cohort.get("selectionSha256") is not None:
-            raise TemporalQDV5ControlPlaneError(
-                "native v5 proposal cohort cannot name a selection"
-            )
-    else:
-        cohort["selectionSha256"] = _sha(
-            cohort.get("selectionSha256"), name="native v5 cohort selection identity"
-        )
-    if (
-        freeze_manifest.get("manifestSha256") != freeze_transaction.get("manifestSha256")
-        or freeze_receipt.get("manifestSha256") != freeze_manifest.get("manifestSha256")
-        or freeze_receipt.get("transactionSha256")
-        != freeze_transaction.get("transactionSha256")
-        or freeze_transaction.get("campaignRole") != campaign_role
-        or freeze_manifest.get("campaignRole") != campaign_role
-        or freeze_manifest.get("panelId") != panel_id
-        or freeze_transaction.get("candidateCount") != cohort["candidateCount"]
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign freezer handoff drifted")
-    freeze_fields = {
-        "transactionSha256": freeze_transaction.get("transactionSha256"),
-        "cohortPopulationSha256": freeze_transaction.get("cohortPopulationSha256"),
-        "preparationSha256": freeze_transaction.get("preparationSha256"),
-        "authorityId": freeze_transaction.get("authorityId"),
-        "evaluationIdentitySha256": freeze_transaction.get("evaluationIdentitySha256"),
-        "campaignSha256": freeze_transaction.get("campaignSha256"),
-        "taskMatrixSha256": freeze_transaction.get("taskMatrixSha256"),
-        "candidateCount": freeze_transaction.get("candidateCount"),
-        "windowCount": freeze_transaction.get("windowCount"),
-        "taskCount": freeze_transaction.get("taskCount"),
-    }
-    for field in (
-        "transactionSha256",
-        "cohortPopulationSha256",
-        "preparationSha256",
-        "authorityId",
-        "evaluationIdentitySha256",
-        "campaignSha256",
-        "taskMatrixSha256",
-    ):
-        freeze_fields[field] = _sha(freeze_fields[field], name=f"native v5 freeze {field}")
-    for field in ("candidateCount", "windowCount", "taskCount"):
-        freeze_fields[field] = _positive(freeze_fields[field], name=f"native v5 freeze {field}")
-    directional_tail_authority = validate_v5_directional_tail_authority(
-        _mapping(
-            seal.get("directionalTailAuthority"),
-            name="native v5 directional tail authority",
-        ),
-        runtime_authority_sha256=authority["authoritySha256"],
-        generation_index=generation,
-    )
-    campaign_seal_document = _self_hashed(
-        _mapping(seal.get("campaignSeal"), name="native v5 campaign seal document"),
-        field="campaignSealSha256",
-        name="native v5 campaign seal document",
-    )
-    tail_transaction = _mapping(
-        seal.get("generationTailTransaction"), name="native v5 tail transaction descriptor"
-    )
-    if set(tail_transaction) != {
-        "path", "rawSha256", "sizeBytes", "transactionSha256"
-    } or tail_transaction.get("path") != "generation-tail-transaction-result.json":
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 tail transaction descriptor schema drifted"
-        )
-    tail_index = _mapping(seal.get("tailResultIndex"), name="native v5 tail index")
-    if set(tail_index) != {
-        "path", "relativePath", "rawSha256", "sizeBytes", "tailResultIndexSha256"
-    } or tail_index.get("relativePath") != "tail-result-index-v4.json":
-        raise TemporalQDV5ControlPlaneError("native v5 tail index descriptor schema drifted")
-    seal_fields = {
-        "directionalTailAuthoritySha256": _sha(
-            directional_tail_authority.get("tailAuthoritySha256"),
-            name="native v5 directional tail authority",
-        ),
-        "campaignSealSha256": _sha(
-            campaign_seal_document.get("campaignSealSha256"),
-            name="native v5 campaign seal identity",
-        ),
-        "tailResultIndexSha256": _sha(
-            tail_index.get("tailResultIndexSha256"), name="native v5 tail index identity"
-        ),
-        "tailTransactionSha256": _sha(
-            tail_transaction.get("transactionSha256"),
-            name="native v5 tail transaction identity",
-        ),
-    }
-    if (
-        campaign_seal_document.get("tailResultIndex", {}).get("sha256")
-        != seal_fields["tailResultIndexSha256"]
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 campaign seal handoff drifted")
-    tail_authority_document = _mapping(
-        seal.get("tailAuthorityReceiptDocument"),
-        name="native v5 tail-authority receipt document",
-    )
-    evaluated = _mapping(
-        tail_authority_document.get("evaluatedMembers"),
-        name="native v5 receipt-bound evaluated members",
-    )
-    if set(evaluated) != {"path", "rawSha256", "sizeBytes", "recordCount"} or (
-        evaluated.get("path") != "evaluated-members.jsonl"
-    ):
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 evaluated-member descriptor schema drifted"
-        )
-    bundles = _self_hashed(
-        _mapping(sidecar.get("candidatePanelBundles"), name="native v5 panel bundles"),
-        field="descriptorSha256",
-        name="native v5 panel bundle descriptor",
-    )
-    if (
-        sidecar_result.get("receiptSha256") != sidecar_receipt.get("receiptSha256")
-        or sidecar_receipt.get("candidatePanelBundles") != bundles
-        or sidecar_receipt.get("campaignSealSha256")
-        != seal_fields["campaignSealSha256"]
-        or sidecar_receipt.get("tailAuthoritySha256")
-        != seal_fields["directionalTailAuthoritySha256"]
-        or sidecar_result.get("candidatePanelBundles") != bundles
-        # The frozen cohort includes every evaluated candidate, including
-        # candidates whose windows terminate as deterministic rejections.
-        # Panel bundles are emitted only for successfully evaluated members,
-        # so their count must bind the tail reducer's evaluated-member stream,
-        # not the original cohort size.
-        or bundles.get("recordCount") != evaluated.get("recordCount")
-    ):
-        raise TemporalQDV5ControlPlaneError("native v5 panel sidecar handoff drifted")
-    evaluated_fields = {
-        "rawSha256": _sha(
-            evaluated.get("rawSha256"), name="native v5 evaluated-member file identity"
-        ),
-        "sizeBytes": _nonnegative(
-            evaluated.get("sizeBytes"), name="native v5 evaluated-member file size"
-        ),
-        "recordCount": _positive(
-            evaluated.get("recordCount"), name="native v5 evaluated-member count"
-        ),
-        "rowSchema": "temporal_qd_evaluated_member_v1",
-    }
-    bundle_fields = {
-        "rawSha256": _sha(
-            bundles.get("rawSha256"), name="native v5 panel bundle file identity"
-        ),
-        "sizeBytes": _nonnegative(
-            bundles.get("sizeBytes"), name="native v5 panel bundle file size"
-        ),
-        "recordCount": _positive(
-            bundles.get("recordCount"), name="native v5 panel bundle count"
-        ),
-        "rowSchema": "temporal_qd_candidate_panel_evidence_bundle_v1",
-    }
-    execution_bindings = _campaign_execution_bindings(
-        freeze=freeze,
-        seal=seal,
-        sidecar=sidecar,
-    )
-    input_value = {
-        "schemaVersion": CAMPAIGN_RECEIPT_INPUT_SCHEMA,
-        "contractVersion": CONTRACT_VERSION,
-        "generationIndex": generation,
-        "campaignRole": campaign_role,
-        "panelId": panel_id,
-        "rotatingEvidenceSha256": rotating_sha,
-        "cohortSource": cohort,
-        "campaignFreeze": freeze_fields,
-        "campaignSeal": seal_fields,
-        "evaluatedMembers": evaluated_fields,
-        "candidatePanelBundles": bundle_fields,
-        "runtimeAuthoritySha256": authority["authoritySha256"],
-        "executionBindings": execution_bindings,
-    }
-    input_value["inputSha256"] = canonical_sha256(input_value)
-    root = _real_directory(output_root, name="native v5 campaign receipt root")
-    input_path = _write_canonical_once(
-        root / "campaign-receipt-input.json", input_value, name="native v5 campaign receipt input"
-    )
-    receipt_path = root / "campaign-receipt.json"
-    binary = pinned_runtime_binary(runtime_authority=authority, role="rotatingPrefinalizer")
-    stdout = _run_pinned(
-        runtime_authority=authority,
-        role="rotatingPrefinalizer",
-        command=[str(binary), "build-campaign-receipt", str(input_path), str(receipt_path)],
-        timeout_seconds=timeout_seconds,
-    )
-    receipt = _self_hashed(
-        _read_canonical_object(receipt_path, name="native v5 rotating campaign receipt"),
-        field="receiptSha256",
-        name="native v5 rotating campaign receipt",
-    )
-    semantic = {
-        "schemaVersion": CAMPAIGN_RECEIPT_SCHEMA,
-        "contractVersion": CONTRACT_VERSION,
-        "generationIndex": generation,
-        "campaignRole": campaign_role,
-        "panelId": panel_id,
-        "rotatingEvidenceSha256": rotating_sha,
-        "cohortSource": cohort,
-        "campaignFreeze": freeze_fields,
-        "campaignSeal": seal_fields,
-        "evaluatedMembers": evaluated_fields,
-        "candidatePanelBundles": bundle_fields,
-    }
-    expected_receipt = {
-        **semantic,
-        "semanticReceiptSha256": canonical_sha256(semantic),
-        "runtimeAuthoritySha256": authority["authoritySha256"],
-        "executionBindings": execution_bindings,
-    }
-    expected_receipt["receiptSha256"] = canonical_sha256(expected_receipt)
-    if receipt != expected_receipt or stdout != receipt:
-        raise TemporalQDV5ControlPlaneError(
-            "native v5 rotating campaign receipt binding drifted"
-        )
-    return {
-        "input": input_value,
-        "inputPath": str(input_path),
-        "receipt": receipt,
-        "receiptPath": str(receipt_path),
-    }
-
-
 __all__ = [
     "ARCHIVE_REDUCTION_MANIFEST_SCHEMA",
     "ARCHIVE_REDUCTION_RESULT_SCHEMA",
-    "CAMPAIGN_RECEIPT_INPUT_SCHEMA",
     "CAMPAIGN_RECEIPT_SCHEMA",
     "CAMPAIGN_SEAL_EXECUTION_SCHEMA",
     "CAMPAIGN_SEAL_SCHEMA",
@@ -6001,15 +5378,12 @@ __all__ = [
     "certify_native_v5_initial_archive",
     "native_v5_archive_transport_path_matches",
     "native_v5_transport_path_matches",
-    "build_native_rotating_campaign_receipt",
-    "build_native_campaign_seal_source",
-    "build_native_panel_bundle_sidecar",
+    "run_native_campaign_output",
     "build_native_v5_prefinalizer_base_manifest",
     "build_native_v5_prefinalizer_resume_manifest",
     "pinned_runtime_binary",
     "extract_native_v5_g0_selected_attempts",
     "extract_native_v5_evolved_attempt_chain",
-    "run_native_campaign_seal",
     "run_native_v5_archive_reducer",
     "run_native_v5_generation_finalizer",
     "run_native_v5_rotating_prefinalizer",

@@ -1,47 +1,83 @@
 # Temporal QD native gateway dispatch
 
-`temporal-qd-gateway-dispatch` is the bounded Rust owner of the existing Lab
-gateway hand-off after a native campaign task matrix is frozen. It does not
-construct candidates, modify campaign authority, publish a generation, or
-invoke Python.
+`temporal-qd-gateway-dispatch` drains one authenticated campaign-input task
+pack into one durable gateway execution receipt. It does not construct
+candidates, alter campaign authority, finalize a generation, or invoke Python.
 
 ## Invocation
 
 ```text
 temporal-qd-gateway-dispatch \
-  --task-manifest <campaign-root>/task-manifest.json \
+  --campaign-input-checkpoint <campaign-root>/campaign-input-checkpoint.json \
   --output-root <campaign-root> \
   --gateway-url http://127.0.0.1:47241 \
   --gateway-token-file <runtime-secret-file> \
   --fresh
 ```
 
-Use `--resume` after an interrupted dispatch. The runtime token is used only
-for HTTP authorization; it is never persisted. Bounded controls are explicit:
-`--enqueue-batch-size`, `--result-batch-size`, `--max-request-bytes`,
-`--max-response-bytes`, `--timeout-seconds`, and
-`--poll-interval-millis`.
+Use `--resume` after interruption. The token is runtime-only and is never
+persisted. Bounded controls include enqueue/result batch sizes, request and
+response byte limits, request/completion timeouts, poll interval, maintenance
+probe interval, and the independent maintenance timeout.
 
-## Durable artifacts
+## Fixed durable layout
 
-The dispatcher writes only these additional artifacts under the campaign root:
+Successful dispatch uses a fixed five-file sidecar under
+`.native-gateway-dispatch`:
 
-- `.native-gateway-dispatch/tasks/<task-id>.json`: immutable self-hashed task
-  objects.
-- `.native-gateway-dispatch/task-index.jsonl` and `task-index.json`: compact
-  task metadata and its self-hashed root.
-- `.native-gateway-dispatch/completion-journal.jsonl`: fsynced, contiguous,
-  self-hashed terminal completion entries.
-- `failures/<task-id>.json`: immutable failure receipts, written before any
-  acknowledgement.
+- `task-index.jsonl`
+- `task-index.json`
+- `completion-journal.jsonl`
+- `results.pack`
+- `execution-receipt.json`
 
-Each completed material is persisted to the existing
-`results/<task-id>.json.gz` deterministic Python-compatible gzip format, then
-its compact record is fsynced to the completion journal before
-`POST /results/ack`. A restart replays the sidecar and journal, revalidates the
-gzip/material representation, and acknowledges a matching redelivery without
-evaluating it again.
+Terminal task failures, when present, are written separately as
+`failures/<task-id>.json` before acknowledgement.
 
-`checkpoint.json` remains the legacy checkpoint shape. It is streamed and
-replaced exactly once, only after every immutable task has a durable terminal
-record; it is never rewritten per completion.
+The task pack is indexed in place; it is not copied into one file per task.
+Successful results are deterministic gzip members appended to `results.pack`,
+not one gzip file per task. Each completion-journal row binds the task and
+attempt to the pack offset and length, compressed and uncompressed SHA-256,
+and admitted result identity.
+
+Therefore successful file count stays constant as task count grows. Logical
+result bytes remain O(tasks), but per-result filesystem metadata, directory
+entries, opens, renames, and synchronization barriers are removed.
+
+## Commit and restart protocol
+
+For each delivered result batch, the dispatcher:
+
+1. validates task, lease, schema, worker material, and scientific result
+   bindings;
+2. appends deterministic gzip members and contiguous journal rows;
+3. flushes and synchronizes the result pack and journal once for the batch;
+4. reopens and verifies the newly committed pack slices; and
+5. acknowledges only those durable completions.
+
+Resume authenticates the campaign-input checkpoint, task index, journal, pack,
+and execution receipt. A matching redelivery is acknowledged from the durable
+record rather than evaluated or written again. Incomplete crash tails are
+truncated to the last committed journal boundary.
+
+## Shared lake-maintenance gate
+
+Lake-wide 409/503 responses open one campaign-level maintenance gate rather
+than creating thousands of task-level requeues. While the gate is open, the
+dispatcher stops enqueue, result polling, and acknowledgement work, honors
+maintenance/retry timing, and sends one bounded recovery probe at the configured
+interval.
+
+A positive probe closes the gate and normal dispatch resumes. Maintenance pause
+time is excluded from the scientific completion timeout and is bounded by its
+own maintenance timeout. Shared infrastructure unavailability is recorded in
+telemetry; it does not consume candidate-window attempt budgets or mutate every
+task into a retry state.
+
+## Downstream boundary
+
+The receipt-last gateway execution receipt binds the task index, completion
+journal, and result pack. The campaign-output checkpoint consumes that receipt
+and validates each remote result exactly once before publishing evaluated
+members, panel bundles, and the tail result. Ordinary downstream restart does
+not rescan the gateway pack.

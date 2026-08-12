@@ -167,19 +167,19 @@ def _fixture(root: Path, count: int) -> tuple[dict, dict, dict, Path, Path, Path
     return rotating, template, catalog, oracle_population_path, evaluation_path, selection_path, common
 
 
-def test_native_v5_freeze_receipt_reader_rejects_oversized_control_document(
+def test_native_v5_campaign_input_reader_rejects_oversized_checkpoint(
     tmp_path: Path,
 ) -> None:
-    """Receipt validation is capped before it attempts JSON parsing."""
+    """Checkpoint validation is capped before it attempts JSON parsing."""
 
-    (tmp_path / "native-freeze-transaction.json").write_bytes(
+    (tmp_path / "campaign-input-checkpoint.json").write_bytes(
         b"x" * (campaign_native._CURRENT_V5_COMPACT_DOCUMENT_LIMIT_BYTES + 1)
     )
     with pytest.raises(
         TemporalDiscoveryContractError,
-        match="native v5 freeze native-freeze-transaction.json exceeds the control-document limit",
+        match="native v5 campaign-input checkpoint exceeds the control-document limit",
     ):
-        campaign_native._validate_v5_freeze_receipts(tmp_path, {}, {})
+        campaign_native._validate_v5_campaign_input_checkpoint(tmp_path, {}, {})
 
 
 def test_native_v5_freeze_rejects_bounded_pipe_overflow(
@@ -261,18 +261,42 @@ def test_native_v5_freeze_matches_python_oracle_and_is_restart_safe(tmp_path: Pa
     freeze_qd_v5_campaign_oracle(population_path=population, template_preparation_path=common / "template.json", output_root=tmp_path / "oracle", **oracle_args)
     native = freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", cohort_selection_path=selection, **common_args)
     manifest = json.loads((tmp_path / "native" / ".native-v5-campaign-freeze-manifest.json").read_text(encoding="utf-8"))
-    receipt = json.loads((tmp_path / "native" / "native-freeze-receipt.json").read_text(encoding="utf-8"))
+    checkpoint = json.loads((tmp_path / "native" / "campaign-input-checkpoint.json").read_text(encoding="utf-8"))
     assert manifest["schemaVersion"] == "temporal_qd_v5_native_campaign_freeze_manifest_v2"
     assert manifest["manifestSha256"] == canonical_sha256({key: value for key, value in manifest.items() if key not in {"manifestSha256", "outputRoot"} and not key.endswith("Path")})
-    assert receipt["manifestSha256"] == manifest["manifestSha256"]
-    assert receipt["nativeRuntimeAuthoritySha256"] == manifest["nativeRuntimeAuthoritySha256"]
+    assert checkpoint["schemaVersion"] == "temporal_qd_v5_campaign_input_checkpoint_v1"
+    assert checkpoint["manifestSha256"] == manifest["manifestSha256"]
+    assert checkpoint["nativeRuntimeAuthoritySha256"] == manifest["nativeRuntimeAuthoritySha256"]
+    assert checkpoint["checkpointSha256"] == canonical_sha256(
+        {key: value for key, value in checkpoint.items() if key != "checkpointSha256"}
+    )
+    assert native["checkpointSha256"] == checkpoint["checkpointSha256"]
     assert native["taskCount"] == candidate_count * 4
     assert native["telemetry"]["peakLiveTasks"] == 1
     assert native["telemetry"]["peakLiveCandidates"] == candidate_count
-    for relative in ("preparation.json", "authority.json", "evaluation-identity.json", "campaign.json", "screening-run/task-manifest.json", "screening-run/checkpoint.json"):
+    for relative in ("cohort-population.json", "screening-run/task-manifest.json"):
         oracle = (tmp_path / "oracle" / relative).read_bytes().replace(b"\r\n", b"\n")
         assert (tmp_path / "native" / relative).read_bytes() == oracle
-    assert freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", cohort_selection_path=selection, **common_args)["campaignSha256"] == native["campaignSha256"]
+    retired = (
+        "preparation.json",
+        "authority.json",
+        "evaluation-identity.json",
+        "campaign.json",
+        "screening-run/authority.json",
+        "screening-run/checkpoint.json",
+        "native-freeze-result.json",
+        "native-freeze-transaction.json",
+        "native-freeze-receipt.json",
+    )
+    assert all(not (tmp_path / "native" / relative).exists() for relative in retired)
+    assert checkpoint["artifactMetrics"]["payloadFileCount"] == 2
+    assert checkpoint["artifactMetrics"]["payloadBytes"] == (
+        (tmp_path / "native" / "cohort-population.json").stat().st_size
+        + (tmp_path / "native" / "screening-run" / "task-manifest.json").stat().st_size
+    )
+    restarted = freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", cohort_selection_path=selection, **common_args)
+    assert restarted["restart"] is True
+    assert restarted["checkpointSha256"] == native["checkpointSha256"]
     payload = json.loads(selection.read_text(encoding="utf-8")); payload["candidateProjection"]["rawSha256"] = "sha256:" + "f" * 64; payload["selectionSha256"] = canonical_sha256({key: value for key, value in payload.items() if key != "selectionSha256"}); _write(tmp_path / "native-input" / "tampered-selection.json", payload)
     with pytest.raises(TemporalDiscoveryContractError, match="raw identity drifted"):
         freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "tampered", cohort_selection_path=tmp_path / "native-input" / "tampered-selection.json", **common_args)

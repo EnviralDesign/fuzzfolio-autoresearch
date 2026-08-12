@@ -1457,7 +1457,7 @@ mod tests {
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest["tailAuthority"]["receiptPath"] =
-            json!(root.path().join("..\\tail-authority.json"));
+            json!(root.path().join("../tail-authority.json"));
         manifest.as_object_mut().unwrap().remove("manifestSha256");
         manifest["manifestSha256"] = json!(sha_value(&manifest));
         write_value(&manifest_path, &manifest);
@@ -1745,20 +1745,28 @@ mod tests {
             .nth(4)
             .unwrap();
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/python_oracle_fixture.py");
-        let python = if cfg!(windows) {
-            let local = repo.join(".venv/Scripts/python.exe");
-            if local.is_file() {
-                local
-            } else {
-                PathBuf::from("python")
-            }
+        let local_python = if cfg!(windows) {
+            repo.join(".venv/Scripts/python.exe")
+        } else {
+            repo.join(".venv/bin/python")
+        };
+        let python = if local_python.is_file() {
+            local_python
+        } else if cfg!(windows) {
+            PathBuf::from("python")
         } else {
             PathBuf::from("python3")
         };
+        let mut python_paths = vec![repo.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            python_paths.extend(std::env::split_paths(&existing));
+        }
+        let python_path = std::env::join_paths(python_paths).unwrap();
         let status = Command::new(python)
             .arg(script)
             .arg(root.path())
             .current_dir(repo)
+            .env("PYTHONPATH", python_path)
             .status()
             .unwrap();
         assert!(status.success());

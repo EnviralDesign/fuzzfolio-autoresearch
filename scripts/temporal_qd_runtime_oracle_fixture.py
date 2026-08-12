@@ -87,10 +87,15 @@ def _write(path: Path, value: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n", encoding="utf-8", newline="\n")
 
 
+def _portable_source_sha256(raw: bytes) -> str:
+    """Hash source semantics independently of Git's CRLF checkout policy."""
+    return "sha256:" + hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _generator_source_identity() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1]
     files = {
-        relative: "sha256:" + hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        relative: _portable_source_sha256((root / relative).read_bytes())
         for relative in GENERATOR_SOURCE_FILES
     }
     value = {
@@ -181,6 +186,7 @@ def _materialized_crossover_witness(
             parent=parent,
             mate=mate,
             module_authority=runtime.operator,
+            native_validator=runtime.validator,
             pair_compiler=runtime.compiler,
             parent_selection=None,
             mate_selection=None,
@@ -274,7 +280,7 @@ def materialize_runtime_oracle_fixture(output_root: Path | str, *, dashboard_roo
                 immigrant,
                 long=replace(immigrant.long, native_authority=foreign_authority),
             )
-            rejected_pair, rejected = _propose_crossover(proposal_seed=rejection_seed, parent=immigrant, mate=foreign_mate, module_authority=runtime.operator, pair_compiler=runtime.compiler, parent_selection=None, mate_selection=None, mate_selection_attempts=[])
+            rejected_pair, rejected = _propose_crossover(proposal_seed=rejection_seed, parent=immigrant, mate=foreign_mate, module_authority=runtime.operator, native_validator=runtime.validator, pair_compiler=runtime.compiler, parent_selection=None, mate_selection=None, mate_selection_attempts=[])
             if rejected_pair is not None or rejected.get("disposition") != "operation_rejected":
                 raise AssertionError("foreign-authority crossover must be the rejection witness")
             cases["sameSideCrossoverRejected"] = (rejected_pair, rejected)

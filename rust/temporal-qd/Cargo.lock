@@ -1091,7 +1091,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "temporal-qd-campaign-freeze",
  "temporal-qd-contract",
+ "temporal-qd-rotating-prefinalizer",
  "temporal-qd-tail-reducer",
  "windows-sys 0.61.2",
 ]
@@ -1128,6 +1130,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "temporal-qd-campaign-freeze",
  "temporal-qd-campaign-seal",
  "temporal-qd-contract",
  "windows-sys 0.61.2",

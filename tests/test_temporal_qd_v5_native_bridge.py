@@ -711,6 +711,13 @@ def test_pure_v5_generation_bindings_match_the_oracle_only_authority_adapter() -
 
     inputs = _authority_inputs()
     source = inputs["pairSourceAuthority"]
+    sealed_dashboard_root = Path(
+        str(source["nativeJsonlAuthority"]["dashboardSourceRoot"])
+    )
+    if not sealed_dashboard_root.is_dir():
+        pytest.skip(
+            "sealed external Dashboard authority checkout is unavailable"
+        )
     run_config = {
         "runId": "v5-native-bridge-parity",
         "pairRunConfigSha256": source["pairRunConfigSha256"],
