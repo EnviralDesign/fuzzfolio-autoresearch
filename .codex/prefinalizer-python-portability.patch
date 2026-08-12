@@ -1,0 +1,57 @@
+--- a/rust/temporal-qd/crates/qd-rotating-prefinalizer/tests/v5_panel_bundle_sidecar.rs
++++ b/rust/temporal-qd/crates/qd-rotating-prefinalizer/tests/v5_panel_bundle_sidecar.rs
+@@ -11,7 +11,11 @@
+ fn fixture(root: &Path) {
+     let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
+         Path::new(env!("CARGO_MANIFEST_DIR"))
+-            .join("../../../../.venv/Scripts/python.exe")
++            .join(if cfg!(windows) {
++                "../../../../.venv/Scripts/python.exe"
++            } else {
++                "../../../../.venv/bin/python"
++            })
+             .into_os_string()
+     });
+     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+--- a/rust/temporal-qd/crates/qd-rotating-prefinalizer/tests/v5_panel_receipt.rs
++++ b/rust/temporal-qd/crates/qd-rotating-prefinalizer/tests/v5_panel_receipt.rs
+@@ -12,7 +12,11 @@
+ fn fixture_count(root: &Path, count: usize) {
+     let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
+         Path::new(env!("CARGO_MANIFEST_DIR"))
+-            .join("../../../../.venv/Scripts/python.exe")
++            .join(if cfg!(windows) {
++                "../../../../.venv/Scripts/python.exe"
++            } else {
++                "../../../../.venv/bin/python"
++            })
+             .into_os_string()
+     });
+     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+--- a/rust/temporal-qd/crates/qd-rotating-prefinalizer/tests/v5_transaction.rs
++++ b/rust/temporal-qd/crates/qd-rotating-prefinalizer/tests/v5_transaction.rs
+@@ -77,11 +77,19 @@
+     fs::create_dir_all(&output).unwrap();
+     let script =
+         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/build_v5_funnel_oracle_fixture.py");
+-    let python = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+-        .ancestors()
+-        .nth(4)
+-        .expect("repository root")
+-        .join(".venv/Scripts/python.exe");
++    let python = std::env::var_os("PYTHON")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| {
++            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++                .ancestors()
++                .nth(4)
++                .expect("repository root")
++                .join(if cfg!(windows) {
++                    ".venv/Scripts/python.exe"
++                } else {
++                    ".venv/bin/python"
++                })
++        });
+     let status = Command::new(python)
+         .arg(script)
+         .arg(&output)
