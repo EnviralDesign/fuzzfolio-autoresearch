@@ -873,6 +873,22 @@ impl RuntimeParentSelector {
         .map_err(|error| invalid(format!("runtime parent archive is invalid: {error}")))
     }
 
+    pub fn from_native_v5_archive(
+        archive: &Value,
+        parent_references: &BTreeMap<String, ParentReference>,
+        pair_generation_config_sha256: &str,
+        allow_empty_quality_bootstrap: bool,
+    ) -> Result<Self> {
+        archive::ArchiveParentSelector::from_native_v5_archive(
+            archive,
+            parent_references,
+            pair_generation_config_sha256,
+            allow_empty_quality_bootstrap,
+        )
+        .map(Self::Archive)
+        .map_err(|error| invalid(format!("runtime parent archive is invalid: {error}")))
+    }
+
     /// Production constructor. It uses the exact archive projection validated
     /// by [`RuntimeManifest::from_value`], so parent selection does not reopen
     /// a raw file or diverge from identity-ledger archive bootstrap.

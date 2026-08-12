@@ -25,9 +25,10 @@ use temporal_qd_contract::{
 };
 use temporal_qd_kernel::v5::{
     V5AttemptJournal, V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5SelectedProjection,
-    V5SharedConstructionAuthority,
+    V5SharedConstructionAuthority, parent_reference_from_v5_compact_record,
 };
 use temporal_qd_kernel::{
+    factory::ParentReference,
     g0_funnel::{
         DEFAULT_G0_ADMISSION_THREAD_CAP, G0FunnelOutcome, G0FunnelRequest,
         MAX_G0_ADMISSION_THREAD_CAP, finalize_g0,
@@ -2248,6 +2249,7 @@ struct V5EvolvedInputDocument {
     value: Value,
     binding_sha256: String,
     semantic_sha256: String,
+    path: PathBuf,
 }
 
 fn read_v5_evolved_input_document(
@@ -2295,7 +2297,127 @@ fn read_v5_evolved_input_document(
         value,
         binding_sha256,
         semantic_sha256,
+        path,
     })
+}
+
+fn native_v5_object_path(root: &Path, identity: &str, label: &str) -> Result<PathBuf> {
+    let digest = identity
+        .strip_prefix("sha256:")
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .ok_or_else(|| anyhow!("{label} is not a lowercase SHA-256 identity"))?;
+    safe_existing_file(&root.join(format!("{digest}.json")), label)
+}
+
+/// Reopen only the retained G0 compact records/deltas addressed by the
+/// committed archive. The archive self-hash binds each proposal entry; the
+/// compact record binds its delta; and the sealed compiler independently
+/// reconstructs the exact opaque parent payload before it reaches selection.
+fn native_v5_g0_parent_references(
+    manifest: &V5ProposalManifest,
+    archive: &V5EvolvedInputDocument,
+) -> Result<BTreeMap<String, ParentReference>> {
+    if manifest.generation_index != 2 {
+        bail!("native v5 G0 parent recovery is valid only for generation two");
+    }
+    let finalization_root = archive
+        .path
+        .parent()
+        .filter(|path| {
+            path.file_name().and_then(|value| value.to_str()) == Some("native-finalization")
+        })
+        .ok_or_else(|| anyhow!("native v5 G0 parent archive is outside native-finalization"))?;
+    if archive.path.file_name().and_then(|value| value.to_str()) != Some("archive.json") {
+        bail!("native v5 G0 parent archive has an unexpected filename");
+    }
+    let generation_root = finalization_root
+        .parent()
+        .ok_or_else(|| anyhow!("native v5 G0 parent archive lacks a generation root"))?;
+    let object_root = generation_root.join("proposal/v5-native/objects/sha256");
+    let authority = V5SharedConstructionAuthority::from_shared_object(&manifest.frozen_authority)
+        .context("open sealed native v5 G0 parent reconstruction authority")?;
+    let cells = archive
+        .value
+        .get("cells")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("native v5 G0 parent archive cells are invalid"))?;
+    let mut references = BTreeMap::new();
+    for cell in cells {
+        let members = cell
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("native v5 G0 parent archive cell members are invalid"))?;
+        for member in members {
+            let candidate = member
+                .get("candidate")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("native v5 G0 parent member lacks candidate"))?;
+            let candidate_id = candidate
+                .get("candidateId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("native v5 G0 parent candidate lacks candidateId"))?;
+            let record_sha256 = candidate
+                .get("proposalEntrySha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("native v5 G0 parent candidate lacks proposalEntrySha256")
+                })?;
+            let record_path = native_v5_object_path(
+                &object_root,
+                record_sha256,
+                "native v5 G0 compact parent record",
+            )?;
+            let record_raw =
+                read_stable_existing_file(&record_path, "native v5 G0 compact parent record")?;
+            let record_value: Value = serde_json::from_slice(&record_raw)
+                .context("parse native v5 G0 compact parent record")?;
+            let record = V5CompactAcceptedRecord::from_value(&record_value)
+                .context("validate native v5 G0 compact parent record")?;
+            if record.record_sha256()? != record_sha256
+                || record.candidate_id != candidate_id
+                || candidate
+                    .get("candidateIdentitySha256")
+                    .and_then(Value::as_str)
+                    != Some(record.candidate_identity_sha256.as_str())
+                || candidate.get("programSha256").and_then(Value::as_str)
+                    != Some(record.compiled.program_sha256.as_str())
+                || candidate.get("sourceProfileSha256").and_then(Value::as_str)
+                    != Some(record.compiled.raw_pair_sha256.as_str())
+                || candidate
+                    .get("profileSnapshotSha256")
+                    .and_then(Value::as_str)
+                    != Some(record.compiled.profile_snapshot_sha256.as_str())
+            {
+                bail!("native v5 G0 archive candidate drifts from its compact record");
+            }
+            let delta_path = native_v5_object_path(
+                &object_root,
+                &record.proposal_delta_sha256,
+                "native v5 G0 compact parent delta",
+            )?;
+            let delta_raw =
+                read_stable_existing_file(&delta_path, "native v5 G0 compact parent delta")?;
+            let delta: Value = serde_json::from_slice(&delta_raw)
+                .context("parse native v5 G0 compact parent delta")?;
+            let reference = parent_reference_from_v5_compact_record(&authority, &delta, &record)
+                .context("reconstruct native v5 G0 parent material")?;
+            if references
+                .insert(candidate_id.to_owned(), reference)
+                .is_some()
+            {
+                bail!("native v5 G0 parent archive repeats a candidate");
+            }
+        }
+    }
+    if references.is_empty() {
+        bail!("native v5 G0 parent archive has no retained compact material");
+    }
+    Ok(references)
 }
 
 /// Authenticate both later-generation input bindings and translate them into
@@ -2325,11 +2447,21 @@ fn v5_evolved_transaction_request(
     }
     let (allow_empty_quality_bootstrap, parent_schedule) =
         v5_evolved_runtime_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
-    let parents = RuntimeParentSelector::from_archive(
-        &parent_archive.value,
-        &manifest.generation_config_sha256,
-        allow_empty_quality_bootstrap,
-    )
+    let parents = if manifest.generation_index == 2 {
+        let references = native_v5_g0_parent_references(manifest, &parent_archive)?;
+        RuntimeParentSelector::from_native_v5_archive(
+            &parent_archive.value,
+            &references,
+            &manifest.generation_config_sha256,
+            allow_empty_quality_bootstrap,
+        )
+    } else {
+        RuntimeParentSelector::from_archive(
+            &parent_archive.value,
+            &manifest.generation_config_sha256,
+            allow_empty_quality_bootstrap,
+        )
+    }
     .context("open typed native v5 evolved parent selector")?;
 
     let input_ledger =

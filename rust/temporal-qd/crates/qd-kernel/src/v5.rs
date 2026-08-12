@@ -8104,7 +8104,7 @@ fn parent_material_from_reconstructed_pair(
 /// Construct an archive parent reference from a compact G0 record.  This is
 /// the only G0-to-later-generation bridge; it verifies compact reconstruction
 /// before creating an opaque selector payload.
-pub(crate) fn parent_reference_from_v5_compact_record(
+pub fn parent_reference_from_v5_compact_record(
     authority: &V5SharedConstructionAuthority,
     proposal_delta: &Value,
     record: &V5CompactAcceptedRecord,

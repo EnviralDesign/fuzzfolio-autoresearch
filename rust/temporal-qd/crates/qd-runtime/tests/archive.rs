@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 use temporal_qd_contract::canonical_sha256;
 use temporal_qd_kernel::{
-    factory::{NativeConstructionContext, NativePairAuthority, ProposalIntent},
+    factory::{NativeConstructionContext, NativePairAuthority, ParentReference, ProposalIntent},
     genome::{CanonicalPairCompiler, FrozenModule, FrozenPair, GenomeError, IdentitySnapshot},
     grammar::{GrammarContext, GrammarError, NativeValidator, TypedFragmentGrammar},
     identity::proposal_side,
@@ -744,6 +746,57 @@ fn direction_aware_native_rotating_archive_derives_omitted_projection() {
     assert!(
         VerifiedParentArchive::from_archive(&archive).is_err(),
         "partial direction projections must remain fail-closed"
+    );
+}
+
+#[test]
+fn native_v5_archive_uses_compiler_authenticated_compact_parent_references() {
+    let mut archive = directional_archive(archive(), "balanced");
+    let mut references = BTreeMap::new();
+    for cell in archive["cells"].as_array_mut().unwrap() {
+        for member in cell["members"].as_array_mut().unwrap() {
+            let candidate_id = member["candidateId"].as_str().unwrap().to_owned();
+            let candidate = member["candidate"].as_object_mut().unwrap();
+            let pair_payload = candidate.remove("bidirectionalGenome").unwrap();
+            let pair = FrozenPair::from_payload(&pair_payload).unwrap();
+            candidate.remove("candidateIdentityMaterial");
+            candidate.insert(
+                "proposalEntrySha256".into(),
+                Value::String(canonical_sha256(&json!({"candidateId": candidate_id})).unwrap()),
+            );
+            references.insert(
+                candidate_id.clone(),
+                ParentReference {
+                    pair_identity_sha256: pair.identity_sha256().unwrap(),
+                    candidate_id,
+                    pair_payload,
+                    selection_audit: None,
+                },
+            );
+        }
+    }
+    archive.as_object_mut().unwrap().remove("archiveSha256");
+    archive["archiveSha256"] = Value::String(canonical_sha256(&archive).unwrap());
+
+    let selector = ArchiveParentSelector::from_native_v5_archive(
+        &archive,
+        &references,
+        GENERATION_SEED,
+        false,
+    )
+    .expect("native v5 compact parent references must feed archive selection");
+    assert_eq!(selector.eligible_parent_count(), 4);
+
+    let first = references.values_mut().next().unwrap();
+    first.candidate_id.push_str("_substituted");
+    assert!(
+        ArchiveParentSelector::from_native_v5_archive(
+            &archive,
+            &references,
+            GENERATION_SEED,
+            false,
+        )
+        .is_err()
     );
 }
 

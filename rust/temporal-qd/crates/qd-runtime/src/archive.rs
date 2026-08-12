@@ -361,6 +361,26 @@ pub struct ArchiveParentSelector {
 impl VerifiedParentArchive {
     /// Strictly validate and retain a complete production archive once.
     pub fn from_archive(archive: &Value) -> Result<Self> {
+        Self::from_archive_with_native_parent_references(archive, None)
+    }
+
+    /// Validate a native-v5 rotating archive while supplying the compiler-
+    /// authenticated compact parent material addressed by each retained
+    /// candidate. Historical archives embed `bidirectionalGenome`; native-v5
+    /// archives instead bind their compact record through
+    /// `candidate.proposalEntrySha256` and keep the large immutable material in
+    /// the sibling content-addressed proposal store.
+    pub fn from_native_v5_archive(
+        archive: &Value,
+        parent_references: &BTreeMap<String, ParentReference>,
+    ) -> Result<Self> {
+        Self::from_archive_with_native_parent_references(archive, Some(parent_references))
+    }
+
+    fn from_archive_with_native_parent_references(
+        archive: &Value,
+        parent_references: Option<&BTreeMap<String, ParentReference>>,
+    ) -> Result<Self> {
         let archive_sha256 = canonical_identity(archive, "archiveSha256", "QD parent archive")?;
         let archive_map = map(archive, "QD parent archive")?;
         if archive_map.get("schemaVersion").and_then(Value::as_str) != Some(QD_ARCHIVE_SCHEMA)
@@ -454,6 +474,7 @@ impl VerifiedParentArchive {
                 &compiler_authority,
                 &pair_policy_sha256,
                 direction_aware,
+                parent_references,
                 &mut seen_cells,
                 &mut seen_candidates,
             )?);
@@ -499,6 +520,16 @@ impl ArchiveParentSelector {
         allow_empty_quality_bootstrap: bool,
     ) -> Result<Self> {
         let verified = VerifiedParentArchive::from_archive(archive)?;
+        Self::from_verified(&verified, generation_seed, allow_empty_quality_bootstrap)
+    }
+
+    pub fn from_native_v5_archive(
+        archive: &Value,
+        parent_references: &BTreeMap<String, ParentReference>,
+        generation_seed: &str,
+        allow_empty_quality_bootstrap: bool,
+    ) -> Result<Self> {
+        let verified = VerifiedParentArchive::from_native_v5_archive(archive, parent_references)?;
         Self::from_verified(&verified, generation_seed, allow_empty_quality_bootstrap)
     }
 
@@ -853,6 +884,7 @@ fn parse_cell(
     compiler_authority: &IdentitySnapshot,
     pair_policy_sha256: &str,
     direction_aware: bool,
+    native_parent_references: Option<&BTreeMap<String, ParentReference>>,
     seen_cells: &mut BTreeSet<String>,
     seen_candidates: &mut BTreeSet<String>,
 ) -> Result<SourceCell> {
@@ -886,6 +918,7 @@ fn parse_cell(
                 compiler_authority,
                 pair_policy_sha256,
                 direction_aware,
+                native_parent_references,
                 &cell_id,
                 &coordinates,
                 seen_candidates,
@@ -1060,6 +1093,7 @@ fn parse_member(
     compiler_authority: &IdentitySnapshot,
     pair_policy_sha256: &str,
     direction_aware: bool,
+    native_parent_references: Option<&BTreeMap<String, ParentReference>>,
     cell_id: &str,
     coordinates: &[String; 7],
     seen_candidates: &mut BTreeSet<String>,
@@ -1202,49 +1236,122 @@ fn parse_member(
     if candidate.get("candidateId").and_then(Value::as_str) != Some(candidate_id.as_str()) {
         return Err(invalid("QD archive member/candidate ID mismatch"));
     }
-    let pair_payload = field(candidate, "bidirectionalGenome", "QD archive candidate")?;
-    let pair = FrozenPair::from_payload(pair_payload).map_err(|error| {
-        invalid(format!(
-            "QD bidirectional pair material is invalid: {error}"
-        ))
-    })?;
-    if pair.pair_compiler.canonical_payload() != compiler_authority.canonical_payload() {
-        return Err(invalid("QD bidirectional pair compiler authority mismatch"));
-    }
-    if candidate.get("sourceProfile") != Some(&pair.profile)
-        || candidate.get("sourceProfileSha256").and_then(Value::as_str)
-            != Some(pair.raw_pair_sha256.as_str())
-        || candidate.get("programSha256").and_then(Value::as_str)
-            != Some(pair.native_program_sha256.as_str())
-    {
-        return Err(invalid(
-            "QD economic candidate does not bind the exact frozen v3/both pair",
-        ));
-    }
-    let pair_identity_sha256 = pair
-        .identity_sha256()
-        .map_err(|error| invalid(format!("QD pair identity is invalid: {error}")))?;
-    let identity_material = map(
-        field(
-            candidate,
-            "candidateIdentityMaterial",
-            "QD archive candidate",
-        )?,
-        "QD candidate identity material",
-    )?;
-    if identity_material
-        .get("bidirectionalGenomeIdentitySha256")
-        .and_then(Value::as_str)
-        != Some(pair_identity_sha256.as_str())
-        || identity_material
-            .get("pairPolicySha256")
-            .and_then(Value::as_str)
-            != Some(pair_policy_sha256)
-    {
-        return Err(invalid(
-            "QD candidate identity does not bind frozen pair material",
-        ));
-    }
+    let (pair_identity_sha256, pair_payload, long_profile_sha256, short_profile_sha256) =
+        if let Some(pair_payload) = candidate.get("bidirectionalGenome") {
+            let pair = FrozenPair::from_payload(pair_payload).map_err(|error| {
+                invalid(format!(
+                    "QD bidirectional pair material is invalid: {error}"
+                ))
+            })?;
+            if pair.pair_compiler.canonical_payload() != compiler_authority.canonical_payload() {
+                return Err(invalid("QD bidirectional pair compiler authority mismatch"));
+            }
+            if candidate.get("sourceProfile") != Some(&pair.profile)
+                || candidate.get("sourceProfileSha256").and_then(Value::as_str)
+                    != Some(pair.raw_pair_sha256.as_str())
+                || candidate.get("programSha256").and_then(Value::as_str)
+                    != Some(pair.native_program_sha256.as_str())
+            {
+                return Err(invalid(
+                    "QD economic candidate does not bind the exact frozen v3/both pair",
+                ));
+            }
+            let pair_identity_sha256 = pair
+                .identity_sha256()
+                .map_err(|error| invalid(format!("QD pair identity is invalid: {error}")))?;
+            let identity_material = map(
+                field(
+                    candidate,
+                    "candidateIdentityMaterial",
+                    "QD archive candidate",
+                )?,
+                "QD candidate identity material",
+            )?;
+            if identity_material
+                .get("bidirectionalGenomeIdentitySha256")
+                .and_then(Value::as_str)
+                != Some(pair_identity_sha256.as_str())
+                || identity_material
+                    .get("pairPolicySha256")
+                    .and_then(Value::as_str)
+                    != Some(pair_policy_sha256)
+            {
+                return Err(invalid(
+                    "QD candidate identity does not bind frozen pair material",
+                ));
+            }
+            (
+                pair_identity_sha256,
+                pair_payload.clone(),
+                pair.long.profile_sha256,
+                pair.short.profile_sha256,
+            )
+        } else {
+            let references = native_parent_references.ok_or_else(|| {
+                invalid("QD archive candidate lacks bidirectionalGenome or native parent material")
+            })?;
+            let reference = references.get(&candidate_id).ok_or_else(|| {
+                invalid("native QD archive candidate lacks compact parent material")
+            })?;
+            reference.validate().map_err(|error| {
+                invalid(format!(
+                    "native QD archive parent material is invalid: {error}"
+                ))
+            })?;
+            if reference.candidate_id != candidate_id {
+                return Err(invalid(
+                    "native QD archive parent material candidate identity drifted",
+                ));
+            }
+            let proposal_entry = string(candidate, "proposalEntrySha256", "QD archive candidate")?;
+            exact_sha256(&proposal_entry, "native QD archive proposal entry SHA-256")?;
+            let profile = map(
+                field(candidate, "sourceProfile", "QD archive candidate")?,
+                "native QD archive source profile",
+            )?;
+            let graph = map(
+                field(profile, "graph", "native QD archive source profile")?,
+                "native QD archive graph",
+            )?;
+            let arbitration = map(
+                field(graph, "entryArbitration", "native QD archive graph")?,
+                "native QD archive entry arbitration",
+            )?;
+            let modules = field(
+                arbitration,
+                "modules",
+                "native QD archive entry arbitration",
+            )?
+            .as_array()
+            .ok_or_else(|| invalid("native QD archive entry modules must be an array"))?;
+            let profile_for_side = |side: &str| -> Result<String> {
+                let mut matches = modules
+                    .iter()
+                    .filter(|module| module.get("direction").and_then(Value::as_str) == Some(side));
+                let module = matches.next().ok_or_else(|| {
+                    invalid(format!("native QD archive lacks {side} entry module"))
+                })?;
+                if matches.next().is_some() {
+                    return Err(invalid(format!(
+                        "native QD archive repeats {side} entry module"
+                    )));
+                }
+                let module = map(module, "native QD archive entry module")?;
+                let identity = string(
+                    module,
+                    "sourceProfileSnapshotSha256",
+                    "native QD archive entry module",
+                )?;
+                exact_sha256(&identity, "native QD archive source profile snapshot")?;
+                Ok(identity)
+            };
+            (
+                reference.pair_identity_sha256.clone(),
+                reference.pair_payload.clone(),
+                profile_for_side("long")?,
+                profile_for_side("short")?,
+            )
+        };
     if member
         .get("robustBreederEligible")
         .is_some_and(|value| value.as_bool().is_none())
@@ -1330,8 +1437,8 @@ fn parse_member(
         source_profile_sha256,
         profile_snapshot_sha256,
         execution_config,
-        long_profile_sha256: pair.long.profile_sha256,
-        short_profile_sha256: pair.short.profile_sha256,
+        long_profile_sha256,
+        short_profile_sha256,
     };
     // Selection is the only long-lived consumer of a full frozen pair.  The
     // archive validator still reopened and authenticated every pair above,
