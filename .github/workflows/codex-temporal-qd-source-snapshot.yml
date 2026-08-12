@@ -1,0 +1,33 @@
+name: Codex Temporal QD source snapshot
+
+on:
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'codex/temporal-qd-simplification'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Package source tree
+        shell: bash
+        run: tar --exclude=.git --exclude=target --exclude=.venv -czf temporal-qd-source.tar.gz .
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporal-qd-source-${{ github.event.pull_request.head.sha || github.sha }}
+          path: temporal-qd-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
