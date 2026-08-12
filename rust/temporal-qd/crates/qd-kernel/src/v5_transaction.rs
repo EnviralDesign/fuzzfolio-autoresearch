@@ -1613,6 +1613,179 @@ pub fn verify_selected_v5_g0_materialization(
 }
 
 impl V5G0TransactionResult {
+    /// Parse one complete canonical proposal checkpoint without replaying the
+    /// scientific constructor.  Every nested component still validates its
+    /// exact schema and self-hash, and the complete canonical transaction root
+    /// is checked byte-for-byte.  A caller that needs audited reconstruction
+    /// invokes [`Self::verify_checkpoint_replay`] explicitly.
+    pub fn from_value(value: &Value) -> Result<Self> {
+        let fields = value
+            .as_object()
+            .ok_or_else(|| contract("v5 G0 transaction checkpoint must be an object"))?;
+        let expected = [
+            "schemaVersion",
+            "generationIndex",
+            "generationConfigSha256",
+            "sharedAuthoritySha256",
+            "targetAccepted",
+            "maxAttempts",
+            "evaluationWidth",
+            "targetReached",
+            "stopReason",
+            "attemptJournal",
+            "attempts",
+            "outcomeAudits",
+            "acceptedRecords",
+            "compactAcceptedJournal",
+            "attemptProposalDeltas",
+            "acceptedProposalDeltas",
+            "identityLedger",
+            "scheduleStateReceipt",
+            "acceptedPool",
+            "campaignLedger",
+            "g0Selection",
+            "selectedProjectionIndex",
+            "publicationPlanSha256",
+            "publicationPlan",
+            "transactionSha256",
+        ];
+        if fields.len() != expected.len() || expected.iter().any(|key| !fields.contains_key(*key)) {
+            return Err(contract("v5 G0 transaction checkpoint fields are not exact"));
+        }
+        if required(value, "schemaVersion", "v5 G0 transaction checkpoint")?.as_str()
+            != Some(V5_G0_TRANSACTION_SCHEMA)
+        {
+            return Err(contract("v5 G0 transaction checkpoint schema is invalid"));
+        }
+        let supplied = exact_sha(
+            required(value, "transactionSha256", "v5 G0 transaction checkpoint")?,
+            "v5 G0 transaction checkpoint SHA-256",
+        )?;
+        if canonical_sha256_without_object_field(value, "transactionSha256")? != supplied {
+            return Err(contract("v5 G0 transaction checkpoint identity drifted"));
+        }
+        let attempt_rows = required(value, "attempts", "v5 G0 transaction checkpoint")?
+            .as_array()
+            .ok_or_else(|| contract("v5 G0 transaction attempts must be an array"))?;
+        let outcome_audits = required(value, "outcomeAudits", "v5 G0 transaction checkpoint")?
+            .as_array()
+            .ok_or_else(|| contract("v5 G0 transaction audits must be an array"))?;
+        let accepted_records = required(value, "acceptedRecords", "v5 G0 transaction checkpoint")?
+            .as_array()
+            .ok_or_else(|| contract("v5 G0 accepted records must be an array"))?;
+        let attempt_deltas = required(
+            value,
+            "attemptProposalDeltas",
+            "v5 G0 transaction checkpoint",
+        )?
+        .as_array()
+        .ok_or_else(|| contract("v5 G0 attempt deltas must be an array"))?;
+        let accepted_deltas = required(
+            value,
+            "acceptedProposalDeltas",
+            "v5 G0 transaction checkpoint",
+        )?
+        .as_array()
+        .ok_or_else(|| contract("v5 G0 accepted deltas must be an array"))?;
+        let optional = |field: &str| -> Result<Option<&Value>> {
+            let value = required(value, field, "v5 G0 transaction checkpoint")?;
+            Ok((!value.is_null()).then_some(value))
+        };
+        let durable = V5G0DurableArtifacts::from_canonical_values(
+            required(value, "attemptJournal", "v5 G0 transaction checkpoint")?,
+            attempt_rows,
+            outcome_audits,
+            accepted_records,
+            required(
+                value,
+                "compactAcceptedJournal",
+                "v5 G0 transaction checkpoint",
+            )?,
+            attempt_deltas,
+            accepted_deltas,
+            required(value, "identityLedger", "v5 G0 transaction checkpoint")?,
+            required(
+                value,
+                "scheduleStateReceipt",
+                "v5 G0 transaction checkpoint",
+            )?,
+            optional("acceptedPool")?,
+            optional("campaignLedger")?,
+            optional("g0Selection")?,
+            optional("selectedProjectionIndex")?,
+            required(value, "publicationPlan", "v5 G0 transaction checkpoint")?,
+        )?;
+        let result = Self {
+            generation_index: required(value, "generationIndex", "v5 G0 transaction checkpoint")?
+                .as_u64()
+                .ok_or_else(|| contract("v5 G0 transaction generation index is invalid"))?,
+            generation_config_sha256: exact_sha(
+                required(
+                    value,
+                    "generationConfigSha256",
+                    "v5 G0 transaction checkpoint",
+                )?,
+                "v5 G0 transaction generation config SHA-256",
+            )?,
+            shared_authority_sha256: exact_sha(
+                required(
+                    value,
+                    "sharedAuthoritySha256",
+                    "v5 G0 transaction checkpoint",
+                )?,
+                "v5 G0 transaction shared authority SHA-256",
+            )?,
+            target_accepted: required(value, "targetAccepted", "v5 G0 transaction checkpoint")?
+                .as_u64()
+                .ok_or_else(|| contract("v5 G0 transaction target is invalid"))?,
+            max_attempts: required(value, "maxAttempts", "v5 G0 transaction checkpoint")?
+                .as_u64()
+                .ok_or_else(|| contract("v5 G0 transaction maximum attempts is invalid"))?,
+            evaluation_width: required(
+                value,
+                "evaluationWidth",
+                "v5 G0 transaction checkpoint",
+            )?
+            .as_u64()
+            .ok_or_else(|| contract("v5 G0 transaction evaluation width is invalid"))?,
+            // The thread cap is deliberately excluded from semantic identity.
+            thread_cap: 1,
+            target_reached: required(value, "targetReached", "v5 G0 transaction checkpoint")?
+                .as_bool()
+                .ok_or_else(|| contract("v5 G0 transaction target state is invalid"))?,
+            stop_reason: exact_text(
+                required(value, "stopReason", "v5 G0 transaction checkpoint")?,
+                "v5 G0 transaction stop reason",
+            )?,
+            attempts: durable.attempts,
+            outcome_audits: durable.outcome_audits,
+            attempt_journal: durable.attempt_journal,
+            accepted_records: durable.accepted_records,
+            compact_accepted_journal: durable.compact_accepted_journal,
+            attempt_proposal_deltas: durable.attempt_proposal_deltas,
+            accepted_proposal_deltas: durable.accepted_proposal_deltas,
+            identity_ledger: durable.identity_ledger,
+            schedule_state_receipt: durable.schedule_state_receipt,
+            accepted_pool: durable.accepted_pool,
+            campaign_ledger: durable.campaign_ledger,
+            g0_selection: durable.g0_selection,
+            selected_projection_index: durable.selected_projection_index,
+            publication_plan: durable.publication_plan,
+        };
+        if result.transaction_sha256()? != supplied || result.to_value()? != *value {
+            return Err(contract(
+                "v5 G0 transaction checkpoint differs from its typed components",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Run the expensive sealed-authority reconstruction only when an audited
+    /// proof is requested.  Normal trusted restart uses [`Self::from_value`].
+    pub fn verify_checkpoint_replay(&self, request: &V5G0TransactionRequest) -> Result<()> {
+        verify_v5_g0_transaction_replay(request, self)
+    }
+
     pub fn publication_plan_sha256(&self) -> Result<String> {
         self.publication_plan
             .publication_plan_sha256()
@@ -3766,6 +3939,27 @@ mod tests {
                 .to_value()
                 .expect("parallel compact journal"),
         );
+    }
+
+    #[test]
+    fn v5_g0_transaction_checkpoint_round_trips_and_replays_on_demand() {
+        let request = request(1, 2, 2);
+        let result = execute_v5_g0_transaction(request.clone())
+            .expect("execute native G0 transaction checkpoint fixture");
+        let encoded = result.to_value().expect("encode transaction checkpoint");
+        let parsed = V5G0TransactionResult::from_value(&encoded)
+            .expect("parse transaction checkpoint without constructor replay");
+        assert_eq!(
+            parsed.to_value().expect("re-encode transaction checkpoint"),
+            encoded,
+        );
+        parsed
+            .verify_checkpoint_replay(&request)
+            .expect("explicit audited checkpoint replay");
+
+        let mut tampered = encoded;
+        tampered["targetAccepted"] = Value::from(3_u64);
+        assert!(V5G0TransactionResult::from_value(&tampered).is_err());
     }
 
     #[test]
