@@ -11352,6 +11352,7 @@ def run_qd_supervisor(
                         ),
                         manifest_path=_native_finalization_root(root, latest)
                         / "manifest.json",
+                        committed_restart_only=True,
                     )
                 except TemporalQDV5ControlPlaneError as exc:
                     raise TemporalDiscoveryContractError(str(exc)) from exc
