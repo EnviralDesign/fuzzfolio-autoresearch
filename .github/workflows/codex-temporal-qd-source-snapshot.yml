@@ -1,0 +1,34 @@
+name: Codex Temporal QD source snapshot
+
+on:
+  push:
+    branches:
+      - codex/temporal-qd-simplification
+    paths:
+      - .github/workflows/codex-temporal-qd-source-snapshot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch head
+        uses: actions/checkout@v4
+        with:
+          ref: codex/temporal-qd-simplification
+          fetch-depth: 0
+
+      - name: Package source tree
+        shell: bash
+        run: tar --exclude=.git --exclude=target --exclude=.venv -czf "$RUNNER_TEMP/temporal-qd-source.tar.gz" .
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporal-qd-source-${{ github.sha }}
+          path: ${{ runner.temp }}/temporal-qd-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
