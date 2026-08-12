@@ -11,18 +11,25 @@ fn self_hash(value: &mut Value, field: &str) {
     value[field] = json!(canonical_sha256(value).unwrap());
 }
 
+fn oracle_python() -> std::ffi::OsString {
+    std::env::var_os("PYTHON").unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(if cfg!(windows) {
+                "../../../../.venv/Scripts/python.exe"
+            } else {
+                "../../../../.venv/bin/python"
+            })
+            .into_os_string()
+    })
+}
+
 #[test]
 fn python_oracle_fixture_matches_source_bytes_and_restart_is_compact() {
     let root = tempdir().unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/build_oracle_fixture.py");
     // CI can set PYTHON. The repository venv is the normal local oracle,
     // avoiding the Windows-App-Execution-Alias stub named `python`.
-    let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../.venv/Scripts/python.exe")
-            .into_os_string()
-    });
-    let output = Command::new(python)
+    let output = Command::new(oracle_python())
         .arg(script)
         .arg(root.path())
         .output()
@@ -63,13 +70,8 @@ fn python_oracle_fixture_matches_source_bytes_and_restart_is_compact() {
 fn missing_current_panel_bundle_is_not_relabelled_as_backfill() {
     let root = tempdir().unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/build_oracle_fixture.py");
-    let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../.venv/Scripts/python.exe")
-            .into_os_string()
-    });
     assert!(
-        Command::new(python)
+        Command::new(oracle_python())
             .arg(script)
             .arg(root.path())
             .status()
@@ -103,13 +105,8 @@ fn missing_current_panel_bundle_is_not_relabelled_as_backfill() {
 fn prior_panel_backfill_emits_relocatable_sealed_cohort_selection() {
     let root = tempdir().unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/build_oracle_fixture.py");
-    let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../.venv/Scripts/python.exe")
-            .into_os_string()
-    });
     assert!(
-        Command::new(python)
+        Command::new(oracle_python())
             .arg(script)
             .arg(root.path())
             .status()
@@ -174,13 +171,8 @@ fn prior_panel_backfill_emits_relocatable_sealed_cohort_selection() {
 fn legacy_or_generic_panel_receipt_is_a_hard_v5_failure() {
     let root = tempdir().unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/build_oracle_fixture.py");
-    let python = std::env::var_os("PYTHON").unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../.venv/Scripts/python.exe")
-            .into_os_string()
-    });
     assert!(
-        Command::new(python)
+        Command::new(oracle_python())
             .arg(script)
             .arg(root.path())
             .status()
