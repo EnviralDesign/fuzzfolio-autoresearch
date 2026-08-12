@@ -1,0 +1,38 @@
+name: Codex one-shot proposal fixture portability
+
+on:
+  push:
+    branches:
+      - codex/temporal-qd-simplification
+    paths:
+      - .codex/proposal-fixture-portability.patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-one-shot-proposal-fixture
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/temporal-qd-simplification
+          fetch-depth: 0
+
+      - name: Apply portability fix and remove transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .codex/proposal-fixture-portability.patch
+          git config user.name "Codex"
+          git config user.email "codex@openai.com"
+          git apply --check .codex/proposal-fixture-portability.patch
+          git apply --index --whitespace=nowarn .codex/proposal-fixture-portability.patch
+          git rm -f .codex/proposal-fixture-portability.patch .github/workflows/codex-one-shot-proposal-fixture.yml
+          git commit -m "Use host-native proposal fixture path"
+          git push origin HEAD:codex/temporal-qd-simplification
