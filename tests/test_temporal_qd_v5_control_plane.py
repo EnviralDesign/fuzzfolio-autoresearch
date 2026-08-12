@@ -1731,6 +1731,12 @@ def test_native_v5_finalizer_reopens_only_commit_descriptors(
     )
     source_path = root / "source.json"
     _write(source_path, source)
+    source_transport_path = str(source_path)
+    if control.os.name == "nt":
+        source_transport_path = (
+            control._native_v5_rust_canonical_directory_transport(root)
+            + "\\source.json"
+        )
     manifest = _self_hashed(
         {
             "schemaVersion": control.FINALIZER_MANIFEST_SCHEMA,
@@ -1738,7 +1744,7 @@ def test_native_v5_finalizer_reopens_only_commit_descriptors(
             "operation": "finalize_rotating_generation",
             "runtimeAuthoritySha256": runtime["authoritySha256"],
             "semanticAuthoritySha256": semantic_authority,
-            "sourcePath": str(source_path),
+            "sourcePath": source_transport_path,
             "sourceSha256": source["sourceSha256"],
             "resultPath": "generation-commit.json",
         },

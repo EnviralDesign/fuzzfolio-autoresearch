@@ -3356,7 +3356,9 @@ def run_native_v5_generation_finalizer(
         or manifest.get("contractVersion") != CONTRACT_VERSION
         or manifest.get("operation") != "finalize_rotating_generation"
         or manifest.get("runtimeAuthoritySha256") != authority["authoritySha256"]
-        or manifest.get("sourcePath") != str(source_path)
+        or not native_v5_transport_path_matches(
+            manifest.get("sourcePath"), source_path
+        )
         or manifest.get("resultPath") != "generation-commit.json"
     ):
         raise TemporalQDV5ControlPlaneError("native v5 finalizer manifest is incompatible")
