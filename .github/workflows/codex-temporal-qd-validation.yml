@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: "2"
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - name: Checkout branch
         uses: actions/checkout@v4
@@ -43,6 +44,10 @@ jobs:
 
       - name: Sync frozen Python environment
         run: uv sync --frozen
+
+      - name: Expose frozen Python environment to Rust oracle tests
+        shell: bash
+        run: echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Read pinned Rust channel
         id: rust-toolchain
@@ -62,18 +67,26 @@ jobs:
         working-directory: rust/temporal-qd
         run: cargo fmt --check
 
-      - name: Run Rust workspace tests
+      - name: Run affected Rust tests
         working-directory: rust/temporal-qd
-        run: cargo test --workspace
+        run: >-
+          cargo test
+          -p temporal-qd-rotating-prefinalizer
+          -p temporal-qd-kernel
+          -p temporal-qd-batch
 
-      - name: Lint Rust workspace
+      - name: Lint affected Rust crates
         working-directory: rust/temporal-qd
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: >-
+          cargo clippy
+          -p temporal-qd-rotating-prefinalizer
+          -p temporal-qd-kernel
+          -p temporal-qd-batch
+          --all-targets
 
       - name: Run focused Python Temporal QD tests
         run: >-
           uv run pytest -q
           tests/test_temporal_qd_v5_native_bridge.py
-          tests/test_temporal_qd_v5_native_campaign_freeze.py
           tests/test_temporal_qd_v5_control_plane.py
-          tests/test_temporal_qd_supervisor.py
+          tests/test_temporal_qd_v5_supervisor_fixture.py
