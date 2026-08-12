@@ -2968,20 +2968,32 @@ mod tests {
             task_pack.extend(canonical_json_line(task)?);
         }
         fs::write(&path, task_pack)?;
-        let candidates = tasks
+        let candidate_ids = tasks
             .iter()
             .map(|task| {
                 let task = object(task, "fixture task")?;
-                Ok(json!({"candidateId":text(task,"lane_id")?}))
+                Ok(text(task, "lane_id")?.to_owned())
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<BTreeSet<_>>>()?;
+        let window_ids = tasks
+            .iter()
+            .map(|task| {
+                let task = object(task, "fixture task")?;
+                let payload = object(field(task, "payload")?, "fixture payload")?;
+                Ok(text(payload, "lake_window_semantic_sha256")?.to_owned())
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let candidates = candidate_ids
+            .iter()
+            .map(|candidate_id| json!({"candidateId":candidate_id}))
+            .collect::<Vec<_>>();
         let mut cohort = json!({
             "schemaVersion":"temporal_qd_rotating_cohort_population_v1",
             "generationIndex":1,
             "panelId":"panel-a",
             "cohortRole":"proposal_current_panel",
             "rotatingEvidenceSha256":SHA_A,
-            "candidateCount":tasks.len(),
+            "candidateCount":candidate_ids.len(),
             "candidates":candidates,
             "proposalPopulation":true,
         });
@@ -3005,8 +3017,8 @@ mod tests {
             "campaignSha256":SHA_C,
             "evaluationIdentitySha256":SHA_A,
             "taskMatrixSha256":matrix,
-            "candidateCount":tasks.len(),
-            "windowCount":1,
+            "candidateCount":candidate_ids.len(),
+            "windowCount":window_ids.len(),
             "taskCount":tasks.len(),
             "tasks":{
                 "relativePath":"screening-run/tasks.jsonl",
@@ -3343,6 +3355,109 @@ mod tests {
         assert_eq!(result["telemetry"]["peakLiveTaskBatch"], json!(2));
         assert_eq!(result["telemetry"]["peakLiveCompletionBatch"], json!(1));
         assert_eq!(result["telemetry"]["completedTaskCount"], json!(5));
+        Ok(())
+    }
+
+    #[test]
+    fn disposable_canary_64_candidates_two_windows_recovers_maintenance_and_crash_tail()
+    -> Result<()> {
+        let directory = TempDir::new()?;
+        let root = directory.path();
+        let mut tasks = Vec::with_capacity(128);
+        for candidate_ordinal in 0..64 {
+            let candidate_id = format!("canary-candidate-{candidate_ordinal:03}");
+            for window_ordinal in 0..2 {
+                let task_id = format!("canary-task-{candidate_ordinal:03}-w{window_ordinal}");
+                let mut row = task(&task_id, &candidate_id);
+                row["payload"]["lake_window_semantic_sha256"] =
+                    json!(if window_ordinal == 0 { SHA_B } else { SHA_C });
+                row["payload"]["shared_observation_stream_id"] =
+                    json!(format!("canary-stream-{window_ordinal}"));
+                tasks.push(row);
+            }
+        }
+        let manifest = write_fixture_manifest(root, &tasks)?;
+        let completions = tasks
+            .iter()
+            .enumerate()
+            .map(|(ordinal, task)| {
+                let mut completion =
+                    successful_completion(task, &format!("canary-lease-{ordinal:03}"))?;
+                completion["worker_id"] = json!(format!("canary-worker-{}", ordinal % 4));
+                Ok(completion)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut fresh = request(&manifest, root, DispatchMode::Fresh);
+        fresh.timeout = Duration::from_secs(10);
+        fresh.enqueue_batch_size = 16;
+        fresh.result_batch_size = 8;
+        let mut crashing = FakeLocalGateway::new(root, completions.clone());
+        crashing.maintenance_enqueues_remaining = 2;
+        crashing.fail_ack_once = true;
+        let crash_error = execute_gateway_dispatch_with_client(&fresh, &mut crashing)
+            .expect_err("canary must stop after durable write and before acknowledgement");
+        eprintln!("expected canary crash: {crash_error:#}");
+        assert!(crashing.saw_durable_journal_before_ack);
+
+        let sidecar = root.join(SIDECAR_DIR);
+        let pack_path = sidecar.join(RESULT_PACK_NAME);
+        let journal_path = sidecar.join(COMPLETION_JOURNAL_NAME);
+        OpenOptions::new()
+            .append(true)
+            .open(&pack_path)?
+            .write_all(b"uncommitted-canary-pack-tail")?;
+        OpenOptions::new()
+            .append(true)
+            .open(&journal_path)?
+            .write_all(b"{\"partialCanaryJournalRow\":")?;
+
+        let mut resume = request(&manifest, root, DispatchMode::Resume);
+        resume.timeout = Duration::from_secs(10);
+        resume.enqueue_batch_size = 16;
+        resume.result_batch_size = 8;
+        let mut resumed = FakeLocalGateway::new(root, completions);
+        resumed.reject_enqueues = true;
+        resumed.maintenance_reads_remaining = 2;
+        resumed.maintenance_acks_remaining = 2;
+        let result = execute_gateway_dispatch_with_client(&resume, &mut resumed)?;
+
+        assert_eq!(result["taskCount"], json!(128));
+        assert_eq!(result["completedTaskCount"], json!(128));
+        assert_eq!(result["telemetry"]["duplicateRedeliveryCount"], json!(8));
+        assert_eq!(result["telemetry"]["maintenanceActivations"], json!(2));
+        assert_eq!(result["telemetry"]["maintenanceProbeCount"], json!(2));
+        assert_eq!(result["telemetry"]["peakLiveTaskBatch"], json!(16));
+        assert_eq!(result["telemetry"]["peakLiveCompletionBatch"], json!(8));
+
+        let journal_rows = fs::read_to_string(&journal_path)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(journal_rows.len(), 128);
+        assert_eq!(
+            fs::read_to_string(sidecar.join(TASK_INDEX_NAME))?
+                .lines()
+                .count(),
+            128
+        );
+        assert!(
+            !fs::read(&pack_path)?
+                .windows(b"uncommitted-canary-pack-tail".len())
+                .any(|window| window == b"uncommitted-canary-pack-tail")
+        );
+        assert!(sidecar.join(EXECUTION_RECEIPT_NAME).is_file());
+        let sidecar_file_count = fs::read_dir(&sidecar)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(sidecar_file_count, 5);
+        eprintln!(
+            "disposable canary artifact census: tasks=128 candidates=64 windows=2 files={sidecar_file_count} task_index_bytes={} journal_bytes={} result_pack_bytes={}",
+            fs::metadata(sidecar.join(TASK_INDEX_NAME))?.len(),
+            fs::metadata(&journal_path)?.len(),
+            fs::metadata(&pack_path)?.len()
+        );
         Ok(())
     }
 
