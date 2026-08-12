@@ -1,0 +1,16 @@
+diff --git a/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs b/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs
+index da8400c..6c60935 100644
+--- a/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs
++++ b/rust/temporal-qd/crates/qd-rotating-prefinalizer/src/v5.rs
+@@ -1654,10 +1654,7 @@ fn all_bundles(
+                 "campaign receipt bundle panel relabelled"
+             );
+             validate_bundle(base, &b, Some(candidate))?;
+-            let k = (
+-                candidate_id.to_owned(),
+-                text(&b, "panelId")?.to_owned(),
+-            );
++            let k = (candidate_id.to_owned(), text(&b, "panelId")?.to_owned());
+             if let Some(old) = out.insert(k, b.clone()) {
+                 ensure!(
+                     old == b,
