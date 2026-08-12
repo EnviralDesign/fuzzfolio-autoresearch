@@ -1654,10 +1654,7 @@ fn all_bundles(
                 "campaign receipt bundle panel relabelled"
             );
             validate_bundle(base, &b, Some(candidate))?;
-            let k = (
-                candidate_id.to_owned(),
-                text(&b, "panelId")?.to_owned(),
-            );
+            let k = (candidate_id.to_owned(), text(&b, "panelId")?.to_owned());
             if let Some(old) = out.insert(k, b.clone()) {
                 ensure!(
                     old == b,
