@@ -1,0 +1,60 @@
+name: Codex Temporal QD Rust toolchain snapshot
+
+on:
+  push:
+    branches:
+      - codex/temporal-qd-simplification
+    paths:
+      - .github/workflows/codex-temporal-qd-rust-toolchain-snapshot.yml
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/temporal-qd-simplification
+
+      - name: Read pinned Rust channel
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      - name: Fetch locked Cargo dependencies
+        working-directory: rust/temporal-qd
+        run: cargo fetch --locked
+
+      - name: Package toolchain and Cargo registry
+        shell: bash
+        run: |
+          toolchain_dir="$(rustc --print sysroot)"
+          mkdir -p "$RUNNER_TEMP/rust-bootstrap/toolchain" "$RUNNER_TEMP/rust-bootstrap/cargo"
+          cp -a "$toolchain_dir/." "$RUNNER_TEMP/rust-bootstrap/toolchain/"
+          cp -a "$HOME/.cargo/registry" "$RUNNER_TEMP/rust-bootstrap/cargo/"
+          if [[ -d "$HOME/.cargo/git" ]]; then
+            cp -a "$HOME/.cargo/git" "$RUNNER_TEMP/rust-bootstrap/cargo/"
+          fi
+          tar -C "$RUNNER_TEMP/rust-bootstrap" -czf "$RUNNER_TEMP/temporal-qd-rust-bootstrap.tar.gz" .
+
+      - name: Upload Rust bootstrap
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporal-qd-rust-bootstrap-${{ github.sha }}
+          path: ${{ runner.temp }}/temporal-qd-rust-bootstrap.tar.gz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
