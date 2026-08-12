@@ -2219,7 +2219,7 @@ pub(crate) fn verify_v5_g0_transaction_replay_with_authority(
     authority: &V5SharedConstructionAuthority,
 ) -> Result<()> {
     request.validate_bounds()?;
-    V5G0TransactionRequest::validate_parsed_authority(&authority)?;
+    V5G0TransactionRequest::validate_parsed_authority(authority)?;
     if result.generation_index != request.generation_index
         || result.generation_config_sha256 != request.generation_config_sha256
         || result.target_accepted != request.target_accepted
@@ -2236,7 +2236,7 @@ pub(crate) fn verify_v5_g0_transaction_replay_with_authority(
                 "v5 G0 transaction publication plan replay failed: {error}"
             ))
         })?;
-    result.verify_replay(&authority)
+    result.verify_replay(authority)
 }
 
 /// Parsed canonical durable values owned by qd-batch.  This is deliberately a

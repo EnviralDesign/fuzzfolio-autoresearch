@@ -3,6 +3,12 @@
 //! The public modules are admitted independently against the Python oracle
 //! before the one-shot batch coordinator is allowed to compose them.
 
+// The kernel intentionally retains sealed oracle/replay surfaces that are
+// exercised by downstream binaries and fixture crates rather than this crate's
+// default build. Contract builders also mirror versioned wire schemas, where
+// grouping their arguments would obscure the audited field-by-field mapping.
+#![allow(dead_code)]
+
 pub mod construction;
 pub mod factory;
 pub mod g0;

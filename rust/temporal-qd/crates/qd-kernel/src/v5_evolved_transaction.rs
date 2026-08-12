@@ -544,8 +544,7 @@ impl V5EvolvedProposalDelta {
                 ));
             }
         }
-        if has_terminal_application && !has_terminal_plan
-            || has_terminal_trace && !has_terminal_plan
+        if (has_terminal_application || has_terminal_trace) && !has_terminal_plan
             || has_terminal_plan != has_terminal_trace
         {
             return Err(contract("v5 evolved terminal operator evidence is partial"));
@@ -4594,7 +4593,7 @@ impl V5EvolvedTransactionResult {
             let planned = offline_planned_proposal_from_snapshot(
                 authority, inventory, &snapshots, attempt, delta, refs,
             )?;
-            let replayed = NativeV5EvolvedConstructionEngine::default().construct(
+            let replayed = NativeV5EvolvedConstructionEngine.construct(
                 authority,
                 request,
                 &planned,
@@ -5698,11 +5697,13 @@ mod scheduler_tests {
         let snapshot_refs =
             snapshot_refs_for_native_outcome(&request, &planned, &outcome, &mut snapshots)
                 .expect("seal authenticated parent snapshot");
-        let mut state = ProposalState::default();
         // `ProposalPlanner::select` normally increments this before native
         // construction.  This focused helper supplies its preselected sealed
         // parent directly, so reproduce that one scheduler fact explicitly.
-        state.structural_parent_selections = 1;
+        let mut state = ProposalState {
+            structural_parent_selections: 1,
+            ..ProposalState::default()
+        };
         let (attempt, audit, accepted) =
             admitted_attempt(&request, &authority, &state, &mut ledger, &planned, outcome)
                 .expect("admit sealed native mutation");

@@ -155,7 +155,7 @@ fn prior_panel_backfill_emits_relocatable_sealed_cohort_selection() {
         "temporal_qd_rotating_candidate_projection_row_v1"
     );
     let row: Value = serde_json::from_str(
-        &fs::read_to_string(root.path().join("selected-backfill-candidates.jsonl"))
+        fs::read_to_string(root.path().join("selected-backfill-candidates.jsonl"))
             .unwrap()
             .lines()
             .next()

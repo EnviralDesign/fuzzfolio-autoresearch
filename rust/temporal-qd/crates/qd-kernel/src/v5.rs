@@ -164,7 +164,7 @@ fn clone_value(value: &Value) -> Result<Value> {
 
 fn ordered_rows(value: Option<&Value>, label: &str) -> Result<Vec<Value>> {
     match value {
-        Some(Value::Array(rows)) => Ok(rows.iter().cloned().collect()),
+        Some(Value::Array(rows)) => Ok(rows.to_vec()),
         _ => Err(invalid(format!("{label} must be an ordered array"))),
     }
 }
@@ -259,8 +259,7 @@ fn in_top_remainder(bytes: &[u8; 32], remainder: u64) -> bool {
     // except the final eight are 0xff; the final word is at least
     // `u64::MAX - remainder + 1`.
     bytes[..24].iter().all(|item| *item == 0xff)
-        && u64::from_be_bytes(bytes[24..].try_into().expect("eight bytes"))
-            >= u64::MAX - remainder + 1
+        && u64::from_be_bytes(bytes[24..].try_into().expect("eight bytes")) > u64::MAX - remainder
 }
 
 fn mod_256(bytes: &[u8; 32], modulus: u64) -> u64 {
@@ -879,7 +878,7 @@ pub fn build_immigrant_module(
             object([
                 ("indicators", array(indicator_rows)),
                 ("evidenceGroups", array(vec![group])),
-                ("events", array(event_row.into_iter())),
+                ("events", array(event_row)),
                 ("managementRefs", array(vec![management])),
             ]),
         ),
@@ -5064,7 +5063,7 @@ fn python_topology_value_cmp(left: &Value, right: &Value) -> Result<std::cmp::Or
     }
 }
 
-fn sort_python_tuple_values(values: &mut Vec<Value>) -> Result<()> {
+fn sort_python_tuple_values(values: &mut [Value]) -> Result<()> {
     // `slice::sort_by` cannot surface a fallible comparator.  The compact
     // candidate graphs are bounded, so a stable insertion sort is clearer and
     // lets us fail closed on a Python-incomparable row.
@@ -11537,7 +11536,7 @@ impl V5AttemptParentReference {
     }
 
     pub fn to_value(&self) -> Result<Value> {
-        Ok(self.semantic_value()?)
+        self.semantic_value()
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {

@@ -219,9 +219,7 @@ fn open_v5_inventory_stream(
     Ok(file)
 }
 
-fn v5_object_inventory_descriptor<'a>(
-    inventory: &'a Map<String, Value>,
-) -> Result<&'a Map<String, Value>> {
+fn v5_object_inventory_descriptor(inventory: &Map<String, Value>) -> Result<&Map<String, Value>> {
     let object_store = inventory
         .get("objectStore")
         .and_then(Value::as_object)
@@ -433,6 +431,7 @@ fn v5_safe_relative_output_path(relative: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_v5_inventory_artifact(
     parent: &Path,
     artifact: &Map<String, Value>,
@@ -2951,12 +2950,12 @@ fn verify_staged_v5_evolved_durable_objects(
             );
         }
         let value = read_staged_v5_document(artifact, "native v5 staged evolved durable object")?;
-        if value.get("transactionSha256").and_then(Value::as_str) == Some(transaction_sha256) {
-            if root_value.replace(value.clone()).is_some() {
-                bail!(
-                    "native v5 staged evolved durable object inventory has multiple transaction roots"
-                );
-            }
+        if value.get("transactionSha256").and_then(Value::as_str) == Some(transaction_sha256)
+            && root_value.replace(value.clone()).is_some()
+        {
+            bail!(
+                "native v5 staged evolved durable object inventory has multiple transaction roots"
+            );
         }
         if staged_by_relative
             .insert(artifact.relative_path.clone(), value)
@@ -7856,8 +7855,6 @@ fn validate_and_publish_v5_receipt_last_with<O: PublicationIo>(
 /// than available RAM.
 struct V5StagedBundle<'a> {
     artifacts: BTreeMap<String, &'a V5StagedArtifact>,
-    output_inventory: &'a V5StagedArtifact,
-    receipt: &'a V5StagedArtifact,
 }
 
 fn read_staged_v5_document(staged: &V5StagedArtifact, label: &str) -> Result<Value> {
@@ -8644,8 +8641,6 @@ where
     verify_staged_v5_artifact(receipt)?;
     let bundle = V5StagedBundle {
         artifacts: supplied,
-        output_inventory,
-        receipt,
     };
     let receipt_value =
         read_staged_v5_document(receipt, "native v5 staged evolved output receipt")?;
@@ -8786,8 +8781,6 @@ where
     verify_staged_v5_artifact(receipt)?;
     let bundle = V5StagedBundle {
         artifacts: supplied,
-        output_inventory,
-        receipt,
     };
     let receipt_value = read_staged_v5_document(receipt, "native v5 staged output receipt")?;
     let invocation_result =

@@ -188,10 +188,6 @@ fn recipe(facts: &[&str], outcome: &str) -> Value {
     ])
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "sealed grammar productions directly mirror the eight-field Python registry declaration"
-)]
 fn spec(
     production_id: &str,
     family: &str,
@@ -865,10 +861,6 @@ fn all(guards: Vec<Value>) -> Value {
     ])
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the helper intentionally mirrors the closed Dashboard transition JSON schema"
-)]
 fn transition(
     id: String,
     source: String,

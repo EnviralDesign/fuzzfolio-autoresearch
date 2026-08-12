@@ -338,7 +338,7 @@ impl GenerateGenerationRequest {
                     if self.target_unique_candidates < 5 {
                         0
                     } else {
-                        (self.target_unique_candidates + 4) / 5
+                        self.target_unique_candidates.div_ceil(5)
                     }
                 } else {
                     self.target_unique_candidates

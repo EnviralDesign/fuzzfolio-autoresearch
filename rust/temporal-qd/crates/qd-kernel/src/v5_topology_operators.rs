@@ -558,7 +558,7 @@ fn canonical_program(program: &Value, sealed: &Value) -> Result<Value> {
     }
     let graph = Graph::parse(&program)?;
     graph.validate()?;
-    Ok(graph.canonical(&program)?)
+    graph.canonical(&program)
 }
 
 fn validate_budget(value: &Value) -> Result<()> {
@@ -1065,7 +1065,7 @@ impl Graph {
         let target = self.node(&old.target)?.clone();
         if !matches!(source.zone.as_str(), "entry" | "setup")
             || !matches!(target.zone.as_str(), "entry" | "setup")
-            || (!old.effect.is_null() && !(target.zone == "entry" && target.kind == "entry"))
+            || !(old.effect.is_null() || target.zone == "entry" && target.kind == "entry")
         {
             return Err(invalid("setup insertion requires a pre-position edge"));
         }

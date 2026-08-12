@@ -3985,10 +3985,9 @@ fn execute_v5_ladder_freeze_manifest(spec: &Map<String, Value>) -> Result<Value>
         return finish_ladder_delegation(delegated, stage, archive_sha);
     }
     ensure!(
-        fs::symlink_metadata(&archive_path)?
+        !fs::symlink_metadata(&archive_path)?
             .file_type()
             .is_symlink()
-            == false
             && fs::metadata(&archive_path)?.is_file()
             && fs::metadata(&archive_path)?.len() == archive_size
             && file_sha256(&archive_path)? == archive_raw_sha,
@@ -4629,12 +4628,9 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
             })
             .collect::<Vec<_>>();
         finite.push(json!({"candidateId":id,"sourceProfile":profile,"sourceProfileSha256":profile_sha,"instrument":instrument,"timeframe":timeframe,"barLimit":bar_limit,"windowInputs":preparation_inputs}));
-        let profile = object(
-            &finite.last().expect("finite candidate"),
-            "finite candidate",
-        )?
-        .get("sourceProfile")
-        .expect("profile");
+        let profile = object(finite.last().expect("finite candidate"), "finite candidate")?
+            .get("sourceProfile")
+            .expect("profile");
         let canonical_identity = panel_scoped_identity(
             candidate,
             &evidence_context,

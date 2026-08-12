@@ -3165,7 +3165,7 @@ mod tests {
             "fileSha256": sha_token('a'),
             "byteLength": 1,
         });
-        let mut object_values = vec![
+        let mut object_values = [
             publication_plan_object,
             g0_funnel_object,
             g0_funnel_stream_receipt_object,
@@ -3245,7 +3245,7 @@ mod tests {
                 .collect(),
         };
         let (_, _, result) = build_v5_proposal_receipt_and_result(&parsed, &input).unwrap();
-        return (manifest, result.value);
+        (manifest, result.value)
     }
 
     fn rehash_result_inventory_chain(result: &mut Value) {
