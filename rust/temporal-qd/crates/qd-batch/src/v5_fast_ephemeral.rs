@@ -24,7 +24,8 @@ use temporal_qd_kernel::v5_evolved_publication::{
 use temporal_qd_kernel::v5_evolved_transaction::execute_v5_evolved_transaction_with_progress;
 use temporal_qd_kernel::v5_publication::{
     V5G0PublicationFragmentKind, V5G0PublicationFragmentSink, V5G0PublicationFragmentSource,
-    V5G0PublicationFragments, V5G0StreamedArtifact, prepare_v5_g0_publication_stream,
+    V5G0PublicationFragments, V5G0StreamedArtifact,
+    prepare_v5_g0_publication_stream_from_fresh_transaction,
 };
 use temporal_qd_kernel::v5_transaction::execute_v5_g0_transaction_with_progress;
 
@@ -313,7 +314,7 @@ pub(crate) fn execute_g0(
         None,
     );
     let publication_started = Instant::now();
-    let stream = prepare_v5_g0_publication_stream(&request, &transaction)
+    let stream = prepare_v5_g0_publication_stream_from_fresh_transaction(&request, &transaction)
         .context("prepare fast-ephemeral G0 publication stream")?;
     if stream.selected_count() as u64 != manifest.evaluation_population_size {
         bail!("fast-ephemeral selected evaluation width drifted");
