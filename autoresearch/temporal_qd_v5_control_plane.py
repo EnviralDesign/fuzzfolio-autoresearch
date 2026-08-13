@@ -3950,7 +3950,9 @@ def run_native_v5_campaign_freeze(
         if reduction_result is not None
         else "temporal_qd_v5_campaign_input_result_v1"
     )
-    if result.get("schemaVersion") != expected_schema or result.get("outputRoot") != str(root):
+    if result.get("schemaVersion") != expected_schema or not native_v5_transport_path_matches(
+        result.get("outputRoot"), root
+    ):
         raise TemporalQDV5ControlPlaneError("native v5 campaign freeze result drifted")
     manifest_path = _real_path(
         root / ".native-v5-campaign-freeze-manifest.json",
