@@ -105,7 +105,9 @@ def _sealed_native_freeze_input_identities(
     }
 
 
-def _fixture(root: Path, count: int) -> tuple[dict, dict, dict, Path, Path, Path, Path]:
+def _fixture(
+    root: Path, count: int, *, cohort_role: str = "retained_parent_current_panel"
+) -> tuple[dict, dict, dict, Path, Path, Path, Path]:
     """Make a 4-window native-selection fixture without a Python task loop."""
 
     profile = {
@@ -171,11 +173,14 @@ def _fixture(root: Path, count: int) -> tuple[dict, dict, dict, Path, Path, Path
         "programSha256": "sha256:" + hashlib.sha256(f"program-{index}".encode()).hexdigest(),
         "sourceProfile": profile, "sourceProfileSha256": profile_sha,
     } for index in range(count)]
-    oracle_population = build_rotating_cohort_population(candidates=candidates, generation_index=1, panel_id="panel-1", cohort_role="retained_parent_current_panel", rotating_evidence_sha256=rotating["rotatingEvidenceSha256"])
+    oracle_population = build_rotating_cohort_population(candidates=candidates, generation_index=1, panel_id="panel-1", cohort_role=cohort_role, rotating_evidence_sha256=rotating["rotatingEvidenceSha256"])
     oracle_population_path = root / "oracle-input" / "population.json"; _write(oracle_population_path, oracle_population)
-    native_input = root / "native-input"; evaluation_path = native_input / "evaluation-population.json"
+    native_input = root / "native-input"
+    native_input.mkdir(parents=True, exist_ok=True)
+    evaluation_path = native_input / "evaluation-population.json"
     evaluation = {"schemaVersion": "temporal_qd_evaluation_population_v1", "generationIndex": 1, "populationSha256": "sha256:" + "d" * 64, "candidates": candidates}
-    evaluation["evaluationPopulationSha256"] = canonical_sha256(evaluation); _write(evaluation_path, evaluation)
+    evaluation["evaluationPopulationSha256"] = canonical_sha256(evaluation)
+    evaluation_path.write_bytes(canonical_json_bytes(evaluation) + b"\n")
     projection = native_input / "selected.jsonl"; rows = []
     for candidate in candidates:
         row = {"schemaVersion": "temporal_qd_rotating_candidate_projection_row_v1", "candidateId": candidate["candidateId"], "candidateIdentitySha256": candidate["candidateIdentitySha256"], "candidate": candidate}
@@ -183,7 +188,8 @@ def _fixture(root: Path, count: int) -> tuple[dict, dict, dict, Path, Path, Path
     projection.write_bytes(b"\n".join(rows) + b"\n")
     selection = {"schemaVersion": "temporal_qd_rotating_cohort_selection_v1", "contractVersion": "temporal_qd_rotating_prefinalizer_v1", "generationIndex": 1, "campaignRole": "retained_parent_current_panel", "panelId": "panel-1", "rotatingEvidenceSha256": rotating["rotatingEvidenceSha256"], "candidateIds": [candidate["candidateId"] for candidate in candidates], "candidateProjection": {"relativePath": "selected.jsonl", "rawSha256": "sha256:" + hashlib.sha256(projection.read_bytes()).hexdigest(), "sizeBytes": projection.stat().st_size, "recordCount": count, "rowSchema": "temporal_qd_rotating_candidate_projection_row_v1"}, "sourceBindings": {}}
     selection["selectionSha256"] = canonical_sha256(selection)
-    selection_path = native_input / "selection.json"; _write(selection_path, selection)
+    selection_path = native_input / "selection.json"
+    selection_path.write_bytes(canonical_json_bytes(selection) + b"\n")
     return rotating, template, catalog, oracle_population_path, evaluation_path, selection_path, common
 
 
@@ -253,11 +259,13 @@ def test_native_v5_freeze_rejects_bounded_pipe_overflow(
 
 @pytest.mark.parametrize("candidate_count", (2, 128))
 def test_native_v5_freeze_matches_python_oracle_and_is_restart_safe(tmp_path: Path, candidate_count: int) -> None:
-    rotating, _template, _catalog, population, evaluation, selection, common = _fixture(tmp_path, candidate_count)
+    rotating, _template, _catalog, population, evaluation, _selection, common = _fixture(
+        tmp_path, candidate_count, cohort_role="proposal_current_panel"
+    )
     common_args = dict(
         execution_engine_commit="a" * 40, worker_contract_sha256="sha256:" + "c" * 64,
         construction_catalog_path=common / "catalog.json", rotating_evidence=rotating,
-        campaign_role="retained_parent_current_panel", panel_id="panel-1",
+        campaign_role="proposal_current_panel", panel_id="panel-1",
         archive_policy_authority=directional_qd_archive_policy_authority(),
         behavior_attribution_requirement=evolvable_behavior_attribution_requirement(),
     )
@@ -279,7 +287,7 @@ def test_native_v5_freeze_matches_python_oracle_and_is_restart_safe(tmp_path: Pa
         }
     }
     freeze_qd_v5_campaign_oracle(population_path=population, template_preparation_path=common / "template.json", output_root=tmp_path / "oracle", **oracle_args)
-    native = freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", cohort_selection_path=selection, **common_args)
+    native = freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", **common_args)
     manifest = json.loads((tmp_path / "native" / ".native-v5-campaign-freeze-manifest.json").read_text(encoding="utf-8"))
     checkpoint = json.loads((tmp_path / "native" / "campaign-input-checkpoint.json").read_text(encoding="utf-8"))
     assert manifest["schemaVersion"] == "temporal_qd_v5_native_campaign_freeze_manifest_v2"
@@ -292,11 +300,44 @@ def test_native_v5_freeze_matches_python_oracle_and_is_restart_safe(tmp_path: Pa
     )
     assert native["checkpointSha256"] == checkpoint["checkpointSha256"]
     assert native["taskCount"] == candidate_count * 4
-    assert native["telemetry"]["peakLiveTasks"] == 1
-    assert native["telemetry"]["peakLiveCandidates"] == candidate_count
-    for relative in ("cohort-population.json", "screening-run/task-manifest.json"):
-        oracle = (tmp_path / "oracle" / relative).read_bytes().replace(b"\r\n", b"\n")
-        assert (tmp_path / "native" / relative).read_bytes() == oracle
+    assert native["artifactMetrics"] == checkpoint["artifactMetrics"]
+    assert native["telemetry"]["processPeakWorkingSetBytes"] > 0
+    oracle_cohort = json.loads(population.read_text(encoding="utf-8"))
+    native_cohort = json.loads(
+        (tmp_path / "native" / "cohort-population.json").read_text(encoding="utf-8")
+    )
+    assert native_cohort["proposalPopulation"] is True
+    assert native_cohort["populationSha256"] == canonical_sha256(
+        {key: value for key, value in native_cohort.items() if key != "populationSha256"}
+    )
+    for key in (
+        "schemaVersion",
+        "generationIndex",
+        "panelId",
+        "cohortRole",
+        "rotatingEvidenceSha256",
+        "candidateCount",
+        "candidates",
+    ):
+        assert native_cohort[key] == oracle_cohort[key]
+    oracle_task_manifest = json.loads(
+        (tmp_path / "oracle" / "screening-run" / "task-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    native_task_rows = [
+        json.loads(line)
+        for line in (
+            tmp_path / "native" / "screening-run" / "tasks.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    oracle_task_rows = oracle_task_manifest["tasks"]
+    for row in oracle_task_rows:
+        row["payload"].pop("raw_source_profile_sha256")
+    assert native_task_rows == oracle_task_rows
+    assert checkpoint["tasks"]["relativePath"] == "screening-run/tasks.jsonl"
+    assert checkpoint["tasks"]["recordCount"] == candidate_count * 4
+    assert checkpoint["tasks"]["taskMatrixSha256"] == canonical_sha256(native_task_rows)
     retired = (
         "preparation.json",
         "authority.json",
@@ -312,22 +353,42 @@ def test_native_v5_freeze_matches_python_oracle_and_is_restart_safe(tmp_path: Pa
     assert checkpoint["artifactMetrics"]["payloadFileCount"] == 2
     assert checkpoint["artifactMetrics"]["payloadBytes"] == (
         (tmp_path / "native" / "cohort-population.json").stat().st_size
-        + (tmp_path / "native" / "screening-run" / "task-manifest.json").stat().st_size
+        + (tmp_path / "native" / "screening-run" / "tasks.jsonl").stat().st_size
     )
-    restarted = freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", cohort_selection_path=selection, **common_args)
+    assert checkpoint["artifactMetrics"]["taskPackBytes"] == (
+        tmp_path / "native" / "screening-run" / "tasks.jsonl"
+    ).stat().st_size
+    restarted = freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "native", **common_args)
     assert restarted["restart"] is True
     assert restarted["checkpointSha256"] == native["checkpointSha256"]
-    payload = json.loads(selection.read_text(encoding="utf-8")); payload["candidateProjection"]["rawSha256"] = "sha256:" + "f" * 64; payload["selectionSha256"] = canonical_sha256({key: value for key, value in payload.items() if key != "selectionSha256"}); _write(tmp_path / "native-input" / "tampered-selection.json", payload)
-    with pytest.raises(TemporalDiscoveryContractError, match="raw identity drifted"):
-        freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "tampered", cohort_selection_path=tmp_path / "native-input" / "tampered-selection.json", **common_args)
+    tampered = json.loads(evaluation.read_text(encoding="utf-8"))
+    tampered["candidates"][0]["sourceProfile"]["instruments"] = ["GBPUSD"]
+    tampered["evaluationPopulationSha256"] = canonical_sha256(
+        {key: value for key, value in tampered.items() if key != "evaluationPopulationSha256"}
+    )
+    tampered_path = tmp_path / "native-input" / "tampered-evaluation.json"
+    tampered_path.write_bytes(canonical_json_bytes(tampered) + b"\n")
+    with pytest.raises(TemporalDiscoveryContractError, match="source profile identity drifted"):
+        freeze_qd_v5_campaign_native(
+            evaluation_population_path=tampered_path,
+            evaluation_population_raw_sha256="sha256:"
+            + hashlib.sha256(tampered_path.read_bytes()).hexdigest(),
+            template_preparation_path=common / "template.json",
+            output_root=tmp_path / "tampered",
+            **{
+                key: value
+                for key, value in common_args.items()
+                if key != "evaluation_population_raw_sha256"
+            },
+        )
 
 
-def test_native_v5_freeze_rejects_selection_candidate_identity_rebinding(tmp_path: Path) -> None:
-    rotating, _template, _catalog, _population, evaluation, selection, common = _fixture(tmp_path, 4)
+def test_native_v5_freeze_rejects_proposal_profile_identity_rebinding(tmp_path: Path) -> None:
+    rotating, _template, _catalog, _population, evaluation, _selection, common = _fixture(tmp_path, 4)
     common_args = dict(
         execution_engine_commit="a" * 40, worker_contract_sha256="sha256:" + "c" * 64,
         construction_catalog_path=common / "catalog.json", rotating_evidence=rotating,
-        campaign_role="retained_parent_current_panel", panel_id="panel-1",
+        campaign_role="proposal_current_panel", panel_id="panel-1",
         archive_policy_authority=directional_qd_archive_policy_authority(),
         behavior_attribution_requirement=evolvable_behavior_attribution_requirement(),
     )
@@ -338,18 +399,17 @@ def test_native_v5_freeze_rejects_selection_candidate_identity_rebinding(tmp_pat
             catalog=common / "catalog.json",
         )
     )
-    projection = selection.parent / "selected.jsonl"
-    rows = [json.loads(line) for line in projection.read_text(encoding="utf-8").splitlines()]
-    rows[0]["candidate"]["programSha256"] = "sha256:" + "e" * 64
-    rows[0]["projectionRowSha256"] = canonical_sha256({key: value for key, value in rows[0].items() if key != "projectionRowSha256"})
-    encoded = b"\n".join(canonical_json_bytes(row) for row in rows) + b"\n"
-    projection.write_bytes(encoded)
-    payload = json.loads(selection.read_text(encoding="utf-8"))
-    payload["candidateProjection"].update(rawSha256="sha256:" + hashlib.sha256(encoded).hexdigest(), sizeBytes=len(encoded))
-    payload["selectionSha256"] = canonical_sha256({key: value for key, value in payload.items() if key != "selectionSha256"})
-    _write(selection, payload)
-    with pytest.raises(TemporalDiscoveryContractError, match="programSha256 binding drifted"):
-        freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "rebound", cohort_selection_path=selection, **common_args)
+    payload = json.loads(evaluation.read_text(encoding="utf-8"))
+    payload["candidates"][0]["sourceProfile"]["instruments"] = ["GBPUSD"]
+    payload["evaluationPopulationSha256"] = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "evaluationPopulationSha256"}
+    )
+    evaluation.write_bytes(canonical_json_bytes(payload) + b"\n")
+    common_args["evaluation_population_raw_sha256"] = "sha256:" + hashlib.sha256(
+        evaluation.read_bytes()
+    ).hexdigest()
+    with pytest.raises(TemporalDiscoveryContractError, match="source profile identity drifted"):
+        freeze_qd_v5_campaign_native(evaluation_population_path=evaluation, template_preparation_path=common / "template.json", output_root=tmp_path / "rebound", **common_args)
 
 
 @pytest.mark.parametrize("candidate_count", (4, 128))

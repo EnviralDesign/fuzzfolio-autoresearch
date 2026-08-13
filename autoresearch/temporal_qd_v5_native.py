@@ -43,10 +43,10 @@ V5_PROPOSAL_OBJECT_INVENTORY_ROW_SCHEMA = (
 )
 V5_PROPOSAL_OBJECT_INVENTORY_PATH = "v5-native/object-inventory.jsonl"
 V5_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA = (
-    "temporal_qd_native_v5_proposal_adoption_evidence_v2"
+    "temporal_qd_native_v5_proposal_adoption_evidence_v3"
 )
 V5_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA = (
-    "temporal_qd_native_v5_proposal_adoption_telemetry_v2"
+    "temporal_qd_native_v5_proposal_adoption_telemetry_v3"
 )
 V5_EVOLVED_PROPOSAL_RESULT_SCHEMA = (
     "temporal_qd_native_v5_evolved_construction_result_v3"
@@ -58,10 +58,10 @@ V5_EVOLVED_PROPOSAL_CONSTRUCTION_SUMMARY_SCHEMA = (
     "temporal_qd_native_v5_evolved_construction_summary_v1"
 )
 V5_EVOLVED_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA = (
-    "temporal_qd_native_v5_evolved_adoption_evidence_v1"
+    "temporal_qd_native_v5_evolved_adoption_evidence_v2"
 )
 V5_EVOLVED_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA = (
-    "temporal_qd_native_v5_evolved_adoption_telemetry_v1"
+    "temporal_qd_native_v5_evolved_adoption_telemetry_v2"
 )
 V5_PROPOSAL_EXECUTION_AUTHORITY_SCHEMA = (
     "temporal_qd_native_v5_proposal_execution_authority_v1"
@@ -640,42 +640,121 @@ def _validate_v5_adoption_telemetry_with_schema(
         telemetry,
         {
             "schemaVersion",
-            "outputAuthentication",
+            "executionPath",
+            "validationMode",
+            "authenticationStrategy",
+            "phases",
+            "processCpuMilliseconds",
+            "cpuUtilizationMilliCores",
             "publicArtifactBytesRead",
             "objectStoreBytesRead",
             "authenticatedFileCount",
+            "io",
+            "validationPasses",
+            "parallelAuthenticationWorkers",
             "proposalReconstructionCount",
             "legacyRichExpansionCount",
             "processTree",
             "threadCap",
+            "constructionPrefetchMultiplier",
         },
         name=label,
     )
     if (
         telemetry.get("schemaVersion") != expected_schema
         or telemetry.get("threadCap") != manifest["threadCap"]
+        or telemetry.get("constructionPrefetchMultiplier") != 16
     ):
         raise TemporalQDV5NativeError(f"{label} is incompatible")
-    timing = _mapping(
-        telemetry.get("outputAuthentication"), name="v5 adoption output authentication"
-    )
+    execution_path = telemetry.get("executionPath")
+    validation_mode = telemetry.get("validationMode")
+    strategy = telemetry.get("authenticationStrategy")
+    if (
+        execution_path not in {"fresh", "sealed_restart", "receipt_recovery"}
+        or validation_mode not in {"balanced", "strict"}
+        or strategy
+        not in {
+            "fresh_publication_proof",
+            "receipt_bound_content",
+            "strict_deep_replay",
+        }
+        or (validation_mode == "strict" and strategy != "strict_deep_replay")
+        or (
+            validation_mode == "balanced"
+            and execution_path == "fresh"
+            and strategy != "fresh_publication_proof"
+        )
+        or (
+            validation_mode == "balanced"
+            and execution_path != "fresh"
+            and strategy != "receipt_bound_content"
+        )
+    ):
+        raise TemporalQDV5NativeError(
+            f"{label} path/mode/authentication strategy is incompatible"
+        )
+    phases = _mapping(telemetry.get("phases"), name="v5 adoption phases")
     _exact_keys(
-        timing,
-        {"wallMilliseconds"},
-        name="v5 adoption output authentication",
+        phases,
+        {
+            "staticAuthorityMilliseconds",
+            "constructionMilliseconds",
+            "stagingMilliseconds",
+            "prepublicationValidationMilliseconds",
+            "publicationMilliseconds",
+            "outputAuthenticationMilliseconds",
+            "totalMilliseconds",
+        },
+        name="v5 adoption phases",
     )
-    for key, item in timing.items():
-        _nonnegative(item, name=f"v5 adoption output authentication {key}")
+    for key, item in phases.items():
+        _nonnegative(item, name=f"v5 adoption phases {key}")
+    for key in ("processCpuMilliseconds", "cpuUtilizationMilliCores"):
+        item = telemetry.get(key)
+        if item is not None:
+            _nonnegative(item, name=f"v5 adoption telemetry {key}")
     for key in (
         "publicArtifactBytesRead",
         "objectStoreBytesRead",
         "authenticatedFileCount",
+        "parallelAuthenticationWorkers",
     ):
         _nonnegative(telemetry.get(key), name=f"v5 adoption telemetry {key}")
-    for key in (
-        "proposalReconstructionCount",
-        "legacyRichExpansionCount",
-    ):
+    if telemetry["authenticatedFileCount"] <= 0:
+        raise TemporalQDV5NativeError("v5 adoption must authenticate at least one file")
+    if telemetry["parallelAuthenticationWorkers"] > manifest["threadCap"]:
+        raise TemporalQDV5NativeError("v5 adoption authentication worker cap drifted")
+    if strategy == "receipt_bound_content" and telemetry["parallelAuthenticationWorkers"] <= 0:
+        raise TemporalQDV5NativeError(
+            "v5 receipt-bound authentication records no workers"
+        )
+    io = _mapping(telemetry.get("io"), name="v5 adoption I/O telemetry")
+    _exact_keys(
+        io,
+        {"filesReopened", "bytesRead", "bytesHashed", "bytesWritten", "jsonRowsParsed"},
+        name="v5 adoption I/O telemetry",
+    )
+    for key, item in io.items():
+        _nonnegative(item, name=f"v5 adoption I/O telemetry {key}")
+    passes = _mapping(
+        telemetry.get("validationPasses"), name="v5 adoption validation passes"
+    )
+    _exact_keys(
+        passes,
+        {
+            "constructorReplay",
+            "redundantFreshReplay",
+            "publicationPrepareReplay",
+            "stagedSemanticReplay",
+            "stagedFinalRehash",
+            "receiptBoundContentAuthentication",
+            "deepOutputReplay",
+        },
+        name="v5 adoption validation passes",
+    )
+    for key, item in passes.items():
+        _nonnegative(item, name=f"v5 adoption validation passes {key}")
+    for key in ("proposalReconstructionCount", "legacyRichExpansionCount"):
         if _nonnegative(telemetry.get(key), name=f"v5 adoption telemetry {key}") != 0:
             raise TemporalQDV5NativeError(
                 f"v5 adoption telemetry records forbidden nonzero {key}"

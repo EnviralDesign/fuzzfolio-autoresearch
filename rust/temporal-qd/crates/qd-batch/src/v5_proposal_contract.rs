@@ -41,9 +41,9 @@ pub const V5_PROPOSAL_OBJECT_INVENTORY_ROW_SCHEMA: &str =
     "temporal_qd_native_v5_proposal_object_inventory_row_v1";
 pub const V5_PROPOSAL_OBJECT_INVENTORY_PATH: &str = "v5-native/object-inventory.jsonl";
 pub const V5_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA: &str =
-    "temporal_qd_native_v5_proposal_adoption_evidence_v2";
+    "temporal_qd_native_v5_proposal_adoption_evidence_v3";
 pub const V5_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA: &str =
-    "temporal_qd_native_v5_proposal_adoption_telemetry_v2";
+    "temporal_qd_native_v5_proposal_adoption_telemetry_v3";
 /// The later-generation transaction/publication boundary has deliberately
 /// separate outer seal schemas.  It must never be accepted as a sparse G0
 /// bootstrap result merely because both executions share an invocation
@@ -55,9 +55,9 @@ pub const V5_EVOLVED_PROPOSAL_RECEIPT_SCHEMA: &str =
 pub const V5_EVOLVED_PROPOSAL_CONSTRUCTION_SUMMARY_SCHEMA: &str =
     "temporal_qd_native_v5_evolved_construction_summary_v1";
 pub const V5_EVOLVED_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA: &str =
-    "temporal_qd_native_v5_evolved_adoption_evidence_v1";
+    "temporal_qd_native_v5_evolved_adoption_evidence_v2";
 pub const V5_EVOLVED_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA: &str =
-    "temporal_qd_native_v5_evolved_adoption_telemetry_v1";
+    "temporal_qd_native_v5_evolved_adoption_telemetry_v2";
 pub const V5_PROPOSAL_OPERATION: &str = "native_v5_proposal_construction";
 pub const V5_PROPOSAL_RESULT_PATH: &str = "v5-proposal-result.json";
 pub const V5_PROPOSAL_INPUTS_SCHEMA: &str = "temporal_qd_native_v5_proposal_inputs_v1";
@@ -2657,42 +2657,164 @@ fn validate_adoption_telemetry_with_schema(
         fields,
         &[
             "schemaVersion",
-            "outputAuthentication",
+            "executionPath",
+            "validationMode",
+            "authenticationStrategy",
+            "phases",
+            "processCpuMilliseconds",
+            "cpuUtilizationMilliCores",
             "publicArtifactBytesRead",
             "objectStoreBytesRead",
             "authenticatedFileCount",
+            "io",
+            "validationPasses",
+            "parallelAuthenticationWorkers",
             "proposalReconstructionCount",
             "legacyRichExpansionCount",
             "processTree",
             "threadCap",
+            "constructionPrefetchMultiplier",
         ],
         label,
     )?;
     if fields.get("schemaVersion").and_then(Value::as_str) != Some(expected_schema)
         || fields.get("threadCap").and_then(Value::as_u64) != Some(manifest.thread_cap)
+        || fields
+            .get("constructionPrefetchMultiplier")
+            .and_then(Value::as_u64)
+            != Some(16)
     {
         bail!("native v5 proposal adoption telemetry is incompatible");
     }
-    let timing = object(
-        field(fields, "outputAuthentication", label)?,
-        "native v5 proposal adoption output authentication",
-    )?;
+    let execution_path = fields
+        .get("executionPath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{label} lacks execution path"))?;
+    let validation_mode = fields
+        .get("validationMode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{label} lacks validation mode"))?;
+    let strategy = fields
+        .get("authenticationStrategy")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{label} lacks authentication strategy"))?;
+    if !matches!(
+        execution_path,
+        "fresh" | "sealed_restart" | "receipt_recovery"
+    ) || !matches!(validation_mode, "balanced" | "strict")
+        || !matches!(
+            strategy,
+            "fresh_publication_proof" | "receipt_bound_content" | "strict_deep_replay"
+        )
+        || (validation_mode == "strict" && strategy != "strict_deep_replay")
+        || (validation_mode == "balanced"
+            && execution_path == "fresh"
+            && strategy != "fresh_publication_proof")
+        || (validation_mode == "balanced"
+            && execution_path != "fresh"
+            && strategy != "receipt_bound_content")
+    {
+        bail!("native v5 proposal adoption path/mode/authentication strategy is incompatible");
+    }
+    let phases = object(field(fields, "phases", label)?, "native v5 proposal phases")?;
     exact_keys(
-        timing,
-        &["wallMilliseconds"],
-        "native v5 proposal adoption output authentication",
+        phases,
+        &[
+            "staticAuthorityMilliseconds",
+            "constructionMilliseconds",
+            "stagingMilliseconds",
+            "prepublicationValidationMilliseconds",
+            "publicationMilliseconds",
+            "outputAuthenticationMilliseconds",
+            "totalMilliseconds",
+        ],
+        "native v5 proposal phases",
     )?;
-    count_field(
-        timing,
-        "wallMilliseconds",
-        "native v5 proposal adoption output authentication",
-    )?;
+    for key in [
+        "staticAuthorityMilliseconds",
+        "constructionMilliseconds",
+        "stagingMilliseconds",
+        "prepublicationValidationMilliseconds",
+        "publicationMilliseconds",
+        "outputAuthenticationMilliseconds",
+        "totalMilliseconds",
+    ] {
+        count_field(phases, key, "native v5 proposal phases")?;
+    }
+    for key in ["processCpuMilliseconds", "cpuUtilizationMilliCores"] {
+        if fields.get(key) != Some(&Value::Null) {
+            count_field(fields, key, label)?;
+        }
+    }
     for key in [
         "publicArtifactBytesRead",
         "objectStoreBytesRead",
         "authenticatedFileCount",
+        "parallelAuthenticationWorkers",
     ] {
         count_field(fields, key, label)?;
+    }
+    if count_field(fields, "authenticatedFileCount", label)? == 0
+        || count_field(fields, "parallelAuthenticationWorkers", label)? > manifest.thread_cap
+    {
+        bail!("native v5 proposal adoption file/worker telemetry is incompatible");
+    }
+    if strategy == "receipt_bound_content"
+        && count_field(fields, "parallelAuthenticationWorkers", label)? == 0
+    {
+        bail!("native v5 receipt-bound authentication records no workers");
+    }
+    let io = object(
+        field(fields, "io", label)?,
+        "native v5 proposal I/O telemetry",
+    )?;
+    exact_keys(
+        io,
+        &[
+            "filesReopened",
+            "bytesRead",
+            "bytesHashed",
+            "bytesWritten",
+            "jsonRowsParsed",
+        ],
+        "native v5 proposal I/O telemetry",
+    )?;
+    for key in [
+        "filesReopened",
+        "bytesRead",
+        "bytesHashed",
+        "bytesWritten",
+        "jsonRowsParsed",
+    ] {
+        count_field(io, key, "native v5 proposal I/O telemetry")?;
+    }
+    let passes = object(
+        field(fields, "validationPasses", label)?,
+        "native v5 proposal validation-pass telemetry",
+    )?;
+    exact_keys(
+        passes,
+        &[
+            "constructorReplay",
+            "redundantFreshReplay",
+            "publicationPrepareReplay",
+            "stagedSemanticReplay",
+            "stagedFinalRehash",
+            "receiptBoundContentAuthentication",
+            "deepOutputReplay",
+        ],
+        "native v5 proposal validation-pass telemetry",
+    )?;
+    for key in [
+        "constructorReplay",
+        "redundantFreshReplay",
+        "publicationPrepareReplay",
+        "stagedSemanticReplay",
+        "stagedFinalRehash",
+        "receiptBoundContentAuthentication",
+        "deepOutputReplay",
+    ] {
+        count_field(passes, key, "native v5 proposal validation-pass telemetry")?;
     }
     for key in ["proposalReconstructionCount", "legacyRichExpansionCount"] {
         if count_field(fields, key, label)? != 0 {

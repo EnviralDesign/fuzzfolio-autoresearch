@@ -15,6 +15,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -64,8 +65,8 @@ use temporal_qd_kernel::{
         V5G0PublicationStream, prepare_v5_g0_publication_stream, verify_v5_g0_publication_adoption,
     },
     v5_transaction::{
-        V5G0CompactIdentityLedger, V5G0DurableObjectKind, V5G0TransactionRequest,
-        V5G0TransactionResult, execute_v5_g0_transaction,
+        V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER, V5G0CompactIdentityLedger, V5G0DurableObjectKind,
+        V5G0TransactionRequest, V5G0TransactionResult, execute_v5_g0_transaction,
         reconstruct_v5_g0_transaction_from_artifacts, verify_v5_g0_transaction_replay,
     },
 };
@@ -129,11 +130,210 @@ fn execute_manifest(manifest_path: &Path) -> Result<()> {
     }
 }
 
-#[derive(Default)]
+const V5_VALIDATION_MODE_ENV: &str = "TEMPORAL_QD_V5_VALIDATION_MODE";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5ValidationMode {
+    Balanced,
+    Strict,
+}
+
+impl V5ValidationMode {
+    fn from_environment() -> Result<Self> {
+        match env::var(V5_VALIDATION_MODE_ENV) {
+            Ok(value) if value == "balanced" => Ok(Self::Balanced),
+            Ok(value) if value == "strict" => Ok(Self::Strict),
+            Ok(value) => {
+                bail!("{V5_VALIDATION_MODE_ENV} must be exactly balanced or strict, not {value:?}")
+            }
+            Err(env::VarError::NotPresent) => Ok(Self::Balanced),
+            Err(error) => Err(error).context(format!("read {V5_VALIDATION_MODE_ENV} as Unicode")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Strict => "strict",
+        }
+    }
+
+    fn is_strict(self) -> bool {
+        self == Self::Strict
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5ExecutionPath {
+    Fresh,
+    SealedRestart,
+    ReceiptRecovery,
+}
+
+impl V5ExecutionPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::SealedRestart => "sealed_restart",
+            Self::ReceiptRecovery => "receipt_recovery",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5AuthenticationStrategy {
+    FreshPublicationProof,
+    ReceiptBoundContent,
+    StrictDeepReplay,
+}
+
+impl V5AuthenticationStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshPublicationProof => "fresh_publication_proof",
+            Self::ReceiptBoundContent => "receipt_bound_content",
+            Self::StrictDeepReplay => "strict_deep_replay",
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
 struct V5AdoptionBytes {
     public_artifact_bytes: u64,
     object_store_bytes: u64,
     authenticated_file_count: u64,
+}
+
+impl V5AdoptionBytes {
+    fn total_bytes(self) -> Result<u64> {
+        self.public_artifact_bytes
+            .checked_add(self.object_store_bytes)
+            .ok_or_else(|| anyhow!("native v5 adoption byte total overflows"))
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct V5PhaseDurations {
+    static_authority: Duration,
+    construction: Duration,
+    staging: Duration,
+    prepublication_validation: Duration,
+    publication: Duration,
+    output_authentication: Duration,
+}
+
+#[derive(Default, Clone, Copy)]
+struct V5IoTelemetry {
+    files_reopened: u64,
+    bytes_read: u64,
+    bytes_hashed: u64,
+    bytes_written: u64,
+    json_rows_parsed: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+struct V5ValidationPasses {
+    constructor_replay: u64,
+    redundant_fresh_replay: u64,
+    publication_prepare_replay: u64,
+    staged_semantic_replay: u64,
+    staged_final_rehash: u64,
+    receipt_bound_content_authentication: u64,
+    deep_output_replay: u64,
+}
+
+impl V5IoTelemetry {
+    fn merge(&mut self, other: Self) -> Result<()> {
+        self.files_reopened = self
+            .files_reopened
+            .checked_add(other.files_reopened)
+            .ok_or_else(|| anyhow!("native v5 telemetry file-open count overflows"))?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(other.bytes_read)
+            .ok_or_else(|| anyhow!("native v5 telemetry read bytes overflow"))?;
+        self.bytes_hashed = self
+            .bytes_hashed
+            .checked_add(other.bytes_hashed)
+            .ok_or_else(|| anyhow!("native v5 telemetry hashed bytes overflow"))?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(other.bytes_written)
+            .ok_or_else(|| anyhow!("native v5 telemetry written bytes overflow"))?;
+        self.json_rows_parsed = self
+            .json_rows_parsed
+            .checked_add(other.json_rows_parsed)
+            .ok_or_else(|| anyhow!("native v5 telemetry JSON-row count overflows"))?;
+        Ok(())
+    }
+}
+
+impl V5ValidationPasses {
+    fn merge(&mut self, other: Self) -> Result<()> {
+        macro_rules! add {
+            ($field:ident) => {
+                self.$field = self.$field.checked_add(other.$field).ok_or_else(|| {
+                    anyhow!(concat!(
+                        "native v5 validation-pass ",
+                        stringify!($field),
+                        " overflows"
+                    ))
+                })?;
+            };
+        }
+        add!(constructor_replay);
+        add!(redundant_fresh_replay);
+        add!(publication_prepare_replay);
+        add!(staged_semantic_replay);
+        add!(staged_final_rehash);
+        add!(receipt_bound_content_authentication);
+        add!(deep_output_replay);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V5ExecutionMeasurements {
+    path: V5ExecutionPath,
+    mode: V5ValidationMode,
+    strategy: V5AuthenticationStrategy,
+    phases: V5PhaseDurations,
+    io: V5IoTelemetry,
+    passes: V5ValidationPasses,
+    parallel_authentication_workers: u64,
+    process_cpu: Option<Duration>,
+    total: Duration,
+}
+
+struct V5FreshExecution {
+    bytes: V5AdoptionBytes,
+    phases: V5PhaseDurations,
+    passes: V5ValidationPasses,
+}
+
+struct V5Authentication {
+    bytes: V5AdoptionBytes,
+    elapsed: Duration,
+    strategy: V5AuthenticationStrategy,
+    parallel_workers: u64,
+    io: V5IoTelemetry,
+    passes: V5ValidationPasses,
+}
+
+struct V5RecoveredResult<T> {
+    result: T,
+    authentication: V5Authentication,
+    publication: Duration,
+}
+
+#[derive(Debug)]
+struct V5PublishDurations {
+    validation: Duration,
+    publication: Duration,
+}
+
+fn duration_milliseconds(duration: Duration) -> Result<u64> {
+    u64::try_from(duration.as_millis()).context("convert native v5 phase milliseconds")
 }
 
 #[derive(Clone, Debug)]
@@ -416,6 +616,413 @@ fn verify_v5_object_inventory_sidecar(
         .ok_or_else(|| anyhow!("native v5 authenticated byte count overflows"))?;
     observed.authenticated_file_count += 1;
     Ok(objects)
+}
+
+fn v5_expected_adoption_bytes(immutable_result: &Value) -> Result<V5AdoptionBytes> {
+    let result = immutable_result
+        .as_object()
+        .ok_or_else(|| anyhow!("native v5 immutable result is invalid"))?;
+    let receipt = result
+        .get("receipt")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("native v5 immutable result lacks receipt"))?;
+    let inventory = receipt
+        .get("outputInventory")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("native v5 immutable receipt lacks output inventory"))?;
+    let artifacts = inventory
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("native v5 immutable output inventory lacks artifacts"))?;
+    let descriptor = v5_object_inventory_descriptor(inventory)?;
+    let receipt_bytes = u64::try_from(canonical_json_line(&Value::Object(receipt.clone()))?.len())
+        .context("convert native v5 receipt byte length")?;
+    let public_artifact_bytes = artifacts
+        .iter()
+        .try_fold(receipt_bytes, |total, artifact| {
+            total
+                .checked_add(
+                    artifact
+                        .get("byteLength")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            anyhow!("native v5 output inventory artifact lacks byte length")
+                        })?,
+                )
+                .ok_or_else(|| anyhow!("native v5 public artifact byte total overflows"))
+        })?;
+    let public_artifact_bytes = public_artifact_bytes
+        .checked_add(
+            descriptor
+                .get("byteLength")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("native v5 object inventory lacks byte length"))?,
+        )
+        .ok_or_else(|| anyhow!("native v5 public artifact byte total overflows"))?;
+    let object_store_bytes = descriptor
+        .get("objectByteCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("native v5 object inventory lacks object byte count"))?;
+    let object_count = descriptor
+        .get("objectCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("native v5 object inventory lacks object count"))?;
+    let authenticated_file_count = 2_u64
+        .checked_add(artifacts.len() as u64)
+        .and_then(|count| count.checked_add(object_count))
+        .ok_or_else(|| anyhow!("native v5 authenticated file count overflows"))?;
+    Ok(V5AdoptionBytes {
+        public_artifact_bytes,
+        object_store_bytes,
+        authenticated_file_count,
+    })
+}
+
+/// Recover exact object paths and file digests from the receipt-bound sidecar.
+/// Balanced adoption hashes the sidecar itself but deliberately does not repeat
+/// canonical reserialization or semantic object replay that was already proven
+/// before the receipt-last publication barrier. Strict mode retains that replay.
+fn read_v5_receipt_bound_object_inventory(
+    output_root: &Path,
+    inventory: &Map<String, Value>,
+    allowed: &mut BTreeSet<String>,
+) -> Result<(Vec<V5InventoryFile>, u64)> {
+    let descriptor = v5_object_inventory_descriptor(inventory)?;
+    let relative = descriptor
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native v5 object inventory descriptor lacks path"))?;
+    if relative != V5_OUTPUT_INVENTORY_PATH
+        || descriptor.get("schemaVersion").and_then(Value::as_str)
+            != Some(V5_PROPOSAL_OBJECT_INVENTORY_DESCRIPTOR_SCHEMA)
+        || descriptor.get("rowSchemaVersion").and_then(Value::as_str)
+            != Some(V5_PROPOSAL_OBJECT_INVENTORY_ROW_SCHEMA)
+    {
+        bail!("native v5 receipt-bound object inventory descriptor is incompatible");
+    }
+    if !allowed.insert(relative.to_owned()) {
+        bail!("native v5 object inventory sidecar aliases another output artifact");
+    }
+    let expected_sha = descriptor
+        .get("fileSha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native v5 object inventory descriptor lacks file SHA-256"))?;
+    let expected_length = descriptor
+        .get("byteLength")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("native v5 object inventory descriptor lacks byte length"))?;
+    let expected_count = descriptor
+        .get("objectCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("native v5 object inventory descriptor lacks object count"))?;
+    let expected_object_bytes = descriptor
+        .get("objectByteCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("native v5 object inventory descriptor lacks object byte count"))?;
+    let sidecar = safe_existing_file(
+        &output_root.join(relative),
+        "native v5 receipt-bound object inventory sidecar",
+    )?;
+    let mut reader = BufReader::new(
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&sidecar)
+            .with_context(|| format!("open native v5 object inventory: {}", sidecar.display()))?,
+    );
+    let mut digest = Sha256::new();
+    let mut encoded_bytes = 0_u64;
+    let mut object_bytes = 0_u64;
+    let mut ordinal = 0_u64;
+    let mut prior_sha: Option<String> = None;
+    let mut objects = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("stream receipt-bound native v5 object inventory row")?;
+        if read == 0 {
+            break;
+        }
+        if line.len() > 16 * 1024 || line.last() != Some(&b'\n') {
+            bail!("native v5 receipt-bound object inventory row is not bounded JSONL");
+        }
+        digest.update(&line);
+        encoded_bytes = encoded_bytes
+            .checked_add(line.len() as u64)
+            .ok_or_else(|| anyhow!("native v5 object inventory byte count overflows"))?;
+        let value: Value = serde_json::from_slice(&line)
+            .context("parse receipt-bound native v5 object inventory row")?;
+        let row = value
+            .as_object()
+            .ok_or_else(|| anyhow!("native v5 object inventory row is not an object"))?;
+        let exact = [
+            "schemaVersion",
+            "ordinal",
+            "relativePath",
+            "objectSha256",
+            "fileSha256",
+            "byteLength",
+            "rowSha256",
+        ];
+        if row.len() != exact.len()
+            || exact.iter().any(|key| !row.contains_key(*key))
+            || row.get("schemaVersion").and_then(Value::as_str)
+                != Some(V5_PROPOSAL_OBJECT_INVENTORY_ROW_SCHEMA)
+            || row.get("ordinal").and_then(Value::as_u64) != Some(ordinal)
+        {
+            bail!("native v5 receipt-bound object inventory row fields/ordinal drifted");
+        }
+        let object_sha = row
+            .get("objectSha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("native v5 object inventory row lacks object SHA-256"))?;
+        let file_sha = row
+            .get("fileSha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("native v5 object inventory row lacks file SHA-256"))?;
+        let valid_sha = |value: &str| {
+            value.len() == 71
+                && value.starts_with("sha256:")
+                && value[7..]
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        if !valid_sha(object_sha)
+            || !valid_sha(file_sha)
+            || prior_sha
+                .as_deref()
+                .is_some_and(|prior| object_sha <= prior)
+        {
+            bail!("native v5 receipt-bound object inventory identities are invalid");
+        }
+        let relative = format!("sha256/{}.json", &object_sha[7..]);
+        if row.get("relativePath").and_then(Value::as_str) != Some(relative.as_str()) {
+            bail!("native v5 receipt-bound object inventory path drifted");
+        }
+        let byte_length = row
+            .get("byteLength")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("native v5 object inventory row lacks byte length"))?;
+        object_bytes = object_bytes
+            .checked_add(byte_length)
+            .ok_or_else(|| anyhow!("native v5 object inventory object bytes overflow"))?;
+        let full_relative = format!("v5-native/objects/{relative}");
+        if !allowed.insert(full_relative.clone()) {
+            bail!("native v5 receipt-bound object inventory repeats an output path");
+        }
+        objects.push(V5InventoryFile {
+            relative_path: full_relative,
+            file_sha256: file_sha.to_owned(),
+            byte_length,
+        });
+        prior_sha = Some(object_sha.to_owned());
+        ordinal += 1;
+    }
+    let actual_sha = format!("sha256:{:x}", digest.finalize());
+    if encoded_bytes != expected_length
+        || actual_sha != expected_sha
+        || ordinal != expected_count
+        || object_bytes != expected_object_bytes
+    {
+        bail!("native v5 receipt-bound object inventory descriptor binding drifted");
+    }
+    Ok((objects, ordinal))
+}
+
+fn authenticate_v5_inventory_files_parallel(
+    output_root: &Path,
+    files: &[(V5InventoryFile, bool)],
+    thread_cap: u64,
+) -> Result<u64> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let workers = usize::min(thread_cap as usize, files.len()).max(1);
+    let chunk_size = files.len().div_ceil(workers);
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for chunk in files.chunks(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<()> {
+                for (file, object_store) in chunk {
+                    v5_safe_relative_output_path(
+                        &file.relative_path,
+                        "native v5 receipt-bound output artifact",
+                    )?;
+                    require_v5_file_digest(
+                        &output_root.join(&file.relative_path),
+                        file.byte_length,
+                        &file.file_sha256,
+                        if *object_store {
+                            "native v5 receipt-bound object-store artifact"
+                        } else {
+                            "native v5 receipt-bound public artifact"
+                        },
+                    )?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow!("native v5 receipt-bound authentication worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(workers as u64)
+}
+
+fn authenticate_v5_receipt_bound_content(
+    output_root: &Path,
+    manifest: &V5ProposalManifest,
+    immutable_result: &Value,
+) -> Result<V5Authentication> {
+    let started = Instant::now();
+    let result = immutable_result
+        .as_object()
+        .ok_or_else(|| anyhow!("native v5 immutable result is invalid"))?;
+    let receipt = result
+        .get("receipt")
+        .cloned()
+        .ok_or_else(|| anyhow!("native v5 immutable result lacks receipt"))?;
+    let persisted = read_optional_v5_canonical_document(
+        &output_root.join(V5_OUTPUT_RECEIPT_PATH),
+        "native v5 receipt-bound output receipt",
+    )?
+    .ok_or_else(|| anyhow!("native v5 receipt-bound output receipt is missing"))?;
+    if persisted != receipt {
+        bail!("native v5 persisted output receipt differs from the immutable result");
+    }
+    let receipt_fields = receipt
+        .as_object()
+        .ok_or_else(|| anyhow!("native v5 immutable receipt is invalid"))?;
+    let inventory = receipt_fields
+        .get("outputInventory")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("native v5 immutable receipt lacks output inventory"))?;
+    let artifacts = inventory
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("native v5 output inventory lacks artifacts"))?;
+    let mut allowed = BTreeSet::from([V5_OUTPUT_RECEIPT_PATH.to_owned()]);
+    let mut files = Vec::<(V5InventoryFile, bool)>::new();
+    for artifact in artifacts {
+        let artifact = artifact
+            .as_object()
+            .ok_or_else(|| anyhow!("native v5 output inventory artifact is invalid"))?;
+        let file = v5_inventory_file_identity(artifact, "native v5 output inventory artifact")?;
+        v5_safe_relative_output_path(&file.relative_path, "native v5 output inventory artifact")?;
+        if !allowed.insert(file.relative_path.clone()) {
+            bail!("native v5 output inventory repeats an artifact path");
+        }
+        files.push((file, false));
+    }
+    let (objects, object_rows) =
+        read_v5_receipt_bound_object_inventory(output_root, inventory, &mut allowed)?;
+    files.extend(objects.into_iter().map(|file| (file, true)));
+    require_v5_owned_namespace_file_set(output_root, &allowed)
+        .context("verify receipt-bound native v5 owned output namespaces before hashing")?;
+    let workers =
+        authenticate_v5_inventory_files_parallel(output_root, &files, manifest.thread_cap)?;
+    require_v5_owned_namespace_file_set(output_root, &allowed)
+        .context("verify receipt-bound native v5 owned output namespaces after hashing")?;
+    let bytes = v5_expected_adoption_bytes(immutable_result)?;
+    let receipt_bytes = u64::try_from(canonical_json_line(&receipt)?.len())
+        .context("convert native v5 receipt byte length")?;
+    let hashed_files_bytes = files.iter().try_fold(0_u64, |total, (file, _)| {
+        total
+            .checked_add(file.byte_length)
+            .ok_or_else(|| anyhow!("native v5 receipt-bound hashed byte total overflows"))
+    })?;
+    let descriptor_bytes = v5_object_inventory_descriptor(inventory)?
+        .get("byteLength")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("native v5 object inventory lacks byte length"))?;
+    let io = V5IoTelemetry {
+        files_reopened: files.len() as u64 + 2,
+        bytes_read: receipt_bytes
+            .checked_add(descriptor_bytes)
+            .and_then(|total| total.checked_add(hashed_files_bytes))
+            .ok_or_else(|| anyhow!("native v5 receipt-bound read byte total overflows"))?,
+        bytes_hashed: descriptor_bytes
+            .checked_add(hashed_files_bytes)
+            .ok_or_else(|| anyhow!("native v5 receipt-bound hash byte total overflows"))?,
+        bytes_written: 0,
+        json_rows_parsed: object_rows,
+    };
+    Ok(V5Authentication {
+        bytes,
+        elapsed: started.elapsed(),
+        strategy: V5AuthenticationStrategy::ReceiptBoundContent,
+        parallel_workers: workers,
+        io,
+        passes: V5ValidationPasses {
+            receipt_bound_content_authentication: 1,
+            ..V5ValidationPasses::default()
+        },
+    })
+}
+
+fn authenticate_v5_proposal_output(
+    output_root: &Path,
+    manifest: &V5ProposalManifest,
+    result: &V5ProposalResult,
+    mode: V5ValidationMode,
+) -> Result<V5Authentication> {
+    if !mode.is_strict() {
+        return authenticate_v5_receipt_bound_content(output_root, manifest, &result.value);
+    }
+    let started = Instant::now();
+    let bytes = verify_v5_output_inventory(output_root, manifest, result)?;
+    let total = bytes.total_bytes()?;
+    Ok(V5Authentication {
+        bytes,
+        elapsed: started.elapsed(),
+        strategy: V5AuthenticationStrategy::StrictDeepReplay,
+        parallel_workers: 1,
+        io: V5IoTelemetry {
+            files_reopened: bytes.authenticated_file_count,
+            bytes_read: total,
+            bytes_hashed: total,
+            bytes_written: 0,
+            json_rows_parsed: 0,
+        },
+        passes: V5ValidationPasses {
+            deep_output_replay: 1,
+            ..V5ValidationPasses::default()
+        },
+    })
+}
+
+fn authenticate_v5_evolved_proposal_output(
+    output_root: &Path,
+    manifest: &V5ProposalManifest,
+    result: &V5EvolvedProposalResult,
+    mode: V5ValidationMode,
+) -> Result<V5Authentication> {
+    if !mode.is_strict() {
+        return authenticate_v5_receipt_bound_content(output_root, manifest, &result.value);
+    }
+    let started = Instant::now();
+    let bytes = verify_v5_evolved_output_inventory(output_root, manifest, result)?;
+    let total = bytes.total_bytes()?;
+    Ok(V5Authentication {
+        bytes,
+        elapsed: started.elapsed(),
+        strategy: V5AuthenticationStrategy::StrictDeepReplay,
+        parallel_workers: 1,
+        io: V5IoTelemetry {
+            files_reopened: bytes.authenticated_file_count,
+            bytes_read: total,
+            bytes_hashed: total,
+            bytes_written: 0,
+            json_rows_parsed: 0,
+        },
+        passes: V5ValidationPasses {
+            deep_output_replay: 1,
+            ..V5ValidationPasses::default()
+        },
+    })
 }
 
 fn v5_safe_relative_output_path(relative: &str, label: &str) -> Result<()> {
@@ -1879,9 +2486,23 @@ struct V5ProcessMemoryCountersEx {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct V5FileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
+    fn GetProcessTimes(
+        process: *mut c_void,
+        creation: *mut V5FileTime,
+        exit: *mut V5FileTime,
+        kernel: *mut V5FileTime,
+        user: *mut V5FileTime,
+    ) -> i32;
 }
 
 #[cfg(windows)]
@@ -1892,6 +2513,61 @@ unsafe extern "system" {
         counters: *mut V5ProcessMemoryCountersEx,
         counters_size: u32,
     ) -> i32;
+}
+
+#[cfg(windows)]
+fn v5_process_cpu_duration() -> Result<Option<Duration>> {
+    let mut creation = V5FileTime {
+        low_date_time: 0,
+        high_date_time: 0,
+    };
+    let mut exit = V5FileTime {
+        low_date_time: 0,
+        high_date_time: 0,
+    };
+    let mut kernel = V5FileTime {
+        low_date_time: 0,
+        high_date_time: 0,
+    };
+    let mut user = V5FileTime {
+        low_date_time: 0,
+        high_date_time: 0,
+    };
+    let queried = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if queried == 0 {
+        bail!("query native v5 Windows process CPU time with GetProcessTimes");
+    }
+    let ticks = |value: &V5FileTime| {
+        (u64::from(value.high_date_time) << 32) | u64::from(value.low_date_time)
+    };
+    let total_100ns = ticks(&kernel)
+        .checked_add(ticks(&user))
+        .ok_or_else(|| anyhow!("native v5 Windows process CPU time overflows"))?;
+    Ok(Some(Duration::from_nanos(
+        total_100ns
+            .checked_mul(100)
+            .ok_or_else(|| anyhow!("native v5 Windows process CPU nanoseconds overflow"))?,
+    )))
+}
+
+#[cfg(not(windows))]
+fn v5_process_cpu_duration() -> Result<Option<Duration>> {
+    Ok(None)
+}
+
+fn elapsed_process_cpu(started: Option<Duration>, finished: Option<Duration>) -> Option<Duration> {
+    match (started, finished) {
+        (Some(started), Some(finished)) => finished.checked_sub(started),
+        _ => None,
+    }
 }
 
 /// Execution-only process-tree evidence. It is never put in the immutable
@@ -1962,11 +2638,22 @@ fn v5_adoption_evidence_with_schemas(
     evidence_schema: &str,
     telemetry_schema: &str,
     bytes: V5AdoptionBytes,
-    elapsed: Duration,
+    measurements: V5ExecutionMeasurements,
 ) -> Result<Value> {
     let process_tree = v5_execution_process_tree_evidence()?;
-    let wall_milliseconds = u64::try_from(elapsed.as_millis())
-        .context("convert native v5 output authentication elapsed milliseconds")?;
+    let process_cpu_milliseconds = measurements
+        .process_cpu
+        .map(duration_milliseconds)
+        .transpose()?;
+    let total_milliseconds = duration_milliseconds(measurements.total)?;
+    let cpu_utilization_milli_cores = match (process_cpu_milliseconds, total_milliseconds) {
+        (Some(cpu), total) if total > 0 => Some(
+            cpu.checked_mul(1_000)
+                .ok_or_else(|| anyhow!("native v5 CPU utilization overflows"))?
+                / total,
+        ),
+        _ => None,
+    };
     let result_fields = immutable_result
         .as_object()
         .ok_or_else(|| anyhow!("native v5 immutable result is invalid"))?;
@@ -1978,6 +2665,9 @@ fn v5_adoption_evidence_with_schemas(
         .get("nativeBatchAuthority")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("native v5 batch authority is invalid"))?;
+    let phases = measurements.phases;
+    let passes = measurements.passes;
+    let io = measurements.io;
     let mut value = Map::from_iter([
         (
             "schemaVersion".to_owned(),
@@ -2039,18 +2729,45 @@ fn v5_adoption_evidence_with_schemas(
             "telemetry".to_owned(),
             serde_json::json!({
                 "schemaVersion": telemetry_schema,
-                // Execution-only telemetry is intentionally separate from
-                // immutable receipt/result identities.
-                "outputAuthentication": {
-                    "wallMilliseconds": wall_milliseconds,
+                "executionPath": measurements.path.as_str(),
+                "validationMode": measurements.mode.as_str(),
+                "authenticationStrategy": measurements.strategy.as_str(),
+                "phases": {
+                    "staticAuthorityMilliseconds": duration_milliseconds(phases.static_authority)?,
+                    "constructionMilliseconds": duration_milliseconds(phases.construction)?,
+                    "stagingMilliseconds": duration_milliseconds(phases.staging)?,
+                    "prepublicationValidationMilliseconds": duration_milliseconds(phases.prepublication_validation)?,
+                    "publicationMilliseconds": duration_milliseconds(phases.publication)?,
+                    "outputAuthenticationMilliseconds": duration_milliseconds(phases.output_authentication)?,
+                    "totalMilliseconds": total_milliseconds,
                 },
+                "processCpuMilliseconds": process_cpu_milliseconds,
+                "cpuUtilizationMilliCores": cpu_utilization_milli_cores,
                 "publicArtifactBytesRead": bytes.public_artifact_bytes,
                 "objectStoreBytesRead": bytes.object_store_bytes,
                 "authenticatedFileCount": bytes.authenticated_file_count,
+                "io": {
+                    "filesReopened": io.files_reopened,
+                    "bytesRead": io.bytes_read,
+                    "bytesHashed": io.bytes_hashed,
+                    "bytesWritten": io.bytes_written,
+                    "jsonRowsParsed": io.json_rows_parsed,
+                },
+                "validationPasses": {
+                    "constructorReplay": passes.constructor_replay,
+                    "redundantFreshReplay": passes.redundant_fresh_replay,
+                    "publicationPrepareReplay": passes.publication_prepare_replay,
+                    "stagedSemanticReplay": passes.staged_semantic_replay,
+                    "stagedFinalRehash": passes.staged_final_rehash,
+                    "receiptBoundContentAuthentication": passes.receipt_bound_content_authentication,
+                    "deepOutputReplay": passes.deep_output_replay,
+                },
+                "parallelAuthenticationWorkers": measurements.parallel_authentication_workers,
                 "proposalReconstructionCount": 0_u64,
                 "legacyRichExpansionCount": 0_u64,
                 "processTree": process_tree,
                 "threadCap": manifest.thread_cap,
+                "constructionPrefetchMultiplier": V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER,
             }),
         ),
     ]);
@@ -2063,7 +2780,7 @@ fn v5_adoption_evidence(
     manifest: &V5ProposalManifest,
     result: &V5ProposalResult,
     bytes: V5AdoptionBytes,
-    elapsed: Duration,
+    measurements: V5ExecutionMeasurements,
 ) -> Result<Value> {
     v5_adoption_evidence_with_schemas(
         manifest,
@@ -2071,7 +2788,7 @@ fn v5_adoption_evidence(
         V5_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA,
         V5_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA,
         bytes,
-        elapsed,
+        measurements,
     )
 }
 
@@ -2079,7 +2796,7 @@ fn v5_evolved_adoption_evidence(
     manifest: &V5ProposalManifest,
     result: &V5EvolvedProposalResult,
     bytes: V5AdoptionBytes,
-    elapsed: Duration,
+    measurements: V5ExecutionMeasurements,
 ) -> Result<Value> {
     v5_adoption_evidence_with_schemas(
         manifest,
@@ -2087,7 +2804,7 @@ fn v5_evolved_adoption_evidence(
         V5_EVOLVED_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA,
         V5_EVOLVED_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA,
         bytes,
-        elapsed,
+        measurements,
     )
 }
 
@@ -2120,7 +2837,8 @@ fn recover_v5_invocation_result_from_sealed_receipt(
     invocation_root: &Path,
     result_path: &Path,
     manifest: &V5ProposalManifest,
-) -> Result<Option<V5ProposalResult>> {
+    validation_mode: V5ValidationMode,
+) -> Result<Option<V5RecoveredResult<V5ProposalResult>>> {
     let receipt_path = output_root.join("internal/v5-proposal/receipt.json");
     let Some(receipt) =
         read_optional_v5_canonical_document(&receipt_path, "native v5 sealed proposal receipt")?
@@ -2134,8 +2852,10 @@ fn recover_v5_invocation_result_from_sealed_receipt(
     // completion marker.  This makes receipt-present/result-absent recovery a
     // true adoption pass, not a shortcut that could bless a truncated or
     // swapped output tree.
-    verify_v5_output_inventory(output_root, manifest, &result)
-        .context("authenticate sealed native v5 output tree before result recovery")?;
+    let authentication =
+        authenticate_v5_proposal_output(output_root, manifest, &result, validation_mode)
+            .context("authenticate sealed native v5 output tree before result recovery")?;
+    let publication_started = Instant::now();
     let result_bytes = canonical_json_line(&result.value)
         .context("encode recovered native v5 invocation result")?;
     publish_once(result_path, &result_bytes)
@@ -2159,7 +2879,11 @@ fn recover_v5_invocation_result_from_sealed_receipt(
     ]);
     require_v5_exact_file_set(invocation_root, &allowed)
         .context("verify recovered native v5 invocation file set")?;
-    Ok(Some(recovered))
+    Ok(Some(V5RecoveredResult {
+        result: recovered,
+        authentication,
+        publication: publication_started.elapsed(),
+    }))
 }
 
 /// Evolved counterpart to receipt-present/result-absent recovery.  It only
@@ -2171,7 +2895,8 @@ fn recover_v5_evolved_invocation_result_from_sealed_receipt(
     invocation_root: &Path,
     result_path: &Path,
     manifest: &V5ProposalManifest,
-) -> Result<Option<V5EvolvedProposalResult>> {
+    validation_mode: V5ValidationMode,
+) -> Result<Option<V5RecoveredResult<V5EvolvedProposalResult>>> {
     let receipt_path = output_root.join(V5_OUTPUT_RECEIPT_PATH);
     let Some(receipt) = read_optional_v5_canonical_document(
         &receipt_path,
@@ -2182,8 +2907,10 @@ fn recover_v5_evolved_invocation_result_from_sealed_receipt(
     };
     let result = build_v5_evolved_proposal_result_from_receipt(manifest, &receipt)
         .context("rebuild native v5 evolved invocation result from sealed receipt")?;
-    verify_v5_evolved_output_inventory(output_root, manifest, &result)
-        .context("authenticate sealed native v5 evolved output tree before result recovery")?;
+    let authentication =
+        authenticate_v5_evolved_proposal_output(output_root, manifest, &result, validation_mode)
+            .context("authenticate sealed native v5 evolved output tree before result recovery")?;
+    let publication_started = Instant::now();
     let result_bytes = canonical_json_line(&result.value)
         .context("encode recovered native v5 evolved invocation result")?;
     publish_once(result_path, &result_bytes)
@@ -2206,7 +2933,11 @@ fn recover_v5_evolved_invocation_result_from_sealed_receipt(
     ]);
     require_v5_exact_file_set(invocation_root, &allowed)
         .context("verify recovered native v5 evolved invocation file set")?;
-    Ok(Some(recovered))
+    Ok(Some(V5RecoveredResult {
+        result: recovered,
+        authentication,
+        publication: publication_started.elapsed(),
+    }))
 }
 
 /// Translate only authenticated manifest fields into the typed core request.
@@ -3347,13 +4078,18 @@ fn execute_v5_fresh_transaction(
     invocation_root: &Path,
     result_path: &Path,
     manifest: &V5ProposalManifest,
-) -> Result<()> {
+    validation_mode: V5ValidationMode,
+) -> Result<V5FreshExecution> {
     let ops = StdPublicationIo;
     let request = v5_g0_transaction_request(manifest)?;
+    let construction_started = Instant::now();
     let transaction = execute_v5_g0_transaction(request.clone())
         .context("execute sealed native v5 G0 transaction")?;
-    verify_v5_g0_transaction_replay(&request, &transaction)
-        .context("replay fresh sealed native v5 G0 transaction")?;
+    if validation_mode.is_strict() {
+        verify_v5_g0_transaction_replay(&request, &transaction)
+            .context("replay fresh sealed native v5 G0 transaction")?;
+    }
+    let construction_elapsed = construction_started.elapsed();
     if !transaction.target_reached
         || transaction.accepted_records.len() as u64 != manifest.requested_count
         || transaction.selected_projection_index.is_none()
@@ -3364,6 +4100,7 @@ fn execute_v5_fresh_transaction(
         bail!("native v5 typed G0 transaction did not produce a complete publication bundle");
     }
 
+    let staging_started = Instant::now();
     let staging = v5_private_staging_area(output_root, invocation_root, &manifest.manifest_sha256)?;
     let stream = prepare_v5_g0_publication_stream(&request, &transaction)
         .context("prepare sealed native v5 G0 publication stream")?;
@@ -3916,7 +4653,8 @@ fn execute_v5_fresh_transaction(
         .context("encode native v5 immutable invocation result")?;
     let mut all_artifacts = public_artifacts;
     all_artifacts.extend(object_artifacts);
-    validate_and_publish_v5_staged_receipt_last_with(
+    let bytes = v5_expected_adoption_bytes(&outer_result.value)?;
+    let publish = validate_and_publish_v5_staged_receipt_last_with(
         &ops,
         output_root,
         manifest,
@@ -3926,9 +4664,32 @@ fn execute_v5_fresh_transaction(
         &staged_receipt,
         result_path,
         &invocation_result,
+        validation_mode,
         |bundle| v5_verify_staged_typed_bundle(bundle, manifest, &outer_result, &request),
     )
-    .context("publish native v5 receipt-last transaction")
+    .context("publish native v5 receipt-last transaction")?;
+    let staging_elapsed = staging_started
+        .elapsed()
+        .saturating_sub(publish.validation)
+        .saturating_sub(publish.publication);
+    Ok(V5FreshExecution {
+        bytes,
+        phases: V5PhaseDurations {
+            construction: construction_elapsed,
+            staging: staging_elapsed,
+            prepublication_validation: publish.validation,
+            publication: publish.publication,
+            ..V5PhaseDurations::default()
+        },
+        passes: V5ValidationPasses {
+            constructor_replay: 1,
+            redundant_fresh_replay: u64::from(validation_mode.is_strict()),
+            publication_prepare_replay: 1,
+            staged_semantic_replay: 1,
+            staged_final_rehash: u64::from(validation_mode.is_strict()),
+            ..V5ValidationPasses::default()
+        },
+    })
 }
 
 /// Fresh later-generation construction.  All core semantics are produced by
@@ -3940,15 +4701,20 @@ fn execute_v5_evolved_fresh_transaction(
     invocation_root: &Path,
     result_path: &Path,
     manifest: &V5ProposalManifest,
-) -> Result<()> {
+    validation_mode: V5ValidationMode,
+) -> Result<V5FreshExecution> {
     let ops = StdPublicationIo;
     let (request, mut parents, mut identity_ledger) = v5_evolved_transaction_request(manifest)?;
+    let construction_started = Instant::now();
     let transaction =
         execute_v5_evolved_transaction(request.clone(), &mut parents, &mut identity_ledger)
             .context("execute sealed native v5 evolved transaction")?;
-    transaction
-        .verify_replay()
-        .context("validate fresh sealed native v5 evolved transaction")?;
+    if validation_mode.is_strict() {
+        transaction
+            .verify_replay()
+            .context("validate fresh sealed native v5 evolved transaction")?;
+    }
+    let construction_elapsed = construction_started.elapsed();
     if !transaction.target_reached
         || transaction.accepted_records.len() as u64 != manifest.requested_count
         || transaction.attempts.len() as u64 > manifest.max_proposal_attempts
@@ -3958,6 +4724,7 @@ fn execute_v5_evolved_fresh_transaction(
     let transaction_sha256 = transaction
         .transaction_sha256()
         .context("identify native v5 evolved transaction")?;
+    let staging_started = Instant::now();
     let staging = v5_private_staging_area(output_root, invocation_root, &manifest.manifest_sha256)?;
 
     // A fresh bundle must prove the complete typed durable closure before the
@@ -4360,7 +5127,8 @@ fn execute_v5_evolved_fresh_transaction(
     };
     let mut all_artifacts = public_artifacts;
     all_artifacts.append(&mut object_artifacts);
-    validate_and_publish_v5_evolved_staged_receipt_last_with(
+    let bytes = v5_expected_adoption_bytes(&outer_result.value)?;
+    let publish = validate_and_publish_v5_evolved_staged_receipt_last_with(
         &ops,
         output_root,
         manifest,
@@ -4370,6 +5138,7 @@ fn execute_v5_evolved_fresh_transaction(
         &staged_receipt,
         result_path,
         &invocation_result,
+        validation_mode,
         |bundle| {
             v5_verify_staged_evolved_typed_bundle(
                 bundle,
@@ -4383,7 +5152,29 @@ fn execute_v5_evolved_fresh_transaction(
             )
         },
     )
-    .context("publish native v5 evolved receipt-last transaction")
+    .context("publish native v5 evolved receipt-last transaction")?;
+    let staging_elapsed = staging_started
+        .elapsed()
+        .saturating_sub(publish.validation)
+        .saturating_sub(publish.publication);
+    Ok(V5FreshExecution {
+        bytes,
+        phases: V5PhaseDurations {
+            construction: construction_elapsed,
+            staging: staging_elapsed,
+            prepublication_validation: publish.validation,
+            publication: publish.publication,
+            ..V5PhaseDurations::default()
+        },
+        passes: V5ValidationPasses {
+            constructor_replay: 1,
+            redundant_fresh_replay: u64::from(validation_mode.is_strict()),
+            publication_prepare_replay: 1,
+            staged_semantic_replay: 1,
+            staged_final_rehash: u64::from(validation_mode.is_strict()),
+            ..V5ValidationPasses::default()
+        },
+    })
 }
 
 fn execute_v5_evolved_proposal(
@@ -4392,20 +5183,45 @@ fn execute_v5_evolved_proposal(
     result_path: &Path,
     manifest: &V5ProposalManifest,
     started: Instant,
+    process_cpu_started: Option<Duration>,
+    static_authority_elapsed: Duration,
+    validation_mode: V5ValidationMode,
 ) -> Result<()> {
     if manifest.generation_kind != "evolved" || manifest.generation_index < 2 {
         bail!("native v5 evolved proposal execution requires generation index at least two");
     }
-    let result = match read_optional_v5_canonical_document(
+    let mut phases = V5PhaseDurations {
+        static_authority: static_authority_elapsed,
+        ..V5PhaseDurations::default()
+    };
+    let mut io = V5IoTelemetry::default();
+    let mut passes = V5ValidationPasses::default();
+    let mut parallel_workers = 0_u64;
+    let (result, bytes, path, strategy) = match read_optional_v5_canonical_document(
         result_path,
         "native v5 evolved immutable result",
     )? {
-        Some(result_value) => validate_v5_evolved_proposal_result(&result_value, manifest)
-            .context("validate native v5 evolved immutable result")?,
+        Some(result_value) => {
+            let result = validate_v5_evolved_proposal_result(&result_value, manifest)
+                .context("validate native v5 evolved immutable result")?;
+            let authentication = authenticate_v5_evolved_proposal_output(
+                output_root,
+                manifest,
+                &result,
+                validation_mode,
+            )?;
+            phases.output_authentication = authentication.elapsed;
+            io.merge(authentication.io)?;
+            passes.merge(authentication.passes)?;
+            parallel_workers = authentication.parallel_workers;
+            (
+                result,
+                authentication.bytes,
+                V5ExecutionPath::SealedRestart,
+                authentication.strategy,
+            )
+        }
         None => {
-            // A missing invocation marker may only be recovered from an already
-            // sealed tree.  Extra invocation files are rejected before either
-            // recovery or fresh construction can begin.
             let static_allowed = BTreeSet::from([
                 "authority.json".to_owned(),
                 "frozen-authority.json".to_owned(),
@@ -4418,16 +5234,30 @@ fn execute_v5_evolved_proposal(
                 invocation_root,
                 result_path,
                 manifest,
+                validation_mode,
             )? {
-                Some(result) => result,
+                Some(recovered) => {
+                    phases.output_authentication = recovered.authentication.elapsed;
+                    phases.publication = recovered.publication;
+                    io.merge(recovered.authentication.io)?;
+                    passes.merge(recovered.authentication.passes)?;
+                    parallel_workers = recovered.authentication.parallel_workers;
+                    (
+                        recovered.result,
+                        recovered.authentication.bytes,
+                        V5ExecutionPath::ReceiptRecovery,
+                        recovered.authentication.strategy,
+                    )
+                }
                 None => {
-                    execute_v5_evolved_fresh_transaction(
+                    let fresh = execute_v5_evolved_fresh_transaction(
                         output_root,
                         invocation_root,
                         result_path,
                         manifest,
+                        validation_mode,
                     )?;
-                    let fresh = read_optional_v5_canonical_document(
+                    let result_value = read_optional_v5_canonical_document(
                         result_path,
                         "fresh native v5 evolved immutable result",
                     )?
@@ -4436,8 +5266,39 @@ fn execute_v5_evolved_proposal(
                             "fresh native v5 evolved transaction did not publish its immutable result"
                         )
                     })?;
-                    validate_v5_evolved_proposal_result(&fresh, manifest)
-                        .context("validate fresh native v5 evolved immutable result")?
+                    let result = validate_v5_evolved_proposal_result(&result_value, manifest)
+                        .context("validate fresh native v5 evolved immutable result")?;
+                    phases.construction = fresh.phases.construction;
+                    phases.staging = fresh.phases.staging;
+                    phases.prepublication_validation = fresh.phases.prepublication_validation;
+                    phases.publication = fresh.phases.publication;
+                    passes.merge(fresh.passes)?;
+                    io.bytes_written = fresh.bytes.total_bytes()?;
+                    if validation_mode.is_strict() {
+                        let authentication = authenticate_v5_evolved_proposal_output(
+                            output_root,
+                            manifest,
+                            &result,
+                            validation_mode,
+                        )?;
+                        phases.output_authentication = authentication.elapsed;
+                        io.merge(authentication.io)?;
+                        passes.merge(authentication.passes)?;
+                        parallel_workers = authentication.parallel_workers;
+                        (
+                            result,
+                            authentication.bytes,
+                            V5ExecutionPath::Fresh,
+                            authentication.strategy,
+                        )
+                    } else {
+                        (
+                            result,
+                            fresh.bytes,
+                            V5ExecutionPath::Fresh,
+                            V5AuthenticationStrategy::FreshPublicationProof,
+                        )
+                    }
                 }
             }
         }
@@ -4449,14 +5310,27 @@ fn execute_v5_evolved_proposal(
         V5_PROPOSAL_RESULT_PATH.to_owned(),
     ]);
     require_v5_exact_file_set(invocation_root, &invocation_allowed)?;
-    let bytes = verify_v5_evolved_output_inventory(output_root, manifest, &result)?;
-    let evidence = v5_evolved_adoption_evidence(manifest, &result, bytes, started.elapsed())?;
+    let measurements = V5ExecutionMeasurements {
+        path,
+        mode: validation_mode,
+        strategy,
+        phases,
+        io,
+        passes,
+        parallel_authentication_workers: parallel_workers,
+        process_cpu: elapsed_process_cpu(process_cpu_started, v5_process_cpu_duration()?),
+        total: started.elapsed(),
+    };
+    let evidence = v5_evolved_adoption_evidence(manifest, &result, bytes, measurements)?;
     validate_v5_evolved_proposal_adoption_evidence(&evidence, manifest, &result)
         .context("validate native v5 evolved adoption evidence")?;
     write_stdout_json(&evidence)
 }
 
 fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
+    let started = Instant::now();
+    let process_cpu_started = v5_process_cpu_duration()?;
+    let validation_mode = V5ValidationMode::from_environment()?;
     let manifest = parse_v5_proposal_manifest(manifest_bytes)
         .context("validate native v5 proposal manifest")?;
     let invocation_root = manifest_path
@@ -4473,9 +5347,10 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
     if !invocation_root.starts_with(&output_root) {
         bail!("native v5 proposal manifest parent escapes its sealed output root");
     }
+    let static_authority_started = Instant::now();
     verify_v5_static_authorities(&invocation_root, &manifest, manifest_bytes)?;
+    let static_authority_elapsed = static_authority_started.elapsed();
     let result_path = invocation_root.join(&manifest.result_path);
-    let started = Instant::now();
     if manifest.generation_kind == "evolved" {
         return execute_v5_evolved_proposal(
             &output_root,
@@ -4483,16 +5358,41 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
             &result_path,
             &manifest,
             started,
+            process_cpu_started,
+            static_authority_elapsed,
+            validation_mode,
         );
     }
-    let result =
+    let mut phases = V5PhaseDurations {
+        static_authority: static_authority_elapsed,
+        ..V5PhaseDurations::default()
+    };
+    let mut io = V5IoTelemetry::default();
+    let mut passes = V5ValidationPasses::default();
+    let mut parallel_workers = 0_u64;
+    let (result, bytes, path, strategy) =
         match read_optional_v5_canonical_document(&result_path, "native v5 immutable result")? {
-            Some(result_value) => validate_v5_proposal_result(&result_value, &manifest)
-                .context("validate native v5 immutable result")?,
+            Some(result_value) => {
+                let result = validate_v5_proposal_result(&result_value, &manifest)
+                    .context("validate native v5 immutable result")?;
+                let authentication = authenticate_v5_proposal_output(
+                    &output_root,
+                    &manifest,
+                    &result,
+                    validation_mode,
+                )?;
+                phases.output_authentication = authentication.elapsed;
+                io.merge(authentication.io)?;
+                passes.merge(authentication.passes)?;
+                parallel_workers = authentication.parallel_workers;
+                (
+                    result,
+                    authentication.bytes,
+                    V5ExecutionPath::SealedRestart,
+                    authentication.strategy,
+                )
+            }
             None => {
-                // Reject extra control-plane files before inspecting a possible
-                // sealed receipt.  A partial fresh run may have output artifacts,
-                // but it must not smuggle a second invocation result authority.
                 let static_allowed = BTreeSet::from([
                     "authority.json".to_owned(),
                     "frozen-authority.json".to_owned(),
@@ -4505,16 +5405,30 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
                     &invocation_root,
                     &result_path,
                     &manifest,
+                    validation_mode,
                 )? {
-                    Some(result) => result,
+                    Some(recovered) => {
+                        phases.output_authentication = recovered.authentication.elapsed;
+                        phases.publication = recovered.publication;
+                        io.merge(recovered.authentication.io)?;
+                        passes.merge(recovered.authentication.passes)?;
+                        parallel_workers = recovered.authentication.parallel_workers;
+                        (
+                            recovered.result,
+                            recovered.authentication.bytes,
+                            V5ExecutionPath::ReceiptRecovery,
+                            recovered.authentication.strategy,
+                        )
+                    }
                     None => {
-                        execute_v5_fresh_transaction(
+                        let fresh = execute_v5_fresh_transaction(
                             &output_root,
                             &invocation_root,
                             &result_path,
                             &manifest,
+                            validation_mode,
                         )?;
-                        let fresh = read_optional_v5_canonical_document(
+                        let result_value = read_optional_v5_canonical_document(
                             &result_path,
                             "fresh native v5 immutable result",
                         )?
@@ -4523,8 +5437,39 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
                                 "fresh native v5 transaction did not publish its immutable result"
                             )
                         })?;
-                        validate_v5_proposal_result(&fresh, &manifest)
-                            .context("validate fresh native v5 immutable result")?
+                        let result = validate_v5_proposal_result(&result_value, &manifest)
+                            .context("validate fresh native v5 immutable result")?;
+                        phases.construction = fresh.phases.construction;
+                        phases.staging = fresh.phases.staging;
+                        phases.prepublication_validation = fresh.phases.prepublication_validation;
+                        phases.publication = fresh.phases.publication;
+                        passes.merge(fresh.passes)?;
+                        io.bytes_written = fresh.bytes.total_bytes()?;
+                        if validation_mode.is_strict() {
+                            let authentication = authenticate_v5_proposal_output(
+                                &output_root,
+                                &manifest,
+                                &result,
+                                validation_mode,
+                            )?;
+                            phases.output_authentication = authentication.elapsed;
+                            io.merge(authentication.io)?;
+                            passes.merge(authentication.passes)?;
+                            parallel_workers = authentication.parallel_workers;
+                            (
+                                result,
+                                authentication.bytes,
+                                V5ExecutionPath::Fresh,
+                                authentication.strategy,
+                            )
+                        } else {
+                            (
+                                result,
+                                fresh.bytes,
+                                V5ExecutionPath::Fresh,
+                                V5AuthenticationStrategy::FreshPublicationProof,
+                            )
+                        }
                     }
                 }
             }
@@ -4536,8 +5481,18 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
         V5_PROPOSAL_RESULT_PATH.to_owned(),
     ]);
     require_v5_exact_file_set(&invocation_root, &invocation_allowed)?;
-    let bytes = verify_v5_output_inventory(&output_root, &manifest, &result)?;
-    let evidence = v5_adoption_evidence(&manifest, &result, bytes, started.elapsed())?;
+    let measurements = V5ExecutionMeasurements {
+        path,
+        mode: validation_mode,
+        strategy,
+        phases,
+        io,
+        passes,
+        parallel_authentication_workers: parallel_workers,
+        process_cpu: elapsed_process_cpu(process_cpu_started, v5_process_cpu_duration()?),
+        total: started.elapsed(),
+    };
+    let evidence = v5_adoption_evidence(&manifest, &result, bytes, measurements)?;
     validate_v5_proposal_adoption_evidence(&evidence, &manifest, &result)
         .context("validate native v5 adoption evidence")?;
     write_stdout_json(&evidence)
@@ -8605,6 +9560,7 @@ fn validate_v5_evolved_staged_prepublication_bundle_with<F>(
     output_inventory: &V5StagedArtifact,
     receipt: &V5StagedArtifact,
     invocation_result: &[u8],
+    validation_mode: V5ValidationMode,
     semantic_replay: F,
 ) -> Result<()>
 where
@@ -8730,11 +9686,16 @@ where
         bail!("native v5 staged evolved bundle includes an undeclared artifact path");
     }
     semantic_replay(&bundle)?;
-    for staged in artifacts {
-        verify_staged_v5_artifact(staged)?;
+    // Publication re-hashes each staged source immediately before the hard
+    // link and verifies the linked target. Balanced mode avoids this duplicate
+    // whole-closure pass; strict mode preserves the historical paranoia gate.
+    if validation_mode.is_strict() {
+        for staged in artifacts {
+            verify_staged_v5_artifact(staged)?;
+        }
+        verify_staged_v5_artifact(output_inventory)?;
+        verify_staged_v5_artifact(receipt)?;
     }
-    verify_staged_v5_artifact(output_inventory)?;
-    verify_staged_v5_artifact(receipt)?;
     Ok(())
 }
 
@@ -8745,6 +9706,7 @@ fn validate_v5_staged_prepublication_bundle_with<F>(
     output_inventory: &V5StagedArtifact,
     receipt: &V5StagedArtifact,
     invocation_result: &[u8],
+    validation_mode: V5ValidationMode,
     semantic_replay: F,
 ) -> Result<()>
 where
@@ -8939,14 +9901,16 @@ where
     // file is linked; the generic batch layer intentionally cannot fabricate
     // a parallel rich reconstruction schema.
     semantic_replay(&bundle)?;
-    // Re-hash all privately staged entries once more after the semantic gate.
-    // A mutation racing validation therefore cannot turn a validated bundle
-    // into a different linked artifact.
-    for staged in artifacts {
-        verify_staged_v5_artifact(staged)?;
+    // Publication re-hashes each staged source immediately before the hard
+    // link and verifies the linked target. Balanced mode avoids this duplicate
+    // whole-closure pass; strict mode preserves the historical paranoia gate.
+    if validation_mode.is_strict() {
+        for staged in artifacts {
+            verify_staged_v5_artifact(staged)?;
+        }
+        verify_staged_v5_artifact(output_inventory)?;
+        verify_staged_v5_artifact(receipt)?;
     }
-    verify_staged_v5_artifact(output_inventory)?;
-    verify_staged_v5_artifact(receipt)?;
     Ok(())
 }
 
@@ -9059,12 +10023,14 @@ fn validate_and_publish_v5_staged_receipt_last_with<O, F>(
     receipt: &V5StagedArtifact,
     invocation_result_path: &Path,
     invocation_result: &[u8],
+    validation_mode: V5ValidationMode,
     semantic_replay: F,
-) -> Result<()>
+) -> Result<V5PublishDurations>
 where
     O: PublicationIo,
     F: FnOnce(&V5StagedBundle<'_>) -> Result<()>,
 {
+    let validation_started = Instant::now();
     let validation = validate_v5_staged_prepublication_bundle_with(
         manifest,
         result,
@@ -9072,8 +10038,10 @@ where
         output_inventory,
         receipt,
         invocation_result,
+        validation_mode,
         semantic_replay,
     );
+    let validation_elapsed = validation_started.elapsed();
     if let Err(error) = validation {
         let cleanup = cleanup_staged_v5_bundle(ops, artifacts, output_inventory, receipt);
         return match cleanup {
@@ -9083,6 +10051,7 @@ where
             ))),
         };
     }
+    let publication_started = Instant::now();
     publish_v5_staged_receipt_last_with(
         ops,
         output_root,
@@ -9091,7 +10060,11 @@ where
         receipt,
         invocation_result_path,
         invocation_result,
-    )
+    )?;
+    Ok(V5PublishDurations {
+        validation: validation_elapsed,
+        publication: publication_started.elapsed(),
+    })
 }
 
 /// Receipt-last publisher for the distinct evolved outer contract.  Keeping
@@ -9107,12 +10080,14 @@ fn validate_and_publish_v5_evolved_staged_receipt_last_with<O, F>(
     receipt: &V5StagedArtifact,
     invocation_result_path: &Path,
     invocation_result: &[u8],
+    validation_mode: V5ValidationMode,
     semantic_replay: F,
-) -> Result<()>
+) -> Result<V5PublishDurations>
 where
     O: PublicationIo,
     F: FnOnce(&V5StagedBundle<'_>) -> Result<()>,
 {
+    let validation_started = Instant::now();
     let validation = validate_v5_evolved_staged_prepublication_bundle_with(
         manifest,
         result,
@@ -9120,8 +10095,10 @@ where
         output_inventory,
         receipt,
         invocation_result,
+        validation_mode,
         semantic_replay,
     );
+    let validation_elapsed = validation_started.elapsed();
     if let Err(error) = validation {
         let cleanup = cleanup_staged_v5_bundle(ops, artifacts, output_inventory, receipt);
         return match cleanup {
@@ -9131,6 +10108,7 @@ where
             ))),
         };
     }
+    let publication_started = Instant::now();
     publish_v5_staged_receipt_last_with(
         ops,
         output_root,
@@ -9139,7 +10117,11 @@ where
         receipt,
         invocation_result_path,
         invocation_result,
-    )
+    )?;
+    Ok(V5PublishDurations {
+        validation: validation_elapsed,
+        publication: publication_started.elapsed(),
+    })
 }
 
 fn unique_suffix() -> u128 {
@@ -10686,6 +11668,7 @@ mod tests {
             &staged_receipt,
             &invocation_result_path,
             &invocation_result,
+            V5ValidationMode::Strict,
             |_| Ok(()),
         )
         .unwrap_err();

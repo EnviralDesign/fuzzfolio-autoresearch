@@ -2523,12 +2523,40 @@ impl ParentSelector for G0NoParents {
     }
 }
 
+/// Number of proposal ordinals prepared per admitted worker slot. The worker
+/// count remains bounded by `thread_cap`; this only amortizes thread-scope
+/// creation and gives each worker a deterministic contiguous queue.
+///
+/// Results are still merged in proposal-ordinal order, and any speculative
+/// birth after a rejection is rebuilt before admission, so this value is
+/// control-plane performance policy rather than scientific authority.
+pub const V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER: u64 = 16;
+
 fn execute_with_ledger(
     request: V5G0TransactionRequest,
     authority: V5SharedConstructionAuthority,
     ledger: &mut dyn IdentityLedger,
 ) -> Result<V5G0TransactionResult> {
+    execute_with_ledger_prefetch(
+        request,
+        authority,
+        ledger,
+        V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER,
+    )
+}
+
+fn execute_with_ledger_prefetch(
+    request: V5G0TransactionRequest,
+    authority: V5SharedConstructionAuthority,
+    ledger: &mut dyn IdentityLedger,
+    prefetch_multiplier: u64,
+) -> Result<V5G0TransactionResult> {
     request.validate_bounds()?;
+    if prefetch_multiplier == 0 {
+        return Err(contract(
+            "v5 G0 construction prefetch multiplier must be positive",
+        ));
+    }
     V5G0TransactionRequest::validate_parsed_authority(&authority)?;
     // This is deliberately derived after the sealed authority has been parsed
     // and before any candidate work starts.  No caller provides an opaque
@@ -2562,7 +2590,15 @@ fn execute_with_ledger(
             .max_attempts
             .checked_sub(attempts.len() as u64)
             .ok_or_else(|| contract("v5 G0 attempt accounting underflowed"))?;
-        let batch_count = remaining.min(request.thread_cap) as usize;
+        let accepted_remaining = request
+            .target_accepted
+            .checked_sub(accepted_records.len() as u64)
+            .ok_or_else(|| contract("v5 G0 accepted accounting underflowed"))?;
+        let prefetch_cap = request
+            .thread_cap
+            .checked_mul(prefetch_multiplier)
+            .ok_or_else(|| contract("v5 G0 construction prefetch cap overflowed"))?;
+        let batch_count = remaining.min(accepted_remaining).min(prefetch_cap) as usize;
         let batch_start = state.next_proposal_ordinal;
         let provisional_birth = accepted_records.len() as u64;
         let constructed = construct_batch(
@@ -4142,6 +4178,100 @@ mod tests {
                 &mut Cursor::new(generation_journal),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn v5_g0_prefetch_preserves_rejection_and_birth_semantics() {
+        fn execute_with_first_duplicate_at_cap(thread_cap: u64) -> V5G0TransactionResult {
+            let request = request(thread_cap, 2, 3);
+            let authority =
+                V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
+                    .expect("parse fixture authority");
+            let first_seed = v5::v5_proposal_seed(&request.generation_config_sha256, 0)
+                .expect("first proposal seed");
+            let first = build_v5_g0_accepted_material(&authority, 1, 0, 0, &first_seed)
+                .expect("construct first compact G0 material");
+            let ledger_identity =
+                g0_ledger_identity(&request, &authority).expect("derive G0 ledger authority");
+            let mut ledger = CandidateIdentityLedger::new(
+                ledger_identity,
+                [first.record.candidate_identity_sha256],
+            )
+            .expect("preload exact first-attempt duplicate");
+            execute_with_ledger(request, authority, &mut ledger)
+                .expect("execute prefetched rejected plus accepted attempts")
+        }
+
+        let serial = execute_with_first_duplicate_at_cap(1);
+        let prefetched = execute_with_first_duplicate_at_cap(8);
+        assert_eq!(serial.attempts.len(), 3);
+        assert_eq!(prefetched.attempts.len(), 3);
+        assert_eq!(
+            serial.to_value().expect("serial semantic value"),
+            prefetched.to_value().expect("prefetched semantic value"),
+            "prefetch depth and worker cap must not alter durable output",
+        );
+        assert_eq!(prefetched.attempts[0].disposition, "rejected");
+        assert_eq!(prefetched.accepted_records[0].birth_ordinal, 0);
+        assert_eq!(prefetched.accepted_records[0].proposal_ordinal, 1);
+    }
+
+    #[test]
+    #[ignore = "representative 4k-to-1k performance fixture"]
+    fn v5_g0_4000_to_1024_performance_fixture() {
+        fn execute_with_prefetch(
+            request: V5G0TransactionRequest,
+            prefetch_multiplier: u64,
+        ) -> V5G0TransactionResult {
+            let authority =
+                V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
+                    .expect("parse representative fixture authority");
+            let ledger_identity =
+                g0_ledger_identity(&request, &authority).expect("derive representative ledger");
+            let mut ledger = CandidateIdentityLedger::new(ledger_identity, Vec::<String>::new())
+                .expect("create representative identity ledger");
+            execute_with_ledger_prefetch(request, authority, &mut ledger, prefetch_multiplier)
+                .expect("execute representative G0 fixture")
+        }
+
+        let mut request = request(8, 4_000, 4_000);
+        request.evaluation_width = 1_024;
+
+        let baseline_started = std::time::Instant::now();
+        let baseline = execute_with_prefetch(request.clone(), 1);
+        let baseline_elapsed = baseline_started.elapsed();
+        let baseline_value = baseline.to_value().expect("encode baseline result");
+        let baseline_sha256 =
+            canonical_sha256(&baseline_value).expect("hash baseline representative result");
+
+        let optimized_started = std::time::Instant::now();
+        let optimized = execute_with_prefetch(request, V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER);
+        let optimized_elapsed = optimized_started.elapsed();
+        let optimized_value = optimized.to_value().expect("encode optimized result");
+        let optimized_sha256 =
+            canonical_sha256(&optimized_value).expect("hash optimized representative result");
+
+        assert_eq!(
+            baseline_value, optimized_value,
+            "prefetch changed scientific output"
+        );
+        assert_eq!(baseline_sha256, optimized_sha256);
+        assert_eq!(optimized.accepted_records.len(), 4_000);
+        assert_eq!(
+            optimized
+                .selected_projection_index
+                .as_ref()
+                .map(|index| index.projections.len()),
+            Some(1_024),
+        );
+        let speedup = baseline_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64();
+        eprintln!(
+            "TQD_V5_G0_4000_TO_1024 baseline_elapsed_ms={} optimized_elapsed_ms={} speedup_x={:.3} semantic_sha256={}",
+            baseline_elapsed.as_millis(),
+            optimized_elapsed.as_millis(),
+            speedup,
+            optimized_sha256,
         );
     }
 

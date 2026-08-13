@@ -586,10 +586,40 @@ def _adoption_evidence(
 ) -> dict[str, object]:
     telemetry: dict[str, object] = {
         "schemaVersion": v5.V5_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA,
-        "outputAuthentication": {"wallMilliseconds": 1},
+        "executionPath": "fresh",
+        "validationMode": "balanced",
+        "authenticationStrategy": "fresh_publication_proof",
+        "phases": {
+            "staticAuthorityMilliseconds": 1,
+            "constructionMilliseconds": 2,
+            "stagingMilliseconds": 3,
+            "prepublicationValidationMilliseconds": 4,
+            "publicationMilliseconds": 5,
+            "outputAuthenticationMilliseconds": 0,
+            "totalMilliseconds": 15,
+        },
+        "processCpuMilliseconds": 10,
+        "cpuUtilizationMilliCores": 666,
         "publicArtifactBytesRead": 100,
         "objectStoreBytesRead": 0,
         "authenticatedFileCount": 9,
+        "io": {
+            "filesReopened": 0,
+            "bytesRead": 0,
+            "bytesHashed": 0,
+            "bytesWritten": 100,
+            "jsonRowsParsed": 0,
+        },
+        "validationPasses": {
+            "constructorReplay": 1,
+            "redundantFreshReplay": 0,
+            "publicationPrepareReplay": 1,
+            "stagedSemanticReplay": 1,
+            "stagedFinalRehash": 0,
+            "receiptBoundContentAuthentication": 0,
+            "deepOutputReplay": 0,
+        },
+        "parallelAuthenticationWorkers": 0,
         "proposalReconstructionCount": 0,
         "legacyRichExpansionCount": 0,
         "processTree": {
@@ -600,6 +630,7 @@ def _adoption_evidence(
             "dashboardChildCount": 0,
         },
         "threadCap": manifest["threadCap"],
+        "constructionPrefetchMultiplier": 16,
     }
     batch = manifest["executionAuthority"]["nativeBatchAuthority"]
     evidence: dict[str, object] = {
@@ -627,10 +658,40 @@ def _evolved_adoption_evidence(
 ) -> dict[str, object]:
     telemetry: dict[str, object] = {
         "schemaVersion": v5.V5_EVOLVED_PROPOSAL_ADOPTION_TELEMETRY_SCHEMA,
-        "outputAuthentication": {"wallMilliseconds": 1},
+        "executionPath": "fresh",
+        "validationMode": "balanced",
+        "authenticationStrategy": "fresh_publication_proof",
+        "phases": {
+            "staticAuthorityMilliseconds": 1,
+            "constructionMilliseconds": 2,
+            "stagingMilliseconds": 3,
+            "prepublicationValidationMilliseconds": 4,
+            "publicationMilliseconds": 5,
+            "outputAuthenticationMilliseconds": 0,
+            "totalMilliseconds": 15,
+        },
+        "processCpuMilliseconds": 10,
+        "cpuUtilizationMilliCores": 666,
         "publicArtifactBytesRead": 100,
         "objectStoreBytesRead": 100,
         "authenticatedFileCount": 8,
+        "io": {
+            "filesReopened": 0,
+            "bytesRead": 0,
+            "bytesHashed": 0,
+            "bytesWritten": 200,
+            "jsonRowsParsed": 0,
+        },
+        "validationPasses": {
+            "constructorReplay": 1,
+            "redundantFreshReplay": 0,
+            "publicationPrepareReplay": 1,
+            "stagedSemanticReplay": 1,
+            "stagedFinalRehash": 0,
+            "receiptBoundContentAuthentication": 0,
+            "deepOutputReplay": 0,
+        },
+        "parallelAuthenticationWorkers": 0,
         "proposalReconstructionCount": 0,
         "legacyRichExpansionCount": 0,
         "processTree": {
@@ -641,6 +702,7 @@ def _evolved_adoption_evidence(
             "dashboardChildCount": 0,
         },
         "threadCap": manifest["threadCap"],
+        "constructionPrefetchMultiplier": 16,
     }
     batch = manifest["executionAuthority"]["nativeBatchAuthority"]
     evidence: dict[str, object] = {

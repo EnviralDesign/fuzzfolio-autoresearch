@@ -246,7 +246,7 @@ def _validate_v5_campaign_input_checkpoint(
         "candidateCount",
         "windowCount",
         "taskCount",
-        "taskManifest",
+        "tasks",
         "cohortPopulation",
         "sourceInputs",
         "artifactMetrics",
@@ -292,10 +292,11 @@ def _validate_v5_campaign_input_checkpoint(
         )
     descriptors = (
         (
-            checkpoint.get("taskManifest"),
-            "screening-run/task-manifest.json",
+            checkpoint.get("tasks"),
+            "screening-run/tasks.jsonl",
             "taskMatrixSha256",
             checkpoint.get("taskMatrixSha256"),
+            {"relativePath", "rawSha256", "sizeBytes", "recordCount", "taskMatrixSha256"},
         ),
         (
             checkpoint.get("cohortPopulation"),
@@ -304,16 +305,12 @@ def _validate_v5_campaign_input_checkpoint(
             checkpoint.get("cohortPopulation", {}).get("populationSha256")
             if isinstance(checkpoint.get("cohortPopulation"), Mapping)
             else None,
+            {"relativePath", "rawSha256", "sizeBytes", "populationSha256"},
         ),
     )
     payload_bytes = 0
-    for raw, relative, semantic_field, semantic_sha in descriptors:
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "relativePath",
-            "rawSha256",
-            "sizeBytes",
-            semantic_field,
-        }:
+    for raw, relative, semantic_field, semantic_sha, expected_fields in descriptors:
+        if not isinstance(raw, Mapping) or set(raw) != expected_fields:
             raise TemporalDiscoveryContractError(
                 "native v5 campaign-input payload descriptor drifted"
             )
@@ -338,6 +335,10 @@ def _validate_v5_campaign_input_checkpoint(
                 "native v5 campaign-input payload size drifted"
             )
         payload_bytes += size
+    if checkpoint["tasks"].get("recordCount") != task_count:
+        raise TemporalDiscoveryContractError(
+            "native v5 campaign-input task-pack record count drifted"
+        )
     source_inputs = checkpoint.get("sourceInputs")
     if not isinstance(source_inputs, Mapping) or set(source_inputs) != {
         "evaluationPopulationRawSha256",
@@ -362,10 +363,16 @@ def _validate_v5_campaign_input_checkpoint(
     metrics = checkpoint.get("artifactMetrics")
     if (
         not isinstance(metrics, Mapping)
+        or set(metrics)
+        != {
+            "payloadFileCount",
+            "payloadBytes",
+            "taskPackBytes",
+            "cohortPopulationBytes",
+        }
         or metrics.get("payloadFileCount") != 2
         or metrics.get("payloadBytes") != payload_bytes
-        or metrics.get("taskManifestBytes")
-        != checkpoint["taskManifest"]["sizeBytes"]
+        or metrics.get("taskPackBytes") != checkpoint["tasks"]["sizeBytes"]
         or metrics.get("cohortPopulationBytes")
         != checkpoint["cohortPopulation"]["sizeBytes"]
     ):
