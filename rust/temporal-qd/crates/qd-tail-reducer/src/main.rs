@@ -1,7 +1,9 @@
 use std::env;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
+use temporal_qd_contract::{NativeProgress, NativeProgressSection, NativeProgressSpec};
 
 fn main() {
     let outcome = std::thread::Builder::new()
@@ -63,7 +65,17 @@ fn run() -> Result<()> {
     if args.len() != 3 || args[1] != "--manifest" {
         bail!("usage: temporal-qd-tail-reducer --manifest PATH");
     }
+    let mut spec = NativeProgressSpec::new("tail_reducer", "tail_reduction");
+    spec.subphase = "stream_results_and_reduce_survivors".to_owned();
+    let progress = NativeProgress::from_environment(spec);
+    let handle = progress.handle();
+    let started = Instant::now();
     let result = temporal_qd_tail_reducer::execute_manifest(Path::new(&args[2]))?;
+    handle.record_section(NativeProgressSection::wall(
+        "tail_reduction",
+        started.elapsed(),
+    ));
+    progress.finish(None);
     print!("{}", temporal_qd_contract::canonical_json(&result)?);
     println!();
     Ok(())

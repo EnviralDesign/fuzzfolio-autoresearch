@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping
 from types import SimpleNamespace
 
 import pytest
@@ -463,6 +464,82 @@ def test_native_checked_command_forwards_explicit_environment(tmp_path: Path) ->
     )
     expected = b"forwarded\r\n" if os.name == "nt" else b"forwarded\n"
     assert completed.stdout == expected
+
+
+def _native_progress_program(*, count: int = 3) -> str:
+    payload = {
+        "schemaVersion": native.NATIVE_V5_PROGRESS_SCHEMA,
+        "event": "native_v5_progress",
+        "status": "progress",
+        "family": "test",
+        "phase": "construction",
+        "subphase": "witness",
+        "completedWorkUnits": 1,
+        "totalWorkUnits": count,
+        "elapsedSeconds": 1.0,
+        "estimatedRemainingSeconds": 1.0,
+        "estimatedCompletionAt": "2026-08-13T00:00:00Z",
+    }
+    return (
+        "import json,sys; "
+        f"p={payload!r}; n={count}; "
+        "[(p.__setitem__('completedWorkUnits', i+1), "
+        "sys.stderr.write('TEMPORAL_QD_V5_PROGRESS '+json.dumps(p,separators=(',',':'))+'\\n')) "
+        "for i in range(n)]; "
+        "sys.stderr.flush(); sys.stdout.buffer.write(b'result\\n')"
+    )
+
+
+def test_native_progress_is_forwarded_without_changing_protocol_bytes(tmp_path: Path) -> None:
+    events: list[dict[str, object]] = []
+    completed = native._run_checked(
+        (sys.executable, "-c", _native_progress_program(count=4)),
+        cwd=tmp_path,
+        timeout=5,
+        on_native_progress=events.append,
+        stderr_limit_bytes=64,
+    )
+    assert completed.stdout == b"result\n"
+    assert completed.stderr == b""
+    assert [event["completedWorkUnits"] for event in events] == [1, 2, 3, 4]
+
+
+def test_native_progress_callback_is_fail_open_and_optional(tmp_path: Path) -> None:
+    def broken_logger(_event: Mapping[str, object]) -> None:
+        raise RuntimeError("logger unavailable")
+
+    with_broken_logger = native._run_checked(
+        (sys.executable, "-c", _native_progress_program(count=8)),
+        cwd=tmp_path,
+        timeout=5,
+        on_native_progress=broken_logger,
+        stderr_limit_bytes=64,
+    )
+    with_forwarding_disabled = native._run_checked(
+        (sys.executable, "-c", _native_progress_program(count=8)),
+        cwd=tmp_path,
+        timeout=5,
+        on_native_progress=None,
+        stderr_limit_bytes=64,
+    )
+    assert with_broken_logger.stdout == with_forwarding_disabled.stdout == b"result\n"
+    assert with_broken_logger.stderr == with_forwarding_disabled.stderr == b""
+
+
+def test_invalid_progress_prefix_remains_bounded_stderr(tmp_path: Path) -> None:
+    completed = native._run_checked(
+        (
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('TEMPORAL_QD_V5_PROGRESS not-json\\n'); "
+            "sys.stdout.write('ok\\n')",
+        ),
+        cwd=tmp_path,
+        timeout=5,
+        on_native_progress=None,
+    )
+    assert completed.stdout == b"ok\n"
+    assert completed.stderr == b"TEMPORAL_QD_V5_PROGRESS not-json\n"
 
 
 @pytest.mark.parametrize(

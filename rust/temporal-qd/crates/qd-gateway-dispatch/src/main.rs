@@ -1,8 +1,10 @@
 use std::{env, fs, path::PathBuf, time::Duration};
 
 use anyhow::{Result, bail, ensure};
+use temporal_qd_contract::{NativeProgress, NativeProgressSpec};
 use temporal_qd_gateway_dispatch::{
-    DispatchMode, GatewayDispatchRequest, GatewayRuntimeOptions, execute_gateway_dispatch,
+    DispatchMode, GatewayDispatchRequest, GatewayRuntimeOptions,
+    execute_gateway_dispatch_with_progress,
 };
 
 fn main() {
@@ -156,10 +158,13 @@ fn run() -> Result<()> {
         token,
     );
     runtime.request_timeout = Duration::from_secs(request_timeout_seconds);
-    println!(
-        "{}",
-        temporal_qd_contract::canonical_json(&execute_gateway_dispatch(&request, &runtime)?)?
-    );
+    let mut spec = NativeProgressSpec::new("gateway_dispatch", "startup");
+    spec.subphase = "parse_runtime_and_open_checkpoint".to_owned();
+    let progress = NativeProgress::from_environment(spec);
+    let handle = progress.handle();
+    let result = execute_gateway_dispatch_with_progress(&request, &runtime, Some(&handle))?;
+    progress.finish(None);
+    println!("{}", temporal_qd_contract::canonical_json(&result)?);
     Ok(())
 }
 

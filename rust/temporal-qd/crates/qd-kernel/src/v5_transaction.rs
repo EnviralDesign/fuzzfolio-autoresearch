@@ -10,7 +10,8 @@ use std::{
 };
 
 use temporal_qd_contract::{
-    ContractError, Map, Value, canonical_sha256, canonical_sha256_without_object_field,
+    ContractError, Map, NativeProgressHandle, Value, canonical_sha256,
+    canonical_sha256_without_object_field,
 };
 
 use crate::{
@@ -2454,12 +2455,21 @@ pub fn reconstruct_v5_g0_transaction_from_artifacts(
 /// local and returned to the caller; qd-kernel performs no filesystem or
 /// object-store writes.
 pub fn execute_v5_g0_transaction(request: V5G0TransactionRequest) -> Result<V5G0TransactionResult> {
+    execute_v5_g0_transaction_with_progress(request, None)
+}
+
+/// Execute G0 with an optional operational-only progress sink. The sink is
+/// never consulted by construction, admission, replay, or publication.
+pub fn execute_v5_g0_transaction_with_progress(
+    request: V5G0TransactionRequest,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<V5G0TransactionResult> {
     request.validate_bounds()?;
     let authority = V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)?;
     V5G0TransactionRequest::validate_parsed_authority(&authority)?;
     let ledger_identity = g0_ledger_identity(&request, &authority)?;
     let mut ledger = CandidateIdentityLedger::new(ledger_identity, Vec::<String>::new())?;
-    execute_with_ledger(request, authority, &mut ledger)
+    execute_with_ledger_progress(request, authority, &mut ledger, progress)
 }
 
 fn g0_ledger_identity(
@@ -2537,11 +2547,21 @@ fn execute_with_ledger(
     authority: V5SharedConstructionAuthority,
     ledger: &mut dyn IdentityLedger,
 ) -> Result<V5G0TransactionResult> {
-    execute_with_ledger_prefetch(
+    execute_with_ledger_progress(request, authority, ledger, None)
+}
+
+fn execute_with_ledger_progress(
+    request: V5G0TransactionRequest,
+    authority: V5SharedConstructionAuthority,
+    ledger: &mut dyn IdentityLedger,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<V5G0TransactionResult> {
+    execute_with_ledger_prefetch_progress(
         request,
         authority,
         ledger,
         V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER,
+        progress,
     )
 }
 
@@ -2550,6 +2570,16 @@ fn execute_with_ledger_prefetch(
     authority: V5SharedConstructionAuthority,
     ledger: &mut dyn IdentityLedger,
     prefetch_multiplier: u64,
+) -> Result<V5G0TransactionResult> {
+    execute_with_ledger_prefetch_progress(request, authority, ledger, prefetch_multiplier, None)
+}
+
+fn execute_with_ledger_prefetch_progress(
+    request: V5G0TransactionRequest,
+    authority: V5SharedConstructionAuthority,
+    ledger: &mut dyn IdentityLedger,
+    prefetch_multiplier: u64,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<V5G0TransactionResult> {
     request.validate_bounds()?;
     if prefetch_multiplier == 0 {
@@ -2609,6 +2639,7 @@ fn execute_with_ledger_prefetch(
             provisional_birth,
             batch_count,
             request.thread_cap,
+            progress,
         )?;
         for mut material in constructed {
             if accepted_records.len() as u64 == request.target_accepted {
@@ -2639,6 +2670,9 @@ fn execute_with_ledger_prefetch(
                     planned.proposal_ordinal,
                     &proposal_seed,
                 )?;
+                if let Some(progress) = progress {
+                    progress.advance_constructed(1);
+                }
                 material = ConstructedMaterial {
                     proposal_delta: rebuilt.proposal_delta,
                     record: rebuilt.record,
@@ -2655,7 +2689,8 @@ fn execute_with_ledger_prefetch(
                 &attempt.attempt_sha256()?,
                 accepted.as_ref(),
             )?;
-            if accepted.is_some() {
+            let accepted_now = accepted.is_some();
+            if accepted_now {
                 accepted_deltas.push(material.proposal_delta);
                 attempt_deltas.push(Some(
                     accepted_deltas
@@ -2666,6 +2701,15 @@ fn execute_with_ledger_prefetch(
                 accepted_records.push(material.record);
             } else {
                 attempt_deltas.push(Some(material.proposal_delta));
+            }
+            if let Some(progress) = progress {
+                progress.advance_attempted(1);
+                if accepted_now {
+                    progress.advance_accepted(1);
+                    progress.set_completed_work_units(accepted_records.len() as u64);
+                } else {
+                    progress.advance_rejected(1);
+                }
             }
             audits.push(audit);
             attempts.push(attempt);
@@ -2779,6 +2823,7 @@ fn construct_batch(
     provisional_birth_start: u64,
     count: usize,
     thread_cap: u64,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<Vec<ConstructedMaterial>> {
     let jobs = (0..count)
         .map(|offset| {
@@ -2801,7 +2846,10 @@ fn construct_batch(
         let mut handles = Vec::new();
         for chunk in jobs.chunks(chunk_size) {
             handles.push(scope.spawn(move || {
-                chunk
+                if let Some(progress) = progress {
+                    progress.worker_started();
+                }
+                let result = chunk
                     .iter()
                     .map(|(ordinal, birth, seed)| {
                         let material = build_v5_g0_accepted_material(
@@ -2811,6 +2859,9 @@ fn construct_batch(
                             *ordinal,
                             seed,
                         )?;
+                        if let Some(progress) = progress {
+                            progress.advance_constructed(1);
+                        }
                         Ok::<_, V5Error>((
                             *ordinal,
                             ConstructedMaterial {
@@ -2819,7 +2870,11 @@ fn construct_batch(
                             },
                         ))
                     })
-                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .collect::<std::result::Result<Vec<_>, _>>();
+                if let Some(progress) = progress {
+                    progress.worker_finished();
+                }
+                result
             }));
         }
         handles

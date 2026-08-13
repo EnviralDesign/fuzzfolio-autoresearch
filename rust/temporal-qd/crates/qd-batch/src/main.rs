@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use temporal_qd_contract::{
-    CONTRACT_VERSION, FoundationResult, JsonNewline, Map, NativeVersion, Value,
-    canonical_json_line, canonical_sha256, parse_foundation_manifest, python_pretty_json_line,
+    CONTRACT_VERSION, FoundationResult, JsonNewline, Map, NativeProgress, NativeProgressHandle,
+    NativeProgressSection, NativeProgressSpec, NativeVersion, Value, canonical_json_line,
+    canonical_sha256, parse_foundation_manifest, python_pretty_json_line,
 };
 use temporal_qd_kernel::v5::{
     V5AttemptJournal, V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5SelectedProjection,
@@ -51,8 +52,8 @@ use temporal_qd_kernel::{
         verify_v5_evolved_publication_adoption,
     },
     v5_evolved_transaction::{
-        V5EvolvedTransactionRequest, V5EvolvedTransactionResult, execute_v5_evolved_transaction,
-        reconstruct_selected_parent_references,
+        V5EvolvedTransactionRequest, V5EvolvedTransactionResult,
+        execute_v5_evolved_transaction_with_progress, reconstruct_selected_parent_references,
     },
     v5_g0_funnel::{
         V5_G0_FUNNEL_PROJECTION_STREAM_PATH, V5G0FunnelProjectionStreamReceiptObjectBinding,
@@ -66,7 +67,7 @@ use temporal_qd_kernel::{
     },
     v5_transaction::{
         V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER, V5G0CompactIdentityLedger, V5G0DurableObjectKind,
-        V5G0TransactionRequest, V5G0TransactionResult, execute_v5_g0_transaction,
+        V5G0TransactionRequest, V5G0TransactionResult, execute_v5_g0_transaction_with_progress,
         reconstruct_v5_g0_transaction_from_artifacts, verify_v5_g0_transaction_replay,
     },
 };
@@ -303,6 +304,78 @@ struct V5ExecutionMeasurements {
     parallel_authentication_workers: u64,
     process_cpu: Option<Duration>,
     total: Duration,
+}
+
+fn record_v5_progress_sections(
+    progress: &NativeProgressHandle,
+    phases: V5PhaseDurations,
+    io: V5IoTelemetry,
+    parallel_authentication_workers: u64,
+    requested_count: u64,
+) {
+    for (name, wall, work, bytes, files, workers) in [
+        (
+            "static_authority",
+            phases.static_authority,
+            None,
+            None,
+            None,
+            Some(1),
+        ),
+        (
+            "construction",
+            phases.construction,
+            Some(requested_count),
+            None,
+            None,
+            None,
+        ),
+        (
+            "staging",
+            phases.staging,
+            None,
+            Some(io.bytes_written),
+            None,
+            None,
+        ),
+        (
+            "prepublication_validation",
+            phases.prepublication_validation,
+            None,
+            Some(io.bytes_hashed),
+            Some(io.files_reopened),
+            None,
+        ),
+        (
+            "publication",
+            phases.publication,
+            None,
+            Some(io.bytes_written),
+            None,
+            None,
+        ),
+        (
+            "output_authentication",
+            phases.output_authentication,
+            None,
+            Some(io.bytes_read),
+            Some(io.files_reopened),
+            (parallel_authentication_workers > 0).then_some(parallel_authentication_workers),
+        ),
+    ] {
+        if wall.is_zero() {
+            continue;
+        }
+        progress.record_section(NativeProgressSection {
+            name: name.to_owned(),
+            wall,
+            completed_work_units: work,
+            bytes_processed: bytes,
+            files_processed: files,
+            parallel_workers: workers,
+            ..NativeProgressSection::default()
+        });
+    }
 }
 
 struct V5FreshExecution {
@@ -833,6 +906,7 @@ fn authenticate_v5_inventory_files_parallel(
     output_root: &Path,
     files: &[(V5InventoryFile, bool)],
     thread_cap: u64,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<u64> {
     if files.is_empty() {
         return Ok(0);
@@ -843,23 +917,37 @@ fn authenticate_v5_inventory_files_parallel(
         let mut handles = Vec::new();
         for chunk in files.chunks(chunk_size) {
             handles.push(scope.spawn(move || -> Result<()> {
-                for (file, object_store) in chunk {
-                    v5_safe_relative_output_path(
-                        &file.relative_path,
-                        "native v5 receipt-bound output artifact",
-                    )?;
-                    require_v5_file_digest(
-                        &output_root.join(&file.relative_path),
-                        file.byte_length,
-                        &file.file_sha256,
-                        if *object_store {
-                            "native v5 receipt-bound object-store artifact"
-                        } else {
-                            "native v5 receipt-bound public artifact"
-                        },
-                    )?;
+                if let Some(progress) = progress {
+                    progress.worker_started();
                 }
-                Ok(())
+                let result = (|| -> Result<()> {
+                    for (file, object_store) in chunk {
+                        v5_safe_relative_output_path(
+                            &file.relative_path,
+                            "native v5 receipt-bound output artifact",
+                        )?;
+                        require_v5_file_digest(
+                            &output_root.join(&file.relative_path),
+                            file.byte_length,
+                            &file.file_sha256,
+                            if *object_store {
+                                "native v5 receipt-bound object-store artifact"
+                            } else {
+                                "native v5 receipt-bound public artifact"
+                            },
+                        )?;
+                        if let Some(progress) = progress {
+                            progress.advance_completed(1);
+                            progress.add_files(1);
+                            progress.add_bytes(file.byte_length);
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Some(progress) = progress {
+                    progress.worker_finished();
+                }
+                result
             }));
         }
         for handle in handles {
@@ -876,6 +964,7 @@ fn authenticate_v5_receipt_bound_content(
     output_root: &Path,
     manifest: &V5ProposalManifest,
     immutable_result: &Value,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<V5Authentication> {
     let started = Instant::now();
     let result = immutable_result
@@ -922,8 +1011,23 @@ fn authenticate_v5_receipt_bound_content(
     files.extend(objects.into_iter().map(|file| (file, true)));
     require_v5_owned_namespace_file_set(output_root, &allowed)
         .context("verify receipt-bound native v5 owned output namespaces before hashing")?;
-    let workers =
-        authenticate_v5_inventory_files_parallel(output_root, &files, manifest.thread_cap)?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "output_authentication",
+            "hash_receipt_bound_files",
+            "file",
+            Some(files.len() as u64),
+            false,
+            Some(manifest.thread_cap),
+            None,
+        );
+    }
+    let workers = authenticate_v5_inventory_files_parallel(
+        output_root,
+        &files,
+        manifest.thread_cap,
+        progress,
+    )?;
     require_v5_owned_namespace_file_set(output_root, &allowed)
         .context("verify receipt-bound native v5 owned output namespaces after hashing")?;
     let bytes = v5_expected_adoption_bytes(immutable_result)?;
@@ -968,9 +1072,26 @@ fn authenticate_v5_proposal_output(
     manifest: &V5ProposalManifest,
     result: &V5ProposalResult,
     mode: V5ValidationMode,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<V5Authentication> {
     if !mode.is_strict() {
-        return authenticate_v5_receipt_bound_content(output_root, manifest, &result.value);
+        return authenticate_v5_receipt_bound_content(
+            output_root,
+            manifest,
+            &result.value,
+            progress,
+        );
+    }
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "output_authentication",
+            "strict_deep_replay",
+            "artifact",
+            None,
+            false,
+            Some(1),
+            Some("strict_replay_work_total_not_exposed"),
+        );
     }
     let started = Instant::now();
     let bytes = verify_v5_output_inventory(output_root, manifest, result)?;
@@ -999,9 +1120,26 @@ fn authenticate_v5_evolved_proposal_output(
     manifest: &V5ProposalManifest,
     result: &V5EvolvedProposalResult,
     mode: V5ValidationMode,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<V5Authentication> {
     if !mode.is_strict() {
-        return authenticate_v5_receipt_bound_content(output_root, manifest, &result.value);
+        return authenticate_v5_receipt_bound_content(
+            output_root,
+            manifest,
+            &result.value,
+            progress,
+        );
+    }
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "output_authentication",
+            "strict_deep_replay",
+            "artifact",
+            None,
+            false,
+            Some(1),
+            Some("strict_replay_work_total_not_exposed"),
+        );
     }
     let started = Instant::now();
     let bytes = verify_v5_evolved_output_inventory(output_root, manifest, result)?;
@@ -2838,6 +2976,7 @@ fn recover_v5_invocation_result_from_sealed_receipt(
     result_path: &Path,
     manifest: &V5ProposalManifest,
     validation_mode: V5ValidationMode,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<Option<V5RecoveredResult<V5ProposalResult>>> {
     let receipt_path = output_root.join("internal/v5-proposal/receipt.json");
     let Some(receipt) =
@@ -2853,7 +2992,7 @@ fn recover_v5_invocation_result_from_sealed_receipt(
     // true adoption pass, not a shortcut that could bless a truncated or
     // swapped output tree.
     let authentication =
-        authenticate_v5_proposal_output(output_root, manifest, &result, validation_mode)
+        authenticate_v5_proposal_output(output_root, manifest, &result, validation_mode, progress)
             .context("authenticate sealed native v5 output tree before result recovery")?;
     let publication_started = Instant::now();
     let result_bytes = canonical_json_line(&result.value)
@@ -2896,6 +3035,7 @@ fn recover_v5_evolved_invocation_result_from_sealed_receipt(
     result_path: &Path,
     manifest: &V5ProposalManifest,
     validation_mode: V5ValidationMode,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<Option<V5RecoveredResult<V5EvolvedProposalResult>>> {
     let receipt_path = output_root.join(V5_OUTPUT_RECEIPT_PATH);
     let Some(receipt) = read_optional_v5_canonical_document(
@@ -2907,9 +3047,14 @@ fn recover_v5_evolved_invocation_result_from_sealed_receipt(
     };
     let result = build_v5_evolved_proposal_result_from_receipt(manifest, &receipt)
         .context("rebuild native v5 evolved invocation result from sealed receipt")?;
-    let authentication =
-        authenticate_v5_evolved_proposal_output(output_root, manifest, &result, validation_mode)
-            .context("authenticate sealed native v5 evolved output tree before result recovery")?;
+    let authentication = authenticate_v5_evolved_proposal_output(
+        output_root,
+        manifest,
+        &result,
+        validation_mode,
+        progress,
+    )
+    .context("authenticate sealed native v5 evolved output tree before result recovery")?;
     let publication_started = Instant::now();
     let result_bytes = canonical_json_line(&result.value)
         .context("encode recovered native v5 evolved invocation result")?;
@@ -4079,11 +4224,23 @@ fn execute_v5_fresh_transaction(
     result_path: &Path,
     manifest: &V5ProposalManifest,
     validation_mode: V5ValidationMode,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<V5FreshExecution> {
     let ops = StdPublicationIo;
     let request = v5_g0_transaction_request(manifest)?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "construction",
+            "construct_and_admit_g0",
+            "accepted_candidate",
+            Some(manifest.requested_count),
+            true,
+            Some(manifest.thread_cap),
+            None,
+        );
+    }
     let construction_started = Instant::now();
-    let transaction = execute_v5_g0_transaction(request.clone())
+    let transaction = execute_v5_g0_transaction_with_progress(request.clone(), progress)
         .context("execute sealed native v5 G0 transaction")?;
     if validation_mode.is_strict() {
         verify_v5_g0_transaction_replay(&request, &transaction)
@@ -4100,6 +4257,17 @@ fn execute_v5_fresh_transaction(
         bail!("native v5 typed G0 transaction did not produce a complete publication bundle");
     }
 
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "staging",
+            "materialize_and_hash_publication_bundle",
+            "artifact",
+            None,
+            false,
+            Some(manifest.thread_cap),
+            Some("staging_artifact_total_finalized_after_streaming"),
+        );
+    }
     let staging_started = Instant::now();
     let staging = v5_private_staging_area(output_root, invocation_root, &manifest.manifest_sha256)?;
     let stream = prepare_v5_g0_publication_stream(&request, &transaction)
@@ -4654,6 +4822,17 @@ fn execute_v5_fresh_transaction(
     let mut all_artifacts = public_artifacts;
     all_artifacts.extend(object_artifacts);
     let bytes = v5_expected_adoption_bytes(&outer_result.value)?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "prepublication_and_publication",
+            "validate_then_receipt_last_commit",
+            "artifact",
+            None,
+            false,
+            Some(manifest.thread_cap),
+            Some("validation_and_publication_have_no_single_trustworthy_total"),
+        );
+    }
     let publish = validate_and_publish_v5_staged_receipt_last_with(
         &ops,
         output_root,
@@ -4702,13 +4881,29 @@ fn execute_v5_evolved_fresh_transaction(
     result_path: &Path,
     manifest: &V5ProposalManifest,
     validation_mode: V5ValidationMode,
+    progress: Option<&NativeProgressHandle>,
 ) -> Result<V5FreshExecution> {
     let ops = StdPublicationIo;
     let (request, mut parents, mut identity_ledger) = v5_evolved_transaction_request(manifest)?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "construction",
+            "construct_and_admit_evolved",
+            "accepted_candidate",
+            Some(manifest.requested_count),
+            true,
+            Some(manifest.thread_cap),
+            None,
+        );
+    }
     let construction_started = Instant::now();
-    let transaction =
-        execute_v5_evolved_transaction(request.clone(), &mut parents, &mut identity_ledger)
-            .context("execute sealed native v5 evolved transaction")?;
+    let transaction = execute_v5_evolved_transaction_with_progress(
+        request.clone(),
+        &mut parents,
+        &mut identity_ledger,
+        progress,
+    )
+    .context("execute sealed native v5 evolved transaction")?;
     if validation_mode.is_strict() {
         transaction
             .verify_replay()
@@ -4724,6 +4919,17 @@ fn execute_v5_evolved_fresh_transaction(
     let transaction_sha256 = transaction
         .transaction_sha256()
         .context("identify native v5 evolved transaction")?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "staging",
+            "materialize_and_hash_evolved_publication_bundle",
+            "artifact",
+            None,
+            false,
+            Some(manifest.thread_cap),
+            Some("staging_artifact_total_finalized_after_streaming"),
+        );
+    }
     let staging_started = Instant::now();
     let staging = v5_private_staging_area(output_root, invocation_root, &manifest.manifest_sha256)?;
 
@@ -5128,6 +5334,17 @@ fn execute_v5_evolved_fresh_transaction(
     let mut all_artifacts = public_artifacts;
     all_artifacts.append(&mut object_artifacts);
     let bytes = v5_expected_adoption_bytes(&outer_result.value)?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "prepublication_and_publication",
+            "validate_then_receipt_last_commit",
+            "artifact",
+            None,
+            false,
+            Some(manifest.thread_cap),
+            Some("validation_and_publication_have_no_single_trustworthy_total"),
+        );
+    }
     let publish = validate_and_publish_v5_evolved_staged_receipt_last_with(
         &ops,
         output_root,
@@ -5186,7 +5403,9 @@ fn execute_v5_evolved_proposal(
     process_cpu_started: Option<Duration>,
     static_authority_elapsed: Duration,
     validation_mode: V5ValidationMode,
+    progress: NativeProgress,
 ) -> Result<()> {
+    let progress_handle = progress.handle();
     if manifest.generation_kind != "evolved" || manifest.generation_index < 2 {
         bail!("native v5 evolved proposal execution requires generation index at least two");
     }
@@ -5209,6 +5428,7 @@ fn execute_v5_evolved_proposal(
                 manifest,
                 &result,
                 validation_mode,
+                Some(&progress_handle),
             )?;
             phases.output_authentication = authentication.elapsed;
             io.merge(authentication.io)?;
@@ -5235,6 +5455,7 @@ fn execute_v5_evolved_proposal(
                 result_path,
                 manifest,
                 validation_mode,
+                Some(&progress_handle),
             )? {
                 Some(recovered) => {
                     phases.output_authentication = recovered.authentication.elapsed;
@@ -5256,6 +5477,7 @@ fn execute_v5_evolved_proposal(
                         result_path,
                         manifest,
                         validation_mode,
+                        Some(&progress_handle),
                     )?;
                     let result_value = read_optional_v5_canonical_document(
                         result_path,
@@ -5280,6 +5502,7 @@ fn execute_v5_evolved_proposal(
                             manifest,
                             &result,
                             validation_mode,
+                            Some(&progress_handle),
                         )?;
                         phases.output_authentication = authentication.elapsed;
                         io.merge(authentication.io)?;
@@ -5324,6 +5547,14 @@ fn execute_v5_evolved_proposal(
     let evidence = v5_evolved_adoption_evidence(manifest, &result, bytes, measurements)?;
     validate_v5_evolved_proposal_adoption_evidence(&evidence, manifest, &result)
         .context("validate native v5 evolved adoption evidence")?;
+    record_v5_progress_sections(
+        &progress_handle,
+        measurements.phases,
+        measurements.io,
+        measurements.parallel_authentication_workers,
+        manifest.requested_count,
+    );
+    progress.finish(measurements.process_cpu);
     write_stdout_json(&evidence)
 }
 
@@ -5333,6 +5564,13 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
     let validation_mode = V5ValidationMode::from_environment()?;
     let manifest = parse_v5_proposal_manifest(manifest_bytes)
         .context("validate native v5 proposal manifest")?;
+    let mut progress_spec = NativeProgressSpec::new("proposal_construction", "static_authority");
+    progress_spec.generation_kind = Some(manifest.generation_kind.clone());
+    progress_spec.generation_index = Some(manifest.generation_index);
+    progress_spec.subphase = "authenticate_manifest_and_runtime".to_owned();
+    progress_spec.thread_cap = Some(manifest.thread_cap);
+    let progress = NativeProgress::from_environment(progress_spec);
+    let progress_handle = progress.handle();
     let invocation_root = manifest_path
         .parent()
         .ok_or_else(|| anyhow!("native v5 proposal manifest has no parent directory"))?;
@@ -5361,6 +5599,7 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
             process_cpu_started,
             static_authority_elapsed,
             validation_mode,
+            progress,
         );
     }
     let mut phases = V5PhaseDurations {
@@ -5380,6 +5619,7 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
                     &manifest,
                     &result,
                     validation_mode,
+                    Some(&progress_handle),
                 )?;
                 phases.output_authentication = authentication.elapsed;
                 io.merge(authentication.io)?;
@@ -5406,6 +5646,7 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
                     &result_path,
                     &manifest,
                     validation_mode,
+                    Some(&progress_handle),
                 )? {
                     Some(recovered) => {
                         phases.output_authentication = recovered.authentication.elapsed;
@@ -5427,6 +5668,7 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
                             &result_path,
                             &manifest,
                             validation_mode,
+                            Some(&progress_handle),
                         )?;
                         let result_value = read_optional_v5_canonical_document(
                             &result_path,
@@ -5451,6 +5693,7 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
                                 &manifest,
                                 &result,
                                 validation_mode,
+                                Some(&progress_handle),
                             )?;
                             phases.output_authentication = authentication.elapsed;
                             io.merge(authentication.io)?;
@@ -5495,6 +5738,14 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
     let evidence = v5_adoption_evidence(&manifest, &result, bytes, measurements)?;
     validate_v5_proposal_adoption_evidence(&evidence, &manifest, &result)
         .context("validate native v5 adoption evidence")?;
+    record_v5_progress_sections(
+        &progress_handle,
+        measurements.phases,
+        measurements.io,
+        measurements.parallel_authentication_workers,
+        manifest.requested_count,
+    );
+    progress.finish(measurements.process_cpu);
     write_stdout_json(&evidence)
 }
 

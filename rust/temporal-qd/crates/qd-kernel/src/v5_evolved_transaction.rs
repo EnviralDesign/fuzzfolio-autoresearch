@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temporal_qd_contract::{ContractError, Map, Value, canonical_sha256};
+use temporal_qd_contract::{ContractError, Map, NativeProgressHandle, Value, canonical_sha256};
 
 use crate::{
     factory::{ParentReference, ProposalIntent},
@@ -4949,6 +4949,7 @@ fn execute_with_constructor<F>(
     parents: &mut dyn ParentSelector,
     ledger: &mut dyn IdentityLedger,
     verify_native_replay: bool,
+    progress: Option<&NativeProgressHandle>,
     mut construct: F,
 ) -> Result<V5EvolvedTransactionResult>
 where
@@ -5028,6 +5029,9 @@ where
         }
         let birth_ordinal = records.len() as u64;
         let outcome = construct(&authority, &request, &planned, birth_ordinal)?;
+        if let Some(progress) = progress {
+            progress.advance_constructed(1);
+        }
         if verify_native_replay {
             verify_native_construction_replay(
                 &authority,
@@ -5062,8 +5066,18 @@ where
             accepted_proposal.as_ref(),
         )?;
         deltas.push(delta);
+        let accepted_now = accepted.is_some();
         if let Some(record) = accepted {
             records.push(record);
+        }
+        if let Some(progress) = progress {
+            progress.advance_attempted(1);
+            if accepted_now {
+                progress.advance_accepted(1);
+                progress.set_completed_work_units(records.len() as u64);
+            } else {
+                progress.advance_rejected(1);
+            }
         }
         audits.push(audit);
         attempts.push(attempt);
@@ -5169,12 +5183,24 @@ pub fn execute_v5_evolved_transaction(
     parents: &mut dyn ParentSelector,
     ledger: &mut dyn IdentityLedger,
 ) -> Result<V5EvolvedTransactionResult> {
+    execute_v5_evolved_transaction_with_progress(request, parents, ledger, None)
+}
+
+/// Execute an evolved transaction with optional operational progress. The
+/// handle observes counters only and cannot influence scheduler decisions.
+pub fn execute_v5_evolved_transaction_with_progress(
+    request: V5EvolvedTransactionRequest,
+    parents: &mut dyn ParentSelector,
+    ledger: &mut dyn IdentityLedger,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<V5EvolvedTransactionResult> {
     let mut engine = NativeV5EvolvedConstructionEngine;
     execute_with_constructor(
         request,
         parents,
         ledger,
         true,
+        progress,
         |authority, request, planned, birth_ordinal| {
             engine.construct(authority, request, planned, birth_ordinal)
         },
@@ -5193,6 +5219,7 @@ fn execute_with_engine(
         parents,
         ledger,
         false,
+        None,
         |authority, request, planned, birth_ordinal| {
             engine.construct(authority, request, planned, birth_ordinal)
         },

@@ -29,8 +29,9 @@ use temporal_qd_campaign_seal::{
     CandidateWindowResultAdmission, admit_candidate_window_task_result,
 };
 use temporal_qd_contract::{
-    JsonNewline, canonical_json_bytes, canonical_json_line, canonical_sha256,
-    canonical_sha256_without_object_field, python_pretty_json_line, sha256_prefixed,
+    JsonNewline, NativeProgressHandle, NativeProgressSection, canonical_json_bytes,
+    canonical_json_line, canonical_sha256, canonical_sha256_without_object_field,
+    python_pretty_json_line, sha256_prefixed,
 };
 
 pub const DISPATCH_SCHEMA: &str = "temporal_qd_native_gateway_dispatch_result_v1";
@@ -339,6 +340,10 @@ struct MaintenanceGate {
 }
 
 impl MaintenanceGate {
+    fn is_paused(&self) -> bool {
+        self.active_since.is_some()
+    }
+
     fn run<T>(
         &mut self,
         request: &GatewayDispatchRequest,
@@ -498,8 +503,16 @@ pub fn execute_gateway_dispatch(
     request: &GatewayDispatchRequest,
     runtime: &GatewayRuntimeOptions,
 ) -> Result<Value> {
+    execute_gateway_dispatch_with_progress(request, runtime, None)
+}
+
+pub fn execute_gateway_dispatch_with_progress(
+    request: &GatewayDispatchRequest,
+    runtime: &GatewayRuntimeOptions,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<Value> {
     let mut client = HttpGatewayClient::new(runtime, request)?;
-    execute_gateway_dispatch_with_client(request, &mut client)
+    execute_gateway_dispatch_with_client_and_progress(request, &mut client, progress)
 }
 
 /// Dispatch using a gateway implementation.  The injection point exists for
@@ -508,9 +521,56 @@ pub fn execute_gateway_dispatch_with_client(
     request: &GatewayDispatchRequest,
     client: &mut dyn GatewayClient,
 ) -> Result<Value> {
+    execute_gateway_dispatch_with_client_and_progress(request, client, None)
+}
+
+pub fn execute_gateway_dispatch_with_client_and_progress(
+    request: &GatewayDispatchRequest,
+    client: &mut dyn GatewayClient,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<Value> {
     request.validate()?;
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "checkpoint_authentication",
+            "open_campaign_input_checkpoint",
+            "file",
+            Some(1),
+            false,
+            Some(1),
+            None,
+        );
+    }
+    let checkpoint_started = Instant::now();
     let campaign_input = open_v5_campaign_input_checkpoint(&request.campaign_input_checkpoint_path)
         .context("open gateway campaign-input checkpoint")?;
+    if let Some(progress) = progress {
+        progress.set_generation(None, Some(campaign_input.generation_index));
+        progress.set_completed_work_units(1);
+        progress.record_section(NativeProgressSection {
+            name: "checkpoint_authentication".to_owned(),
+            wall: checkpoint_started.elapsed(),
+            completed_work_units: Some(1),
+            bytes_processed: Some(
+                campaign_input
+                    .task_pack_size_bytes
+                    .saturating_add(campaign_input.cohort_population_size_bytes),
+            ),
+            files_processed: Some(3),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+        progress.begin_phase(
+            "dispatch_state",
+            "open_or_build_index_and_completion_journal",
+            "task",
+            Some(campaign_input.task_count),
+            false,
+            Some(1),
+            None,
+        );
+    }
+    let dispatch_state_started = Instant::now();
     fs::create_dir_all(&request.output_root).with_context(|| {
         format!(
             "create dispatcher output root: {}",
@@ -521,6 +581,17 @@ pub fn execute_gateway_dispatch_with_client(
     paths.ensure_directories()?;
     let (index, created_index) = open_or_build_task_index(request, &paths, &campaign_input)?;
     let mut journal = load_completion_journal(&paths, &index)?;
+    if let Some(progress) = progress {
+        progress.set_completed_work_units(journal.len() as u64);
+        progress.record_section(NativeProgressSection {
+            name: "dispatch_state".to_owned(),
+            wall: dispatch_state_started.elapsed(),
+            completed_work_units: Some(journal.len() as u64),
+            files_processed: Some(2),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+    }
     if paths.execution_receipt.exists() {
         ensure!(
             matches!(request.mode, DispatchMode::Resume),
@@ -545,10 +616,46 @@ pub fn execute_gateway_dispatch_with_client(
     // A deterministic failure could have been acknowledged before the process
     // reached its completion journal append. Recover it from its independent
     // fsynced receipt before any enqueue can cause a redelivery.
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "recovery",
+            "recover_durable_failures",
+            "task",
+            Some(index.task_count),
+            false,
+            Some(1),
+            None,
+        );
+        progress.set_completed_work_units(journal.len() as u64);
+    }
+    let recovery_started = Instant::now();
     recover_durable_failures(&paths, &index, &mut journal, &mut telemetry)?;
+    if let Some(progress) = progress {
+        progress.set_completed_work_units(journal.len() as u64);
+        progress.record_section(NativeProgressSection {
+            name: "durable_failure_recovery".to_owned(),
+            wall: recovery_started.elapsed(),
+            completed_work_units: Some(journal.len() as u64),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+    }
 
     // Consume prior deliveries before enqueue. This preserves the controller's
     // no-second-economic-evaluation restart rule.
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "prior_result_drain",
+            "consume_prior_deliveries",
+            "task",
+            Some(index.task_count),
+            false,
+            Some(1),
+            None,
+        );
+        progress.set_completed_work_units(journal.len() as u64);
+    }
+    let prior_drain_started = Instant::now();
     drain_available_results(
         client,
         request,
@@ -558,6 +665,27 @@ pub fn execute_gateway_dispatch_with_client(
         &mut telemetry,
         &mut maintenance,
     )?;
+    if let Some(progress) = progress {
+        progress.set_completed_work_units(journal.len() as u64);
+        progress.record_section(NativeProgressSection {
+            name: "prior_result_drain".to_owned(),
+            wall: prior_drain_started.elapsed(),
+            completed_work_units: Some(journal.len() as u64),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+        progress.begin_phase(
+            "enqueue",
+            "enqueue_missing_tasks",
+            "task",
+            Some(index.task_count),
+            false,
+            Some(1),
+            None,
+        );
+        progress.set_completed_work_units(journal.len() as u64);
+    }
+    let enqueue_started = Instant::now();
 
     enqueue_missing_tasks(
         client,
@@ -567,6 +695,25 @@ pub fn execute_gateway_dispatch_with_client(
         &mut telemetry,
         &mut maintenance,
     )?;
+    if let Some(progress) = progress {
+        progress.record_section(NativeProgressSection {
+            name: "enqueue".to_owned(),
+            wall: enqueue_started.elapsed(),
+            completed_work_units: Some(index.task_count.saturating_sub(journal.len() as u64)),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+        progress.begin_phase(
+            "completion_wait",
+            "poll_gateway_results",
+            "task",
+            Some(index.task_count),
+            false,
+            Some(1),
+            None,
+        );
+        progress.set_completed_work_units(journal.len() as u64);
+    }
     // Only productive completion-wait time consumes the scientific timeout.
     // A shared dependency outage has its own explicit maintenance bound and
     // never burns task attempts or forces a supervisor restart.
@@ -590,13 +737,55 @@ pub fn execute_gateway_dispatch_with_client(
             &mut telemetry,
             &mut maintenance,
         )?;
+        if let Some(progress) = progress {
+            progress.set_completed_work_units(journal.len() as u64);
+            if consumed == 0 && maintenance.is_paused() {
+                progress.set_subphase(
+                    "maintenance_wait",
+                    Some("gateway_dependency_in_maintenance"),
+                );
+            } else {
+                progress.set_subphase("poll_gateway_results", None);
+            }
+        }
         if consumed == 0 {
             thread::sleep(request.poll_interval);
         }
     }
+    if let Some(progress) = progress {
+        progress.set_completed_work_units(journal.len() as u64);
+        progress.record_section(NativeProgressSection {
+            name: "completion_wait".to_owned(),
+            wall: wait_started.elapsed(),
+            completed_work_units: Some(journal.len() as u64),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+        progress.begin_phase(
+            "receipt_commit",
+            "commit_gateway_execution_receipt",
+            "file",
+            Some(1),
+            false,
+            Some(1),
+            None,
+        );
+    }
     telemetry.completed_task_count = journal.len() as u64;
     telemetry.result_pack_committed = true;
+    let receipt_started = Instant::now();
     let receipt = commit_gateway_execution_receipt(&paths, &index, &journal)?;
+    if let Some(progress) = progress {
+        progress.set_completed_work_units(1);
+        progress.record_section(NativeProgressSection {
+            name: "receipt_commit".to_owned(),
+            wall: receipt_started.elapsed(),
+            completed_work_units: Some(1),
+            files_processed: Some(1),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+    }
     Ok(json!({
         "schemaVersion": DISPATCH_SCHEMA,
         "authorityId": index.authority_id,

@@ -81,6 +81,12 @@ RUNTIME_AUTHORITY_SCHEMA = "temporal_qd_runtime_authority_v1"
 PAIR_GENERATION_SCHEMA = "temporal_qd_pair_generation_v2"
 PAIR_GENERATION_RESULT_SCHEMA = "temporal_qd_pair_generation_result_v1"
 PAIR_GENERATION_PROGRESS_SCHEMA = "temporal_qd_front_generation_progress_v1"
+NATIVE_V5_PROGRESS_SCHEMA = "temporal_qd_v5_native_progress_v1"
+NATIVE_V5_STAGE_SUMMARY_SCHEMA = "temporal_qd_v5_native_stage_summary_v1"
+NATIVE_V5_STAGE_SUMMARY_TABLE_SCHEMA = "temporal_qd_v5_native_stage_summary_table_v1"
+NATIVE_V5_PROGRESS_PREFIX = b"TEMPORAL_QD_V5_PROGRESS "
+_NATIVE_V5_PROGRESS_LINE_LIMIT_BYTES = 16 * 1024
+_NATIVE_V5_PROGRESS_EVENT_LIMIT = 200_000
 NATIVE_BINARY_ENV = "FUZZFOLIO_TEMPORAL_QD_NATIVE_BINARY"
 NATIVE_MINIMUM_HOST_AVAILABLE_BYTES_ENV = (
     "FUZZFOLIO_TEMPORAL_QD_MINIMUM_HOST_AVAILABLE_BYTES"
@@ -321,27 +327,90 @@ def _sha256_file(path: Path) -> str:
 
 
 class _BoundedPipeCapture:
-    """Drain one child pipe without trusting a failed child to stay small."""
+    """Drain one child pipe without trusting a failed child to stay small.
 
-    def __init__(self, stream: Any, *, limit_bytes: int) -> None:
+    Current-v5 native progress uses a reserved stderr prefix. Recognized
+    operational lines are forwarded immediately and deliberately excluded from
+    the retained error buffer, so a healthy multi-hour cadence cannot exhaust
+    the command's bounded diagnostic capture. Invalid or foreign stderr stays
+    in the ordinary bounded buffer and remains available on failure.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        limit_bytes: int,
+        native_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
         self._stream = stream
         self._limit_bytes = limit_bytes
+        self._native_progress_callback = native_progress_callback
         self._buffer = bytearray()
         self._overflowed = False
         self._error: BaseException | None = None
+        self._native_progress_count = 0
+        self._native_progress_bytes = 0
         self._thread = threading.Thread(target=self._drain, daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
+    def _retain(self, chunk: bytes) -> None:
+        remaining = self._limit_bytes - len(self._buffer)
+        if remaining > 0:
+            self._buffer.extend(chunk[:remaining])
+        if len(chunk) > remaining:
+            self._overflowed = True
+
+    def _forward_native_progress(self, line: bytes) -> bool:
+        if (
+            not line.endswith(b"\n")
+            or not line.startswith(NATIVE_V5_PROGRESS_PREFIX)
+            or len(line) > _NATIVE_V5_PROGRESS_LINE_LIMIT_BYTES
+            or self._native_progress_count >= _NATIVE_V5_PROGRESS_EVENT_LIMIT
+        ):
+            return False
+        payload = line[len(NATIVE_V5_PROGRESS_PREFIX) : -1]
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(value, Mapping):
+            return False
+        schema = value.get("schemaVersion")
+        event = value.get("event")
+        if (
+            schema
+            not in {
+                NATIVE_V5_PROGRESS_SCHEMA,
+                NATIVE_V5_STAGE_SUMMARY_SCHEMA,
+                NATIVE_V5_STAGE_SUMMARY_TABLE_SCHEMA,
+            }
+            or event
+            not in {
+                "native_v5_progress",
+                "native_v5_stage_summary",
+                "native_v5_stage_summary_table",
+            }
+        ):
+            return False
+        self._native_progress_count += 1
+        self._native_progress_bytes += len(line)
+        # Operational telemetry is explicitly fail-open. A broken logger must
+        # never change native completion, receipt bytes, or restart decisions.
+        if self._native_progress_callback is not None:
+            try:
+                self._native_progress_callback(dict(value))
+            except BaseException:
+                pass
+        return True
+
     def _drain(self) -> None:
         try:
-            while chunk := self._stream.read(64 * 1024):
-                remaining = self._limit_bytes - len(self._buffer)
-                if remaining > 0:
-                    self._buffer.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    self._overflowed = True
+            while chunk := self._stream.readline(64 * 1024):
+                if not self._forward_native_progress(chunk):
+                    self._retain(chunk)
         except BaseException as exc:
             self._error = exc
         finally:
@@ -355,9 +424,17 @@ class _BoundedPipeCapture:
 
     @property
     def overflowed(self) -> bool:
-        """Whether the child wrote beyond the bounded retained capture."""
+        """Whether ordinary child diagnostics exceeded retained capture."""
 
         return self._overflowed
+
+    @property
+    def native_progress_count(self) -> int:
+        return self._native_progress_count
+
+    @property
+    def native_progress_bytes(self) -> int:
+        return self._native_progress_bytes
 
 
 class _WindowsKillOnCloseJob:
@@ -579,6 +656,26 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _forward_native_progress_event(value: Mapping[str, Any]) -> None:
+    """Forward one validated child event into the supervisor JSONL stream.
+
+    The child already supplies its operational timestamp and event name. The
+    parent only performs a bounded canonical re-encoding; this output is never
+    parsed by scientific code or persisted in any receipt authority.
+    """
+
+    print(
+        json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ),
+        flush=True,
+    )
+
+
 def _run_checked(
     command: Sequence[str],
     *,
@@ -587,6 +684,7 @@ def _run_checked(
     env: Mapping[str, str] | None = None,
     raise_on_nonzero: bool = True,
     on_process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    on_native_progress: Callable[[Mapping[str, Any]], None] | None = _forward_native_progress_event,
     stdout_limit_bytes: int = _NATIVE_CAPTURE_LIMIT_BYTES,
     stderr_limit_bytes: int = _NATIVE_CAPTURE_LIMIT_BYTES,
     minimum_host_available_bytes: int | None = None,
@@ -653,7 +751,9 @@ def _run_checked(
             process.stdout, limit_bytes=stdout_limit_bytes
         )
         stderr_capture = _BoundedPipeCapture(
-            process.stderr, limit_bytes=stderr_limit_bytes
+            process.stderr,
+            limit_bytes=stderr_limit_bytes,
+            native_progress_callback=on_native_progress,
         )
         stdout_capture.start()
         stderr_capture.start()

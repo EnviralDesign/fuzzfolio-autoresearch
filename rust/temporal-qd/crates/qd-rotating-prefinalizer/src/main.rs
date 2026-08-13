@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Instant};
+
+use temporal_qd_contract::{NativeProgress, NativeProgressSection, NativeProgressSpec};
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -8,6 +10,12 @@ fn main() {
         );
         std::process::exit(2);
     };
+    let command = first.to_string_lossy().into_owned();
+    let mut spec = NativeProgressSpec::new("rotating_prefinalizer", "prefinalizer_and_panel_path");
+    spec.subphase = command.clone();
+    let progress = NativeProgress::from_environment(spec);
+    let progress_handle = progress.handle();
+    let progress_started = Instant::now();
     let result = if first == "extract-core-funnel" {
         let (Some(input), Some(output)) = (args.next(), args.next()) else {
             eprintln!(
@@ -200,13 +208,20 @@ fn main() {
         std::process::exit(2);
     };
     match result {
-        Ok(value) => match temporal_qd_contract::canonical_json_line(&value) {
-            Ok(bytes) => print!("{}", String::from_utf8_lossy(&bytes)),
-            Err(error) => {
-                eprintln!("serialize execution: {error:#}");
-                std::process::exit(1);
+        Ok(value) => {
+            progress_handle.record_section(NativeProgressSection::wall(
+                command,
+                progress_started.elapsed(),
+            ));
+            progress.finish(None);
+            match temporal_qd_contract::canonical_json_line(&value) {
+                Ok(bytes) => print!("{}", String::from_utf8_lossy(&bytes)),
+                Err(error) => {
+                    eprintln!("serialize execution: {error:#}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Err(error) => {
             eprintln!("rotating prefinalizer: {error:#}");
             std::process::exit(1);

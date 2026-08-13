@@ -1,6 +1,7 @@
-use std::{env, path::Path};
+use std::{env, path::Path, time::Instant};
 
 use anyhow::{Result, bail};
+use temporal_qd_contract::{NativeProgress, NativeProgressSection, NativeProgressSpec};
 
 fn main() {
     let outcome = std::thread::Builder::new()
@@ -24,7 +25,17 @@ fn run() -> Result<()> {
     if args.len() != 3 || args[1] != "--campaign-output-manifest" {
         bail!("usage: temporal-qd-campaign-seal --campaign-output-manifest PATH");
     }
+    let mut spec = NativeProgressSpec::new("campaign_seal", "campaign_output_commit");
+    spec.subphase = "authenticate_results_reduce_tail_and_commit".to_owned();
+    let progress = NativeProgress::from_environment(spec);
+    let handle = progress.handle();
+    let started = Instant::now();
     let result = temporal_qd_campaign_seal::execute_campaign_output_manifest(Path::new(&args[2]))?;
+    handle.record_section(NativeProgressSection::wall(
+        "campaign_output_commit",
+        started.elapsed(),
+    ));
+    progress.finish(None);
     println!("{}", temporal_qd_contract::canonical_json(&result)?);
     Ok(())
 }

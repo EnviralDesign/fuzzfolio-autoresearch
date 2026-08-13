@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
-use std::{env, path::Path};
+use std::{env, path::Path, time::Instant};
+use temporal_qd_contract::{NativeProgress, NativeProgressSection, NativeProgressSpec};
 
 fn main() {
     let outcome = std::thread::Builder::new()
@@ -22,12 +23,18 @@ fn run() -> Result<()> {
     if args.len() != 3 || args[1] != "--manifest" {
         bail!("usage: temporal-qd-campaign-freeze --manifest PATH");
     }
-    println!(
-        "{}",
-        temporal_qd_contract::canonical_json(&temporal_qd_campaign_freeze::execute_manifest(
-            Path::new(&args[2])
-        )?)?
-    );
+    let mut spec = NativeProgressSpec::new("campaign_freeze", "freeze_and_source_build");
+    spec.subphase = "authenticate_inputs_and_materialize_task_pack".to_owned();
+    let progress = NativeProgress::from_environment(spec);
+    let handle = progress.handle();
+    let started = Instant::now();
+    let result = temporal_qd_campaign_freeze::execute_manifest(Path::new(&args[2]))?;
+    handle.record_section(NativeProgressSection::wall(
+        "freeze_and_source_build",
+        started.elapsed(),
+    ));
+    progress.finish(None);
+    println!("{}", temporal_qd_contract::canonical_json(&result)?);
     Ok(())
 }
 #[cfg(windows)]

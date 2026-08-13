@@ -12,6 +12,7 @@ pub const FOUNDATION_OPERATION: &str = "foundation_probe";
 pub const FOUNDATION_RESULT_PATH: &str = "result.json";
 
 pub mod foundation;
+pub mod progress;
 
 pub use foundation::{
     CanonicalSha256Writer, FoundationManifest, FoundationResult, JsonNewline, NativeContractError,
@@ -19,6 +20,12 @@ pub use foundation::{
     canonical_sha256_streaming, canonical_sha256_without_object_field, parse_foundation_manifest,
     parse_foundation_result, python_pretty_json_line, sha256_prefixed, write_canonical_json,
     write_python_pretty_json,
+};
+pub use progress::{
+    NATIVE_V5_PROGRESS_CADENCE_ENV, NATIVE_V5_PROGRESS_DEFAULT_CADENCE,
+    NATIVE_V5_PROGRESS_ENABLED_ENV, NATIVE_V5_PROGRESS_PREFIX, NATIVE_V5_PROGRESS_SCHEMA,
+    NATIVE_V5_STAGE_SUMMARY_SCHEMA, NATIVE_V5_STAGE_SUMMARY_TABLE_SCHEMA, NativeProgress,
+    NativeProgressHandle, NativeProgressSection, NativeProgressSpec,
 };
 pub use serde_json::{Map, Value};
 pub type ContractError = NativeContractError;
