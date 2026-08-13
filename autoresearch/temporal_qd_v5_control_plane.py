@@ -3985,14 +3985,14 @@ def run_native_v5_campaign_freeze(
         "candidateCount",
         "windowCount",
         "taskCount",
-        "taskManifest",
+        "tasks",
         "cohortPopulation",
         "sourceInputs",
         "artifactMetrics",
         "checkpointSha256",
     }
-    task_manifest = _mapping(
-        checkpoint.get("taskManifest"), name="native v5 task-manifest descriptor"
+    task_pack = _mapping(
+        checkpoint.get("tasks"), name="native v5 task-pack descriptor"
     )
     cohort_population = _mapping(
         checkpoint.get("cohortPopulation"),
@@ -4016,8 +4016,9 @@ def run_native_v5_campaign_freeze(
         or checkpoint.get("panelId") != panel_id
         or checkpoint.get("candidateCount") * checkpoint.get("windowCount")
         != checkpoint.get("taskCount")
-        or task_manifest.get("relativePath") != "screening-run/task-manifest.json"
-        or task_manifest.get("taskMatrixSha256")
+        or task_pack.get("relativePath") != "screening-run/tasks.jsonl"
+        or task_pack.get("recordCount") != checkpoint.get("taskCount")
+        or task_pack.get("taskMatrixSha256")
         != checkpoint.get("taskMatrixSha256")
         or cohort_population.get("relativePath") != "cohort-population.json"
         or source_inputs.get("evaluationPopulationRawSha256")
@@ -4025,11 +4026,11 @@ def run_native_v5_campaign_freeze(
         or source_inputs.get("templatePreparationSha256") != supplied_template_sha256
         or source_inputs.get("constructionCatalogSha256") != supplied_catalog_sha256
         or artifact_metrics.get("payloadFileCount") != 2
-        or artifact_metrics.get("taskManifestBytes") != task_manifest.get("sizeBytes")
+        or artifact_metrics.get("taskPackBytes") != task_pack.get("sizeBytes")
         or artifact_metrics.get("cohortPopulationBytes")
         != cohort_population.get("sizeBytes")
         or artifact_metrics.get("payloadBytes")
-        != task_manifest.get("sizeBytes") + cohort_population.get("sizeBytes")
+        != task_pack.get("sizeBytes") + cohort_population.get("sizeBytes")
     ):
         raise TemporalQDV5ControlPlaneError(
             "native v5 campaign-input checkpoint drifted"
@@ -4043,15 +4044,18 @@ def run_native_v5_campaign_freeze(
     ):
         _sha(checkpoint.get(field), name=f"native v5 campaign input {field}")
     for descriptor, semantic_field in (
-        (task_manifest, "taskMatrixSha256"),
+        (task_pack, "taskMatrixSha256"),
         (cohort_population, "populationSha256"),
     ):
-        if set(descriptor) != {
+        expected_descriptor_fields = {
             "relativePath",
             "rawSha256",
             "sizeBytes",
             semantic_field,
-        }:
+        }
+        if descriptor is task_pack:
+            expected_descriptor_fields.add("recordCount")
+        if set(descriptor) != expected_descriptor_fields:
             raise TemporalQDV5ControlPlaneError(
                 "native v5 campaign-input descriptor schema drifted"
             )
@@ -4104,8 +4108,8 @@ def run_native_v5_campaign_freeze(
         "checkpointPath": str(checkpoint_path),
         "cohortPopulationSha256": cohort_population.get("populationSha256"),
         "cohortPopulationRawSha256": cohort_population.get("rawSha256"),
-        "taskManifestPath": str(root / task_manifest["relativePath"]),
-        "taskManifestRawSha256": task_manifest.get("rawSha256"),
+        "taskPackPath": str(root / task_pack["relativePath"]),
+        "taskPackRawSha256": task_pack.get("rawSha256"),
         "artifactMetrics": dict(artifact_metrics),
     }
 
