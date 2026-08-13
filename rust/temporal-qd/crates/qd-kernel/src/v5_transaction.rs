@@ -1222,6 +1222,27 @@ impl V5G0DurableObjectBinding {
         })
     }
 
+    /// Bind a value emitted directly by a freshly verified typed transaction.
+    /// The typed encoder has already produced and checked the object's self
+    /// hash; reparsing the same JSON value here would duplicate substantial
+    /// work for every audit/delta/record in a 4,000-candidate closure.
+    fn from_fresh_typed_value(
+        kind: V5G0DurableObjectKind,
+        value: Value,
+        identity_field: &str,
+    ) -> Result<Self> {
+        let object_sha256 = exact_sha(
+            required(&value, identity_field, "fresh v5 G0 durable object")?,
+            "fresh v5 G0 durable object SHA-256",
+        )?;
+        Ok(Self {
+            kind,
+            relative_path: compact_record_object_relative_path(&object_sha256)?,
+            object_sha256,
+            value,
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         let supplied = exact_sha(
             &Value::String(self.object_sha256.clone()),
@@ -1919,6 +1940,146 @@ impl V5G0TransactionResult {
         Ok(bindings)
     }
 
+    /// Visit the durable closure from a transaction that has just passed
+    /// [`Self::verify_fresh_construction`] without accumulating a population-
+    /// sized vector or reparsing every typed value to rediscover its self hash.
+    ///
+    /// Persisted/restart callers must use [`Self::durable_object_bindings`],
+    /// whose defensive parser remains unchanged.  The callback is generic so
+    /// batch can stage a bounded group, release it, and continue while still
+    /// propagating filesystem errors directly.
+    pub fn try_for_each_fresh_durable_object_binding<E, F>(
+        &self,
+        mut visit: F,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<V5G0TransactionError>,
+        F: FnMut(V5G0DurableObjectBinding) -> std::result::Result<(), E>,
+    {
+        self.validate_shape().map_err(E::from)?;
+        let mut seen = BTreeSet::new();
+        let mut append = |kind: V5G0DurableObjectKind,
+                          value: Value,
+                          identity_field: &'static str|
+         -> std::result::Result<(), E> {
+            let binding =
+                V5G0DurableObjectBinding::from_fresh_typed_value(kind, value, identity_field)
+                    .map_err(E::from)?;
+            if !seen.insert(binding.object_sha256.clone()) {
+                return Err(E::from(contract(
+                    "fresh v5 G0 durable object list repeats a content-addressed identity",
+                )));
+            }
+            visit(binding)
+        };
+
+        append(
+            V5G0DurableObjectKind::PublicationPlan,
+            self.publication_plan.to_value().map_err(|error| {
+                E::from(contract(format!(
+                    "fresh v5 G0 publication plan encoding failed: {error}"
+                )))
+            })?,
+            "publicationPlanSha256",
+        )?;
+        append(
+            V5G0DurableObjectKind::AttemptJournal,
+            self.attempt_journal
+                .to_value()
+                .map_err(V5G0TransactionError::from)
+                .map_err(E::from)?,
+            "attemptJournalSha256",
+        )?;
+        for audit in &self.outcome_audits {
+            append(
+                V5G0DurableObjectKind::AttemptOutcomeAudit,
+                audit
+                    .to_value()
+                    .map_err(V5G0TransactionError::from)
+                    .map_err(E::from)?,
+                "auditSha256",
+            )?;
+        }
+        for delta in self.attempt_proposal_deltas.iter().flatten() {
+            append(
+                V5G0DurableObjectKind::CompactProposalDelta,
+                delta.clone(),
+                "deltaSha256",
+            )?;
+        }
+        for record in &self.accepted_records {
+            append(
+                V5G0DurableObjectKind::CompactAcceptedRecord,
+                record
+                    .to_value()
+                    .map_err(V5G0TransactionError::from)
+                    .map_err(E::from)?,
+                "recordSha256",
+            )?;
+        }
+        append(
+            V5G0DurableObjectKind::CompactAcceptedJournal,
+            self.compact_accepted_journal.to_value().map_err(E::from)?,
+            "compactJournalSha256",
+        )?;
+        append(
+            V5G0DurableObjectKind::IdentityLedger,
+            self.identity_ledger.to_value().map_err(E::from)?,
+            "identityLedgerSha256",
+        )?;
+        append(
+            V5G0DurableObjectKind::ScheduleStateReceipt,
+            self.schedule_state_receipt.to_value().map_err(E::from)?,
+            "scheduleStateReceiptSha256",
+        )?;
+        if let Some(pool) = &self.accepted_pool {
+            append(
+                V5G0DurableObjectKind::AcceptedPool,
+                pool.clone(),
+                "acceptedPoolSha256",
+            )?;
+        }
+        if let Some(ledger) = &self.campaign_ledger {
+            append(
+                V5G0DurableObjectKind::CampaignLedger,
+                ledger.clone(),
+                "ledgerSha256",
+            )?;
+        }
+        if let Some(selection) = &self.g0_selection {
+            append(
+                V5G0DurableObjectKind::G0Selection,
+                selection.clone(),
+                "selectionSha256",
+            )?;
+        }
+        if let Some(index) = &self.selected_projection_index {
+            append(
+                V5G0DurableObjectKind::SelectedProjectionIndex,
+                index.to_value().map_err(E::from)?,
+                "selectedProjectionIndexSha256",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Exact number of compact objects emitted by
+    /// [`Self::try_for_each_fresh_durable_object_binding`].  This is cheap to
+    /// derive from already-validated typed collections and gives operational
+    /// staging telemetry a trustworthy denominator before the first file is
+    /// written.
+    pub fn fresh_durable_object_count(&self) -> usize {
+        2 // publication plan + attempt journal
+            + self.outcome_audits.len()
+            + self.attempt_proposal_deltas.iter().flatten().count()
+            + self.accepted_records.len()
+            + 3 // compact journal + identity ledger + schedule receipt
+            + usize::from(self.accepted_pool.is_some())
+            + usize::from(self.campaign_ledger.is_some())
+            + usize::from(self.g0_selection.is_some())
+            + usize::from(self.selected_projection_index.is_some())
+    }
+
     /// A small semantic root for the in-memory transaction result.  Durable
     /// writers normally persist the typed child objects separately, but this
     /// root gives a receiver one deterministic replay binding without adding
@@ -2131,6 +2292,33 @@ impl V5G0TransactionResult {
     /// rejects a self-hashed but non-reconstructible compact record without
     /// ever expanding a legacy rich candidate.
     pub fn verify_replay(&self, authority: &V5SharedConstructionAuthority) -> Result<()> {
+        self.verify_fresh_construction(authority)?;
+        for (record, delta) in self
+            .accepted_records
+            .iter()
+            .zip(self.accepted_proposal_deltas.iter())
+        {
+            verify_reconstruct_compact_g0_record(authority, delta, record)?;
+        }
+        Ok(())
+    }
+
+    /// Verify the transaction facts that were assembled directly by the
+    /// current in-process constructor without rebuilding every accepted
+    /// candidate from the sealed authority.
+    ///
+    /// The expensive reconstruction loop in [`Self::verify_replay`] remains
+    /// the persisted/restart gate.  Running it immediately after construction
+    /// merely repeats the work that produced the exact typed records and, at
+    /// G0 width 4,000, used to leave one core busy for several minutes after
+    /// the progress counter had already reached 4,000/4,000.  This narrower
+    /// gate still checks every journal/audit/delta/index/ledger binding and all
+    /// deterministic G0 selection products, so it cannot change durable bytes
+    /// or scientific selection semantics.
+    pub fn verify_fresh_construction(
+        &self,
+        authority: &V5SharedConstructionAuthority,
+    ) -> Result<()> {
         self.validate_shape()?;
         if self.shared_authority_sha256 != authority.shared_authority_sha256 {
             return Err(contract("v5 G0 transaction authority identity drifted"));
@@ -2143,13 +2331,6 @@ impl V5G0TransactionResult {
         self.compact_accepted_journal
             .verify_records(&self.accepted_records)?;
         verify_attempt_proposal_deltas(self)?;
-        for (record, delta) in self
-            .accepted_records
-            .iter()
-            .zip(self.accepted_proposal_deltas.iter())
-        {
-            verify_reconstruct_compact_g0_record(authority, delta, record)?;
-        }
         verify_identity_ledger(self)?;
         verify_schedule_state_receipt(self)?;
         self.verify_g0_products()?;
@@ -2798,7 +2979,7 @@ fn execute_with_ledger_prefetch_progress(
         selected_projection_index,
         publication_plan,
     };
-    result.verify_replay(&authority)?;
+    result.verify_fresh_construction(&authority)?;
     result
         .publication_plan
         .validate_against_request(&request, &authority)

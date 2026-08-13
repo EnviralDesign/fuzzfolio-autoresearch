@@ -56,18 +56,21 @@ use temporal_qd_kernel::{
         execute_v5_evolved_transaction_with_progress, reconstruct_selected_parent_references,
     },
     v5_g0_funnel::{
-        V5_G0_FUNNEL_PROJECTION_STREAM_PATH, V5G0FunnelProjectionStreamReceiptObjectBinding,
-        build_v5_g0_funnel_fragments, verify_v5_g0_funnel_fragment_receipt,
-        verify_v5_g0_funnel_projection_stream, write_v5_g0_funnel_projection_stream,
+        V5_G0_FUNNEL_PROJECTION_STREAM_PATH, V5G0FunnelFragmentReceiptObjectBinding,
+        V5G0FunnelProjectionStreamReceiptObjectBinding, build_v5_g0_funnel_fragments,
+        verify_v5_g0_funnel_fragment_receipt, verify_v5_g0_funnel_projection_stream,
+        write_v5_g0_funnel_projection_stream,
     },
     v5_publication::{
         V5G0PublicationFragmentKind, V5G0PublicationFragmentSink, V5G0PublicationFragmentSource,
         V5G0PublicationFragments, V5G0PublicationInputs, V5G0PublicationReceipt,
-        V5G0PublicationStream, prepare_v5_g0_publication_stream, verify_v5_g0_publication_adoption,
+        V5G0PublicationStream, prepare_v5_g0_publication_stream,
+        prepare_v5_g0_publication_stream_from_fresh_transaction, verify_v5_g0_publication_adoption,
     },
     v5_transaction::{
-        V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER, V5G0CompactIdentityLedger, V5G0DurableObjectKind,
-        V5G0TransactionRequest, V5G0TransactionResult, execute_v5_g0_transaction_with_progress,
+        V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER, V5G0CompactIdentityLedger,
+        V5G0DurableObjectBinding, V5G0DurableObjectKind, V5G0TransactionRequest,
+        V5G0TransactionResult, execute_v5_g0_transaction_with_progress,
         reconstruct_v5_g0_transaction_from_artifacts, verify_v5_g0_transaction_replay,
     },
 };
@@ -217,6 +220,7 @@ impl V5AdoptionBytes {
 struct V5PhaseDurations {
     static_authority: Duration,
     construction: Duration,
+    post_construction: Duration,
     staging: Duration,
     prepublication_validation: Duration,
     publication: Duration,
@@ -329,6 +333,14 @@ fn record_v5_progress_sections(
             None,
             None,
             None,
+        ),
+        (
+            "post_construction",
+            phases.post_construction,
+            None,
+            None,
+            None,
+            Some(1),
         ),
         (
             "staging",
@@ -3912,6 +3924,220 @@ fn stage_v5_canonical_value<O: PublicationIo>(
     stage_v5_relative_bytes_with(ops, output_root, staging, relative, &bytes, label)
 }
 
+const V5_FRESH_DURABLE_STAGE_BATCH_PER_WORKER: usize = 4;
+
+fn stage_v5_fresh_durable_batch<O: PublicationIo + Sync>(
+    ops: &O,
+    output_root: &Path,
+    staging: &V5PrivateStagingArea,
+    bindings: &[V5G0DurableObjectBinding],
+    thread_cap: u64,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<Vec<V5StagedArtifact>> {
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = (thread_cap as usize).min(bindings.len()).max(1);
+    let chunk_size = bindings.len().div_ceil(workers);
+    let joined = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_index, chunk) in bindings.chunks(chunk_size).enumerate() {
+            handles.push(
+                scope.spawn(move || -> Result<Vec<(usize, V5StagedArtifact)>> {
+                    if let Some(progress) = progress {
+                        progress.worker_started();
+                    }
+                    let mut staged = Vec::with_capacity(chunk.len());
+                    let outcome = (|| -> Result<()> {
+                        for (offset, binding) in chunk.iter().enumerate() {
+                            let artifact = stage_v5_canonical_value(
+                                ops,
+                                output_root,
+                                staging,
+                                &binding.relative_path,
+                                &binding.value,
+                                "native v5 staged fresh durable object",
+                            )?;
+                            staged.push((chunk_index * chunk_size + offset, artifact));
+                        }
+                        Ok(())
+                    })();
+                    if let Some(progress) = progress {
+                        progress.worker_finished();
+                    }
+                    if let Err(error) = outcome {
+                        let cleanup = staged.iter().try_for_each(|(_, artifact)| {
+                            discard_staged_v5_artifact(ops, artifact)
+                        });
+                        return match cleanup {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(error.context(format!(
+                                "native v5 fresh durable staging cleanup failed: {cleanup:#}"
+                            ))),
+                        };
+                    }
+                    Ok(staged)
+                }),
+            );
+        }
+
+        let mut staged = Vec::with_capacity(bindings.len());
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(mut artifacts)) => staged.append(&mut artifacts),
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(anyhow!("native v5 fresh durable staging worker panicked"));
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            let cleanup = staged
+                .iter()
+                .try_for_each(|(_, artifact)| discard_staged_v5_artifact(ops, artifact));
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "native v5 staged durable objects could not be removed after worker failure: {cleanup:#}"
+                ))),
+            };
+        }
+        staged.sort_by_key(|(index, _)| *index);
+        Ok(staged
+            .into_iter()
+            .map(|(_, artifact)| artifact)
+            .collect::<Vec<_>>())
+    })?;
+    if let Some(progress) = progress {
+        for artifact in &joined {
+            progress.advance_completed(1);
+            progress.add_files(1);
+            progress.add_bytes(artifact.digest.byte_length);
+        }
+    }
+    Ok(joined)
+}
+
+/// Stage the freshly constructed G0 durable closure in bounded groups.  The
+/// typed transaction yields one binding at a time, so a 4,000-candidate run no
+/// longer accumulates ~12,000 cloned JSON values before the first file write.
+/// Canonical encoding, file write, and fsync are parallelized up to the sealed
+/// construction cap while output ordering and all object identities remain
+/// unchanged.
+fn stage_v5_fresh_g0_durable_objects<O: PublicationIo + Sync>(
+    ops: &O,
+    output_root: &Path,
+    staging: &V5PrivateStagingArea,
+    transaction: &V5G0TransactionResult,
+    thread_cap: u64,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<(Vec<V5StagedArtifact>, BTreeMap<String, String>)> {
+    if !(1..=8).contains(&thread_cap) {
+        bail!("native v5 fresh durable staging thread cap must be in 1..=8");
+    }
+    ensure_safe_directory_tree(
+        &output_root.join("v5-native/objects/sha256"),
+        "native v5 durable object target directory",
+    )?;
+    let expected_count = transaction.fresh_durable_object_count();
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "staging",
+            "stage_durable_object_closure",
+            "durable_object",
+            Some(expected_count as u64),
+            false,
+            Some(thread_cap),
+            None,
+        );
+    }
+    let batch_width = (thread_cap as usize)
+        .saturating_mul(V5_FRESH_DURABLE_STAGE_BATCH_PER_WORKER)
+        .max(1);
+    let mut pending = Vec::with_capacity(batch_width);
+    let mut artifacts = Vec::with_capacity(expected_count);
+    let mut roots = BTreeMap::new();
+    let stage_result = transaction
+        .try_for_each_fresh_durable_object_binding::<anyhow::Error, _>(|binding| {
+            if roots
+                .insert(
+                    binding.kind.as_str().to_owned(),
+                    binding.object_sha256.clone(),
+                )
+                .is_some()
+                && !matches!(
+                    binding.kind,
+                    V5G0DurableObjectKind::AttemptOutcomeAudit
+                        | V5G0DurableObjectKind::CompactProposalDelta
+                        | V5G0DurableObjectKind::CompactAcceptedRecord
+                )
+            {
+                bail!(
+                    "native v5 durable object list repeats a singleton {} binding",
+                    binding.kind.as_str()
+                );
+            }
+            pending.push(binding);
+            if pending.len() >= batch_width {
+                artifacts.extend(stage_v5_fresh_durable_batch(
+                    ops,
+                    output_root,
+                    staging,
+                    &pending,
+                    thread_cap,
+                    progress,
+                )?);
+                pending.clear();
+            }
+            Ok(())
+        })
+        .context("stream fresh native v5 durable object bindings")
+        .and_then(|()| {
+            if !pending.is_empty() {
+                artifacts.extend(stage_v5_fresh_durable_batch(
+                    ops,
+                    output_root,
+                    staging,
+                    &pending,
+                    thread_cap,
+                    progress,
+                )?);
+            }
+            Ok(())
+        });
+    if let Err(error) = stage_result {
+        let cleanup = cleanup_staged_v5_artifacts(ops, &artifacts);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "native v5 prior durable batches could not be removed after staging failure: {cleanup:#}"
+            ))),
+        };
+    }
+    if artifacts.len() != expected_count {
+        let cleanup = cleanup_staged_v5_artifacts(ops, &artifacts);
+        let error = anyhow!(
+            "native v5 fresh durable staging count drifted: expected {expected_count}, observed {}",
+            artifacts.len()
+        );
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "native v5 fresh durable count-drift cleanup failed: {cleanup:#}"
+            ))),
+        };
+    }
+    Ok((artifacts, roots))
+}
+
 fn v5_staged_output_identity(
     kind: &str,
     staged: &V5StagedArtifact,
@@ -4242,11 +4468,23 @@ fn execute_v5_fresh_transaction(
     let construction_started = Instant::now();
     let transaction = execute_v5_g0_transaction_with_progress(request.clone(), progress)
         .context("execute sealed native v5 G0 transaction")?;
+    let construction_elapsed = construction_started.elapsed();
+    if let Some(progress) = progress {
+        progress.begin_phase(
+            "post_construction",
+            "validate_and_prepare_publication",
+            "transaction",
+            None,
+            false,
+            Some(1),
+            Some("post_construction_validation_total_not_exposed"),
+        );
+    }
+    let post_construction_started = Instant::now();
     if validation_mode.is_strict() {
         verify_v5_g0_transaction_replay(&request, &transaction)
             .context("replay fresh sealed native v5 G0 transaction")?;
     }
-    let construction_elapsed = construction_started.elapsed();
     if !transaction.target_reached
         || transaction.accepted_records.len() as u64 != manifest.requested_count
         || transaction.selected_projection_index.is_none()
@@ -4256,27 +4494,28 @@ fn execute_v5_fresh_transaction(
     {
         bail!("native v5 typed G0 transaction did not produce a complete publication bundle");
     }
+    let stream = prepare_v5_g0_publication_stream_from_fresh_transaction(&request, &transaction)
+        .context("prepare sealed native v5 G0 publication stream")?;
+    let post_construction_elapsed = post_construction_started.elapsed();
 
     if let Some(progress) = progress {
         progress.begin_phase(
             "staging",
-            "materialize_and_hash_publication_bundle",
-            "artifact",
-            None,
+            "materialize_selected_publication_fragments",
+            "selected_candidate",
+            Some(stream.selected_count() as u64),
             false,
             Some(manifest.thread_cap),
-            Some("staging_artifact_total_finalized_after_streaming"),
+            None,
         );
     }
     let staging_started = Instant::now();
     let staging = v5_private_staging_area(output_root, invocation_root, &manifest.manifest_sha256)?;
-    let stream = prepare_v5_g0_publication_stream(&request, &transaction)
-        .context("prepare sealed native v5 G0 publication stream")?;
     let mut open_fragments = begin_v5_private_fragment_set(&ops, &staging)?;
     let core_fragments = {
         let mut sink = open_fragments.sink();
         stream
-            .materialize_selected_fragments(&mut sink)
+            .materialize_selected_fragments_parallel(manifest.thread_cap, progress, &mut sink)
             .context("materialize native v5 selected publication fragments")
     };
     let core_fragments = match core_fragments {
@@ -4472,42 +4711,17 @@ fn execute_v5_fresh_transaction(
             )?);
         }
 
-        let durable_bindings = transaction
-            .durable_object_bindings()
-            .context("enumerate sealed native v5 durable objects")?;
-        let mut roots = BTreeMap::new();
-        object_artifacts.reserve(durable_bindings.len() + 3);
-        for binding in durable_bindings {
-            binding
-                .validate()
-                .context("validate sealed native v5 durable object binding")?;
-            if roots
-                .insert(
-                    binding.kind.as_str().to_owned(),
-                    binding.object_sha256.clone(),
-                )
-                .is_some()
-                && !matches!(
-                    binding.kind,
-                    V5G0DurableObjectKind::AttemptOutcomeAudit
-                        | V5G0DurableObjectKind::CompactProposalDelta
-                        | V5G0DurableObjectKind::CompactAcceptedRecord
-                )
-            {
-                bail!(
-                    "native v5 durable object list repeats a singleton {} binding",
-                    binding.kind.as_str()
-                );
-            }
-            object_artifacts.push(stage_v5_canonical_value(
-                &ops,
-                output_root,
-                &staging,
-                &binding.relative_path,
-                &binding.value,
-                "native v5 staged durable object",
-            )?);
-        }
+        let (mut durable_artifacts, roots) = stage_v5_fresh_g0_durable_objects(
+            &ops,
+            output_root,
+            &staging,
+            &transaction,
+            manifest.thread_cap,
+            progress,
+        )
+        .context("stage sealed native v5 fresh durable object closure")?;
+        object_artifacts.reserve(durable_artifacts.len() + 3);
+        object_artifacts.append(&mut durable_artifacts);
         let g0_funnel_binding_value = g0_funnel_binding
             .to_value()
             .context("encode native v5 G0 funnel receipt object binding")?;
@@ -4844,7 +5058,22 @@ fn execute_v5_fresh_transaction(
         result_path,
         &invocation_result,
         validation_mode,
-        |bundle| v5_verify_staged_typed_bundle(bundle, manifest, &outer_result, &request),
+        |bundle| {
+            if validation_mode.is_strict() {
+                v5_verify_staged_typed_bundle(bundle, manifest, &outer_result, &request)
+            } else {
+                v5_verify_staged_fresh_g0_bundle(
+                    bundle,
+                    manifest,
+                    &outer_result,
+                    &request,
+                    &transaction,
+                    &publication_receipt,
+                    &g0_funnel_binding,
+                    &g0_funnel_stream_binding,
+                )
+            }
+        },
     )
     .context("publish native v5 receipt-last transaction")?;
     let staging_elapsed = staging_started
@@ -4855,15 +5084,16 @@ fn execute_v5_fresh_transaction(
         bytes,
         phases: V5PhaseDurations {
             construction: construction_elapsed,
+            post_construction: post_construction_elapsed,
             staging: staging_elapsed,
             prepublication_validation: publish.validation,
             publication: publish.publication,
             ..V5PhaseDurations::default()
         },
         passes: V5ValidationPasses {
-            constructor_replay: 1,
+            constructor_replay: 0,
             redundant_fresh_replay: u64::from(validation_mode.is_strict()),
-            publication_prepare_replay: 1,
+            publication_prepare_replay: 0,
             staged_semantic_replay: 1,
             staged_final_rehash: u64::from(validation_mode.is_strict()),
             ..V5ValidationPasses::default()
@@ -8040,6 +8270,40 @@ fn verify_existing_digest(
     Ok(Some(identity.file_identity))
 }
 
+/// Verify a newly linked target by path, parent, identity, and expected size
+/// without immediately reading its payload a second time.  The staged source
+/// was hashed immediately before the hard-link and both names must resolve to
+/// the same inode/file ID; the group publisher performs the full target hash
+/// after the parent directory has been synchronized.
+fn verify_existing_identity_and_length(
+    path: &Path,
+    expected_length: u64,
+    parent: FileIdentity,
+) -> Result<Option<FileIdentity>> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| anyhow!("existing v5 artifact has no parent"))?;
+    require_directory_identity(parent_path, parent, "existing v5 artifact parent")?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect existing v5 artifact: {}", path.display()));
+        }
+    };
+    if is_link_or_reparse(&metadata) || !metadata.is_file() || metadata.len() != expected_length {
+        bail!(
+            "existing v5 artifact identity/length drifted: {}",
+            path.display()
+        );
+    }
+    let identity = identity_from_path(path)
+        .with_context(|| format!("identify existing v5 artifact: {}", path.display()))?;
+    require_directory_identity(parent_path, parent, "existing v5 artifact parent")?;
+    Ok(Some(identity))
+}
+
 /// Compare two authenticated files byte-for-byte without retaining either
 /// file.  SHA-256 is the durable inventory identity, but write-once adoption
 /// is deliberately stricter: a pre-existing target is accepted only when it
@@ -8167,6 +8431,50 @@ fn verify_staged_v5_artifact(staged: &V5StagedArtifact) -> Result<()> {
     Ok(())
 }
 
+/// Verify the immutable staging identities and expected length without
+/// reading payload bytes.  Balanced fresh validation uses this for the full
+/// closure because each source is independently re-hashed immediately before
+/// publication; strict mode continues to hash here as an additional pass.
+fn verify_staged_v5_artifact_identity(staged: &V5StagedArtifact) -> Result<()> {
+    require_owned_temporary(
+        &staged.temporary,
+        staged.temporary_identity,
+        staged.staging_parent_identity,
+    )?;
+    require_directory_identity(
+        staged
+            .temporary
+            .parent()
+            .ok_or_else(|| anyhow!("staged v5 artifact has no parent"))?,
+        staged.staging_parent_identity,
+        "staged v5 artifact parent",
+    )?;
+    require_directory_identity(
+        staged
+            .target_path
+            .parent()
+            .ok_or_else(|| anyhow!("staged v5 artifact target has no parent"))?,
+        staged.target_parent_identity,
+        "staged v5 artifact target parent",
+    )?;
+    let metadata = fs::symlink_metadata(&staged.temporary).with_context(|| {
+        format!(
+            "inspect staged v5 artifact identity: {}",
+            staged.temporary.display()
+        )
+    })?;
+    if is_link_or_reparse(&metadata)
+        || !metadata.is_file()
+        || metadata.len() != staged.digest.byte_length
+    {
+        bail!(
+            "staged v5 artifact identity/length drifted: {}",
+            staged.temporary.display()
+        );
+    }
+    Ok(())
+}
+
 /// Open a previously sealed staged artifact for a typed streaming verifier.
 /// The caller keeps the handle only for one verifier call and must re-check
 /// the staged digest after closing it; no public target is touched here.
@@ -8201,11 +8509,12 @@ fn link_staged_immutable<O: PublicationIo>(
         verify_staged_v5_artifact(staged)?;
         match ops.hard_link(&staged.temporary, target) {
             Ok(()) => {
-                let published =
-                    verify_existing_digest(target, &staged.digest, staged.target_parent_identity)?
-                        .ok_or_else(|| {
-                            anyhow!("published v5 artifact vanished: {}", target.display())
-                        })?;
+                let published = verify_existing_identity_and_length(
+                    target,
+                    staged.digest.byte_length,
+                    staged.target_parent_identity,
+                )?
+                .ok_or_else(|| anyhow!("published v5 artifact vanished: {}", target.display()))?;
                 require_same_identity(
                     published,
                     staged.temporary_identity,
@@ -8362,10 +8671,99 @@ fn stage_v5_relative_bytes_with<O: PublicationIo>(
     bytes: &[u8],
     label: &str,
 ) -> Result<V5StagedArtifact> {
-    stage_v5_relative_with(ops, output_root, staging, relative, label, |file| {
-        file.write_all(bytes)
-            .with_context(|| format!("write {label} staged bytes"))
-    })
+    v5_safe_relative_output_path(relative, label)?;
+    ensure_safe_existing_directory(output_root, "native v5 output root")?;
+    let target = output_root.join(relative);
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("{label} has no parent path"))?;
+    ensure_safe_directory_tree(target_parent, &format!("{label} target parent"))?;
+    let target_parent_identity = identity_from_path(target_parent).with_context(|| {
+        format!(
+            "identify {label} target parent: {}",
+            target_parent.display()
+        )
+    })?;
+    require_directory_identity(
+        &staging.root,
+        staging.root_identity,
+        "native v5 private staging root",
+    )?;
+    let stage_filename = format!("v5-artifact-{}", &sha256_bytes(relative.as_bytes())[7..]);
+    let (temporary, mut file) = create_temporary(ops, &staging.root, &stage_filename)?;
+    let temporary_identity = identity_from_file(&file)
+        .with_context(|| format!("identify {label} temporary: {}", temporary.display()))?;
+    let expected_digest = V5FileDigest {
+        byte_length: bytes.len() as u64,
+        file_sha256: sha256_bytes(bytes),
+    };
+    let write_outcome = ops
+        .write_all(&mut file, bytes)
+        .with_context(|| format!("write {label} staged bytes"))
+        .and_then(|()| {
+            ops.sync_file(&file)
+                .with_context(|| format!("synchronize {label} temporary: {}", temporary.display()))
+        })
+        .and_then(|()| {
+            let observed_identity = identity_from_file(&file).with_context(|| {
+                format!("re-identify {label} temporary: {}", temporary.display())
+            })?;
+            require_same_identity(observed_identity, temporary_identity, label, &temporary)?;
+            let observed_length = file
+                .metadata()
+                .with_context(|| format!("inspect {label} temporary: {}", temporary.display()))?
+                .len();
+            if observed_length != expected_digest.byte_length {
+                bail!(
+                    "{label} staged byte length drifted: expected {}, observed {observed_length}",
+                    expected_digest.byte_length
+                );
+            }
+            Ok(())
+        });
+    drop(file);
+    if let Err(error) = write_outcome {
+        let cleanup =
+            remove_owned_temporary(ops, &temporary, temporary_identity, staging.root_identity);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "{label} temporary could not be safely removed after byte staging failure: {cleanup:#}"
+            ))),
+        };
+    }
+    let staged = (|| -> Result<V5StagedArtifact> {
+        require_owned_temporary(&temporary, temporary_identity, staging.root_identity)?;
+        Ok(V5StagedArtifact {
+            relative_path: relative.to_owned(),
+            temporary: temporary.clone(),
+            temporary_identity,
+            staging_parent_identity: staging.root_identity,
+            target_path: target,
+            target_parent_identity,
+            // The caller supplied these exact bytes and `write_all` plus the
+            // length/identity checks above prove the complete buffer reached
+            // the fsynced file.  Balanced publication still re-hashes every
+            // source immediately before its hard-link; strict mode also
+            // retains the independent prepublication pass.  Avoiding the
+            // immediate read-back removes one redundant full-file pass for
+            // every compact durable object without weakening the seal.
+            digest: expected_digest,
+        })
+    })();
+    match staged {
+        Ok(staged) => Ok(staged),
+        Err(error) => {
+            let cleanup =
+                remove_owned_temporary(ops, &temporary, temporary_identity, staging.root_identity);
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "{label} temporary could not be safely removed after byte staging failure: {cleanup:#}"
+                ))),
+            }
+        }
+    }
 }
 
 /// Stage the four core-owned public publication documents from a sealed
@@ -8780,6 +9178,92 @@ fn publish_staged_v5_relative_once_with<O: PublicationIo>(
         staged.temporary_identity,
         staged.staging_parent_identity,
     )
+}
+
+/// Publish a pre-receipt artifact group, then synchronize each distinct
+/// parent directory once and perform the final target hash checks.  A G0
+/// durable closure places thousands of immutable objects under one directory;
+/// syncing and re-hashing that directory boundary after every individual
+/// link was pure overhead because no inventory or receipt is adoptable until
+/// the complete group has finished.
+fn publish_staged_v5_group_with<O: PublicationIo>(
+    ops: &O,
+    output_root: &Path,
+    artifacts: &[V5StagedArtifact],
+    label: &str,
+) -> Result<()> {
+    let mut linked = Vec::with_capacity(artifacts.len());
+    let mut parents = BTreeMap::<PathBuf, FileIdentity>::new();
+    let publication = (|| -> Result<()> {
+        for staged in artifacts {
+            v5_safe_relative_output_path(&staged.relative_path, label)?;
+            let target = output_root.join(&staged.relative_path);
+            if target != staged.target_path {
+                bail!(
+                    "native v5 staged artifact target path drifted: {}",
+                    staged.relative_path
+                );
+            }
+            let parent = target
+                .parent()
+                .ok_or_else(|| anyhow!("{label} has no target parent"))?;
+            ensure_safe_existing_directory(parent, &format!("{label} target parent"))?;
+            let parent_identity = identity_from_path(parent)
+                .with_context(|| format!("identify {label} target parent: {}", parent.display()))?;
+            require_same_identity(
+                parent_identity,
+                staged.target_parent_identity,
+                &format!("{label} target parent"),
+                parent,
+            )?;
+            if let Some(existing) = parents.insert(parent.to_path_buf(), parent_identity)
+                && existing != parent_identity
+            {
+                bail!("native v5 staged group parent identity drifted");
+            }
+            let outcome = link_staged_immutable(ops, staged, &target)?;
+            linked.push((staged, target, outcome));
+        }
+
+        for (parent, identity) in &parents {
+            ops.sync_directory(parent).with_context(|| {
+                format!(
+                    "synchronize native v5 staged group parent: {}",
+                    parent.display()
+                )
+            })?;
+            require_directory_identity(parent, *identity, "native v5 staged group parent")?;
+        }
+
+        for (staged, target, outcome) in &linked {
+            let after =
+                verify_existing_digest(target, &staged.digest, staged.target_parent_identity)?
+                    .ok_or_else(|| {
+                        anyhow!("published {label} vanished after group synchronization")
+                    })?;
+            if *outcome == LinkOutcome::Published {
+                require_same_identity(
+                    after,
+                    staged.temporary_identity,
+                    &format!("published {label}"),
+                    target,
+                )?;
+            } else {
+                require_staged_bytes_equal_existing(staged, target, after)?;
+            }
+        }
+        Ok(())
+    })();
+
+    let cleanup = cleanup_staged_v5_artifacts(ops, artifacts);
+    match (publication, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "native v5 grouped staged artifacts could not be safely removed: {cleanup:#}"
+        ))),
+    }
 }
 
 fn discard_staged_v5_artifact<O: PublicationIo>(ops: &O, staged: &V5StagedArtifact) -> Result<()> {
@@ -9238,6 +9722,205 @@ fn v5_staged_typed_object_values(bundle: &V5StagedBundle<'_>) -> Result<BTreeMap
         bail!("native v5 staged bundle lacks immutable objects");
     }
     Ok(objects)
+}
+
+/// Fresh balanced prepublication proof.  The current process still owns the
+/// typed transaction and compact receipt objects that generated these bytes,
+/// so reopening and reparsing the entire ~12k-object durable closure adds no
+/// new scientific evidence.  This gate instead cross-binds every public
+/// compact stream, the final scientific publication documents, and both G0
+/// funnel authorities directly against the in-memory typed values.  Strict
+/// mode and every restart/adoption path continue to use the full object-store
+/// reconstruction below.
+fn v5_verify_staged_fresh_g0_bundle(
+    bundle: &V5StagedBundle<'_>,
+    manifest: &V5ProposalManifest,
+    result: &V5ProposalResult,
+    request: &V5G0TransactionRequest,
+    transaction: &V5G0TransactionResult,
+    publication_receipt: &V5G0PublicationReceipt,
+    g0_funnel_binding: &V5G0FunnelFragmentReceiptObjectBinding,
+    g0_funnel_stream_binding: &V5G0FunnelProjectionStreamReceiptObjectBinding,
+) -> Result<()> {
+    let expected_documents = [
+        (
+            "v5-native/attempt-journal-root.json",
+            transaction
+                .attempt_journal
+                .to_value()
+                .context("encode fresh native v5 attempt journal")?,
+            "attempt journal",
+        ),
+        (
+            "v5-native/identity-ledger.json",
+            transaction
+                .identity_ledger
+                .to_value()
+                .context("encode fresh native v5 identity ledger")?,
+            "identity ledger",
+        ),
+        (
+            "v5-native/authority/shared-authority.json",
+            manifest.frozen_authority.clone(),
+            "shared authority",
+        ),
+        (
+            "g0-bootstrap/accepted-pool.json",
+            transaction
+                .accepted_pool
+                .clone()
+                .ok_or_else(|| anyhow!("fresh native v5 transaction lacks accepted pool"))?,
+            "G0 accepted pool",
+        ),
+        (
+            "g0-bootstrap/campaign-construction-ledger.json",
+            transaction
+                .campaign_ledger
+                .clone()
+                .ok_or_else(|| anyhow!("fresh native v5 transaction lacks campaign ledger"))?,
+            "G0 campaign ledger",
+        ),
+        (
+            "g0-bootstrap/selection.json",
+            transaction
+                .g0_selection
+                .clone()
+                .ok_or_else(|| anyhow!("fresh native v5 transaction lacks G0 selection"))?,
+            "G0 selection",
+        ),
+    ];
+    for (relative, expected, label) in expected_documents {
+        let observed = read_staged_v5_document(
+            staged_v5_artifact_for(bundle, relative, label)?,
+            &format!("fresh native v5 staged {label}"),
+        )?;
+        if observed != expected {
+            bail!("fresh native v5 staged {label} differs from the typed transaction");
+        }
+    }
+
+    let expected_attempts = transaction
+        .attempts
+        .iter()
+        .map(|attempt| attempt.to_value().map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    let expected_records = transaction
+        .accepted_records
+        .iter()
+        .map(|record| record.to_value().map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    let expected_projections = transaction
+        .selected_projection_index
+        .as_ref()
+        .ok_or_else(|| anyhow!("fresh native v5 transaction lacks selected projections"))?
+        .projections
+        .iter()
+        .map(|projection| projection.to_value().map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    for (relative, expected, label) in [
+        (
+            "v5-native/attempts.jsonl",
+            expected_attempts,
+            "attempt rows",
+        ),
+        (
+            "v5-native/accepted-records.jsonl",
+            expected_records,
+            "accepted records",
+        ),
+        (
+            "v5-native/selected-projections.jsonl",
+            expected_projections,
+            "selected projections",
+        ),
+    ] {
+        let observed = parse_v5_canonical_jsonl(
+            &read_staged_v5_bytes(
+                staged_v5_artifact_for(bundle, relative, label)?,
+                &format!("fresh native v5 staged {label}"),
+            )?,
+            &format!("fresh native v5 staged {label}"),
+        )?;
+        if observed != expected {
+            bail!("fresh native v5 staged {label} differ from the typed transaction");
+        }
+    }
+
+    let publication_receipt_value = publication_receipt
+        .to_value()
+        .context("encode fresh native v5 publication receipt")?;
+    let mut pair = open_staged_v5_artifact(
+        staged_v5_artifact_for(bundle, "pair-config.json", "pair config")?,
+        "fresh native v5 staged pair config",
+    )?;
+    let mut population = open_staged_v5_artifact(
+        staged_v5_artifact_for(bundle, "population.json", "population")?,
+        "fresh native v5 staged population",
+    )?;
+    let mut evaluation = open_staged_v5_artifact(
+        staged_v5_artifact_for(
+            bundle,
+            "evaluation-population.json",
+            "evaluation population",
+        )?,
+        "fresh native v5 staged evaluation population",
+    )?;
+    let mut journal = open_staged_v5_artifact(
+        staged_v5_artifact_for(bundle, "generation-journal.json", "generation journal")?,
+        "fresh native v5 staged generation journal",
+    )?;
+    let verified_receipt = verify_v5_g0_publication_adoption(
+        request,
+        transaction,
+        &publication_receipt_value,
+        &mut pair,
+        &mut population,
+        &mut evaluation,
+        &mut journal,
+    )
+    .context("verify fresh native v5 public bundle")?;
+    drop((pair, population, evaluation, journal));
+    if verified_receipt != *publication_receipt {
+        bail!("fresh native v5 staged publication receipt differs from the typed receipt");
+    }
+    v5_verify_publication_receipt_inventory(result, &verified_receipt)?;
+
+    g0_funnel_binding
+        .validate()
+        .context("validate fresh native v5 G0 funnel binding")?;
+    let g0_funnel = verify_v5_g0_funnel_fragment_receipt(
+        request,
+        transaction,
+        &verified_receipt,
+        &g0_funnel_binding.value,
+    )
+    .context("verify fresh native v5 G0 funnel receipt")?;
+    if g0_funnel.funnel_fragments_sha256()? != g0_funnel_binding.g0_funnel_fragments_sha256 {
+        bail!("fresh native v5 G0 funnel identity drifted");
+    }
+    g0_funnel_stream_binding
+        .validate()
+        .context("validate fresh native v5 G0 funnel stream binding")?;
+    let mut stream = open_staged_v5_artifact(
+        staged_v5_artifact_for(
+            bundle,
+            V5_G0_FUNNEL_PROJECTION_STREAM_PATH,
+            "G0 funnel projection stream",
+        )?,
+        "fresh native v5 staged G0 funnel projection stream",
+    )?;
+    let verified_stream = verify_v5_g0_funnel_projection_stream(
+        &g0_funnel,
+        &g0_funnel_stream_binding.value,
+        &mut stream,
+    )
+    .context("verify fresh native v5 G0 funnel projection stream")?;
+    if verified_stream.projection_stream_receipt_sha256()?
+        != g0_funnel_stream_binding.g0_funnel_projection_stream_receipt_sha256
+    {
+        bail!("fresh native v5 G0 funnel projection-stream identity drifted");
+    }
+    Ok(())
 }
 
 fn v5_verify_staged_typed_bundle(
@@ -9979,7 +10662,11 @@ where
                 staged.relative_path
             );
         }
-        verify_staged_v5_artifact(staged)?;
+        if validation_mode.is_strict() {
+            verify_staged_v5_artifact(staged)?;
+        } else {
+            verify_staged_v5_artifact_identity(staged)?;
+        }
         if supplied
             .insert(staged.relative_path.clone(), staged)
             .is_some()
@@ -10063,14 +10750,16 @@ where
         {
             bail!("native v5 staged inventory repeats artifact kind: {kind}");
         }
-        if matches!(
-            kind,
-            "attemptJournal"
-                | "attemptRows"
-                | "compactJournal"
-                | "identityLedger"
-                | "selectedProjectionIndex"
-        ) {
+        if validation_mode.is_strict()
+            && matches!(
+                kind,
+                "attemptJournal"
+                    | "attemptRows"
+                    | "compactJournal"
+                    | "identityLedger"
+                    | "selectedProjectionIndex"
+            )
+        {
             compact_artifacts.insert(
                 kind.to_owned(),
                 read_staged_v5_bytes(staged, "native v5 staged compact replay artifact")?,
@@ -10111,42 +10800,46 @@ where
         bail!("native v5 staged bundle includes an undeclared artifact path");
     }
 
-    // Fetch only the compact audit subset named by the canonical attempt
-    // journal.  Large population/static object-store payloads remain
-    // authenticated by streamed file identity without becoming a Vec.
-    let attempt_rows = compact_artifacts
-        .get("attemptRows")
-        .ok_or_else(|| anyhow!("native v5 staged compact replay lacks attempt rows"))?;
-    let attempt_rows = parse_v5_canonical_jsonl(attempt_rows, "native v5 staged attempt rows")?;
-    let journal = V5AttemptJournal::from_rows(
-        manifest.generation_index,
-        &manifest.generation_config_sha256,
-        &manifest.expected_authority_sha256,
-        &attempt_rows,
-    )
-    .context("replay native v5 staged attempt object references")?;
-    let mut audit_objects = BTreeMap::<String, Vec<u8>>::new();
-    for object_sha in journal
-        .attempts
-        .iter()
-        .map(|attempt| &attempt.outcome_audit_sha256)
-    {
-        let relative = object_paths.get(object_sha).ok_or_else(|| {
-            anyhow!("native v5 staged object store lacks outcome audit {object_sha}")
-        })?;
-        let staged = staged_v5_artifact_for(&bundle, relative, "outcome-audit object")?;
-        if audit_objects
-            .insert(
-                object_sha.clone(),
-                read_staged_v5_bytes(staged, "native v5 staged outcome audit")?,
-            )
-            .is_some()
+    if validation_mode.is_strict() {
+        // Strict mode fetches the compact audit subset named by the canonical
+        // attempt journal and independently replays it.  Balanced fresh mode
+        // already owns the typed in-memory transaction that produced these
+        // exact content-addressed bytes and therefore avoids reopening 4,000
+        // audit objects merely to prove the same fact again.
+        let attempt_rows = compact_artifacts
+            .get("attemptRows")
+            .ok_or_else(|| anyhow!("native v5 staged compact replay lacks attempt rows"))?;
+        let attempt_rows = parse_v5_canonical_jsonl(attempt_rows, "native v5 staged attempt rows")?;
+        let journal = V5AttemptJournal::from_rows(
+            manifest.generation_index,
+            &manifest.generation_config_sha256,
+            &manifest.expected_authority_sha256,
+            &attempt_rows,
+        )
+        .context("replay native v5 staged attempt object references")?;
+        let mut audit_objects = BTreeMap::<String, Vec<u8>>::new();
+        for object_sha in journal
+            .attempts
+            .iter()
+            .map(|attempt| &attempt.outcome_audit_sha256)
         {
-            bail!("native v5 staged attempt journal repeats outcome-audit object identity");
+            let relative = object_paths.get(object_sha).ok_or_else(|| {
+                anyhow!("native v5 staged object store lacks outcome audit {object_sha}")
+            })?;
+            let staged = staged_v5_artifact_for(&bundle, relative, "outcome-audit object")?;
+            if audit_objects
+                .insert(
+                    object_sha.clone(),
+                    read_staged_v5_bytes(staged, "native v5 staged outcome audit")?,
+                )
+                .is_some()
+            {
+                bail!("native v5 staged attempt journal repeats outcome-audit object identity");
+            }
         }
+        verify_v5_compact_journal_replay(manifest, result, &compact_artifacts, &audit_objects)
+            .context("semantically replay native v5 staged compact journals")?;
     }
-    verify_v5_compact_journal_replay(manifest, result, &compact_artifacts, &audit_objects)
-        .context("semantically replay native v5 staged compact journals")?;
     // The caller is the typed core integration seam.  It must cross-bind the
     // remaining ledger/G0/evaluation/generation/population facts before any
     // file is linked; the generic batch layer intentionally cannot fabricate
@@ -10221,14 +10914,12 @@ fn publish_v5_staged_receipt_last_with<O: PublicationIo>(
     invocation_result: &[u8],
 ) -> Result<()> {
     let publication = (|| -> Result<()> {
-        for staged in artifacts {
-            publish_staged_v5_relative_once_with(
-                ops,
-                output_root,
-                staged,
-                "native v5 staged transaction artifact",
-            )?;
-        }
+        publish_staged_v5_group_with(
+            ops,
+            output_root,
+            artifacts,
+            "native v5 staged transaction artifact",
+        )?;
         publish_staged_v5_relative_once_with(
             ops,
             output_root,

@@ -9,10 +9,11 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
+    thread,
 };
 
 use temporal_qd_contract::{
-    CanonicalSha256Writer, ContractError, Map, Value, canonical_sha256,
+    CanonicalSha256Writer, ContractError, Map, NativeProgressHandle, Value, canonical_sha256,
     canonical_sha256_without_object_field, write_canonical_json,
 };
 
@@ -1131,10 +1132,22 @@ pub struct V5G0PublicationStream<'a> {
     transaction: &'a V5G0TransactionResult,
     authority: V5SharedConstructionAuthority,
     publication_request: PublicationRequest,
-    selected_record_indexes: Vec<usize>,
+    selected_materialization_indexes: Vec<V5SelectedMaterializationIndex>,
     selected_references: Vec<AcceptedReference>,
     g0_binding: BTreeMap<String, String>,
     reproduction_allocation_accounting: Value,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct V5SelectedMaterializationIndex {
+    record_index: usize,
+    projection_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5G0PublicationPreparationValidation {
+    PersistedReplay,
+    FreshConstructed,
 }
 
 /// Parse/replay the compact transaction, then prepare a selected-only public
@@ -1144,9 +1157,45 @@ pub fn prepare_v5_g0_publication_stream<'a>(
     request: &'a V5G0TransactionRequest,
     transaction: &'a V5G0TransactionResult,
 ) -> Result<V5G0PublicationStream<'a>> {
+    prepare_v5_g0_publication_stream_with_validation(
+        request,
+        transaction,
+        V5G0PublicationPreparationValidation::PersistedReplay,
+    )
+}
+
+/// Prepare publication directly from the transaction returned by the current
+/// in-process constructor.  Persisted/restart callers must continue to use
+/// [`prepare_v5_g0_publication_stream`], which performs the full sealed replay.
+/// The fresh route avoids reconstructing all 4,000 accepted candidates a
+/// second time before selected-only materialization begins.
+pub fn prepare_v5_g0_publication_stream_from_fresh_transaction<'a>(
+    request: &'a V5G0TransactionRequest,
+    transaction: &'a V5G0TransactionResult,
+) -> Result<V5G0PublicationStream<'a>> {
+    prepare_v5_g0_publication_stream_with_validation(
+        request,
+        transaction,
+        V5G0PublicationPreparationValidation::FreshConstructed,
+    )
+}
+
+fn prepare_v5_g0_publication_stream_with_validation<'a>(
+    request: &'a V5G0TransactionRequest,
+    transaction: &'a V5G0TransactionResult,
+    validation: V5G0PublicationPreparationValidation,
+) -> Result<V5G0PublicationStream<'a>> {
     let authority = V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
         .map_err(V5G0TransactionError::from)?;
-    verify_v5_g0_transaction_replay_with_authority(request, transaction, &authority)?;
+    match validation {
+        V5G0PublicationPreparationValidation::PersistedReplay => {
+            verify_v5_g0_transaction_replay_with_authority(request, transaction, &authority)?;
+        }
+        V5G0PublicationPreparationValidation::FreshConstructed => {
+            request.validate()?;
+            transaction.verify_fresh_construction(&authority)?;
+        }
+    }
     if !transaction.target_reached {
         return Err(contract("cannot publish an incomplete v5 G0 transaction"));
     }
@@ -1323,25 +1372,32 @@ pub fn prepare_v5_g0_publication_stream<'a>(
         .enumerate()
         .map(|(index, record)| Ok((record.record_sha256()?, index)))
         .collect::<std::result::Result<BTreeMap<_, _>, V5G0TransactionError>>()?;
-    let mut selected_record_indexes = index
+    let mut selected_materialization_indexes = index
         .projections
         .iter()
-        .map(|projection| {
-            by_record
+        .enumerate()
+        .map(|(projection_index, projection)| {
+            let record_index = by_record
                 .get(&projection.record_sha256)
                 .copied()
-                .ok_or_else(|| contract("v5 G0 selected projection names an absent compact record"))
+                .ok_or_else(|| {
+                    contract("v5 G0 selected projection names an absent compact record")
+                })?;
+            Ok(V5SelectedMaterializationIndex {
+                record_index,
+                projection_index,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
-    selected_record_indexes.sort_by(|left, right| {
-        transaction.accepted_records[*left]
+    selected_materialization_indexes.sort_by(|left, right| {
+        transaction.accepted_records[left.record_index]
             .candidate_id
-            .cmp(&transaction.accepted_records[*right].candidate_id)
+            .cmp(&transaction.accepted_records[right.record_index].candidate_id)
     });
-    let selected_references = selected_record_indexes
+    let selected_references = selected_materialization_indexes
         .iter()
         .map(|index| {
-            let record = &transaction.accepted_records[*index];
+            let record = &transaction.accepted_records[index.record_index];
             Ok(AcceptedReference {
                 proposal_ordinal: record.proposal_ordinal,
                 candidate_id: record.candidate_id.clone(),
@@ -1360,7 +1416,7 @@ pub fn prepare_v5_g0_publication_stream<'a>(
         transaction,
         authority,
         publication_request,
-        selected_record_indexes,
+        selected_materialization_indexes,
         selected_references,
         g0_binding,
         reproduction_allocation_accounting,
@@ -1377,7 +1433,7 @@ impl<'a> V5G0PublicationStream<'a> {
     }
 
     pub fn selected_count(&self) -> usize {
-        self.selected_record_indexes.len()
+        self.selected_materialization_indexes.len()
     }
 
     /// Synchronously materialize each selected compact record once.  The
@@ -1387,26 +1443,32 @@ impl<'a> V5G0PublicationStream<'a> {
         &self,
         sink: &mut S,
     ) -> Result<()> {
-        for record_index in &self.selected_record_indexes {
-            let record = &self.transaction.accepted_records[*record_index];
-            let delta = &self.transaction.accepted_proposal_deltas[*record_index];
-            let record_sha256 = record.record_sha256().map_err(V5G0TransactionError::from)?;
-            let projection = self
-                .transaction
-                .selected_projection_index
-                .as_ref()
-                .and_then(|index| {
-                    index
-                        .projections
-                        .iter()
-                        .find(|projection| projection.record_sha256 == record_sha256)
-                })
-                .ok_or_else(|| contract("v5 G0 selected compact record lacks projection"))?;
-            let materialization =
-                materialize_selected_v5_g0_record(&self.authority, projection, delta, record)?;
+        for index in &self.selected_materialization_indexes {
+            let materialization = self.materialize_selected(*index)?;
             sink.accept(&materialization)?;
         }
         Ok(())
+    }
+
+    fn materialize_selected(
+        &self,
+        index: V5SelectedMaterializationIndex,
+    ) -> Result<V5SelectedG0Materialization> {
+        let record = &self.transaction.accepted_records[index.record_index];
+        let delta = &self.transaction.accepted_proposal_deltas[index.record_index];
+        let projection = self
+            .transaction
+            .selected_projection_index
+            .as_ref()
+            .and_then(|projections| projections.projections.get(index.projection_index))
+            .ok_or_else(|| contract("v5 G0 selected compact record lacks projection"))?;
+        if projection.record_sha256 != record.record_sha256().map_err(V5G0TransactionError::from)? {
+            return Err(contract(
+                "v5 G0 selected materialization index drifted from compact record",
+            ));
+        }
+        materialize_selected_v5_g0_record(&self.authority, projection, delta, record)
+            .map_err(Into::into)
     }
 
     fn for_each_selected_with<F>(&self, mut callback: F) -> Result<()>
@@ -1435,6 +1497,25 @@ impl<'a> V5G0PublicationStream<'a> {
         &self,
         sink: &mut S,
     ) -> Result<V5G0PublicationFragments> {
+        self.materialize_selected_fragments_parallel(1, None, sink)
+    }
+
+    /// Materialize the selected evaluation width with bounded parallel
+    /// reconstruction while preserving the exact candidate-ID output order.
+    /// At most two work items per worker are retained before their canonical
+    /// fragments are appended, so the 1,024-wide G0 selection does not become
+    /// another population-sized rich-value allocation.
+    pub fn materialize_selected_fragments_parallel<S: V5G0PublicationFragmentSink>(
+        &self,
+        thread_cap: u64,
+        progress: Option<&NativeProgressHandle>,
+        sink: &mut S,
+    ) -> Result<V5G0PublicationFragments> {
+        if !(1..=8).contains(&thread_cap) {
+            return Err(contract(
+                "v5 selected materialization thread cap must be in 1..=8",
+            ));
+        }
         let mut population =
             FragmentAccumulator::new(V5G0PublicationFragmentKind::PopulationCandidates);
         let mut evaluation =
@@ -1443,7 +1524,8 @@ impl<'a> V5G0PublicationStream<'a> {
             FragmentAccumulator::new(V5G0PublicationFragmentKind::EvaluationFunnelEntries);
         let mut journal =
             FragmentAccumulator::new(V5G0PublicationFragmentKind::GenerationJournalBindings);
-        self.for_each_selected_with(|materialization| {
+
+        let mut append = |materialization: &V5SelectedG0Materialization| -> Result<()> {
             population.append(sink, &materialization.rich_evaluation_candidate)?;
             let row = &materialization.publication_precomputed_row;
             let evaluation_candidate =
@@ -1488,7 +1570,66 @@ impl<'a> V5G0PublicationStream<'a> {
             ]);
             journal.append(sink, &journal_binding)?;
             Ok(())
-        })?;
+        };
+
+        let workers = usize::min(
+            thread_cap as usize,
+            self.selected_materialization_indexes.len(),
+        )
+        .max(1);
+        if workers == 1 {
+            for index in &self.selected_materialization_indexes {
+                append(&self.materialize_selected(*index)?)?;
+                if let Some(progress) = progress {
+                    progress.advance_completed(1);
+                }
+            }
+        } else {
+            let batch_width = workers.saturating_mul(2);
+            for batch in self.selected_materialization_indexes.chunks(batch_width) {
+                let chunk_size = batch.len().div_ceil(workers);
+                let joined = thread::scope(|scope| {
+                    let mut handles = Vec::new();
+                    for (chunk_index, chunk) in batch.chunks(chunk_size).enumerate() {
+                        handles.push(scope.spawn(move || -> Result<Vec<_>> {
+                            if let Some(progress) = progress {
+                                progress.worker_started();
+                            }
+                            let outcome = chunk
+                                .iter()
+                                .enumerate()
+                                .map(|(offset, index)| {
+                                    Ok((
+                                        chunk_index * chunk_size + offset,
+                                        self.materialize_selected(*index)?,
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>>>();
+                            if let Some(progress) = progress {
+                                progress.worker_finished();
+                            }
+                            outcome
+                        }));
+                    }
+                    let mut materialized = Vec::with_capacity(batch.len());
+                    for handle in handles {
+                        let mut values = handle.join().map_err(|_| {
+                            contract("v5 selected materialization worker panicked")
+                        })??;
+                        materialized.append(&mut values);
+                    }
+                    Ok::<_, V5G0PublicationError>(materialized)
+                })?;
+                let mut materialized = joined;
+                materialized.sort_by_key(|(offset, _)| *offset);
+                for (_, materialization) in materialized {
+                    append(&materialization)?;
+                    if let Some(progress) = progress {
+                        progress.advance_completed(1);
+                    }
+                }
+            }
+        }
         let fragments = V5G0PublicationFragments {
             population_candidates: population.finish()?,
             evaluation_candidates: evaluation.finish()?,
