@@ -531,8 +531,8 @@ def test_invalid_progress_prefix_remains_bounded_stderr(tmp_path: Path) -> None:
         (
             sys.executable,
             "-c",
-            "import sys; sys.stderr.write('TEMPORAL_QD_V5_PROGRESS not-json\\n'); "
-            "sys.stdout.write('ok\\n')",
+            "import sys; sys.stderr.buffer.write(b'TEMPORAL_QD_V5_PROGRESS not-json\\n'); "
+            "sys.stdout.buffer.write(b'ok\\n')",
         ),
         cwd=tmp_path,
         timeout=5,

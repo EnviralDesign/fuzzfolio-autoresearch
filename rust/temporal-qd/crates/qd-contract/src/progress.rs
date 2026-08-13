@@ -143,10 +143,10 @@ struct Sample {
 
 impl NativeProgress {
     pub fn from_environment(spec: NativeProgressSpec) -> Self {
-        let enabled = match std::env::var(NATIVE_V5_PROGRESS_ENABLED_ENV) {
-            Ok(value) if matches!(value.as_str(), "0" | "false" | "off" | "disabled") => false,
-            _ => true,
-        };
+        let enabled = !matches!(
+            std::env::var(NATIVE_V5_PROGRESS_ENABLED_ENV),
+            Ok(value) if matches!(value.as_str(), "0" | "false" | "off" | "disabled")
+        );
         let cadence = std::env::var(NATIVE_V5_PROGRESS_CADENCE_ENV)
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
