@@ -47,6 +47,12 @@ pub const FUNNEL_SNAPSHOT_PATH: &str = "generation-funnel-snapshot.json";
 pub const COMMIT_PATH: &str = "generation-commit.json";
 pub const STATE_APPLICATION_SIDECAR_SCHEMA: &str =
     "temporal_qd_v5_generation_state_application_sidecar_v1";
+pub const FAST_EPHEMERAL_SOURCE_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_finalization_source_v1";
+pub const FAST_EPHEMERAL_MANIFEST_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_finalization_manifest_v1";
+pub const FAST_EPHEMERAL_RESULT_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_finalization_result_v1";
 
 const ROTATING_SCHEMA: &str = "temporal_qd_rotating_evidence_v1";
 const COHORT_SCHEMA: &str = "temporal_qd_current_panel_evaluation_cohort_v1";
@@ -124,8 +130,20 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     let started = Instant::now();
     let manifest_path = existing_file(manifest_path, "generation finalization manifest")?;
     let output_dir = manifest_path.parent().context("manifest has no parent")?;
+    let manifest_raw = fs::read(&manifest_path)?;
+    let manifest_value: Value =
+        serde_json::from_slice(&manifest_raw).context("parse generation finalization manifest")?;
+    if text(&manifest_value, "schemaVersion").ok() == Some(FAST_EPHEMERAL_MANIFEST_SCHEMA) {
+        return execute_fast_ephemeral_manifest(
+            &manifest_path,
+            output_dir,
+            &manifest_raw,
+            &manifest_value,
+            started,
+        );
+    }
     let commit_path = output_dir.join(COMMIT_PATH);
-    let manifest = parse_manifest(&fs::read(&manifest_path)?, output_dir)?;
+    let manifest = parse_manifest(&manifest_raw, output_dir)?;
     if commit_path.exists() {
         let commit = read_self_hashed(&commit_path, "commitSha256", COMMIT_SCHEMA)?;
         ensure!(
@@ -237,6 +255,238 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
         build_state_application_sidecar(&source, &manifest, &commit, &record, &state_patch)?;
     publish_value_once(output_dir, STATE_APPLICATION_SIDECAR_PATH, &sidecar)?;
     Ok(execution(&source, &manifest, &plan, commit, false, started))
+}
+
+fn execute_fast_ephemeral_manifest(
+    manifest_path: &Path,
+    output_dir: &Path,
+    manifest_raw: &[u8],
+    manifest_value: &Value,
+    started: Instant,
+) -> Result<Value> {
+    ensure!(
+        canonical_json_line(manifest_value)? == manifest_raw,
+        "fast-ephemeral finalization manifest must be canonical JSON plus LF"
+    );
+    exact_keys(
+        object(manifest_value, "fast-ephemeral finalization manifest")?,
+        &[
+            "schemaVersion",
+            "operation",
+            "runtimeAuthoritySha256",
+            "sourcePath",
+            "sourceSha256",
+            "resultPath",
+            "manifestSha256",
+        ],
+        "fast-ephemeral finalization manifest",
+    )?;
+    ensure!(
+        text(manifest_value, "schemaVersion")? == FAST_EPHEMERAL_MANIFEST_SCHEMA
+            && text(manifest_value, "operation")? == "finalize_fast_ephemeral_rotating_generation"
+            && text(manifest_value, "resultPath")? == "fast-ephemeral-result.json",
+        "fast-ephemeral finalization manifest is incompatible"
+    );
+    verify_self_hash(
+        manifest_value,
+        "manifestSha256",
+        "fast-ephemeral finalization manifest",
+    )?;
+    sha(manifest_value, "runtimeAuthoritySha256")?;
+    let source_path = PathBuf::from(text(manifest_value, "sourcePath")?);
+    ensure!(
+        source_path.is_absolute()
+            && source_path.parent() == Some(output_dir)
+            && source_path == output_dir.join("source.json"),
+        "fast-ephemeral finalization source path is not fixed"
+    );
+    let source_raw = fs::read(&source_path).context("read fast-ephemeral finalization source")?;
+    let source_value: Value =
+        serde_json::from_slice(&source_raw).context("parse fast-ephemeral finalization source")?;
+    ensure!(
+        canonical_json_line(&source_value)? == source_raw,
+        "fast-ephemeral finalization source must be canonical JSON plus LF"
+    );
+    ensure!(
+        sha(&source_value, "sourceSha256")? == sha(manifest_value, "sourceSha256")?,
+        "fast-ephemeral manifest/source identity drifted"
+    );
+    let source = load_fast_ephemeral_source(source_value)?;
+    let plan = build_auxiliary_plan(&source)?;
+    ensure!(
+        array(&plan, "obligations")?.is_empty(),
+        "fast-ephemeral finalization source lacks complete panel evidence"
+    );
+    let bundles = admit_receipts(&source, &plan)?;
+    let cumulative = build_cumulative_archive(&source, &bundles)?;
+    let archive = build_parent_archive(&source, &cumulative)?;
+    let cumulative_path = output_dir.join(CUMULATIVE_PATH);
+    let archive_path = output_dir.join(ARCHIVE_PATH);
+    write_fast_value(
+        &cumulative_path,
+        &cumulative,
+        "fast-ephemeral cumulative archive",
+    )?;
+    write_fast_value(&archive_path, &archive, "fast-ephemeral parent archive")?;
+    let parent_schedule = member(
+        member(&archive, "rotatingEvidenceTransaction")?,
+        "parentSchedule",
+    )?
+    .clone();
+    let mut result = json!({
+        "schemaVersion": FAST_EPHEMERAL_RESULT_SCHEMA,
+        "executionMode": "fast-ephemeral-v1",
+        "generationIndex": source.generation_index,
+        "manifestSha256": sha(manifest_value,"manifestSha256")?,
+        "sourceSha256": source.source_sha256,
+        "cumulativeArchive": descriptor(CUMULATIVE_PATH, &cumulative, "archiveSha256")?,
+        "parentArchive": descriptor(ARCHIVE_PATH, &archive, "archiveSha256")?,
+        "parentSchedule": parent_schedule,
+        "candidateCount": source.current_member_count,
+        "memberCount": unsigned(&archive,"memberCount")?,
+        "occupiedCellCount": unsigned(&archive,"occupiedCellCount")?,
+        "newCellCount": unsigned(&archive,"newCellCount")?,
+        "elapsedMilliseconds": started.elapsed().as_millis() as u64
+    });
+    add_self_hash(&mut result, "resultSha256")?;
+    write_fast_value(
+        &output_dir.join("fast-ephemeral-result.json"),
+        &result,
+        "fast-ephemeral finalization result",
+    )?;
+    let _ = manifest_path;
+    Ok(result)
+}
+
+fn load_fast_ephemeral_source(value: Value) -> Result<Source> {
+    exact_keys(
+        object(&value, "fast-ephemeral finalization source")?,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "rotatingEvidence",
+            "cohort",
+            "provisional",
+            "selectedRichMembers",
+            "candidatePanelBundles",
+            "previousCumulativeArchive",
+            "previousParentArchiveSummary",
+            "archivePolicy",
+            "sourceSha256",
+        ],
+        "fast-ephemeral finalization source",
+    )?;
+    ensure!(
+        text(&value, "schemaVersion")? == FAST_EPHEMERAL_SOURCE_SCHEMA,
+        "fast-ephemeral finalization source schema is incompatible"
+    );
+    verify_self_hash(&value, "sourceSha256", "fast-ephemeral finalization source")?;
+    let generation_index = unsigned(&value, "generationIndex")?;
+    let rotating = member(&value, "rotatingEvidence")?.clone();
+    ensure!(
+        text(&rotating, "schemaVersion")? == ROTATING_SCHEMA,
+        "fast-ephemeral rotating contract is incompatible"
+    );
+    verify_self_hash(&rotating, "rotatingEvidenceSha256", "rotating contract")?;
+    let rotating_sha = sha(&rotating, "rotatingEvidenceSha256")?;
+    let panels = array(&rotating, "panels")?;
+    let cycle = unsigned(
+        member(&rotating, "absoluteGenerationMapping")?,
+        "cycleLength",
+    )? as usize;
+    ensure!(
+        cycle > 0 && cycle == panels.len(),
+        "rotating panel cycle is invalid"
+    );
+    let current_panel_id =
+        text(&panels[(generation_index as usize - 1) % cycle], "panelId")?.to_owned();
+    let mut required_panel_ids = Vec::new();
+    for index in 0..generation_index as usize {
+        let panel = text(&panels[index % cycle], "panelId")?.to_owned();
+        if !required_panel_ids.contains(&panel) {
+            required_panel_ids.push(panel);
+        }
+    }
+    let breeder_width = unsigned(member(&rotating, "robustSelection")?, "breederWidth")? as usize;
+    let cohort = member(&value, "cohort")?.clone();
+    verify_self_hash(&cohort, "cohortSha256", "cohort")?;
+    ensure!(
+        unsigned(&cohort, "generationIndex")? == generation_index
+            && sha(&cohort, "rotatingEvidenceSha256")? == rotating_sha
+            && text(&cohort, "panelId")? == current_panel_id,
+        "fast-ephemeral cohort binding drifted"
+    );
+    let provisional = member(&value, "provisional")?.clone();
+    verify_self_hash(&provisional, "provisionalSha256", "provisional")?;
+    ensure!(
+        unsigned(&provisional, "generationIndex")? == generation_index
+            && sha(&provisional, "cohortSha256")? == sha(&cohort, "cohortSha256")?,
+        "fast-ephemeral provisional binding drifted"
+    );
+    let prior_cumulative = nullable_member(&value, "previousCumulativeArchive")?.cloned();
+    if let Some(previous) = &prior_cumulative {
+        verify_self_hash(previous, "archiveSha256", "previous cumulative archive")?;
+    }
+    let previous_parent = member(&value, "previousParentArchiveSummary")?.clone();
+    validate_previous_parent_summary(&previous_parent)?;
+    let archive_policy = member(&value, "archivePolicy")?.clone();
+    verify_self_hash(
+        &archive_policy,
+        "policyBindingSha256",
+        "archive policy binding",
+    )?;
+    validate_corrected_archive_policy(&archive_policy)?;
+    let rich_members =
+        validate_selected_rich_members(&value, generation_index, &cohort, &provisional)?;
+    let baseline_bundles = array(&value, "candidatePanelBundles")?.to_vec();
+    let current_member_count = array(&cohort, "candidates")?.len() as u64;
+    let cell_capacity = derive_cell_capacity(&archive_policy)?;
+    let source_sha256 = sha(&value, "sourceSha256")?;
+    Ok(Source {
+        value,
+        generation_index,
+        rotating_sha,
+        current_panel_id,
+        required_panel_ids,
+        breeder_width,
+        cohort,
+        provisional,
+        baseline_bundles,
+        complete_bundle_snapshot: true,
+        receipts: Vec::new(),
+        prior_cumulative,
+        previous_parent,
+        archive_policy,
+        rich_members,
+        current_member_count,
+        cell_capacity,
+        campaigns: Vec::new(),
+        funnel_source: Value::Null,
+        state_basis: Value::Null,
+        semantic_authority_sha256:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        runtime_authority_sha256:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        completed_generation_records: Vec::new(),
+        proposal_state_authority: Value::Null,
+        expected_plan: None,
+        source_sha256,
+    })
+}
+
+fn write_fast_value(path: &Path, value: &Value, name: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {name} parent"))?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create {name}"))?;
+    file.write_all(&canonical_json_line(value)?)
+        .with_context(|| format!("write {name}"))?;
+    file.flush().with_context(|| format!("flush {name}"))?;
+    Ok(())
 }
 
 fn parse_manifest(raw: &[u8], output_dir: &Path) -> Result<Manifest> {

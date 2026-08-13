@@ -98,6 +98,9 @@ from .temporal_qd_v5_native import (
     V5_PROPOSAL_GENERATION_G0,
     V5_PROPOSAL_OPERATION,
     V5_PROPOSAL_THREAD_CAP_MAXIMUM,
+    V5_EXECUTION_MODE_DURABLE,
+    V5_EXECUTION_MODE_FAST_EPHEMERAL,
+    V5_FAST_EPHEMERAL_ADAPTER_SCHEMA,
     build_v5_bidirectional_pair_policy,
     build_v5_proposal_input_binding,
     build_v5_generation_bindings,
@@ -116,6 +119,7 @@ from .temporal_qd_v5_control_plane import (
     GENERATION_STATE_APPLICATION_SIDECAR_SCHEMA,
     GENERATION_STATE_PATCH_SCHEMA,
     TemporalQDV5ControlPlaneError,
+    build_native_v5_fast_ephemeral_prefinalizer_base_manifest,
     build_native_v5_prefinalizer_base_manifest,
     build_native_v5_prefinalizer_resume_manifest,
     certify_native_v5_initial_archive,
@@ -128,6 +132,7 @@ from .temporal_qd_v5_control_plane import (
     run_native_gateway_dispatch,
     run_native_v5_campaign_freeze,
     run_native_v5_generation_finalizer,
+    run_native_v5_fast_ephemeral_generation_finalizer,
     run_native_v5_rotating_prefinalizer,
     run_native_v5_evidence_ladder_archive_freeze,
     run_native_v5_archive_reducer,
@@ -980,6 +985,92 @@ def _validate_native_v5_construction_adapter(
     """
 
     adapter = _clone(value, name="native v5 construction adapter")
+    if adapter.get("schemaVersion") == V5_FAST_EPHEMERAL_ADAPTER_SCHEMA:
+        expected_fields = {
+            "schemaVersion",
+            "executionMode",
+            "operation",
+            "completed",
+            "generationKind",
+            "generationIndex",
+            "generationConfigSha256",
+            "attemptCount",
+            "acceptedCandidateCount",
+            "selectedEvaluationCandidateCount",
+            "proposalResultSha256",
+            "evaluationPopulation",
+            "identityLedger",
+            "adapterSha256",
+        }
+        if set(adapter) != expected_fields:
+            raise TemporalDiscoveryContractError(
+                "native v5 fast-ephemeral adapter shape drifted"
+            )
+        supplied_adapter_sha256 = _sha256(
+            adapter.pop("adapterSha256"),
+            name="native v5 fast-ephemeral construction adapter",
+        )
+        if supplied_adapter_sha256 != canonical_sha256(adapter):
+            raise TemporalDiscoveryContractError(
+                "native v5 fast-ephemeral adapter identity drifted"
+            )
+        adapter["adapterSha256"] = supplied_adapter_sha256
+        if (
+            adapter.get("executionMode") != V5_EXECUTION_MODE_FAST_EPHEMERAL
+            or adapter.get("operation") != V5_PROPOSAL_OPERATION
+            or adapter.get("completed") is not True
+            or adapter.get("generationKind") != generation_kind
+            or adapter.get("generationIndex") != generation_index
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 fast-ephemeral adapter binding drifted"
+            )
+        config_sha256 = _sha256(
+            adapter.get("generationConfigSha256"),
+            name="native v5 fast-ephemeral generation config",
+        )
+        if (
+            generation_config_sha256 is not None
+            and config_sha256 != generation_config_sha256
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 fast-ephemeral generation config drifted"
+            )
+        _sha256(
+            adapter.get("proposalResultSha256"),
+            name="native v5 fast-ephemeral proposal result",
+        )
+        for field in (
+            "attemptCount",
+            "acceptedCandidateCount",
+            "selectedEvaluationCandidateCount",
+        ):
+            count = adapter.get(field)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise TemporalDiscoveryContractError(
+                    f"native v5 fast-ephemeral {field} is invalid"
+                )
+        if (
+            adapter["acceptedCandidateCount"] > adapter["attemptCount"]
+            or adapter["selectedEvaluationCandidateCount"]
+            > adapter["acceptedCandidateCount"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 fast-ephemeral construction counts drifted"
+            )
+        adapter["evaluationPopulation"] = _native_v5_adapter_artifact(
+            adapter=adapter,
+            name="evaluationPopulation",
+            relative_path="evaluation-population.json",
+            proposal_root=proposal_root,
+        )
+        adapter["identityLedger"] = _native_v5_adapter_artifact(
+            adapter=adapter,
+            name="identityLedger",
+            relative_path="identity-ledger.json",
+            proposal_root=proposal_root,
+        )
+        return adapter
     expected_fields = {
         "schemaVersion",
         "operation",
@@ -1587,6 +1678,9 @@ def _run_native_v5_generation(
             generation_kind=generation_kind,
             parent_archive_input=parent_input,
             identity_ledger_input=identity_ledger_input,
+            execution_mode=str(
+                config.get("nativeV5ExecutionMode") or V5_EXECUTION_MODE_DURABLE
+            ),
         )
     except TemporalQDV5NativeError as exc:
         raise TemporalDiscoveryContractError(str(exc)) from exc
@@ -1605,24 +1699,29 @@ def _run_native_v5_generation(
         raise TemporalDiscoveryContractError(
             "native v5 construction receipt count disagrees with frozen dimensions"
         )
-    invocation = _build_native_v5_supervisor_invocation(
-        root=root,
-        generation_index=generation_index,
-        generation_config=generation_config,
-        generation_kind=generation_kind,
-        evaluation_population_size=evaluation_width,
-        parent_archive_input=parent_input,
-        identity_ledger_input=identity_ledger_input,
-        construction_adapter=checked_adapter,
+    fast_ephemeral = (
+        checked_adapter.get("executionMode") == V5_EXECUTION_MODE_FAST_EPHEMERAL
     )
-    return {
+    invocation = (
+        None
+        if fast_ephemeral
+        else _build_native_v5_supervisor_invocation(
+            root=root,
+            generation_index=generation_index,
+            generation_config=generation_config,
+            generation_kind=generation_kind,
+            evaluation_population_size=evaluation_width,
+            parent_archive_input=parent_input,
+            identity_ledger_input=identity_ledger_input,
+            construction_adapter=checked_adapter,
+        )
+    )
+    result = {
         "completed": True,
         "generationKind": generation_kind,
-        "populationSha256": checked_adapter["population"]["semanticSha256"],
         "evaluationPopulationSha256": checked_adapter["evaluationPopulation"][
             "semanticSha256"
         ],
-        "journalSha256": checked_adapter["generationJournal"]["semanticSha256"],
         "proposalCount": checked_adapter["attemptCount"],
         "candidateCount": checked_adapter["selectedEvaluationCandidateCount"],
         "acceptedCandidateCount": checked_adapter["acceptedCandidateCount"],
@@ -1665,8 +1764,14 @@ def _run_native_v5_generation(
         # config.  The legacy continuation cursor has no v5 proposal role.
         "nextImmigrantContinuationOrdinal": 0,
         "nativeV5Construction": checked_adapter,
-        "nativeV5Invocation": invocation,
     }
+    if fast_ephemeral:
+        result["executionMode"] = V5_EXECUTION_MODE_FAST_EPHEMERAL
+    else:
+        result["populationSha256"] = checked_adapter["population"]["semanticSha256"]
+        result["journalSha256"] = checked_adapter["generationJournal"]["semanticSha256"]
+        result["nativeV5Invocation"] = invocation
+    return result
 
 
 def _native_v5_campaign_timeout(value: object, *, name: str) -> int:
@@ -2346,6 +2451,237 @@ def _complete_native_v5_generation(
         "funnelReduction": funnel,
         "prefinalizer": prefinalizer,
         "finalization": finalization,
+    }
+
+
+def _complete_native_v5_generation_fast_ephemeral(
+    *,
+    root: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    config: Mapping[str, Any],
+    generation_index: int,
+    generation_result: Mapping[str, Any],
+    parent_archive_descriptor: Mapping[str, Any],
+    previous_cumulative_archive_descriptor: Mapping[str, Any] | None,
+    gateway_token: str | None,
+) -> dict[str, Any]:
+    """Run the scientifically required rotating path without durable replay machinery."""
+
+    rotating = config.get("rotatingEvidence")
+    evolvable = _v5_evolvable_authority(config)
+    if (
+        not isinstance(rotating, Mapping)
+        or evolvable is None
+        or not isinstance(evolvable.get("archivePolicyAuthority"), Mapping)
+    ):
+        raise TemporalDiscoveryContractError(
+            "fast-ephemeral completion requires rotating/archive authorities"
+        )
+    generation_kind = generation_result.get("generationKind")
+    adapter = _validate_native_v5_construction_adapter(
+        value=_clone(
+            generation_result.get("nativeV5Construction"),
+            name="fast-ephemeral proposal construction adapter",
+        ),
+        proposal_root=_native_v5_proposal_root(root, generation_index),
+        generation_index=generation_index,
+        generation_kind=str(generation_kind),
+    )
+    if adapter.get("executionMode") != V5_EXECUTION_MODE_FAST_EPHEMERAL:
+        raise TemporalDiscoveryContractError(
+            "fast-ephemeral completion received a durable adapter"
+        )
+    runtime_authority = _native_runtime_authority_for_generation(
+        root=root, generation_index=generation_index
+    )
+    _require_native_v5_control_plane_runtime_authority(runtime_authority)
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    current_panel = panel_for_generation(rotating, generation_index)
+    evaluation_population_path = Path(
+        str(adapter["evaluationPopulation"]["absolutePath"])
+    )
+    state["stage"] = "fast_ephemeral_proposal_campaign"
+    _save_state(state_path, state)
+    proposal_campaign = _run_native_v5_campaign_round(
+        runtime_authority=runtime_authority,
+        config=config,
+        generation_index=generation_index,
+        evaluation_population_path=evaluation_population_path,
+        evaluation_population_raw_sha256=str(
+            adapter["evaluationPopulation"]["fileSha256"]
+        ),
+        campaign_root=(generation_root / "campaign" / "proposal-current-panel"),
+        panel=current_panel,
+        campaign_role="proposal_current_panel",
+        cohort_source={
+            "kind": "proposal_evaluation_population",
+            "sourceSemanticSha256": adapter["evaluationPopulation"]["semanticSha256"],
+            "candidateCount": adapter["selectedEvaluationCandidateCount"],
+            "selectionSha256": None,
+        },
+        gateway_token=gateway_token,
+    )
+    task_count = int(
+        proposal_campaign["campaignReceipt"]["receipt"]["campaignInput"][
+            "taskCount"
+        ]
+    )
+    state["stage"] = "fast_ephemeral_rotating_merge"
+    _save_state(state_path, state)
+    try:
+        base = build_native_v5_fast_ephemeral_prefinalizer_base_manifest(
+            runtime_authority=runtime_authority,
+            output_root=(generation_root / "prefinalizer" / "fast-base"),
+            generation_index=generation_index,
+            rotating_evidence=rotating,
+            archive_policy_authority=_native_v5_archive_policy_binding(
+                evolvable["archivePolicyAuthority"]
+            ),
+            previous_parent_archive_binding=_native_v5_prefinalizer_archive_binding(
+                parent_archive_descriptor,
+                name="fast-ephemeral previous parent archive",
+            ),
+            previous_cumulative_archive_binding=(
+                _native_v5_prefinalizer_archive_binding(
+                    previous_cumulative_archive_descriptor,
+                    name="fast-ephemeral previous cumulative archive",
+                )
+                if previous_cumulative_archive_descriptor is not None
+                else None
+            ),
+            proposal_campaign_receipt_path=Path(
+                proposal_campaign["campaignReceipt"]["receiptPath"]
+            ),
+            finalizer_output_root=_native_finalization_root(root, generation_index),
+        )
+        prefinalizer = run_native_v5_rotating_prefinalizer(
+            runtime_authority=runtime_authority,
+            manifest_path=Path(base["manifestPath"]),
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+
+    while prefinalizer["receipt"]["status"] != "ready_for_finalizer":
+        selections = tuple(prefinalizer["taskSelections"])
+        if not selections:
+            raise TemporalDiscoveryContractError(
+                "fast-ephemeral merge awaited work without a Rust selection"
+            )
+        receipts: list[Path] = []
+        for selection in sorted(selections, key=lambda item: int(item["taskOrdinal"])):
+            panel = _native_v5_panel_by_id(
+                rotating_evidence=rotating, panel_id=str(selection["panelId"])
+            )
+            round_root = (
+                generation_root
+                / "campaign"
+                / "fast-prefinalizer"
+                / f"round-{int(prefinalizer['receipt']['roundIndex']):04d}"
+                / f"task-{int(selection['taskOrdinal']):04d}"
+            )
+            campaign = _run_native_v5_campaign_round(
+                runtime_authority=runtime_authority,
+                config=config,
+                generation_index=generation_index,
+                evaluation_population_path=evaluation_population_path,
+                evaluation_population_raw_sha256=str(
+                    adapter["evaluationPopulation"]["fileSha256"]
+                ),
+                campaign_root=round_root,
+                panel=panel,
+                campaign_role=str(selection["campaignRole"]),
+                cohort_source={
+                    "kind": "sealed_cohort_selection",
+                    "sourceSemanticSha256": selection["candidateSetSha256"],
+                    "candidateCount": selection["candidateCount"],
+                    "selectionSha256": selection["selectionSha256"],
+                },
+                cohort_selection_path=Path(selection["selectionPath"]),
+                gateway_token=gateway_token,
+            )
+            task_count += int(
+                campaign["campaignReceipt"]["receipt"]["campaignInput"][
+                    "taskCount"
+                ]
+            )
+            receipts.append(Path(campaign["campaignReceipt"]["receiptPath"]))
+        try:
+            resume = build_native_v5_prefinalizer_resume_manifest(
+                runtime_authority=runtime_authority,
+                output_root=(
+                    generation_root
+                    / "prefinalizer"
+                    / f"fast-round-{int(prefinalizer['receipt']['roundIndex']) + 1:04d}"
+                ),
+                base_manifest_path=Path(base["manifestPath"]),
+                previous_execution_receipt=prefinalizer["receipt"],
+                new_campaign_receipt_paths=tuple(receipts),
+            )
+            prefinalizer = run_native_v5_rotating_prefinalizer(
+                runtime_authority=runtime_authority,
+                manifest_path=Path(resume["manifestPath"]),
+            )
+        except TemporalQDV5ControlPlaneError as exc:
+            raise TemporalDiscoveryContractError(str(exc)) from exc
+
+    finalizer_binding = prefinalizer["receipt"].get("finalizerManifest")
+    if not isinstance(finalizer_binding, Mapping):
+        raise TemporalDiscoveryContractError(
+            "fast-ephemeral merge omitted its finalizer manifest"
+        )
+    state["stage"] = "fast_ephemeral_finalization"
+    _save_state(state_path, state)
+    try:
+        finalization = run_native_v5_fast_ephemeral_generation_finalizer(
+            runtime_authority=runtime_authority,
+            manifest_path=Path(str(finalizer_binding["path"])),
+        )
+    except TemporalQDV5ControlPlaneError as exc:
+        raise TemporalDiscoveryContractError(str(exc)) from exc
+    finalized = finalization["result"]
+    record = {
+        "schemaVersion": "temporal_qd_v5_fast_ephemeral_generation_record_v1",
+        "generationIndex": generation_index,
+        "candidateCount": int(adapter["selectedEvaluationCandidateCount"]),
+        "totalGenerationTaskCount": task_count,
+        "archivePath": "archive.json",
+        "archiveSha256": finalized["parentArchive"]["archiveSha256"],
+        "cumulativeArchiveSha256": finalized["cumulativeArchive"]["archiveSha256"],
+        "occupiedCellCount": finalized["occupiedCellCount"],
+        "newCellCount": finalized["newCellCount"],
+        "memberCount": finalized["memberCount"],
+        "parentSchedule": finalized["parentSchedule"],
+    }
+    record["generationRecordSha256"] = canonical_sha256(record)
+    completed = list(state.get("completedGenerations") or [])
+    completed.append(record)
+    state.update(
+        {
+            "stage": "generation_proposal",
+            "currentGenerationIndex": generation_index + 1,
+            "uniqueCandidatesEvaluated": int(
+                state.get("uniqueCandidatesEvaluated") or 0
+            )
+            + int(adapter["selectedEvaluationCandidateCount"]),
+            "workerTasksCompleted": int(state.get("workerTasksCompleted") or 0)
+            + task_count,
+            "completedGenerations": completed,
+            NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY: _native_v5_identity_ledger_descriptor(
+                adapter["identityLedger"],
+                name="fast-ephemeral committed identity ledger",
+                expected_path=_native_v5_proposal_root(root, generation_index)
+                / "identity-ledger.json",
+            ),
+        }
+    )
+    _save_state(state_path, state)
+    return {
+        "generationRecord": record,
+        "proposalCampaign": proposal_campaign,
+        "prefinalizer": prefinalizer,
+        "finalization": finalization,
+        "identityLedger": state[NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY],
     }
 
 
@@ -9196,6 +9532,7 @@ def _frozen_config(
     evaluation_population_size: int | None = None,
     evolvable_module_authority_config: Mapping[str, Any] | None = None,
     initial_archive_transport_descriptor: Mapping[str, Any] | None = None,
+    native_v5_execution_mode: str = V5_EXECUTION_MODE_DURABLE,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -9209,6 +9546,11 @@ def _frozen_config(
         raise TemporalDiscoveryContractError(
             "generation evaluation timeout must be at least 60 seconds"
         )
+    if native_v5_execution_mode not in {
+        V5_EXECUTION_MODE_DURABLE,
+        V5_EXECUTION_MODE_FAST_EPHEMERAL,
+    }:
+        raise TemporalDiscoveryContractError("native v5 execution mode is invalid")
     normalized_parameters = _normalize_parameters(parameters)
     evaluation_target = generation_count * int(
         normalized_parameters["targetUniqueCandidates"]
@@ -9236,6 +9578,13 @@ def _frozen_config(
         if evolvable_module_authority_config is not None
         else None
     )
+    if (
+        native_v5_execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL
+        and evolvable_authority is None
+    ):
+        raise TemporalDiscoveryContractError(
+            "fast-ephemeral-v1 requires current native v5 construction"
+        )
     # A current v5 run receives a Rust-certified archive transport, not an
     # archive payload.  Reading the archive here used to make fresh G0
     # creation a Python candidate/archive authority before the first native
@@ -9581,6 +9930,11 @@ def _frozen_config(
         "policySha256": policy_sha256,
         "frozenPolicy": _clone(frozen_policy, name="frozen QD policy"),
         "broadAdmission": bool(broad_admission),
+        **(
+            {"nativeV5ExecutionMode": native_v5_execution_mode}
+            if native_v5_execution_mode != V5_EXECUTION_MODE_DURABLE
+            else {}
+        ),
         **(
             {
                 "broadAdmissionContract": {
@@ -10920,6 +11274,7 @@ def run_qd_supervisor(
     authorize_native_finalization_authority_rotation: bool = False,
     stop_before_evaluation_generation: int | None = None,
     evolvable_module_authority_config: Mapping[str, Any] | None = None,
+    native_v5_execution_mode: str = V5_EXECUTION_MODE_DURABLE,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
     native_finalization_validation = _normalize_native_finalization_validation(
@@ -10935,6 +11290,14 @@ def run_qd_supervisor(
         if config_path.is_file()
         else None
     )
+    if (
+        persisted_config is not None
+        and persisted_config.get("nativeV5ExecutionMode", V5_EXECUTION_MODE_DURABLE)
+        != native_v5_execution_mode
+    ):
+        raise TemporalDiscoveryContractError(
+            "native v5 execution mode differs from the existing run"
+        )
     _require_native_v5_finalization_engine(
         generation_finalization_engine=generation_finalization_engine,
         supplied_evolvable_authority=evolvable_module_authority_config,
@@ -11064,6 +11427,7 @@ def run_qd_supervisor(
             evaluation_population_size=evaluation_population_size,
             evolvable_module_authority_config=evolvable_module_authority_config,
             initial_archive_transport_descriptor=initial_archive_transport_descriptor,
+            native_v5_execution_mode=native_v5_execution_mode,
         )
     if (
         tail_result_mode == TAIL_RESULT_MODE_INDEXED
@@ -11080,6 +11444,7 @@ def run_qd_supervisor(
             "Rust generation finalization requires indexed tail authority"
         )
     state_path = root / "state.json"
+    state_existed_at_start = state_path.exists()
     if legacy_reopen is None:
         _write_once(config_path, config)
         if config.get("evidenceLadder") is not None:
@@ -11112,6 +11477,14 @@ def run_qd_supervisor(
             "tripwire": None,
         }
         _save_state(state_path, state)
+    if (
+        config.get("nativeV5ExecutionMode") == V5_EXECUTION_MODE_FAST_EPHEMERAL
+        and state_existed_at_start
+    ):
+        raise TemporalDiscoveryContractError(
+            "fast-ephemeral-v1 is deliberately non-resumable; discard the partial "
+            "run root and start a fresh run"
+        )
     _require_irreversible_native_cutover_engine(
         root=root,
         generation_finalization_engine=generation_finalization_engine,
@@ -11616,37 +11989,64 @@ def run_qd_supervisor(
                         "current native v5 does not support the legacy Python "
                         "stop-before-evaluation canary"
                     )
-                native_completion = _complete_native_v5_generation(
-                    root=root,
-                    state=state,
-                    state_path=state_path,
-                    config=config,
-                    generation_index=generation_index,
-                    generation_result=generation_result,
-                    identity_ledger_input=native_v5_identity_ledger_input,
-                    parent_archive_descriptor=parent_archive_descriptor,
-                    previous_cumulative_archive_descriptor=previous_cumulative_archive_descriptor,
-                    gateway_token=gateway_token,
+                fast_ephemeral = (
+                    config.get("nativeV5ExecutionMode")
+                    == V5_EXECUTION_MODE_FAST_EPHEMERAL
                 )
-                generation_record = native_completion["generationRecord"]
-                committed_native_v5_identity_ledger_descriptor = (
-                    _native_v5_identity_ledger_descriptor(
-                        state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY),
-                        name="native v5 committed postproposal identity ledger",
-                        expected_path=_native_v5_identity_ledger_output_path(
-                            root, generation_index
-                        ),
+                native_completion = (
+                    _complete_native_v5_generation_fast_ephemeral(
+                        root=root,
+                        state=state,
+                        state_path=state_path,
+                        config=config,
+                        generation_index=generation_index,
+                        generation_result=generation_result,
+                        parent_archive_descriptor=parent_archive_descriptor,
+                        previous_cumulative_archive_descriptor=previous_cumulative_archive_descriptor,
+                        gateway_token=gateway_token,
+                    )
+                    if fast_ephemeral
+                    else _complete_native_v5_generation(
+                        root=root,
+                        state=state,
+                        state_path=state_path,
+                        config=config,
+                        generation_index=generation_index,
+                        generation_result=generation_result,
+                        identity_ledger_input=native_v5_identity_ledger_input,
+                        parent_archive_descriptor=parent_archive_descriptor,
+                        previous_cumulative_archive_descriptor=previous_cumulative_archive_descriptor,
+                        gateway_token=gateway_token,
                     )
                 )
-                expected_ledger = _native_v5_identity_ledger_descriptor_from_adapter(
-                    adapter=_clone(
-                        generation_result["nativeV5Construction"],
-                        name="native v5 completed construction adapter",
-                    ),
-                    root=root,
-                    generation_index=generation_index,
-                    name="native v5 completed proposal identity ledger",
-                )
+                generation_record = native_completion["generationRecord"]
+                if fast_ephemeral:
+                    committed_native_v5_identity_ledger_descriptor = (
+                        _native_v5_identity_ledger_descriptor(
+                            native_completion["identityLedger"],
+                            name="fast-ephemeral committed identity ledger",
+                        )
+                    )
+                    expected_ledger = committed_native_v5_identity_ledger_descriptor
+                else:
+                    committed_native_v5_identity_ledger_descriptor = (
+                        _native_v5_identity_ledger_descriptor(
+                            state.get(NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY),
+                            name="native v5 committed postproposal identity ledger",
+                            expected_path=_native_v5_identity_ledger_output_path(
+                                root, generation_index
+                            ),
+                        )
+                    )
+                    expected_ledger = _native_v5_identity_ledger_descriptor_from_adapter(
+                        adapter=_clone(
+                            generation_result["nativeV5Construction"],
+                            name="native v5 completed construction adapter",
+                        ),
+                        root=root,
+                        generation_index=generation_index,
+                        name="native v5 completed proposal identity ledger",
+                    )
                 if committed_native_v5_identity_ledger_descriptor != expected_ledger:
                     raise TemporalDiscoveryContractError(
                         "native v5 postproposal identity-ledger descriptor drifted"
@@ -12701,11 +13101,22 @@ def main() -> None:
         default=3600,
         help="frozen whole-process timeout for one native pair generation",
     )
+    parser.add_argument(
+        "--native-v5-execution-mode",
+        choices=(V5_EXECUTION_MODE_DURABLE, V5_EXECUTION_MODE_FAST_EPHEMERAL),
+        default=V5_EXECUTION_MODE_DURABLE,
+        help=(
+            "durable keeps receipt/restart machinery; fast-ephemeral-v1 writes "
+            "direct disposable outputs and refuses resume"
+        ),
+    )
     args = parser.parse_args()
     if args.bidirectional_pair_config is None and any(value is None for value in (args.source_preparation, args.base_generator_root, args.confirmed_entry_admission_root, args.validator_command_file)):
         parser.error("legacy mode requires --source-preparation, --base-generator-root, --confirmed-entry-admission-root, and --validator-command-file")
     parameters = _read(args.parameters, name="QD supervisor parameters")
     if args.continue_from is not None:
+        if args.native_v5_execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL:
+            parser.error("fast-ephemeral-v1 does not support continuation or resume")
         if args.initial_archive is not None:
             parser.error("--continue-from derives the source campaign's immutable final archive; do not also pass --initial-archive")
         result = run_qd_continuation(
@@ -12846,6 +13257,7 @@ def main() -> None:
             if args.evolvable_module_authority_config is not None
             else None
         ),
+        native_v5_execution_mode=args.native_v5_execution_mode,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

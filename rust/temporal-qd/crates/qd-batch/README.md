@@ -31,3 +31,15 @@ require contiguous ordinals and strictly increasing identities, authenticate eve
 declared object, reject namespace extras, and then run typed kernel replay. A committed
 receipt can recreate the invocation result without reopening manifest input documents
 or private publication fragments.
+
+## Disposable fast execution
+
+`--execution-mode fast-ephemeral-v1` is a separate, deliberately non-resumable
+current-v5 path. It performs the same typed G0/evolved construction and emits the
+evaluation population and identity ledger needed by the live experiment, but it does
+not build the private staging tree, immutable object store, object inventory, journal,
+publication receipts, adoption proof, or pre-publication replay. Outputs are written
+directly and the command refuses any pre-existing transaction output.
+
+This mode is for disposable research runs where a crash means deleting the run root
+and starting over. The default remains the durable receipt-last path.

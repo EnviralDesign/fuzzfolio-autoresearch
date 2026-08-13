@@ -82,6 +82,15 @@ count dynamic and identity-bound; the supervisor freezes an upper bound rather
 than claiming one fixed campaign total. Conservative costs control quality and
 reproduction; the no-cost view is diagnostic only.
 
+For disposable iteration, pass `--native-v5-execution-mode fast-ephemeral-v1`.
+This keeps the typed Rust construction, worker evaluation, rotating-evidence
+selection, and final archive calculation, while omitting proposal staging/object
+publication, pre-publication replay, generation funnel/ledger/checkpoint/state-patch
+construction, and restart adoption. It writes only the live population/identity
+inputs and the cumulative/parent archives needed for the next generation. The mode
+cannot resume: after a crash, delete the run root and start again. Durable remains the
+default.
+
 First materialize the immutable rotating evidence authority. It attests all
 sixteen year-quarter cells, freezes four Latin-square panels, labels the later
 12-month and 36-month stages as research scrutiny, and leaves only the outer

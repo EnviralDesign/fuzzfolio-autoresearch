@@ -1904,6 +1904,104 @@ def test_new_transaction_starts_one_native_batch_and_no_python_candidate_child(
     assert result["attemptCount"] == 5
 
 
+def test_fast_ephemeral_bridge_is_distinct_minimal_and_non_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root = tmp_path / "output"
+    batch = _batch_authority()
+    binary = tmp_path / "temporal-qd-batch.exe"
+    binary.write_bytes(b"fixture")
+    monkeypatch.setattr(native, "require_native_batch", lambda: (binary, batch))
+    monkeypatch.setattr(native, "_sha256_file", lambda _path: batch["executableSha256"])
+    monkeypatch.setattr(native, "native_source_sha256", lambda: batch["sourceSha256"])
+    commands: list[tuple[str, ...]] = []
+
+    def run_once(command: object, **_kwargs: object) -> SimpleNamespace:
+        command = tuple(str(part) for part in command)
+        commands.append(command)
+        assert command[3:] == (
+            "--execution-mode",
+            v5.V5_EXECUTION_MODE_FAST_EPHEMERAL,
+        )
+        manifest = json.loads(Path(command[2]).read_text(encoding="utf-8"))
+        artifacts = {
+            "evaluationPopulation": {
+                "relativePath": "evaluation-population.json",
+                "semanticSha256": _sha("c"),
+                "fileSha256": _sha("d"),
+                "byteLength": 123,
+            },
+            "identityLedger": {
+                "relativePath": "identity-ledger.json",
+                "semanticSha256": _sha("e"),
+                "fileSha256": _sha("f"),
+                "byteLength": 45,
+            },
+        }
+        result = {
+            "schemaVersion": v5.V5_FAST_EPHEMERAL_RESULT_SCHEMA,
+            "executionMode": v5.V5_EXECUTION_MODE_FAST_EPHEMERAL,
+            "status": "completed",
+            "generationKind": v5.V5_PROPOSAL_GENERATION_G0,
+            "generationIndex": manifest["generationIndex"],
+            "manifestSha256": manifest["manifestSha256"],
+            "generationConfigSha256": manifest["generationConfigSha256"],
+            "attemptCount": manifest["requestedCount"],
+            "acceptedCandidateCount": manifest["requestedCount"],
+            "selectedEvaluationCandidateCount": manifest["evaluationPopulationSize"],
+            "artifacts": artifacts,
+            "timings": {
+                "staticAuthorityMilliseconds": 1,
+                "constructionMilliseconds": 2,
+                "ephemeralPublicationMilliseconds": 3,
+                "totalMilliseconds": 6,
+            },
+        }
+        result["resultSha256"] = sha256(canonical_json_bytes(result))
+        result_path = Path(command[2]).parent / v5.V5_PROPOSAL_RESULT_FILENAME
+        result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+        complete = {
+            "schemaVersion": v5.V5_FAST_EPHEMERAL_COMPLETE_SCHEMA,
+            "executionMode": v5.V5_EXECUTION_MODE_FAST_EPHEMERAL,
+            "generationIndex": manifest["generationIndex"],
+            "resultSha256": result["resultSha256"],
+            "artifacts": artifacts,
+        }
+        complete["completeSha256"] = sha256(canonical_json_bytes(complete))
+        (output_root / "COMPLETE.json").write_bytes(
+            canonical_json_bytes(complete) + b"\n"
+        )
+        return SimpleNamespace(stdout=canonical_json_bytes(result) + b"\n")
+
+    monkeypatch.setattr(native, "_run_checked", run_once)
+    kwargs = _native_run_kwargs(output_root)
+    kwargs["execution_mode"] = v5.V5_EXECUTION_MODE_FAST_EPHEMERAL
+    adapter = v5.run_native_v5_generation_construction(**kwargs)
+
+    assert adapter["schemaVersion"] == v5.V5_FAST_EPHEMERAL_ADAPTER_SCHEMA
+    assert adapter["executionMode"] == v5.V5_EXECUTION_MODE_FAST_EPHEMERAL
+    assert set(adapter) == {
+        "schemaVersion",
+        "executionMode",
+        "operation",
+        "completed",
+        "generationKind",
+        "generationIndex",
+        "generationConfigSha256",
+        "attemptCount",
+        "acceptedCandidateCount",
+        "selectedEvaluationCandidateCount",
+        "proposalResultSha256",
+        "evaluationPopulation",
+        "identityLedger",
+        "adapterSha256",
+    }
+    assert len(commands) == 1
+    with pytest.raises(v5.TemporalQDV5NativeError, match="non-resumable"):
+        v5.run_native_v5_generation_construction(**kwargs)
+    assert len(commands) == 1
+
+
 def test_native_v5_rejects_oversized_compact_proposal_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

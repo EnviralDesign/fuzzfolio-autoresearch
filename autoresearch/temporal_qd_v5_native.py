@@ -104,6 +104,13 @@ V5_G0_NATIVE_V5_INVOCATION_SCHEMA = (
     "temporal_qd_native_v5_g0_invocation_descriptor_v1"
 )
 V5_PROPOSAL_OPERATION = "native_v5_proposal_construction"
+V5_EXECUTION_MODE_DURABLE = "durable"
+V5_EXECUTION_MODE_FAST_EPHEMERAL = "fast-ephemeral-v1"
+V5_FAST_EPHEMERAL_RESULT_SCHEMA = "temporal_qd_v5_fast_ephemeral_result_v1"
+V5_FAST_EPHEMERAL_COMPLETE_SCHEMA = "temporal_qd_v5_fast_ephemeral_complete_v1"
+V5_FAST_EPHEMERAL_ADAPTER_SCHEMA = (
+    "temporal_qd_native_v5_fast_ephemeral_generation_adapter_v1"
+)
 V5_PROPOSAL_RESULT_FILENAME = "v5-proposal-result.json"
 V5_PROPOSAL_GENERATION_G0 = "g0"
 V5_PROPOSAL_GENERATION_EVOLVED = "evolved"
@@ -2644,6 +2651,117 @@ def _validate_v5_receipt(
     )
 
 
+def _validate_fast_ephemeral_artifact(
+    value: object, *, output_root: Path, relative_path: str, name: str
+) -> dict[str, Any]:
+    artifact = _mapping(value, name=name)
+    _exact_keys(
+        artifact,
+        {"relativePath", "semanticSha256", "fileSha256", "byteLength"},
+        name=name,
+    )
+    if (
+        _safe_relative_output_path(artifact.get("relativePath"), name=f"{name} path")
+        != relative_path
+    ):
+        raise TemporalQDV5NativeError(f"{name} path drifted")
+    _sha(artifact.get("semanticSha256"), name=f"{name} semantic identity")
+    _sha(artifact.get("fileSha256"), name=f"{name} file identity")
+    if _nonnegative(artifact.get("byteLength"), name=f"{name} byte length") == 0:
+        raise TemporalQDV5NativeError(f"{name} cannot be empty")
+    # The Rust writer produced these bytes and their digest in one pass. The
+    # thin Python plane deliberately does not reopen or rehash them.
+    artifact["absolutePath"] = str(output_root / relative_path)
+    return artifact
+
+
+def validate_v5_fast_ephemeral_result(
+    value: object, *, manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    checked_manifest = validate_v5_proposal_manifest(manifest)
+    result = _mapping(value, name="v5 fast-ephemeral result")
+    _exact_keys(
+        result,
+        {
+            "schemaVersion",
+            "executionMode",
+            "status",
+            "generationKind",
+            "generationIndex",
+            "manifestSha256",
+            "generationConfigSha256",
+            "attemptCount",
+            "acceptedCandidateCount",
+            "selectedEvaluationCandidateCount",
+            "artifacts",
+            "timings",
+            "resultSha256",
+        },
+        name="v5 fast-ephemeral result",
+    )
+    if (
+        result.get("schemaVersion") != V5_FAST_EPHEMERAL_RESULT_SCHEMA
+        or result.get("executionMode") != V5_EXECUTION_MODE_FAST_EPHEMERAL
+        or result.get("status") != "completed"
+        or result.get("generationKind") != checked_manifest["generationKind"]
+        or result.get("generationIndex") != checked_manifest["generationIndex"]
+        or result.get("manifestSha256") != checked_manifest["manifestSha256"]
+        or result.get("generationConfigSha256")
+        != checked_manifest["generationConfigSha256"]
+        or result.get("acceptedCandidateCount") != checked_manifest["requestedCount"]
+        or result.get("selectedEvaluationCandidateCount")
+        != checked_manifest["evaluationPopulationSize"]
+        or not isinstance(result.get("attemptCount"), int)
+        or isinstance(result.get("attemptCount"), bool)
+        or result["attemptCount"] < result["acceptedCandidateCount"]
+        or result["attemptCount"] > checked_manifest["maxProposalAttempts"]
+    ):
+        raise TemporalQDV5NativeError(
+            "v5 fast-ephemeral result is incompatible with its manifest"
+        )
+    artifacts = _mapping(
+        result.get("artifacts"), name="v5 fast-ephemeral artifacts"
+    )
+    _exact_keys(
+        artifacts,
+        {"evaluationPopulation", "identityLedger"},
+        name="v5 fast-ephemeral artifacts",
+    )
+    output_root = _v5_proposal_output_root(
+        checked_manifest["outputRoot"], name="v5 proposal output root"
+    )
+    _validate_fast_ephemeral_artifact(
+        artifacts["evaluationPopulation"],
+        output_root=output_root,
+        relative_path="evaluation-population.json",
+        name="v5 fast-ephemeral evaluation population",
+    )
+    _validate_fast_ephemeral_artifact(
+        artifacts["identityLedger"],
+        output_root=output_root,
+        relative_path="identity-ledger.json",
+        name="v5 fast-ephemeral identity ledger",
+    )
+    timings = _mapping(result.get("timings"), name="v5 fast-ephemeral timings")
+    _exact_keys(
+        timings,
+        {
+            "staticAuthorityMilliseconds",
+            "constructionMilliseconds",
+            "ephemeralPublicationMilliseconds",
+            "totalMilliseconds",
+        },
+        name="v5 fast-ephemeral timings",
+    )
+    for key, timing in timings.items():
+        _nonnegative(timing, name=f"v5 fast-ephemeral timing {key}")
+    return _self_hashed_object(
+        result,
+        identity_field="resultSha256",
+        name="v5 fast-ephemeral result",
+    )
+
+
 def validate_v5_proposal_result(
     value: object, *, manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -3646,6 +3764,50 @@ def validate_v5_g0_native_v5_invocation_descriptor(
     return descriptor
 
 
+def _v5_fast_ephemeral_generation_adapter_payload(
+    *, result: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    checked_manifest = validate_v5_proposal_manifest(manifest)
+    checked_result = validate_v5_fast_ephemeral_result(
+        result, manifest=checked_manifest
+    )
+    output_root = _v5_proposal_output_root(
+        checked_manifest["outputRoot"], name="v5 proposal output root"
+    )
+    artifacts = _mapping(
+        checked_result["artifacts"], name="v5 fast-ephemeral artifacts"
+    )
+    evaluation_population = _validate_fast_ephemeral_artifact(
+        artifacts["evaluationPopulation"],
+        output_root=output_root,
+        relative_path="evaluation-population.json",
+        name="v5 fast-ephemeral evaluation population",
+    )
+    identity_ledger = _validate_fast_ephemeral_artifact(
+        artifacts["identityLedger"],
+        output_root=output_root,
+        relative_path="identity-ledger.json",
+        name="v5 fast-ephemeral identity ledger",
+    )
+    return {
+        "schemaVersion": V5_FAST_EPHEMERAL_ADAPTER_SCHEMA,
+        "executionMode": V5_EXECUTION_MODE_FAST_EPHEMERAL,
+        "operation": V5_PROPOSAL_OPERATION,
+        "completed": True,
+        "generationKind": checked_result["generationKind"],
+        "generationIndex": checked_result["generationIndex"],
+        "generationConfigSha256": checked_result["generationConfigSha256"],
+        "attemptCount": checked_result["attemptCount"],
+        "acceptedCandidateCount": checked_result["acceptedCandidateCount"],
+        "selectedEvaluationCandidateCount": checked_result[
+            "selectedEvaluationCandidateCount"
+        ],
+        "proposalResultSha256": checked_result["resultSha256"],
+        "evaluationPopulation": evaluation_population,
+        "identityLedger": identity_ledger,
+    }
+
+
 def _v5_generation_construction_adapter_payload(
     *,
     result: Mapping[str, Any],
@@ -3744,8 +3906,14 @@ def build_v5_generation_construction_adapter(
     chain; it never opens or reconstructs a rich candidate/population.
     """
 
-    value = _v5_generation_construction_adapter_payload(
-        result=result, manifest=manifest
+    value = (
+        _v5_fast_ephemeral_generation_adapter_payload(
+            result=result, manifest=manifest
+        )
+        if result.get("schemaVersion") == V5_FAST_EPHEMERAL_RESULT_SCHEMA
+        else _v5_generation_construction_adapter_payload(
+            result=result, manifest=manifest
+        )
     )
     value["adapterSha256"] = sha256(canonical_json_bytes(value))
     return validate_v5_generation_construction_adapter(
@@ -3762,8 +3930,14 @@ def validate_v5_generation_construction_adapter(
     """Require an adapter to be the exact projection of a sealed receipt tree."""
 
     adapter = _mapping(value, name="v5 generation construction adapter")
-    expected = _v5_generation_construction_adapter_payload(
-        result=result, manifest=manifest
+    expected = (
+        _v5_fast_ephemeral_generation_adapter_payload(
+            result=result, manifest=manifest
+        )
+        if result.get("schemaVersion") == V5_FAST_EPHEMERAL_RESULT_SCHEMA
+        else _v5_generation_construction_adapter_payload(
+            result=result, manifest=manifest
+        )
     )
     expected["adapterSha256"] = sha256(canonical_json_bytes(expected))
     _exact_keys(
@@ -3799,6 +3973,7 @@ def run_native_v5_proposal_construction(
     identity_ledger_input: Mapping[str, Any] | None = None,
     on_process_started: Callable[[Any], None] | None = None,
     on_execution_evidence: Callable[[Mapping[str, Any]], None] | None = None,
+    execution_mode: str = V5_EXECUTION_MODE_DURABLE,
     _return_manifest: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
     """Run exactly one batch transaction, with no compatibility fallback.
@@ -3812,6 +3987,11 @@ def run_native_v5_proposal_construction(
     root = native._ensure_real_directory_tree(
         output_root, name="native v5 proposal output root"
     )
+    if execution_mode not in {
+        V5_EXECUTION_MODE_DURABLE,
+        V5_EXECUTION_MODE_FAST_EPHEMERAL,
+    }:
+        raise TemporalQDV5NativeError("native v5 execution mode is incompatible")
     timeout = _positive(execution_timeout_seconds, name="v5 execution timeout")
     # Fresh v5 owns no compile-at-launch escape hatch.  The exact batch
     # executable must already be present and is sealed before the one native
@@ -3871,8 +4051,15 @@ def run_native_v5_proposal_construction(
         )
         is not None
     )
+    if execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL and had_existing_result:
+        raise TemporalQDV5NativeError(
+            "fast-ephemeral-v1 is non-resumable; discard the incomplete run directory"
+        )
+    command = [str(binary), "--manifest", str(manifest_path)]
+    if execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL:
+        command.extend(("--execution-mode", V5_EXECUTION_MODE_FAST_EPHEMERAL))
     completed = native._run_checked(
-        (str(binary), "--manifest", str(manifest_path)),
+        tuple(command),
         cwd=native._repo_root(),
         timeout=float(timeout),
         on_process_started=on_process_started,
@@ -3891,11 +4078,13 @@ def run_native_v5_proposal_construction(
         raise TemporalQDV5NativeError(
             "completed native v5 transaction did not publish its immutable result"
         )
-    artifact = _validate_v5_result_for_manifest(
-        native._parse_canonical_json_line(
-            published[0], name="native v5 proposal result"
-        ),
-        manifest=manifest,
+    published_value = native._parse_canonical_json_line(
+        published[0], name="native v5 proposal result"
+    )
+    artifact = (
+        validate_v5_fast_ephemeral_result(published_value, manifest=manifest)
+        if execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL
+        else _validate_v5_result_for_manifest(published_value, manifest=manifest)
     )
     stdout_schema = (
         stdout_value.get("schemaVersion") if isinstance(stdout_value, Mapping) else None
@@ -3906,7 +4095,56 @@ def run_native_v5_proposal_construction(
         if manifest["generationKind"] == V5_PROPOSAL_GENERATION_G0
         else V5_EVOLVED_PROPOSAL_ADOPTION_EVIDENCE_SCHEMA
     )
-    if stdout_schema == evidence_schema:
+    if execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL:
+        stdout = validate_v5_fast_ephemeral_result(stdout_value, manifest=manifest)
+        if artifact != stdout:
+            raise TemporalQDV5NativeError(
+                "native v5 fast-ephemeral stdout/result artifact disagreement"
+            )
+        completion = native._existing_regular_file(
+            root / "COMPLETE.json",
+            name="native v5 fast-ephemeral completion marker",
+            maximum_bytes=_V5_COMPACT_PROPOSAL_RESULT_LIMIT_BYTES,
+        )
+        if completion is None:
+            raise TemporalQDV5NativeError(
+                "native v5 fast-ephemeral process did not publish COMPLETE.json"
+            )
+        complete = _mapping(
+            native._parse_canonical_json_line(
+                completion[0], name="native v5 fast-ephemeral completion marker"
+            ),
+            name="native v5 fast-ephemeral completion marker",
+        )
+        _exact_keys(
+            complete,
+            {
+                "schemaVersion",
+                "executionMode",
+                "generationIndex",
+                "resultSha256",
+                "artifacts",
+                "completeSha256",
+            },
+            name="native v5 fast-ephemeral completion marker",
+        )
+        if (
+            complete.get("schemaVersion") != V5_FAST_EPHEMERAL_COMPLETE_SCHEMA
+            or complete.get("executionMode") != V5_EXECUTION_MODE_FAST_EPHEMERAL
+            or complete.get("generationIndex") != artifact["generationIndex"]
+            or complete.get("resultSha256") != artifact["resultSha256"]
+            or complete.get("artifacts") != artifact["artifacts"]
+        ):
+            raise TemporalQDV5NativeError(
+                "native v5 fast-ephemeral completion binding drifted"
+            )
+        _self_hashed_object(
+            complete,
+            identity_field="completeSha256",
+            name="native v5 fast-ephemeral completion marker",
+        )
+        execution_evidence = artifact
+    elif stdout_schema == evidence_schema:
         if manifest["generationKind"] == V5_PROPOSAL_GENERATION_G0:
             execution_evidence = validate_v5_proposal_adoption_evidence(
                 stdout_value,
@@ -3964,6 +4202,7 @@ def run_native_v5_generation_construction(
     identity_ledger_input: Mapping[str, Any] | None = None,
     on_process_started: Callable[[Any], None] | None = None,
     on_execution_evidence: Callable[[Mapping[str, Any]], None] | None = None,
+    execution_mode: str = V5_EXECUTION_MODE_DURABLE,
 ) -> dict[str, Any]:
     """Run one native v5 transaction and return its exact supervisor adapter.
 
@@ -3990,6 +4229,7 @@ def run_native_v5_generation_construction(
         identity_ledger_input=identity_ledger_input,
         on_process_started=on_process_started,
         on_execution_evidence=on_execution_evidence,
+        execution_mode=execution_mode,
         _return_manifest=True,
     )
     if not isinstance(outcome, tuple) or len(outcome) != 2:

@@ -137,6 +137,18 @@ PREFINALIZER_BASE_MANIFEST_SCHEMA = "temporal_qd_v5_rotating_prefinalizer_manife
 PREFINALIZER_RESUME_MANIFEST_SCHEMA = (
     "temporal_qd_v5_rotating_prefinalizer_resume_manifest_v2"
 )
+FAST_EPHEMERAL_PREFINALIZER_BASE_MANIFEST_SCHEMA = (
+    "temporal_qd_v5_fast_ephemeral_prefinalizer_manifest_v1"
+)
+FAST_EPHEMERAL_PREFINALIZER_RESUME_MANIFEST_SCHEMA = (
+    "temporal_qd_v5_fast_ephemeral_prefinalizer_resume_manifest_v1"
+)
+FAST_EPHEMERAL_FINALIZER_MANIFEST_SCHEMA = (
+    "temporal_qd_v5_fast_ephemeral_finalization_manifest_v1"
+)
+FAST_EPHEMERAL_FINALIZER_RESULT_SCHEMA = (
+    "temporal_qd_v5_fast_ephemeral_finalization_result_v1"
+)
 PREFINALIZER_TASK_PLAN_SCHEMA = "temporal_qd_v5_rotating_prefinalizer_task_plan_v2"
 PREFINALIZER_TASK_SELECTION_SCHEMA = (
     "temporal_qd_v5_native_rich_candidate_selection_v2"
@@ -2693,6 +2705,88 @@ def build_native_v5_prefinalizer_base_manifest(
     return {"manifest": manifest, "manifestPath": str(path)}
 
 
+def build_native_v5_fast_ephemeral_prefinalizer_base_manifest(
+    *,
+    runtime_authority: Mapping[str, Any],
+    output_root: Path | str,
+    generation_index: int,
+    rotating_evidence: Mapping[str, Any],
+    archive_policy_authority: Mapping[str, Any],
+    previous_parent_archive_binding: Mapping[str, Any],
+    previous_cumulative_archive_binding: Mapping[str, Any] | None,
+    proposal_campaign_receipt_path: Path | str,
+    finalizer_output_root: Path | str,
+) -> dict[str, Any]:
+    """Publish the deliberately small, non-resumable-research merge authority."""
+
+    authority = _validate_runtime_authority(runtime_authority)
+    root = _real_directory(output_root, name="fast-ephemeral prefinalizer root")
+    finalizer_root = _real_directory(
+        finalizer_output_root, name="fast-ephemeral finalizer output root"
+    )
+    rotating = _self_hashed(
+        _mapping(rotating_evidence, name="fast-ephemeral rotating evidence"),
+        field="rotatingEvidenceSha256",
+        name="fast-ephemeral rotating evidence",
+    )
+    policy = _self_hashed(
+        _mapping(archive_policy_authority, name="fast-ephemeral archive policy"),
+        field="policyBindingSha256",
+        name="fast-ephemeral archive policy",
+    )
+    parent = _native_v5_archive_binding(
+        previous_parent_archive_binding,
+        name="fast-ephemeral previous parent archive",
+    )
+    cumulative = (
+        _native_v5_archive_binding(
+            previous_cumulative_archive_binding,
+            name="fast-ephemeral previous cumulative archive",
+        )
+        if previous_cumulative_archive_binding is not None
+        else None
+    )
+    proposal_receipt = _self_hashed(
+        _read_bounded_canonical_object(
+            proposal_campaign_receipt_path,
+            name="fast-ephemeral proposal campaign receipt",
+        ),
+        field="receiptSha256",
+        name="fast-ephemeral proposal campaign receipt",
+    )
+    if proposal_receipt.get("schemaVersion") not in {
+        CAMPAIGN_RECEIPT_SCHEMA,
+        CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA,
+    }:
+        raise TemporalQDV5ControlPlaneError(
+            "fast-ephemeral proposal campaign receipt schema drifted"
+        )
+    manifest = {
+        "schemaVersion": FAST_EPHEMERAL_PREFINALIZER_BASE_MANIFEST_SCHEMA,
+        "generationIndex": _positive(
+            generation_index, name="fast-ephemeral generation"
+        ),
+        "rotatingEvidence": rotating,
+        "archivePolicyAuthority": policy,
+        "previousParentArchiveBinding": parent,
+        "previousCumulativeArchiveBinding": cumulative,
+        "proposalCampaignReceiptBinding": _descriptor(
+            proposal_campaign_receipt_path
+        ),
+        "finalizerOutputRoot": _native_v5_rust_canonical_directory_transport(
+            finalizer_root
+        ),
+        "runtimeAuthoritySha256": authority["authoritySha256"],
+    }
+    manifest["manifestSha256"] = canonical_sha256(manifest)
+    path = _write_canonical_once(
+        root / "manifest.json",
+        manifest,
+        name="fast-ephemeral prefinalizer manifest",
+    )
+    return {"manifest": manifest, "manifestPath": str(path)}
+
+
 def _validated_native_v5_prefinalizer_execution_receipt(
     *,
     value: Mapping[str, Any],
@@ -2912,7 +3006,11 @@ def build_native_v5_prefinalizer_resume_manifest(
         field="manifestSha256",
         name="native v5 prefinalizer base manifest",
     )
-    if base.get("schemaVersion") != PREFINALIZER_BASE_MANIFEST_SCHEMA:
+    base_schema = base.get("schemaVersion")
+    if base_schema not in {
+        PREFINALIZER_BASE_MANIFEST_SCHEMA,
+        FAST_EPHEMERAL_PREFINALIZER_BASE_MANIFEST_SCHEMA,
+    }:
         raise TemporalQDV5ControlPlaneError("native v5 resume base manifest schema drifted")
     previous, _selections = _validated_native_v5_prefinalizer_execution_receipt(
         value=previous_execution_receipt,
@@ -2968,7 +3066,11 @@ def build_native_v5_prefinalizer_resume_manifest(
         receipt_ids.add(receipt["receiptSha256"])
         receipts.append(_descriptor(receipt_path))
     manifest = {
-        "schemaVersion": PREFINALIZER_RESUME_MANIFEST_SCHEMA,
+        "schemaVersion": (
+            FAST_EPHEMERAL_PREFINALIZER_RESUME_MANIFEST_SCHEMA
+            if base_schema == FAST_EPHEMERAL_PREFINALIZER_BASE_MANIFEST_SCHEMA
+            else PREFINALIZER_RESUME_MANIFEST_SCHEMA
+        ),
         "contractVersion": CONTRACT_VERSION,
         "operation": "resume_native_v5_rotating_generation",
         "baseManifestBinding": _descriptor(base_manifest_path),
@@ -3013,8 +3115,17 @@ def run_native_v5_rotating_prefinalizer(
     )
     if (
         manifest.get("schemaVersion")
-        not in {PREFINALIZER_BASE_MANIFEST_SCHEMA, PREFINALIZER_RESUME_MANIFEST_SCHEMA}
-        or manifest.get("contractVersion") != CONTRACT_VERSION
+        not in {
+            PREFINALIZER_BASE_MANIFEST_SCHEMA,
+            PREFINALIZER_RESUME_MANIFEST_SCHEMA,
+            FAST_EPHEMERAL_PREFINALIZER_BASE_MANIFEST_SCHEMA,
+            FAST_EPHEMERAL_PREFINALIZER_RESUME_MANIFEST_SCHEMA,
+        }
+        or (
+            manifest.get("schemaVersion")
+            != FAST_EPHEMERAL_PREFINALIZER_BASE_MANIFEST_SCHEMA
+            and manifest.get("contractVersion") != CONTRACT_VERSION
+        )
         or manifest.get("runtimeAuthoritySha256") != authority["authoritySha256"]
     ):
         raise TemporalQDV5ControlPlaneError("native v5 prefinalizer manifest is incompatible")
@@ -3586,6 +3697,129 @@ def run_native_v5_generation_finalizer(
             root / GENERATION_STATE_APPLICATION_SIDECAR_FILENAME
         ),
         "identityLedgerPromotion": identity_ledger_promotion,
+        "outputRoot": str(root),
+    }
+
+
+def run_native_v5_fast_ephemeral_generation_finalizer(
+    *,
+    runtime_authority: Mapping[str, Any],
+    manifest_path: Path | str,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """Run the non-resumable two-artifact rotating finalizer."""
+
+    authority = _validate_runtime_authority(runtime_authority)
+    path = _real_path(manifest_path, name="fast-ephemeral finalizer manifest")
+    root = _real_path(path.parent, name="fast-ephemeral finalizer root", directory=True)
+    manifest = _self_hashed(
+        _read_bounded_canonical_object(
+            path, name="fast-ephemeral finalizer manifest"
+        ),
+        field="manifestSha256",
+        name="fast-ephemeral finalizer manifest",
+    )
+    if (
+        set(manifest)
+        != {
+            "schemaVersion",
+            "operation",
+            "runtimeAuthoritySha256",
+            "sourcePath",
+            "sourceSha256",
+            "resultPath",
+            "manifestSha256",
+        }
+        or manifest.get("schemaVersion") != FAST_EPHEMERAL_FINALIZER_MANIFEST_SCHEMA
+        or manifest.get("operation")
+        != "finalize_fast_ephemeral_rotating_generation"
+        or manifest.get("runtimeAuthoritySha256") != authority["authoritySha256"]
+        or not native_v5_transport_path_matches(
+            manifest.get("sourcePath"), root / "source.json"
+        )
+        or manifest.get("resultPath") != "fast-ephemeral-result.json"
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "fast-ephemeral finalizer manifest is incompatible"
+        )
+    binary = pinned_runtime_binary(
+        runtime_authority=authority, role="generationFinalizer"
+    )
+    stdout = _run_pinned(
+        runtime_authority=authority,
+        role="generationFinalizer",
+        command=[str(binary), str(path)],
+        timeout_seconds=timeout_seconds,
+    )
+    result_path = root / "fast-ephemeral-result.json"
+    result = _self_hashed(
+        _read_bounded_canonical_object(
+            result_path, name="fast-ephemeral finalizer result"
+        ),
+        field="resultSha256",
+        name="fast-ephemeral finalizer result",
+    )
+    if (
+        set(result)
+        != {
+            "schemaVersion",
+            "executionMode",
+            "generationIndex",
+            "manifestSha256",
+            "sourceSha256",
+            "cumulativeArchive",
+            "parentArchive",
+            "parentSchedule",
+            "candidateCount",
+            "memberCount",
+            "occupiedCellCount",
+            "newCellCount",
+            "elapsedMilliseconds",
+            "resultSha256",
+        }
+        or result.get("schemaVersion") != FAST_EPHEMERAL_FINALIZER_RESULT_SCHEMA
+        or result.get("executionMode") != "fast-ephemeral-v1"
+        or result.get("manifestSha256") != manifest["manifestSha256"]
+        or result.get("sourceSha256") != manifest["sourceSha256"]
+        or stdout != result
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "fast-ephemeral finalizer result drifted"
+        )
+    artifacts: dict[str, dict[str, Any]] = {}
+    for field, relative in (
+        ("cumulativeArchive", "evidence/cumulative-archive.json"),
+        ("parentArchive", "archive.json"),
+    ):
+        descriptor = _mapping(
+            result.get(field), name=f"fast-ephemeral {field} descriptor"
+        )
+        if set(descriptor) != {"path", "archiveSha256", "bytes", "fileSha256"} or descriptor.get("path") != relative:
+            raise TemporalQDV5ControlPlaneError(
+                f"fast-ephemeral {field} descriptor drifted"
+            )
+        artifacts[field] = {
+            "relativePath": relative,
+            "absolutePath": str(root / relative),
+            "semanticSha256": _sha(
+                descriptor.get("archiveSha256"),
+                name=f"fast-ephemeral {field} semantic identity",
+            ),
+            "fileSha256": _sha(
+                descriptor.get("fileSha256"),
+                name=f"fast-ephemeral {field} file identity",
+            ),
+            "byteLength": _nonnegative(
+                descriptor.get("bytes"),
+                name=f"fast-ephemeral {field} byte length",
+            ),
+        }
+    return {
+        "manifest": manifest,
+        "manifestPath": str(path),
+        "result": result,
+        "resultPath": str(result_path),
+        "artifacts": artifacts,
         "outputRoot": str(root),
     }
 
@@ -5380,12 +5614,14 @@ __all__ = [
     "native_v5_transport_path_matches",
     "run_native_campaign_output",
     "build_native_v5_prefinalizer_base_manifest",
+    "build_native_v5_fast_ephemeral_prefinalizer_base_manifest",
     "build_native_v5_prefinalizer_resume_manifest",
     "pinned_runtime_binary",
     "extract_native_v5_g0_selected_attempts",
     "extract_native_v5_evolved_attempt_chain",
     "run_native_v5_archive_reducer",
     "run_native_v5_generation_finalizer",
+    "run_native_v5_fast_ephemeral_generation_finalizer",
     "run_native_v5_rotating_prefinalizer",
     "run_native_v5_campaign_freeze",
     "run_native_v5_evidence_ladder_archive_freeze",

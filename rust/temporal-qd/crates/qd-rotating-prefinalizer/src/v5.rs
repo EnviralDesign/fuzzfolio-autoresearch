@@ -26,6 +26,10 @@ pub const RESUME_MANIFEST_SCHEMA: &str = "temporal_qd_v5_rotating_prefinalizer_r
 pub const BASE_MANIFEST_SCHEMA_V2: &str = "temporal_qd_v5_rotating_prefinalizer_manifest_v2";
 pub const RESUME_MANIFEST_SCHEMA_V2: &str =
     "temporal_qd_v5_rotating_prefinalizer_resume_manifest_v2";
+pub const FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_prefinalizer_manifest_v1";
+pub const FAST_EPHEMERAL_RESUME_MANIFEST_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_prefinalizer_resume_manifest_v1";
 pub const RESULT_SCHEMA: &str = "temporal_qd_v5_rotating_prefinalizer_result_v1";
 pub const TASK_PLAN_SCHEMA: &str = "temporal_qd_v5_rotating_prefinalizer_task_plan_v2";
 pub const NON_PROPOSAL_SELECTION_SCHEMA: &str = "temporal_qd_v5_non_proposal_task_selection_v2";
@@ -459,9 +463,14 @@ fn validate_result_outputs(root: &Path, result: &Value) -> Result<()> {
 fn authenticated_prepare(root: &Path, manifest: &Value) -> Result<Prepared> {
     if matches!(
         text(manifest, "schemaVersion")?,
-        BASE_MANIFEST_SCHEMA | BASE_MANIFEST_SCHEMA_V2
+        BASE_MANIFEST_SCHEMA | BASE_MANIFEST_SCHEMA_V2 | FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA
     ) {
-        let base = validate_base(manifest, root).context("validate v5 base manifest")?;
+        let base = if text(manifest, "schemaVersion")? == FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA {
+            validate_fast_ephemeral_base(manifest, root)
+                .context("validate fast-ephemeral v5 base manifest")?
+        } else {
+            validate_base(manifest, root).context("validate v5 base manifest")?
+        };
         prepare(root, manifest, &base, Vec::new(), 0, None).context("prepare v5 base transaction")
     } else {
         let (base, receipts, round, previous) = validate_resume(manifest, root)?;
@@ -485,6 +494,7 @@ struct Base {
     completed_generation_records: Value,
     proposal_state_authority: Value,
     finalizer_output_root: PathBuf,
+    fast_ephemeral: bool,
 }
 struct Prepared {
     plan: Value,
@@ -630,6 +640,98 @@ fn validate_base(v: &Value, root: &Path) -> Result<Base> {
         completed_generation_records,
         proposal_state_authority,
         finalizer_output_root,
+        fast_ephemeral: false,
+    })
+}
+
+fn validate_fast_ephemeral_base(v: &Value, root: &Path) -> Result<Base> {
+    exact(
+        v,
+        &[
+            "schemaVersion",
+            "generationIndex",
+            "rotatingEvidence",
+            "archivePolicyAuthority",
+            "previousParentArchiveBinding",
+            "previousCumulativeArchiveBinding",
+            "proposalCampaignReceiptBinding",
+            "finalizerOutputRoot",
+            "runtimeAuthoritySha256",
+            "manifestSha256",
+        ],
+        "fast-ephemeral v5 base manifest",
+    )?;
+    ensure!(
+        text(v, "schemaVersion")? == FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA,
+        "fast-ephemeral v5 base manifest schema is invalid"
+    );
+    self_hash(v, "manifestSha256", "fast-ephemeral v5 base manifest")?;
+    let generation = unsigned(v, "generationIndex")?;
+    ensure!(generation > 0, "fast-ephemeral generation must be positive");
+    let runtime = hash_of(v, "runtimeAuthoritySha256")?.to_owned();
+    let rotating = member(v, "rotatingEvidence")?.clone();
+    self_hash(&rotating, "rotatingEvidenceSha256", "rotating evidence")?;
+    let archive_policy = member(v, "archivePolicyAuthority")?.clone();
+    self_hash(
+        &archive_policy,
+        "policyBindingSha256",
+        "archive policy authority",
+    )?;
+    let proposal_receipt = reopen_receipt(member(v, "proposalCampaignReceiptBinding")?, root)?;
+    ensure!(
+        text(&proposal_receipt, "campaignRole")? == "proposal_current_panel"
+            && unsigned(&proposal_receipt, "generationIndex")? == generation
+            && hash_of(&proposal_receipt, "rotatingEvidenceSha256")?
+                == hash_of(&rotating, "rotatingEvidenceSha256")?,
+        "fast-ephemeral proposal campaign receipt binding drifted"
+    );
+    let parent_binding = member(v, "previousParentArchiveBinding")?;
+    let parent_input = reopen_value(parent_binding, root)?;
+    if let Some(parent) = &parent_input {
+        ensure!(
+            hash_of(parent_binding, "archiveSha256")? == hash_of(parent, "archiveSha256")?,
+            "fast-ephemeral parent archive identity drifted"
+        );
+        self_hash(parent, "archiveSha256", "fast-ephemeral parent archive")?;
+    }
+    let parent_members = parent_input
+        .as_ref()
+        .map(parent_member_rows)
+        .transpose()?
+        .unwrap_or_default();
+    let prior_parent = derive_parent_summary(parent_input)?;
+    let cumulative_binding = member(v, "previousCumulativeArchiveBinding")?;
+    let prior_cumulative = reopen_value(cumulative_binding, root)?.unwrap_or(Value::Null);
+    if !prior_cumulative.is_null() {
+        ensure!(
+            hash_of(cumulative_binding, "archiveSha256")?
+                == hash_of(&prior_cumulative, "archiveSha256")?,
+            "fast-ephemeral cumulative archive identity drifted"
+        );
+        self_hash(
+            &prior_cumulative,
+            "archiveSha256",
+            "fast-ephemeral cumulative archive",
+        )?;
+    }
+    let finalizer_output_root = sealed_finalizer_output_root(text(v, "finalizerOutputRoot")?)?;
+    Ok(Base {
+        value: v.clone(),
+        generation,
+        semantic: hash_of(v, "manifestSha256")?.to_owned(),
+        runtime,
+        rotating,
+        state: Value::Null,
+        proposal_receipt,
+        prior_parent,
+        parent_members,
+        prior_cumulative,
+        archive_policy,
+        funnel: Value::Null,
+        completed_generation_records: Value::Array(Vec::new()),
+        proposal_state_authority: Value::Null,
+        finalizer_output_root,
+        fast_ephemeral: true,
     })
 }
 
@@ -688,8 +790,12 @@ fn validate_resume(v: &Value, root: &Path) -> Result<(Base, Vec<Value>, u64, Val
     )?;
     let schema = text(v, "schemaVersion")?;
     ensure!(
-        matches!(schema, RESUME_MANIFEST_SCHEMA | RESUME_MANIFEST_SCHEMA_V2)
-            && text(v, "contractVersion")? == CONTRACT_VERSION
+        matches!(
+            schema,
+            RESUME_MANIFEST_SCHEMA
+                | RESUME_MANIFEST_SCHEMA_V2
+                | FAST_EPHEMERAL_RESUME_MANIFEST_SCHEMA
+        ) && text(v, "contractVersion")? == CONTRACT_VERSION
             && text(v, "operation")? == RESUME_OPERATION,
         "v5 resume manifest schema/version is invalid"
     );
@@ -699,10 +805,16 @@ fn validate_resume(v: &Value, root: &Path) -> Result<(Base, Vec<Value>, u64, Val
         (schema == RESUME_MANIFEST_SCHEMA
             && text(&base_value, "schemaVersion")? == BASE_MANIFEST_SCHEMA)
             || (schema == RESUME_MANIFEST_SCHEMA_V2
-                && text(&base_value, "schemaVersion")? == BASE_MANIFEST_SCHEMA_V2),
+                && text(&base_value, "schemaVersion")? == BASE_MANIFEST_SCHEMA_V2)
+            || (schema == FAST_EPHEMERAL_RESUME_MANIFEST_SCHEMA
+                && text(&base_value, "schemaVersion")? == FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA),
         "resume/base manifest version drifted"
     );
-    let base = validate_base(&base_value, root)?;
+    let base = if schema == FAST_EPHEMERAL_RESUME_MANIFEST_SCHEMA {
+        validate_fast_ephemeral_base(&base_value, root)?
+    } else {
+        validate_base(&base_value, root)?
+    };
     ensure!(
         hash_of(v, "runtimeAuthoritySha256")? == base.runtime,
         "resume runtime authority drifted"
@@ -1045,10 +1157,36 @@ fn prepare(
     let ready = if status == "ready_for_finalizer" {
         let ordered_bundles = bundles.into_values().collect::<Vec<_>>();
         let rich_rows = array(&rich, "members")?.clone();
-        let mut source = json!({"schemaVersion":"temporal_qd_generation_finalization_source_v2","contractVersion":CONTRACT_VERSION,"generationIndex":base.generation,"semanticAuthoritySha256":base.semantic,"runtimeAuthoritySha256":base.runtime,"stateBasis":base.state,"completedGenerationRecords":base.completed_generation_records,"proposalStateAuthority":base.proposal_state_authority,"rotatingEvidence":base.rotating,"cohort":cohort,"provisional":provisional,"panelCoverage":coverage,"selectedRichMembers":rich,"baselineCandidatePanelBundles":ordered_bundles,"previousCumulativeArchive":base.prior_cumulative,"previousParentArchiveSummary":base.prior_parent,"archivePolicy":base.archive_policy,"admittedCampaignLedger":ledger,"funnelReductionSource":base.funnel});
+        let mut source = if base.fast_ephemeral {
+            json!({
+                "schemaVersion":"temporal_qd_v5_fast_ephemeral_finalization_source_v1",
+                "generationIndex":base.generation,
+                "rotatingEvidence":base.rotating,
+                "cohort":cohort,
+                "provisional":provisional,
+                "selectedRichMembers":rich,
+                "candidatePanelBundles":ordered_bundles,
+                "previousCumulativeArchive":base.prior_cumulative,
+                "previousParentArchiveSummary":base.prior_parent,
+                "archivePolicy":base.archive_policy
+            })
+        } else {
+            json!({"schemaVersion":"temporal_qd_generation_finalization_source_v2","contractVersion":CONTRACT_VERSION,"generationIndex":base.generation,"semanticAuthoritySha256":base.semantic,"runtimeAuthoritySha256":base.runtime,"stateBasis":base.state,"completedGenerationRecords":base.completed_generation_records,"proposalStateAuthority":base.proposal_state_authority,"rotatingEvidence":base.rotating,"cohort":cohort,"provisional":provisional,"panelCoverage":coverage,"selectedRichMembers":rich,"baselineCandidatePanelBundles":ordered_bundles,"previousCumulativeArchive":base.prior_cumulative,"previousParentArchiveSummary":base.prior_parent,"archivePolicy":base.archive_policy,"admittedCampaignLedger":ledger,"funnelReductionSource":base.funnel})
+        };
         add(&mut source, "sourceSha256")?;
         let froot = &base.finalizer_output_root;
-        let mut fm = json!({"schemaVersion":"temporal_qd_generation_finalization_manifest_v2","contractVersion":CONTRACT_VERSION,"operation":"finalize_rotating_generation","runtimeAuthoritySha256":base.runtime,"semanticAuthoritySha256":base.semantic,"sourcePath":froot.join("source.json"),"sourceSha256":hash_of(&source,"sourceSha256")?,"resultPath":"generation-commit.json"});
+        let mut fm = if base.fast_ephemeral {
+            json!({
+                "schemaVersion":"temporal_qd_v5_fast_ephemeral_finalization_manifest_v1",
+                "operation":"finalize_fast_ephemeral_rotating_generation",
+                "runtimeAuthoritySha256":base.runtime,
+                "sourcePath":froot.join("source.json"),
+                "sourceSha256":hash_of(&source,"sourceSha256")?,
+                "resultPath":"fast-ephemeral-result.json"
+            })
+        } else {
+            json!({"schemaVersion":"temporal_qd_generation_finalization_manifest_v2","contractVersion":CONTRACT_VERSION,"operation":"finalize_rotating_generation","runtimeAuthoritySha256":base.runtime,"semanticAuthoritySha256":base.semantic,"sourcePath":froot.join("source.json"),"sourceSha256":hash_of(&source,"sourceSha256")?,"resultPath":"generation-commit.json"})
+        };
         add(&mut fm, "manifestSha256")?;
         Some((rich_rows, source, fm))
     } else {

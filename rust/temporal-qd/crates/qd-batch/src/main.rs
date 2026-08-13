@@ -6,6 +6,7 @@
 
 mod g0_funnel_contract;
 mod generation_contract;
+mod v5_fast_ephemeral;
 mod v5_proposal_contract;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,8 +65,8 @@ use temporal_qd_kernel::{
     v5_publication::{
         V5G0PublicationFragmentKind, V5G0PublicationFragmentSink, V5G0PublicationFragmentSource,
         V5G0PublicationFragments, V5G0PublicationInputs, V5G0PublicationReceipt,
-        V5G0PublicationStream, prepare_v5_g0_publication_stream,
-        prepare_v5_g0_publication_stream_from_fresh_transaction, verify_v5_g0_publication_adoption,
+        V5G0PublicationStream, prepare_v5_g0_publication_stream_from_fresh_transaction,
+        verify_v5_g0_publication_adoption,
     },
     v5_transaction::{
         V5_G0_CONSTRUCTION_PREFETCH_MULTIPLIER, V5G0CompactIdentityLedger,
@@ -116,18 +117,38 @@ fn run() -> Result<()> {
         return write_stdout_json(&serde_json::to_value(NativeVersion::current())?);
     }
     if args.len() == 3 && args[1] == "--manifest" {
-        return execute_manifest(Path::new(&args[2]));
+        return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::Durable);
     }
-    bail!("usage: temporal-qd-batch --version-json | --manifest PATH")
+    if args.len() == 5
+        && args[1] == "--manifest"
+        && args[3] == "--execution-mode"
+        && args[4] == "fast-ephemeral-v1"
+    {
+        return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::FastEphemeralV1);
+    }
+    bail!(
+        "usage: temporal-qd-batch --version-json | --manifest PATH [--execution-mode fast-ephemeral-v1]"
+    )
 }
 
-fn execute_manifest(manifest_path: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5BatchExecutionMode {
+    Durable,
+    FastEphemeralV1,
+}
+
+fn execute_manifest(manifest_path: &Path, execution_mode: V5BatchExecutionMode) -> Result<()> {
     let manifest_path = safe_existing_file(manifest_path, "manifest")?;
     let raw = fs::read(&manifest_path)
         .with_context(|| format!("read manifest: {}", manifest_path.display()))?;
     let value: Value = serde_json::from_slice(&raw).context("parse manifest dispatch envelope")?;
     match value.get("schemaVersion").and_then(Value::as_str) {
-        Some(V5_PROPOSAL_MANIFEST_SCHEMA) => execute_v5_proposal(&manifest_path, &raw),
+        Some(V5_PROPOSAL_MANIFEST_SCHEMA) => {
+            execute_v5_proposal(&manifest_path, &raw, execution_mode)
+        }
+        Some(_) if execution_mode == V5BatchExecutionMode::FastEphemeralV1 => {
+            bail!("fast-ephemeral-v1 is admitted only for native v5 proposal construction")
+        }
         Some(GENERATION_MANIFEST_SCHEMA) => execute_generation(&manifest_path, &raw),
         Some(G0_FUNNEL_MANIFEST_SCHEMA) => execute_g0_funnel(&manifest_path, &raw),
         _ => execute_foundation_bytes(&manifest_path, &raw),
@@ -5788,7 +5809,11 @@ fn execute_v5_evolved_proposal(
     write_stdout_json(&evidence)
 }
 
-fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
+fn execute_v5_proposal(
+    manifest_path: &Path,
+    manifest_bytes: &[u8],
+    execution_mode: V5BatchExecutionMode,
+) -> Result<()> {
     let started = Instant::now();
     let process_cpu_started = v5_process_cpu_duration()?;
     let validation_mode = V5ValidationMode::from_environment()?;
@@ -5819,6 +5844,29 @@ fn execute_v5_proposal(manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()
     verify_v5_static_authorities(&invocation_root, &manifest, manifest_bytes)?;
     let static_authority_elapsed = static_authority_started.elapsed();
     let result_path = invocation_root.join(&manifest.result_path);
+    if execution_mode == V5BatchExecutionMode::FastEphemeralV1 {
+        if manifest.generation_kind == "evolved" {
+            return v5_fast_ephemeral::execute_evolved(
+                &output_root,
+                &result_path,
+                &manifest,
+                &progress_handle,
+                progress,
+                started,
+                static_authority_elapsed,
+            );
+        }
+        return v5_fast_ephemeral::execute_g0(
+            &output_root,
+            &invocation_root,
+            &result_path,
+            &manifest,
+            &progress_handle,
+            progress,
+            started,
+            static_authority_elapsed,
+        );
+    }
     if manifest.generation_kind == "evolved" {
         return execute_v5_evolved_proposal(
             &output_root,
@@ -9888,11 +9936,14 @@ fn v5_verify_staged_fresh_g0_bundle(
     g0_funnel_binding
         .validate()
         .context("validate fresh native v5 G0 funnel binding")?;
+    let g0_funnel_binding_value = g0_funnel_binding
+        .to_value()
+        .context("encode fresh native v5 G0 funnel binding")?;
     let g0_funnel = verify_v5_g0_funnel_fragment_receipt(
         request,
         transaction,
         &verified_receipt,
-        &g0_funnel_binding.value,
+        &g0_funnel_binding_value,
     )
     .context("verify fresh native v5 G0 funnel receipt")?;
     if g0_funnel.funnel_fragments_sha256()? != g0_funnel_binding.g0_funnel_fragments_sha256 {

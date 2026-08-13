@@ -549,6 +549,22 @@ def test_fresh_v5_defaults_to_one_native_transaction_and_never_opens_python_auth
     assert supervisor._validate_frozen_sources(config) == []
 
 
+def test_fast_ephemeral_mode_is_frozen_as_a_distinct_current_v5_contract(
+    tmp_path: Path,
+) -> None:
+    inputs, _fixture = _fresh_v5_fixture(tmp_path)
+    inputs["native_v5_execution_mode"] = supervisor.V5_EXECUTION_MODE_FAST_EPHEMERAL
+
+    config, warnings = supervisor._frozen_config(**inputs)
+
+    assert warnings == []
+    assert (
+        config["nativeV5ExecutionMode"]
+        == supervisor.V5_EXECUTION_MODE_FAST_EPHEMERAL
+    )
+    assert supervisor._validate_frozen_sources(config) == []
+
+
 def test_fresh_v5_refuses_an_explicit_python_fallback_before_any_authority_opens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -613,6 +629,157 @@ def test_current_v5_requires_rust_finalization_before_config_or_authority_work(
             run_root=restart_root,
             generation_finalization_engine=supervisor.GENERATION_FINALIZATION_ENGINE_PYTHON,
         )
+
+
+def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path.resolve()
+    proposal_root = root / "generations" / "generation-0001" / "proposal"
+    evaluation_population = proposal_root / "evaluation-population.json"
+    identity_ledger = proposal_root / "identity-ledger.json"
+    state: dict[str, Any] = {
+        "stage": "generation_proposal",
+        "uniqueCandidatesEvaluated": 0,
+        "workerTasksCompleted": 0,
+        "completedGenerations": [],
+    }
+    adapter = {
+        "executionMode": supervisor.V5_EXECUTION_MODE_FAST_EPHEMERAL,
+        "selectedEvaluationCandidateCount": 1,
+        "evaluationPopulation": {
+            "absolutePath": str(evaluation_population),
+            "semanticSha256": _sha("evaluation-semantic"),
+            "fileSha256": _sha("evaluation-file"),
+            "byteLength": 123,
+        },
+        "identityLedger": {
+            "absolutePath": str(identity_ledger),
+            "semanticSha256": _sha("ledger-semantic"),
+            "fileSha256": _sha("ledger-file"),
+            "byteLength": 99,
+        },
+    }
+    runtime = {"authoritySha256": _sha("runtime")}
+    panel = {"panelId": "panel-1"}
+    rotating = {
+        "rotatingEvidenceSha256": _sha("rotating"),
+        "panels": [panel],
+        "absoluteGenerationMapping": {"cycleLength": 1},
+    }
+    config = {
+        "rotatingEvidence": rotating,
+        "evolvableModuleAuthority": {
+            "archivePolicyAuthority": {"policyBindingSha256": _sha("policy")}
+        },
+    }
+
+    monkeypatch.setattr(
+        supervisor,
+        "_validate_native_v5_construction_adapter",
+        lambda **_kwargs: adapter,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_v5_evolvable_authority",
+        lambda _config: config["evolvableModuleAuthority"],
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_native_v5_archive_policy_binding",
+        lambda value: dict(value),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_native_v5_prefinalizer_archive_binding",
+        lambda value, **_kwargs: dict(value),
+    )
+    monkeypatch.setattr(
+        supervisor, "_native_runtime_authority_for_generation", lambda **_kwargs: runtime
+    )
+    monkeypatch.setattr(
+        supervisor, "_require_native_v5_control_plane_runtime_authority", lambda _value: None
+    )
+    monkeypatch.setattr(supervisor, "panel_for_generation", lambda *_args: panel)
+    monkeypatch.setattr(
+        supervisor,
+        "_run_native_v5_campaign_round",
+        lambda **_kwargs: {
+            "campaignReceipt": {
+                "receiptPath": str(root / "campaign-receipt.json"),
+                "receipt": {"campaignInput": {"taskCount": 3}},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "build_native_v5_fast_ephemeral_prefinalizer_base_manifest",
+        lambda **_kwargs: {"manifestPath": str(root / "prefinalizer-base.json")},
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "run_native_v5_rotating_prefinalizer",
+        lambda **_kwargs: {
+            "receipt": {
+                "status": "ready_for_finalizer",
+                "roundIndex": 0,
+                "finalizerManifest": {"path": str(root / "finalizer" / "manifest.json")},
+            },
+            "taskSelections": [],
+        },
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "run_native_v5_fast_ephemeral_generation_finalizer",
+        lambda **_kwargs: {
+            "result": {
+                "parentArchive": {"archiveSha256": _sha("parent")},
+                "cumulativeArchive": {"archiveSha256": _sha("cumulative")},
+                "occupiedCellCount": 1,
+                "newCellCount": 1,
+                "memberCount": 1,
+                "parentSchedule": {"schemaVersion": "fixture"},
+            },
+            "artifacts": {},
+        },
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_native_v5_identity_ledger_descriptor",
+        lambda value, **_kwargs: dict(value),
+    )
+    monkeypatch.setattr(supervisor, "_save_state", lambda *_args: None)
+    forbidden = lambda *_args, **_kwargs: pytest.fail(
+        "fast-ephemeral path entered durable generation finalization"
+    )
+    monkeypatch.setattr(supervisor, "_complete_native_v5_generation", forbidden)
+    monkeypatch.setattr(supervisor, "_apply_native_v5_state_application", forbidden)
+
+    result = supervisor._complete_native_v5_generation_fast_ephemeral(
+        root=root,
+        state=state,
+        state_path=root / "state.json",
+        config=config,
+        generation_index=1,
+        generation_result={
+            "generationKind": "g0",
+            "nativeV5Construction": adapter,
+        },
+        parent_archive_descriptor=_sealed_archive_descriptor(
+            root / "initial-archive.json", semantic_sha256=_sha("initial")
+        ),
+        previous_cumulative_archive_descriptor=None,
+        gateway_token="fixture-token",
+    )
+
+    assert result["generationRecord"]["candidateCount"] == 1
+    assert result["generationRecord"]["totalGenerationTaskCount"] == 3
+    assert state["uniqueCandidatesEvaluated"] == 1
+    assert state["workerTasksCompleted"] == 3
+    assert state["currentGenerationIndex"] == 2
+    assert state[supervisor.NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY] == adapter[
+        "identityLedger"
+    ]
 
 
 def test_v5_legacy_construction_apis_reject_before_work_but_named_oracle_survives(

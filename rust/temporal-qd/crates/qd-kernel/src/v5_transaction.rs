@@ -1997,7 +1997,7 @@ impl V5G0TransactionResult {
                     .to_value()
                     .map_err(V5G0TransactionError::from)
                     .map_err(E::from)?,
-                "auditSha256",
+                "outcomeAuditSha256",
             )?;
         }
         for delta in self.attempt_proposal_deltas.iter().flatten() {
@@ -4275,6 +4275,15 @@ mod tests {
             .durable_object_bindings()
             .expect("derive closed durable object inventory");
         assert!(bindings.iter().all(|binding| binding.validate().is_ok()));
+        let mut fresh_bindings = Vec::new();
+        result
+            .try_for_each_fresh_durable_object_binding::<V5G0TransactionError, _>(|binding| {
+                fresh_bindings.push(binding);
+                Ok(())
+            })
+            .expect("stream fresh typed durable object inventory");
+        assert_eq!(fresh_bindings, bindings);
+        assert_eq!(fresh_bindings.len(), result.fresh_durable_object_count());
         let kinds = bindings
             .iter()
             .map(|binding| binding.kind)
