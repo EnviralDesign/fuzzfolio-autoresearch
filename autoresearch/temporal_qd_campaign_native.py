@@ -58,6 +58,41 @@ def _require_regular_file(path: Path, *, name: str) -> Path:
     return path
 
 
+def _native_transport_path_matches(
+    reported_path: object, expected_path: Path | str
+) -> bool:
+    """Admit Rust's one canonical Windows spelling for a validated path.
+
+    ``std::fs::canonicalize`` prepends ``\\\\?\\`` to ordinary drive-rooted
+    paths on Windows.  Preserve that reported spelling in every Rust receipt,
+    but treat it as the same transport location as the already-resolved path
+    passed to the native freezer.  No UNC, separator, case, or other alias is
+    admitted.
+    """
+
+    if not isinstance(reported_path, str):
+        return False
+    try:
+        expected = os.fspath(expected_path)
+    except TypeError:
+        return False
+    if not isinstance(expected, str) or not expected:
+        return False
+    if reported_path == expected:
+        return True
+    if os.name != "nt":
+        return False
+    if (
+        len(expected) < 3
+        or not expected[0].isalpha()
+        or expected[1] != ":"
+        or expected[2] != "\\"
+        or "/" in expected
+    ):
+        return False
+    return reported_path == "\\\\?\\" + expected
+
+
 def _read_current_v5_compact_bytes(
     path: Path | str,
     *,
@@ -726,7 +761,7 @@ def freeze_qd_v5_campaign_native(
     )
     if not isinstance(result, dict) or result.get("schemaVersion") != expected_schema:
         raise TemporalDiscoveryContractError("Rust-native v5 campaign-freeze result schema drifted")
-    if result.get("outputRoot") != str(root):
+    if not _native_transport_path_matches(result.get("outputRoot"), root):
         raise TemporalDiscoveryContractError("Rust-native v5 campaign-freeze output binding drifted")
     _validate_v5_campaign_input_checkpoint(root, manifest, result)
     if raw_file_sha256(binary) != binary_sha256:

@@ -66,6 +66,26 @@ def _write(path: Path, value: object) -> None:
     path.write_bytes((json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-path ABI")
+def test_native_v5_freezer_accepts_only_exact_extended_drive_transport(
+    tmp_path: Path,
+) -> None:
+    expected = (tmp_path / "campaign").resolve()
+    assert campaign_native._native_transport_path_matches(str(expected), expected)
+    assert campaign_native._native_transport_path_matches(
+        "\\\\?\\" + str(expected), expected
+    )
+    assert not campaign_native._native_transport_path_matches(
+        "\\\\?\\" + str((tmp_path / "foreign").resolve()), expected
+    )
+    assert not campaign_native._native_transport_path_matches(
+        str(expected).replace("\\", "/"), expected
+    )
+    assert not campaign_native._native_transport_path_matches(
+        "\\\\?\\UNC\\server\\share\\campaign", expected
+    )
+
+
 def _sealed_native_freeze_input_identities(
     *, evaluation: Path, template: Path, catalog: Path
 ) -> dict[str, str]:
