@@ -50,7 +50,7 @@ FailureStatus = Literal["requeued", "failed", "lease_lost"]
 DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024
 DEFAULT_LAB_WS_PING_INTERVAL_SECONDS = 30.0
 DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS = 180.0
-DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS = 90.0
+DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS = 30.0
 DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS = 45.0
 DEFAULT_MAX_RESULT_BACKLOG_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_RESULT_BACKPRESSURE_BYTES = 1024 * 1024 * 1024
@@ -165,12 +165,14 @@ def _is_lake_capacity_overload(error: str, error_type: str | None = None) -> boo
     )
 
 
-def _is_lake_mutation_conflict(error: str) -> bool:
-    normalized = str(error or "").strip().lower()
-    return _is_lake_window_request(normalized) and (
-        "409 client error" in normalized
-        or "409 conflict" in normalized
-        or "409 server error" in normalized
+def _is_lake_mutation_conflict(
+    *,
+    lake_error_code: str | None,
+    retry_reason: str | None,
+) -> bool:
+    return (
+        str(lake_error_code or "").strip().lower() == "lake_mutation_in_progress"
+        and str(retry_reason or "").strip().lower() == "mutation"
     )
 
 
@@ -194,6 +196,8 @@ def _retry_delay_for_failure(
     error: str,
     retry_after_seconds: float | None,
     error_type: str | None,
+    lake_error_code: str | None,
+    retry_reason: str | None,
     config: "LabGatewayConfig",
 ) -> float:
     explicit = _parse_positive_float(retry_after_seconds)
@@ -203,10 +207,9 @@ def _retry_delay_for_failure(
     normalized = str(error or "").strip().lower()
     if _is_lake_capacity_overload(normalized, error_type):
         return max(float(config.lake_timeout_retry_after_seconds), 0.0)
-    if (
-        "remote market data lake is mutating" in normalized
-        or "retry after the mutation completes" in normalized
-        or _is_lake_mutation_conflict(normalized)
+    if _is_lake_mutation_conflict(
+        lake_error_code=lake_error_code,
+        retry_reason=retry_reason,
     ):
         return max(float(config.lake_mutation_retry_after_seconds), 0.0)
     if _is_lake_service_unavailable(normalized):
@@ -219,13 +222,20 @@ def _retry_delay_for_failure(
     return 0.0
 
 
-def _failure_preserves_attempt_budget(error: str, error_type: str | None = None) -> bool:
+def _failure_preserves_attempt_budget(
+    error: str,
+    error_type: str | None = None,
+    *,
+    lake_error_code: str | None = None,
+    retry_reason: str | None = None,
+) -> bool:
     normalized = str(error or "").strip().lower()
     return (
         _is_lake_capacity_overload(normalized, error_type)
-        or "remote market data lake is mutating" in normalized
-        or "retry after the mutation completes" in normalized
-        or _is_lake_mutation_conflict(normalized)
+        or _is_lake_mutation_conflict(
+            lake_error_code=lake_error_code,
+            retry_reason=retry_reason,
+        )
         or _is_lake_service_unavailable(normalized)
         or ("read timed out" in normalized and ("192.168.1.2" in normalized or "market data lake" in normalized))
     )
@@ -996,6 +1006,8 @@ class PlayHandLabGateway:
         error_type: str | None = None,
         error_module: str | None = None,
         error_repr: str | None = None,
+        lake_error_code: str | None = None,
+        retry_reason: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             now = _now()
@@ -1014,13 +1026,24 @@ class PlayHandLabGateway:
                 error=error,
                 retry_after_seconds=retry_after_seconds,
                 error_type=error_type,
+                lake_error_code=lake_error_code,
+                retry_reason=retry_reason,
                 config=self.config,
             )
             lake_capacity_overload = _is_lake_capacity_overload(error, error_type)
+            lake_mutation_conflict = _is_lake_mutation_conflict(
+                lake_error_code=lake_error_code,
+                retry_reason=retry_reason,
+            )
             preserve_attempt_budget = bool(
                 retryable
                 and retry_delay > 0
-                and _failure_preserves_attempt_budget(error, error_type)
+                and _failure_preserves_attempt_budget(
+                    error,
+                    error_type,
+                    lake_error_code=lake_error_code,
+                    retry_reason=retry_reason,
+                )
             )
             if retryable and (task.attempt_number < task.max_attempts or preserve_attempt_budget):
                 if preserve_attempt_budget and task.attempt_number > 0:
@@ -1038,8 +1061,13 @@ class PlayHandLabGateway:
                     self._open_lake_circuit_locked(
                         now=now,
                         retry_delay=retry_delay,
-                        error=error,
-                        reason=("capacity_overload" if lake_capacity_overload else None),
+                        reason=(
+                            "capacity_overload"
+                            if lake_capacity_overload
+                            else "mutation"
+                            if lake_mutation_conflict
+                            else "unavailable"
+                        ),
                     )
                     task.available_at = self._lake_retry_not_before
                     if lake_health_probe:
@@ -1069,6 +1097,8 @@ class PlayHandLabGateway:
                     **({"error_type": str(error_type)} if error_type else {}),
                     **({"error_module": str(error_module)} if error_module else {}),
                     **({"error_repr": str(error_repr)} if error_repr else {}),
+                    **({"lake_error_code": str(lake_error_code)} if lake_error_code else {}),
+                    **({"retry_reason": str(retry_reason)} if retry_reason else {}),
                     **(
                         {"terminal_result": dict(terminal_result)}
                         if isinstance(terminal_result, dict)
@@ -1267,7 +1297,6 @@ class PlayHandLabGateway:
         *,
         now: float,
         retry_delay: float,
-        error: str,
         reason: str | None = None,
     ) -> None:
         already_open = self._lake_retry_reason is not None
@@ -1275,11 +1304,7 @@ class PlayHandLabGateway:
             self._lake_retry_not_before,
             now + retry_delay,
         )
-        self._lake_retry_reason = reason or (
-            "mutation"
-            if "mutation" in str(error).lower() or "409" in str(error).lower()
-            else "unavailable"
-        )
+        self._lake_retry_reason = reason or "unavailable"
         self._lake_recovery_dispatch_limit = None
         self._lake_recovery_successes_at_limit = 0
         self._lake_recovery_lease_ids.clear()
@@ -2104,6 +2129,16 @@ class LabGatewayAsgiApp:
                             if payload.get("error_repr") is not None
                             else None
                         ),
+                        lake_error_code=(
+                            str(payload["lake_error_code"])
+                            if payload.get("lake_error_code") is not None
+                            else None
+                        ),
+                        retry_reason=(
+                            str(payload["retry_reason"])
+                            if payload.get("retry_reason") is not None
+                            else None
+                        ),
                         terminal_result=(
                             dict(payload["terminal_result"])
                             if isinstance(payload.get("terminal_result"), dict)
@@ -2331,6 +2366,16 @@ class LabGatewayAsgiApp:
                 error_repr=(
                     str(payload["error_repr"])
                     if payload.get("error_repr") is not None
+                    else None
+                ),
+                lake_error_code=(
+                    str(payload["lake_error_code"])
+                    if payload.get("lake_error_code") is not None
+                    else None
+                ),
+                retry_reason=(
+                    str(payload["retry_reason"])
+                    if payload.get("retry_reason") is not None
                     else None
                 ),
                 terminal_result=(

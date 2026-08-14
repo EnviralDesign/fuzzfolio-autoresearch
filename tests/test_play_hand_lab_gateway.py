@@ -36,7 +36,7 @@ def test_lab_gateway_defaults_are_cloud_tolerant() -> None:
     assert config.worker_prune_after_seconds == 1800.0
     assert config.max_result_backlog_bytes == 2 * 1024 * 1024 * 1024
     assert config.result_backpressure_bytes == 1024 * 1024 * 1024
-    assert config.lake_mutation_retry_after_seconds == 90.0
+    assert config.lake_mutation_retry_after_seconds == 30.0
     assert config.lake_timeout_retry_after_seconds == 45.0
 
 
@@ -337,6 +337,8 @@ def test_lab_gateway_delays_lake_mutation_retryable_failure() -> None:
         first_claim["lease_id"],
         error="Remote market data lake is mutating; retry after the mutation completes",
         retryable=True,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
 
     assert failed["status"] == "requeued"
@@ -376,6 +378,8 @@ def test_lab_gateway_lake_mutation_retries_do_not_exhaust_attempt_cap() -> None:
         first_claim["lease_id"],
         error="Remote market data lake is mutating; retry after the mutation completes",
         retryable=True,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
     assert first_failed["status"] == "requeued"
     assert first_failed["attempt_budget_preserved"] is True
@@ -388,6 +392,8 @@ def test_lab_gateway_lake_mutation_retries_do_not_exhaust_attempt_cap() -> None:
         second_claim["lease_id"],
         error="Remote market data lake is mutating; retry after the mutation completes",
         retryable=True,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
 
     snapshot = gateway.snapshot()
@@ -598,7 +604,7 @@ def test_lab_gateway_capacity_recovery_ramps_dispatch_before_full_refan() -> Non
     assert sum(claim["status"] == "leased" for claim in normal_claims) > 8
 
 
-def test_lab_gateway_lake_409_without_retry_header_uses_mutation_cadence() -> None:
+def test_lab_gateway_generic_lake_409_does_not_open_mutation_circuit() -> None:
     gateway = PlayHandLabGateway(
         LabGatewayConfig(lake_mutation_retry_after_seconds=900.0)
     )
@@ -625,16 +631,15 @@ def test_lab_gateway_lake_409_without_retry_header_uses_mutation_cadence() -> No
     )
 
     snapshot = gateway.snapshot()
-    assert failed["status"] == "requeued"
-    assert failed["retry_after_seconds"] == 900.0
-    assert failed["attempt_budget_preserved"] is True
-    assert snapshot["failed_tasks"] == 0
-    assert snapshot["queued_tasks"] == 1
-    assert snapshot["metrics"]["failures_final"] == 0
-    assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
+    assert failed["status"] == "failed"
+    assert snapshot["failed_tasks"] == 1
+    assert snapshot["queued_tasks"] == 0
+    assert snapshot["lake_circuit_state"] == "closed"
+    assert snapshot["metrics"]["failures_final"] == 1
+    assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 0
 
 
-def test_lab_gateway_translated_attestation_conflict_uses_mutation_cadence() -> None:
+def test_lab_gateway_structured_attestation_mutation_uses_mutation_cadence() -> None:
     gateway = PlayHandLabGateway(
         LabGatewayConfig(lake_mutation_retry_after_seconds=900.0)
     )
@@ -658,6 +663,8 @@ def test_lab_gateway_translated_attestation_conflict_uses_mutation_cadence() -> 
         ),
         retryable=True,
         retry_after_seconds=None,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
 
     snapshot = gateway.snapshot()
@@ -695,6 +702,8 @@ def test_lab_gateway_lake_retry_stops_claiming_unrelated_tasks() -> None:
             "conflict; retry after the mutation completes"
         ),
         retryable=True,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
 
     blocked = gateway.claim("worker-2")
@@ -739,6 +748,8 @@ def test_lab_gateway_lake_recovery_allows_one_probe_before_reopening() -> None:
             "conflict; retry after the mutation completes"
         ),
         retryable=True,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
     gateway._lake_retry_not_before = time.monotonic() - 0.001
 
@@ -803,6 +814,8 @@ def test_lab_gateway_results_endpoint_reports_shared_lake_maintenance() -> None:
         claim["lease_id"],
         error="409 Client Error from market data lake window-attestations",
         retryable=True,
+        lake_error_code="lake_mutation_in_progress",
+        retry_reason="mutation",
     )
 
     server = build_lab_gateway_http_server(
