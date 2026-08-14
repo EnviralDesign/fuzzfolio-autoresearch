@@ -2052,6 +2052,7 @@ def test_campaign_output_checkpoint_replaces_source_seal_sidecar_and_receipt(
 
     campaign_input = {
         "schemaVersion": "temporal_qd_v5_campaign_input_checkpoint_v1",
+        "nativeRuntimeAuthoritySha256": _sha("campaign-freezer-runtime"),
         "generationIndex": 1,
         "campaignRole": "proposal_current_panel",
         "panelId": "panel-1",
@@ -2098,6 +2099,11 @@ def test_campaign_output_checkpoint_replaces_source_seal_sidecar_and_receipt(
         )
         assert manifest["campaignInputCheckpointPath"] == str(input_path)
         assert manifest["gatewayExecutionReceiptPath"] == str(gateway_path)
+        assert manifest["runtimeAuthoritySha256"] == runtime["authoritySha256"]
+        assert (
+            campaign_input["nativeRuntimeAuthoritySha256"]
+            != manifest["runtimeAuthoritySha256"]
+        )
 
         campaign_seal_document = _self_hashed(
             {"schemaVersion": control.CAMPAIGN_SEAL_SCHEMA},
