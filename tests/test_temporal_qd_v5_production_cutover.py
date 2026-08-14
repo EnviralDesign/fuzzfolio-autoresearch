@@ -637,7 +637,7 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
     root = tmp_path.resolve()
     proposal_root = root / "generations" / "generation-0001" / "proposal"
     evaluation_population = proposal_root / "evaluation-population.json"
-    identity_ledger = proposal_root / "v5-native" / "identity-ledger.json"
+    identity_ledger = proposal_root / "identity-ledger.json"
     state: dict[str, Any] = {
         "stage": "generation_proposal",
         "uniqueCandidatesEvaluated": 0,
@@ -655,7 +655,7 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
         },
         "identityLedger": {
             "absolutePath": str(identity_ledger),
-            "relativePath": "v5-native/identity-ledger.json",
+            "relativePath": "identity-ledger.json",
             "semanticSha256": _sha("ledger-semantic"),
             "fileSha256": _sha("ledger-file"),
             "byteLength": 99,
@@ -779,6 +779,37 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
         "fileSha256": _sha("ledger-file"),
         "byteLength": 99,
     }
+
+    adapter["identityLedger"] = {
+        **adapter["identityLedger"],
+        "absolutePath": str(proposal_root / "v5-native" / "identity-ledger.json"),
+        "relativePath": "v5-native/identity-ledger.json",
+    }
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="fast-ephemeral committed identity ledger descriptor path drifted",
+    ):
+        supervisor._complete_native_v5_generation_fast_ephemeral(
+            root=root,
+            state={
+                "stage": "generation_proposal",
+                "uniqueCandidatesEvaluated": 0,
+                "workerTasksCompleted": 0,
+                "completedGenerations": [],
+            },
+            state_path=root / "state-path-drift.json",
+            config=config,
+            generation_index=1,
+            generation_result={
+                "generationKind": "g0",
+                "nativeV5Construction": adapter,
+            },
+            parent_archive_descriptor=_sealed_archive_descriptor(
+                root / "initial-archive.json", semantic_sha256=_sha("initial")
+            ),
+            previous_cumulative_archive_descriptor=None,
+            gateway_token="fixture-token",
+        )
 
 
 def test_v5_legacy_construction_apis_reject_before_work_but_named_oracle_survives(

@@ -2672,6 +2672,7 @@ def _complete_native_v5_generation_fast_ephemeral(
                 root=root,
                 generation_index=generation_index,
                 name="fast-ephemeral committed identity ledger",
+                expected_relative_path="identity-ledger.json",
             ),
         }
     )
@@ -4799,6 +4800,7 @@ def _native_v5_identity_ledger_descriptor_from_adapter(
     root: Path,
     generation_index: int,
     name: str,
+    expected_relative_path: str = "v5-native/identity-ledger.json",
 ) -> dict[str, Any]:
     artifact = adapter.get("identityLedger")
     if not isinstance(artifact, Mapping):
@@ -4811,9 +4813,12 @@ def _native_v5_identity_ledger_descriptor_from_adapter(
             "byteLength": artifact.get("byteLength"),
         },
         name=name,
-        expected_path=_native_v5_identity_ledger_output_path(root, generation_index),
+        expected_path=(
+            _native_v5_proposal_root(root, generation_index)
+            / Path(expected_relative_path)
+        ),
     )
-    if artifact.get("relativePath") != "v5-native/identity-ledger.json":
+    if artifact.get("relativePath") != expected_relative_path:
         raise TemporalDiscoveryContractError(f"{name} relative path drifted")
     return material
 
