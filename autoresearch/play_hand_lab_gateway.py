@@ -485,6 +485,8 @@ class LabGatewayConfig:
     worker_prune_after_seconds: float = 1800.0
     lake_mutation_retry_after_seconds: float = DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS
     lake_timeout_retry_after_seconds: float = DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS
+    lake_recovery_initial_dispatch_limit: int = 1
+    lake_recovery_max_dispatch_limit: int = 64
 
 
 @dataclass(slots=True)
@@ -557,6 +559,9 @@ class PlayHandLabGateway:
         self._lake_retry_reason: str | None = None
         self._lake_probe_lease_id: str | None = None
         self._lake_probe_task_id: str | None = None
+        self._lake_recovery_dispatch_limit: int | None = None
+        self._lake_recovery_successes_at_limit = 0
+        self._lake_recovery_lease_ids: set[str] = set()
         self._metrics: dict[str, int] = {
             "tasks_enqueued": 0,
             "duplicate_task_enqueues": 0,
@@ -578,6 +583,9 @@ class PlayHandLabGateway:
             "lake_circuit_breaker_collapsed_failures": 0,
             "lake_circuit_breaker_recoveries": 0,
             "lake_capacity_overload_requeues": 0,
+            "lake_recovery_ramp_limited_claims": 0,
+            "lake_recovery_ramp_advances": 0,
+            "lake_recovery_ramp_completions": 0,
             "slot_limited_claims": 0,
             "incompatible_claims": 0,
             "results_acked": 0,
@@ -761,6 +769,22 @@ class PlayHandLabGateway:
                     "retry_reason": self._lake_retry_reason,
                     "probe_task_id": self._lake_probe_task_id,
                 }
+            if (
+                not lake_circuit_open
+                and self._lake_recovery_dispatch_limit is not None
+                and len(self._lake_recovery_lease_ids)
+                >= self._lake_recovery_dispatch_limit
+            ):
+                worker.status_detail = "lake_recovery_ramp"
+                self._metrics["no_work_claims"] += 1
+                self._metrics["lake_recovery_ramp_limited_claims"] += 1
+                return {
+                    "status": "no_work",
+                    "retry_after_seconds": self.config.no_work_retry_after_seconds,
+                    "reason": "lake_recovery_ramp",
+                    "dispatch_limit": self._lake_recovery_dispatch_limit,
+                    "active_recovery_leases": len(self._lake_recovery_lease_ids),
+                }
             if len(worker.active_lease_ids) >= max(int(worker.slots), 1):
                 worker.status_detail = "slot_limited"
                 self._metrics["slot_limited_claims"] += 1
@@ -843,6 +867,8 @@ class PlayHandLabGateway:
                 worker.status_detail = "lake_health_probe"
                 self._metrics["lake_circuit_breaker_probe_claims"] += 1
             else:
+                if self._lake_recovery_dispatch_limit is not None:
+                    self._lake_recovery_lease_ids.add(lease.lease_id)
                 worker.status_detail = "busy"
             self._metrics["claims"] += 1
             return {
@@ -927,6 +953,7 @@ class PlayHandLabGateway:
 
             task = self._tasks[lease.task_id]
             lake_health_probe = lease_id == self._lake_probe_lease_id
+            lake_recovery_lease = lease_id in self._lake_recovery_lease_ids
             result_payload = dict(result or {})
             result_status = str(result_payload.get("status") or status or "success").lower()
             failed_completion = result_status in {"failed", "error"}
@@ -953,6 +980,8 @@ class PlayHandLabGateway:
             self._trim_completion_history_locked()
             if lake_health_probe and not failed_completion:
                 self._close_lake_circuit_locked()
+            elif lake_recovery_lease and not failed_completion:
+                self._advance_lake_recovery_ramp_locked()
             return {"status": "accepted", "completion": _completion_receipt(completion)}
 
     def fail(
@@ -1003,18 +1032,18 @@ class PlayHandLabGateway:
                 self._metrics["failures_requeued"] += 1
                 if retry_delay > 0:
                     self._metrics["retry_delayed_requeues"] += 1
-                if preserve_attempt_budget and not lake_capacity_overload:
+                if preserve_attempt_budget:
+                    if lake_capacity_overload:
+                        self._metrics["lake_capacity_overload_requeues"] += 1
                     self._open_lake_circuit_locked(
                         now=now,
                         retry_delay=retry_delay,
                         error=error,
+                        reason=("capacity_overload" if lake_capacity_overload else None),
                     )
                     task.available_at = self._lake_retry_not_before
                     if lake_health_probe:
                         self._metrics["lake_circuit_breaker_probe_failures"] += 1
-                    self._metrics["retry_preserved_attempt_requeues"] += 1
-                elif preserve_attempt_budget:
-                    self._metrics["lake_capacity_overload_requeues"] += 1
                     self._metrics["retry_preserved_attempt_requeues"] += 1
                 return {
                     "status": "requeued",
@@ -1205,6 +1234,9 @@ class PlayHandLabGateway:
                 "lake_retry_reason": self._lake_retry_reason,
                 "lake_circuit_state": self._lake_circuit_state_locked(now),
                 "lake_probe_task_id": self._lake_probe_task_id,
+                "lake_recovery_dispatch_limit": self._lake_recovery_dispatch_limit,
+                "lake_recovery_active_leases": len(self._lake_recovery_lease_ids),
+                "lake_recovery_successes_at_limit": self._lake_recovery_successes_at_limit,
                 "metrics": dict(self._metrics),
             }
             if include_workers:
@@ -1220,6 +1252,7 @@ class PlayHandLabGateway:
 
     def _remove_lease_locked(self, lease: LabLease) -> None:
         self._leases.pop(lease.lease_id, None)
+        self._lake_recovery_lease_ids.discard(lease.lease_id)
         if lease.lease_id == self._lake_probe_lease_id:
             self._lake_probe_lease_id = None
             self._lake_probe_task_id = None
@@ -1235,21 +1268,30 @@ class PlayHandLabGateway:
         now: float,
         retry_delay: float,
         error: str,
+        reason: str | None = None,
     ) -> None:
         already_open = self._lake_retry_reason is not None
         self._lake_retry_not_before = max(
             self._lake_retry_not_before,
             now + retry_delay,
         )
-        self._lake_retry_reason = (
+        self._lake_retry_reason = reason or (
             "mutation"
             if "mutation" in str(error).lower() or "409" in str(error).lower()
             else "unavailable"
         )
+        self._lake_recovery_dispatch_limit = None
+        self._lake_recovery_successes_at_limit = 0
+        self._lake_recovery_lease_ids.clear()
         if already_open:
             self._metrics["lake_circuit_breaker_collapsed_failures"] += 1
         else:
             self._metrics["lake_circuit_breaker_activations"] += 1
+            logger.warning(
+                "Lake circuit opened reason=%s retry_after_seconds=%.3f",
+                self._lake_retry_reason,
+                max(self._lake_retry_not_before - now, 0.0),
+            )
 
     def _close_lake_circuit_locked(self) -> None:
         if self._lake_retry_reason is None:
@@ -1258,7 +1300,39 @@ class PlayHandLabGateway:
         self._lake_retry_reason = None
         self._lake_probe_lease_id = None
         self._lake_probe_task_id = None
+        self._lake_recovery_dispatch_limit = max(
+            int(self.config.lake_recovery_initial_dispatch_limit),
+            1,
+        )
+        self._lake_recovery_successes_at_limit = 0
+        self._lake_recovery_lease_ids.clear()
         self._metrics["lake_circuit_breaker_recoveries"] += 1
+        logger.info(
+            "Lake circuit recovered; dispatch ramp started limit=%s",
+            self._lake_recovery_dispatch_limit,
+        )
+
+    def _advance_lake_recovery_ramp_locked(self) -> None:
+        current = self._lake_recovery_dispatch_limit
+        if current is None:
+            return
+        self._lake_recovery_successes_at_limit += 1
+        if self._lake_recovery_successes_at_limit < current:
+            return
+        maximum = max(int(self.config.lake_recovery_max_dispatch_limit), current)
+        if current >= maximum:
+            self._lake_recovery_dispatch_limit = None
+            self._lake_recovery_successes_at_limit = 0
+            self._metrics["lake_recovery_ramp_completions"] += 1
+            logger.info("Lake recovery dispatch ramp completed")
+            return
+        self._lake_recovery_dispatch_limit = min(current * 2, maximum)
+        self._lake_recovery_successes_at_limit = 0
+        self._metrics["lake_recovery_ramp_advances"] += 1
+        logger.info(
+            "Lake recovery dispatch ramp advanced limit=%s",
+            self._lake_recovery_dispatch_limit,
+        )
 
     def _lake_circuit_state_locked(self, now: float) -> str:
         if self._lake_retry_reason is None:

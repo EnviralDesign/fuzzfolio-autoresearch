@@ -436,7 +436,7 @@ def test_lab_gateway_lake_503_without_retry_header_preserves_attempt_budget() ->
     assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
 
 
-def test_lab_gateway_capacity_overload_requeues_without_opening_global_circuit() -> None:
+def test_lab_gateway_capacity_overload_requeues_and_opens_global_circuit() -> None:
     gateway = PlayHandLabGateway(LabGatewayConfig(lake_timeout_retry_after_seconds=4.0))
     for index in range(2):
         gateway.enqueue(
@@ -467,10 +467,135 @@ def test_lab_gateway_capacity_overload_requeues_without_opening_global_circuit()
     assert failed["status"] == "requeued"
     assert failed["attempt_budget_preserved"] is True
     assert failed["retry_after_seconds"] == 2.5
-    assert next_claim["status"] == "leased"
-    assert snapshot["lake_circuit_state"] == "closed"
+    assert next_claim["status"] == "no_work"
+    assert snapshot["lake_circuit_state"] == "cooldown"
+    assert snapshot["lake_retry_reason"] == "capacity_overload"
     assert snapshot["metrics"]["lake_capacity_overload_requeues"] == 1
-    assert snapshot["metrics"]["lake_circuit_breaker_activations"] == 0
+    assert snapshot["metrics"]["lake_circuit_breaker_activations"] == 1
+
+
+def test_lab_gateway_200_worker_lake_burst_collapses_to_one_recovery_probe() -> None:
+    gateway = PlayHandLabGateway(LabGatewayConfig(lake_timeout_retry_after_seconds=4.0))
+    for index in range(201):
+        gateway.enqueue(
+            LabTask(
+                task_id=f"task-{index}",
+                lane_id="lane-1",
+                attempt_id=f"attempt-{index}",
+                max_attempts=1,
+            )
+        )
+        gateway.register_worker(f"worker-{index}")
+
+    claims = [gateway.claim(f"worker-{index}") for index in range(200)]
+    assert all(claim["status"] == "leased" for claim in claims)
+
+    for index, claim in enumerate(claims):
+        failure = gateway.fail(
+            f"worker-{index}",
+            claim["lease_id"],
+            error="Remote market data lake scope archive capacity overload retry deadline exceeded",
+            error_type="RemoteLakeOverloaded",
+            retryable=True,
+            retry_after_seconds=2.5,
+        )
+        assert failure["status"] == "requeued"
+        assert failure["attempt_budget_preserved"] is True
+
+    saturated = gateway.snapshot()
+    blocked = gateway.claim("worker-200")
+    assert saturated["failed_tasks"] == 0
+    assert saturated["queued_tasks"] == 201
+    assert saturated["active_leases"] == 0
+    assert saturated["lake_circuit_state"] == "cooldown"
+    assert saturated["metrics"]["lake_capacity_overload_requeues"] == 200
+    assert saturated["metrics"]["lake_circuit_breaker_activations"] == 1
+    assert saturated["metrics"]["lake_circuit_breaker_collapsed_failures"] == 199
+    assert blocked["status"] == "no_work"
+    assert blocked["reason"] == "lake_retry_delay"
+
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
+    probe = gateway.claim("worker-200")
+    second = gateway.claim("worker-0")
+    assert probe["status"] == "leased"
+    assert probe["lake_health_probe"] is True
+    assert second["status"] == "no_work"
+    assert second["reason"] == "lake_health_probe_in_flight"
+
+    gateway.complete("worker-200", probe["lease_id"], result={"status": "success"})
+    recovered = gateway.snapshot()
+    assert recovered["lake_circuit_state"] == "closed"
+    assert recovered["failed_tasks"] == 0
+    assert recovered["metrics"]["lake_circuit_breaker_recoveries"] == 1
+
+
+def test_lab_gateway_capacity_recovery_ramps_dispatch_before_full_refan() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(
+            lake_timeout_retry_after_seconds=1.0,
+            lake_recovery_initial_dispatch_limit=1,
+            lake_recovery_max_dispatch_limit=8,
+        )
+    )
+    for index in range(64):
+        gateway.enqueue(
+            LabTask(
+                task_id=f"task-{index}",
+                lane_id="lane-1",
+                attempt_id=f"attempt-{index}",
+                max_attempts=1,
+            )
+        )
+        gateway.register_worker(f"worker-{index}")
+
+    failed = gateway.claim("worker-0")
+    gateway.fail(
+        "worker-0",
+        failed["lease_id"],
+        error="Remote market data lake scope archive capacity overload",
+        error_type="RemoteLakeOverloaded",
+        retryable=True,
+        retry_after_seconds=1.0,
+    )
+    gateway._lake_retry_not_before = time.monotonic() - 0.001
+    probe = gateway.claim("worker-1")
+    gateway.complete("worker-1", probe["lease_id"], result={"status": "success"})
+
+    assert gateway.snapshot()["lake_recovery_dispatch_limit"] == 1
+    worker_cursor = 2
+    for expected_limit in (1, 2, 4, 8):
+        tranche: list[tuple[str, dict[str, object]]] = []
+        for _ in range(expected_limit):
+            worker_id = f"worker-{worker_cursor}"
+            claim = gateway.claim(worker_id)
+            worker_cursor += 1
+            assert claim["status"] == "leased"
+            tranche.append((worker_id, claim))
+
+        blocked = gateway.claim(f"worker-{worker_cursor}")
+        worker_cursor += 1
+        assert blocked["status"] == "no_work"
+        assert blocked["reason"] == "lake_recovery_ramp"
+        assert blocked["dispatch_limit"] == expected_limit
+
+        for worker_id, claim in tranche:
+            gateway.complete(
+                worker_id,
+                claim["lease_id"],
+                result={"status": "success"},
+            )
+
+    recovered = gateway.snapshot()
+    assert recovered["lake_recovery_dispatch_limit"] is None
+    assert recovered["lake_recovery_active_leases"] == 0
+    assert recovered["metrics"]["lake_recovery_ramp_advances"] == 3
+    assert recovered["metrics"]["lake_recovery_ramp_completions"] == 1
+    assert recovered["metrics"]["lake_recovery_ramp_limited_claims"] == 4
+
+    normal_claims = [
+        gateway.claim(f"worker-{index}") for index in range(worker_cursor, 64)
+    ]
+    assert sum(claim["status"] == "leased" for claim in normal_claims) > 8
 
 
 def test_lab_gateway_lake_409_without_retry_header_uses_mutation_cadence() -> None:
