@@ -39,6 +39,20 @@ pub const FINALIZER_MANIFEST_PATH: &str = "manifest.json";
 pub const SELECTED_CANDIDATES_PATH: &str = "selected-backfill-candidates.jsonl";
 pub const COHORT_SELECTION_SCHEMA: &str = "temporal_qd_rotating_cohort_selection_v1";
 
+fn is_v5_manifest_schema(value: &Value) -> bool {
+    matches!(
+        value.get("schemaVersion").and_then(Value::as_str),
+        Some(
+            v5::BASE_MANIFEST_SCHEMA
+                | v5::BASE_MANIFEST_SCHEMA_V2
+                | v5::FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA
+                | v5::RESUME_MANIFEST_SCHEMA
+                | v5::RESUME_MANIFEST_SCHEMA_V2
+                | v5::FAST_EPHEMERAL_RESUME_MANIFEST_SCHEMA
+        )
+    )
+}
+
 const ROTATING_SCHEMA: &str = "temporal_qd_rotating_evidence_v1";
 const COHORT_SCHEMA: &str = "temporal_qd_current_panel_evaluation_cohort_v1";
 const PROVISIONAL_SCHEMA: &str = "temporal_qd_provisional_survivors_v1";
@@ -70,11 +84,7 @@ struct CompactMember {
 pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     let raw = fs::read(manifest_path).context("read prefinalizer manifest")?;
     let value: Value = serde_json::from_slice(&raw).context("parse prefinalizer manifest")?;
-    if value.get("schemaVersion").and_then(Value::as_str) == Some(v5::BASE_MANIFEST_SCHEMA)
-        || value.get("schemaVersion").and_then(Value::as_str) == Some(v5::BASE_MANIFEST_SCHEMA_V2)
-        || value.get("schemaVersion").and_then(Value::as_str) == Some(v5::RESUME_MANIFEST_SCHEMA)
-        || value.get("schemaVersion").and_then(Value::as_str) == Some(v5::RESUME_MANIFEST_SCHEMA_V2)
-    {
+    if is_v5_manifest_schema(&value) {
         return v5::execute_manifest(manifest_path);
     }
     execute_legacy_manifest(manifest_path)
@@ -86,11 +96,7 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
 pub fn execute_manifest_compact(manifest_path: &Path) -> Result<Value> {
     let raw = fs::read(manifest_path).context("read prefinalizer manifest")?;
     let value: Value = serde_json::from_slice(&raw).context("parse prefinalizer manifest")?;
-    if value.get("schemaVersion").and_then(Value::as_str) == Some(v5::BASE_MANIFEST_SCHEMA)
-        || value.get("schemaVersion").and_then(Value::as_str) == Some(v5::BASE_MANIFEST_SCHEMA_V2)
-        || value.get("schemaVersion").and_then(Value::as_str) == Some(v5::RESUME_MANIFEST_SCHEMA)
-        || value.get("schemaVersion").and_then(Value::as_str) == Some(v5::RESUME_MANIFEST_SCHEMA_V2)
-    {
+    if is_v5_manifest_schema(&value) {
         return v5::execute_manifest_compact(manifest_path);
     }
     execute_legacy_manifest(manifest_path)
@@ -1363,4 +1369,26 @@ fn exact_keys(map: &Map<String, Value>, expected: &[&str], name: &str) -> Result
     let wanted = expected.iter().copied().collect::<BTreeSet<_>>();
     ensure!(actual == wanted, "{name} keys are not exact");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_router_admits_fast_ephemeral_base_and_resume_schemas() {
+        for schema in [
+            v5::BASE_MANIFEST_SCHEMA,
+            v5::BASE_MANIFEST_SCHEMA_V2,
+            v5::FAST_EPHEMERAL_BASE_MANIFEST_SCHEMA,
+            v5::RESUME_MANIFEST_SCHEMA,
+            v5::RESUME_MANIFEST_SCHEMA_V2,
+            v5::FAST_EPHEMERAL_RESUME_MANIFEST_SCHEMA,
+        ] {
+            assert!(is_v5_manifest_schema(&json!({"schemaVersion": schema})));
+        }
+        assert!(!is_v5_manifest_schema(
+            &json!({"schemaVersion": MANIFEST_SCHEMA})
+        ));
+    }
 }
