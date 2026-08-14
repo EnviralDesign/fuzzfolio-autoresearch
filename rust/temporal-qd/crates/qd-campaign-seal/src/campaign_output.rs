@@ -536,12 +536,16 @@ fn validate_input_binding(
 ) -> Result<()> {
     ensure!(
         input.checkpoint_sha256 == manifest.campaign_input_checkpoint_sha256
-            && input.native_runtime_authority_sha256 == manifest.runtime_authority_sha256
             && input.generation_index == manifest.generation_index
             && input.campaign_role == manifest.campaign_role
             && input.panel_id == manifest.panel_id,
         "campaign-output manifest/input checkpoint binding drifted"
     );
+    // The input checkpoint is authored by qd-campaign-freeze, while the output
+    // manifest binds the independently pinned qd-campaign-seal execution.  The
+    // checkpoint hash transitively preserves the freezer runtime authority;
+    // requiring it to equal the sealer authority makes every real multi-binary
+    // handoff impossible.
     Ok(())
 }
 
@@ -1408,5 +1412,53 @@ mod tests {
         write_value(&journal_path, &tampered, true)?;
         assert!(load_packed_gateway_completions(&journal_path, &receipt).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn campaign_output_accepts_distinct_freezer_and_sealer_runtime_authorities() -> Result<()> {
+        let manifest = CampaignOutputManifest {
+            manifest_sha256: SHA_A.into(),
+            runtime_authority_sha256: SHA_B.into(),
+            campaign_input_checkpoint_path: PathBuf::from("campaign-input-checkpoint.json"),
+            campaign_input_checkpoint_sha256: SHA_C.into(),
+            gateway_execution_receipt_path: PathBuf::from("execution-receipt.json"),
+            gateway_execution_receipt_sha256: SHA_A.into(),
+            generation_index: 1,
+            campaign_role: "proposal_current_panel".into(),
+            panel_id: "panel-1".into(),
+            rotating_evidence_sha256: SHA_B.into(),
+            panel: json!({"panelId": "panel-1"}),
+            cohort_source: json!({}),
+            minimum_total_trades: 0,
+            minimum_trades_per_window: 0,
+            cap_trades: 0,
+            provisional_limit: 1,
+        };
+        let input = V5CampaignInputCheckpoint {
+            value: json!({}),
+            root: PathBuf::new(),
+            manifest_sha256: SHA_A.into(),
+            native_runtime_authority_sha256: SHA_C.into(),
+            generation_index: 1,
+            campaign_role: "proposal_current_panel".into(),
+            panel_id: "panel-1".into(),
+            authority_id: SHA_A.into(),
+            campaign_sha256: SHA_A.into(),
+            evaluation_identity_sha256: SHA_A.into(),
+            task_matrix_sha256: SHA_A.into(),
+            candidate_count: 1,
+            window_count: 1,
+            task_count: 1,
+            cohort_population_sha256: SHA_A.into(),
+            checkpoint_sha256: SHA_C.into(),
+            task_pack_path: PathBuf::new(),
+            task_pack_raw_sha256: SHA_A.into(),
+            task_pack_size_bytes: 0,
+            cohort_population_path: PathBuf::new(),
+            cohort_population_raw_sha256: SHA_A.into(),
+            cohort_population_size_bytes: 0,
+        };
+
+        validate_input_binding(&manifest, &input)
     }
 }
