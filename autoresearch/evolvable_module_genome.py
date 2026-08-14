@@ -724,14 +724,32 @@ class EvolvableModuleCompilerV1:
         # creates an unreachable state in otherwise valid entry/management-only
         # genomes, which native v2 correctly rejects.
         has_exit_regions = any(node.zone is Zone.EXIT for node in nodes.values())
-        states: list[dict[str, Any]] = [{"id": "entry_pending"}, {"id": "position_hub"}]
+        has_one_shot_break_even = any(
+            nodes[edge.target_id].zone is Zone.MANAGEMENT
+            and edge.effect in {EffectKind.BREAK_EVEN, EffectKind.TIGHTEN_STOP}
+            for edge in genome.edges
+        )
+        hub_states = ["position_hub_be0", "position_hub_be1"] if has_one_shot_break_even else ["position_hub"]
+        states: list[dict[str, Any]] = [{"id": "entry_pending"}, *({"id": state} for state in hub_states)]
         if has_exit_regions:
-            states.append({"id": "exit_pending"})
+            states.extend(
+                {"id": f"exit_pending_be{phase}" if has_one_shot_break_even else "exit_pending"}
+                for phase in range(len(hub_states))
+            )
         node_state: dict[str, str] = {}
         for node in sorted(nodes.values(), key=lambda item: item.node_id):
             if node.node_id == hub.node_id or (node.zone is Zone.ENTRY and node.kind == "entry") or node.zone is Zone.EXIT:
                 continue
-            state = f"n_{node.node_id}"; node_state[node.node_id] = state; states.append({"id": state})
+            state = f"n_{node.node_id}"; node_state[node.node_id] = state
+            if has_one_shot_break_even and node.zone is Zone.MANAGEMENT:
+                needs_consumed_phase = any(
+                    edge.target_id == node.node_id
+                    and edge.effect not in {EffectKind.BREAK_EVEN, EffectKind.TIGHTEN_STOP}
+                    for edge in genome.edges
+                )
+                states.extend({"id": f"{state}_be{phase}"} for phase in range(2 if needs_consumed_phase else 1))
+            else:
+                states.append({"id": state})
         transitions: list[dict[str, Any]] = []
         def emit(identifier: str, source: str, destination: str, *, priority: int, guard: Mapping[str, Any], actions: Sequence[Mapping[str, Any]], reason: str, event_class: str = "decision") -> None:
             transitions.append({"id": identifier, "sourceStateId": source, "destinationStateId": destination, "eventClass": event_class, "priority": priority, "guard": _clone(dict(guard), name="compiled guard"), "actions": [_clone(dict(action), name="compiled action") for action in actions], "reasonCode": reason})
@@ -745,7 +763,7 @@ class EvolvableModuleCompilerV1:
             # entry result is the shared entry_pending execution-status route.
             if target.node_id == hub.node_id:
                 continue
-            source_state = "position_hub" if source.node_id == hub.node_id else node_state[source.node_id]
+            source_state = hub_states[0] if source.node_id == hub.node_id else node_state[source.node_id]
             guard = _guard_all(source.guard, edge.guard, target.guard)
             if target.zone is Zone.ENTRY and target.kind == "entry":
                 plan = next((use.resource_id for use in target.resources if use.kind is ResourceKind.MANAGEMENT_REF), None)
@@ -754,14 +772,23 @@ class EvolvableModuleCompilerV1:
             elif target.zone is Zone.SETUP:
                 emit(f"e_{edge.edge_id}", source_state, node_state[target.node_id], priority=edge.priority, guard=guard, actions=[], reason="evolvable.setup.advance")
             elif target.zone is Zone.MANAGEMENT:
-                pending = node_state[target.node_id]
+                pending_base = node_state[target.node_id]
                 action = self._management_action(edge.effect, target)
-                emit(f"e_{edge.edge_id}", "position_hub", pending, priority=edge.priority, guard=_guard_all({"kind": "position_exists", "expected": True}, guard), actions=[action], reason="evolvable.management.request")
-                for status, priority in (("applied", 10), ("rejected", 20), ("canceled", 30)):
-                    emit(f"e_{edge.edge_id}_{status}", pending, "position_hub", priority=priority, guard={"kind": "execution_status_is", "status": status}, actions=[], reason=f"evolvable.management.{status}", event_class="execution")
-                emit(f"e_{edge.edge_id}_closed", pending, self._recovery_state(recovery, node_state, start_state), priority=40, guard={"kind": "execution_status_is", "status": "closed"}, actions=[], reason="evolvable.management.closed", event_class="execution")
+                one_shot = edge.effect in {EffectKind.BREAK_EVEN, EffectKind.TIGHTEN_STOP}
+                phase_count = 1 if has_one_shot_break_even and one_shot else len(hub_states)
+                for phase in range(phase_count):
+                    suffix = f"_be{phase}" if has_one_shot_break_even else ""
+                    pending = f"{pending_base}_be{phase}" if has_one_shot_break_even else pending_base
+                    emit(f"e_{edge.edge_id}{suffix}", hub_states[phase], pending, priority=edge.priority, guard=_guard_all({"kind": "position_exists", "expected": True}, guard), actions=[action], reason="evolvable.management.request")
+                    for status, status_priority in (("applied", 10), ("rejected", 20), ("canceled", 30)):
+                        destination_phase = 1 if has_one_shot_break_even and one_shot and status == "applied" else phase
+                        emit(f"e_{edge.edge_id}_{status}{suffix}", pending, hub_states[destination_phase], priority=status_priority, guard={"kind": "execution_status_is", "status": status}, actions=[], reason=f"evolvable.management.{status}", event_class="execution")
+                    emit(f"e_{edge.edge_id}_closed{suffix}", pending, self._recovery_state(recovery, node_state, start_state), priority=40, guard={"kind": "execution_status_is", "status": "closed"}, actions=[], reason="evolvable.management.closed", event_class="execution")
             elif target.zone is Zone.EXIT:
-                emit(f"e_{edge.edge_id}", "position_hub", "exit_pending", priority=edge.priority, guard=_guard_all({"kind": "position_exists", "expected": True}, guard), actions=[{"kind": EffectKind.EXIT.value}], reason="evolvable.exit.request")
+                for phase, hub_state in enumerate(hub_states):
+                    suffix = f"_be{phase}" if has_one_shot_break_even else ""
+                    pending = f"exit_pending_be{phase}" if has_one_shot_break_even else "exit_pending"
+                    emit(f"e_{edge.edge_id}{suffix}", hub_state, pending, priority=edge.priority, guard=_guard_all({"kind": "position_exists", "expected": True}, guard), actions=[{"kind": EffectKind.EXIT.value}], reason="evolvable.exit.request")
             elif target.zone is Zone.RECOVERY:
                 emit(
                     f"e_{edge.edge_id}",
@@ -772,15 +799,20 @@ class EvolvableModuleCompilerV1:
                     actions=[],
                     reason="evolvable.pre_position_recovery",
                 )
-        emit("entry_filled", "entry_pending", "position_hub", priority=10, guard={"kind": "execution_status_is", "status": "filled"}, actions=[], reason="evolvable.entry.filled", event_class="execution")
+        emit("entry_filled", "entry_pending", hub_states[0], priority=10, guard={"kind": "execution_status_is", "status": "filled"}, actions=[], reason="evolvable.entry.filled", event_class="execution")
         emit("entry_rejected", "entry_pending", start_state, priority=20, guard={"kind": "execution_status_is", "status": "rejected"}, actions=[], reason="evolvable.entry.rejected", event_class="execution")
         emit("entry_canceled", "entry_pending", start_state, priority=30, guard={"kind": "execution_status_is", "status": "canceled"}, actions=[], reason="evolvable.entry.canceled", event_class="execution")
         recovery_state = self._recovery_state(recovery, node_state, start_state)
-        emit("position_protective_closed", "position_hub", recovery_state, priority=10, guard={"kind": "execution_status_is", "status": "closed"}, actions=[], reason="position.protective_closed", event_class="execution")
+        for phase, hub_state in enumerate(hub_states):
+            suffix = f"_be{phase}" if has_one_shot_break_even else ""
+            emit(f"position_protective_closed{suffix}", hub_state, recovery_state, priority=10, guard={"kind": "execution_status_is", "status": "closed"}, actions=[], reason="position.protective_closed", event_class="execution")
         if has_exit_regions:
-            emit("exit_closed", "exit_pending", recovery_state, priority=10, guard={"kind": "execution_status_is", "status": "closed"}, actions=[], reason="evolvable.exit.closed", event_class="execution")
-            emit("exit_rejected", "exit_pending", "position_hub", priority=20, guard={"kind": "execution_status_is", "status": "rejected"}, actions=[], reason="evolvable.exit.rejected", event_class="execution")
-            emit("exit_canceled", "exit_pending", "position_hub", priority=30, guard={"kind": "execution_status_is", "status": "canceled"}, actions=[], reason="evolvable.exit.canceled", event_class="execution")
+            for phase, hub_state in enumerate(hub_states):
+                suffix = f"_be{phase}" if has_one_shot_break_even else ""
+                pending = f"exit_pending_be{phase}" if has_one_shot_break_even else "exit_pending"
+                emit(f"exit_closed{suffix}", pending, recovery_state, priority=10, guard={"kind": "execution_status_is", "status": "closed"}, actions=[], reason="evolvable.exit.closed", event_class="execution")
+                emit(f"exit_rejected{suffix}", pending, hub_state, priority=20, guard={"kind": "execution_status_is", "status": "rejected"}, actions=[], reason="evolvable.exit.rejected", event_class="execution")
+                emit(f"exit_canceled{suffix}", pending, hub_state, priority=30, guard={"kind": "execution_status_is", "status": "canceled"}, actions=[], reason="evolvable.exit.canceled", event_class="execution")
         for index, node in enumerate(recovery):
             destination = node_state[recovery[index + 1].node_id] if index + 1 < len(recovery) else start_state
             emit(f"recovery_{index}", node_state[node.node_id], destination, priority=10, guard=_guard_all(node.guard, {"kind": "state_age_at_least", "events": node.timeout_bars}), actions=[], reason="evolvable.recovery.timeout")

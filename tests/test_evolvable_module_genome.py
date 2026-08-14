@@ -71,7 +71,7 @@ class _Validator:
         return {"candidateId": candidate_id, "candidateAcceptable": True, "status": "valid_evaluable"}
 
 
-def test_golden_compile_uses_shared_position_hub_priority_and_native_boundary() -> None:
+def test_golden_compile_consumes_break_even_once_and_preserves_phase() -> None:
     validator = _Validator()
     result = EvolvableModuleCompilerV1().compile(_genome(), candidate_id="golden-evolvable", native_validator=validator)
     profile = result["profile"]
@@ -80,17 +80,48 @@ def test_golden_compile_uses_shared_position_hub_priority_and_native_boundary() 
     assert validator.calls and validator.calls[0][1] == "golden-evolvable"
     assert profile["version"] == "v2" and profile["directionMode"] == "long"
     graph = profile["graph"]
-    management = next(item for item in graph["transitions"] if item["id"] == "e_hub_manage")
-    exit_ = next(item for item in graph["transitions"] if item["id"] == "e_hub_exit")
-    assert management["sourceStateId"] == exit_["sourceStateId"] == "position_hub"
+    management = next(item for item in graph["transitions"] if item["id"] == "e_hub_manage_be0")
+    exit_ = next(item for item in graph["transitions"] if item["id"] == "e_hub_exit_be0")
+    assert management["sourceStateId"] == exit_["sourceStateId"] == "position_hub_be0"
     assert management["priority"] < exit_["priority"]
     assert management["actions"] == [{"kind": "move_stop_to_break_even_next_open"}]
-    assert any(item["id"] == "position_protective_closed" and item["sourceStateId"] == "position_hub" for item in graph["transitions"])
+    assert not any(
+        item["sourceStateId"] == "position_hub_be1"
+        and item["actions"] == [{"kind": "move_stop_to_break_even_next_open"}]
+        for item in graph["transitions"]
+    )
+    by_id = {item["id"]: item for item in graph["transitions"]}
+    assert by_id["e_hub_manage_applied_be0"]["destinationStateId"] == "position_hub_be1"
+    assert by_id["e_hub_manage_rejected_be0"]["destinationStateId"] == "position_hub_be0"
+    assert by_id["e_hub_manage_canceled_be0"]["destinationStateId"] == "position_hub_be0"
+    assert by_id["exit_rejected_be1"]["destinationStateId"] == "position_hub_be1"
+    assert any(item["id"] == "position_protective_closed_be1" and item["sourceStateId"] == "position_hub_be1" for item in graph["transitions"])
     assert all(len(item["actions"]) <= 1 for item in graph["transitions"])
     assert len(graph["states"]) <= 14 and len(graph["transitions"]) <= 56
     # This is deliberately a content golden: names/metadata must not drift
     # unnoticed while native validation remains an authority boundary.
-    assert result["profileSha256"] == "sha256:c0792c21cfc53b81314a562fb79dbb9a4de278e16f5a0c99d44f25e0cc551100"
+    assert result["profileSha256"] == "sha256:27aff8a43077ed1bbe5ce76ffd2aca10bfdd419be95acf75e18d71777bf843fa"
+
+
+def test_zero_r_tighten_stop_is_also_consumed_once() -> None:
+    genome = _genome()
+    edges = tuple(
+        GenomeEdgeV1(
+            edge.edge_id,
+            edge.source_id,
+            edge.target_id,
+            priority=edge.priority,
+            guard=edge.guard,
+            effect=EffectKind.TIGHTEN_STOP if edge.effect is EffectKind.BREAK_EVEN else edge.effect,
+        )
+        for edge in genome.edges
+    )
+    tightened = EvolvableModuleGenomeV1(genome.direction, genome.resources, genome.nodes, edges)
+    transitions = EvolvableModuleCompilerV1().compile(tightened, candidate_id="zero-r-tighten")["profile"]["graph"]["transitions"]
+    requests = [item for item in transitions if item["actions"] and item["actions"][0]["kind"] == EffectKind.TIGHTEN_STOP.value]
+    assert len(requests) == 1
+    assert requests[0]["sourceStateId"] == "position_hub_be0"
+    assert next(item for item in transitions if item["id"] == "e_hub_manage_applied_be0")["destinationStateId"] == "position_hub_be1"
 
 
 def test_codec_dispatch_round_trip_and_id_independent_topology_signature() -> None:
