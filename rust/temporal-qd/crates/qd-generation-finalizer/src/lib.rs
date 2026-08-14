@@ -3319,30 +3319,34 @@ fn publish_value_once(root: &Path, name: &str, value: &Value) -> Result<()> {
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let parent = path.parent().context("output has no parent")?;
-    let filename = path
-        .file_name()
-        .context("output has no filename")?
-        .to_string_lossy();
-    let tmp = parent.join(format!(".{filename}.{}.{nonce}.tmp", std::process::id()));
+    // The output root is intentionally descriptive and can be deep.  Keep the
+    // temporary basename short so Windows publication does not exceed the
+    // classic path-length boundary merely by repeating the output filename.
+    let tmp = parent.join(format!(".p{}.{}.tmp", std::process::id(), nonce));
     let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     f.write_all(&bytes)?;
     f.sync_all()?;
     drop(f);
-    match fs::hard_link(&tmp, &path) {
+    match fs::rename(&tmp, &path) {
         Ok(()) => {
-            fs::remove_file(&tmp)?;
             sync_directory(parent)?;
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure!(fs::read(&path)? == bytes, "immutable output {name} differs");
-            fs::remove_file(&tmp)?;
+        Err(_error) if path.exists() => {
+            let identical = fs::read(&path)? == bytes;
+            let _ = fs::remove_file(&tmp);
+            ensure!(identical, "immutable output {name} differs");
             sync_directory(parent)?;
             Ok(())
         }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
-            Err(e.into())
+            Err(e).with_context(|| {
+                format!(
+                    "rename synced immutable output into place: {}",
+                    path.display()
+                )
+            })
         }
     }
 }
@@ -3508,6 +3512,23 @@ mod tests {
     const HASH_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HASH_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn immutable_value_publish_uses_rename_and_is_restart_safe() -> Result<()> {
+        let root = tempdir()?;
+        let value = json!({"value": 1});
+        publish_value_once(root.path(), RECORD_PATH, &value)?;
+        let path = root.path().join(RECORD_PATH);
+        let expected = canonical_json_line(&value)?;
+        assert_eq!(fs::read(&path)?, expected);
+
+        publish_value_once(root.path(), RECORD_PATH, &value)?;
+        let error = publish_value_once(root.path(), RECORD_PATH, &json!({"value": 2}))
+            .expect_err("divergent immutable output must fail");
+        assert!(error.to_string().contains("immutable output"));
+        assert_eq!(fs::read(path)?, expected);
+        Ok(())
+    }
 
     #[test]
     fn derives_scalar_cell_capacity_from_the_frozen_archive_policy() {

@@ -2511,7 +2511,10 @@ fn publish_bytes_once(output_dir: &Path, name: &str, bytes: &[u8]) -> Result<()>
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temporary = output_dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), nanos));
+    // Keep the temporary basename short.  Current-v5 output roots can already
+    // be close to the classic Windows MAX_PATH boundary, and repeating the
+    // destination basename here made the temporary path needlessly longer.
+    let temporary = output_dir.join(format!(".p{}.{}.tmp", std::process::id(), nanos));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -2519,25 +2522,30 @@ fn publish_bytes_once(output_dir: &Path, name: &str, bytes: &[u8]) -> Result<()>
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    match fs::hard_link(&temporary, &destination) {
+    match fs::rename(&temporary, &destination) {
         Ok(()) => {
-            fs::remove_file(&temporary)?;
             sync_directory(output_dir)?;
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(_error) if destination.exists() => {
+            let identical = fs::read(&destination)? == bytes;
+            let _ = fs::remove_file(&temporary);
             ensure!(
-                fs::read(&destination)? == bytes,
+                identical,
                 "refusing divergent existing immutable artifact: {}",
                 destination.display()
             );
-            fs::remove_file(&temporary)?;
             sync_directory(output_dir)?;
             Ok(())
         }
         Err(error) => {
             let _ = fs::remove_file(&temporary);
-            Err(error.into())
+            Err(error).with_context(|| {
+                format!(
+                    "rename synced immutable artifact into place: {}",
+                    destination.display()
+                )
+            })
         }
     }
 }
@@ -2823,6 +2831,42 @@ mod tests {
     const SHA_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SHA_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn immutable_publish_uses_short_rename_temp_and_is_restart_safe() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target_parent_len = 215usize;
+        let padding_len = target_parent_len
+            .saturating_sub(root.path().to_string_lossy().len() + 1)
+            .max(1);
+        let output = root.path().join("x".repeat(padding_len));
+        fs::create_dir(&output)?;
+        let destination = output.join(TAIL_MANIFEST_PATH);
+        assert!(destination.to_string_lossy().len() < 260);
+        let old_style_temp = output.join(format!(
+            ".{TAIL_MANIFEST_PATH}.12345.1234567890123456789.tmp"
+        ));
+        let new_style_temp = output.join(".p12345.1234567890123456789.tmp");
+        assert!(old_style_temp.to_string_lossy().len() >= 260);
+        assert!(new_style_temp.to_string_lossy().len() < 260);
+
+        publish_bytes_once(&output, TAIL_MANIFEST_PATH, b"first\n")?;
+        assert_eq!(fs::read(&destination)?, b"first\n");
+        assert!(fs::read_dir(&output)?.all(|entry| {
+            !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".p")
+        }));
+
+        publish_bytes_once(&output, TAIL_MANIFEST_PATH, b"first\n")?;
+        let error = publish_bytes_once(&output, TAIL_MANIFEST_PATH, b"different\n")
+            .expect_err("divergent immutable output must fail");
+        assert!(error.to_string().contains("refusing divergent existing"));
+        assert_eq!(fs::read(&destination)?, b"first\n");
+        Ok(())
+    }
 
     fn valid_v3_result() -> Value {
         let start = "2024-01-01T00:00:00Z";

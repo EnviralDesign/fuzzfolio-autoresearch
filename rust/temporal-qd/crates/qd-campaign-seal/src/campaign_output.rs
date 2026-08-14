@@ -94,8 +94,12 @@ pub fn execute_manifest(manifest_path: &Path) -> Result<Value> {
     reset_staging_directory(&staging)?;
     let (index, raw_inventory, metrics) = build_index_and_inventory(&source)?;
     let index_bytes = canonical_json_bytes(&index)?;
-    fs::write(staging.join(DIRECTIONAL_INDEX_PATH), &index_bytes)?;
-    File::open(staging.join(DIRECTIONAL_INDEX_PATH))?.sync_all()?;
+    let index_path = staging.join(DIRECTIONAL_INDEX_PATH);
+    write_new_synced_file(
+        &index_path,
+        &index_bytes,
+        "campaign-output tail-result index",
+    )?;
     let seal = build_campaign_seal(
         &internal_manifest,
         &source,
@@ -1128,6 +1132,19 @@ fn reset_staging_directory(path: &Path) -> Result<()> {
     ensure_real_directory(path, "campaign-output staging directory")
 }
 
+fn write_new_synced_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create {label}: {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write {label}: {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {label}: {}", path.display()))?;
+    Ok(())
+}
+
 fn write_jsonl(path: &Path, rows: &[Value], row_schema: &str, hash_field: &str) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     for row in rows {
@@ -1176,6 +1193,22 @@ mod tests {
     const SHA_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SHA_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn partial_staging_is_discarded_before_synced_index_rewrite() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let staging = root.path().join(".campaign-output.staging");
+        fs::create_dir(&staging)?;
+        fs::write(staging.join(DIRECTIONAL_INDEX_PATH), b"partial")?;
+        fs::write(staging.join(".p123.456.tmp"), b"orphan")?;
+
+        reset_staging_directory(&staging)?;
+        assert_eq!(fs::read_dir(&staging)?.count(), 0);
+        let index = staging.join(DIRECTIONAL_INDEX_PATH);
+        write_new_synced_file(&index, b"complete\n", "test tail-result index")?;
+        assert_eq!(fs::read(index)?, b"complete\n");
+        Ok(())
+    }
 
     fn write_value(path: &Path, value: &Value, newline: bool) -> Result<()> {
         let bytes = if newline {

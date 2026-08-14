@@ -2863,12 +2863,14 @@ fn ensure_real_directory(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn temporary_path(parent: &Path, base: &str) -> PathBuf {
+fn temporary_path(parent: &Path, _base: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    parent.join(format!(".{base}.{}.{}.tmp", std::process::id(), nanos))
+    // Avoid repeating a potentially long destination basename.  Deep native
+    // campaign roots otherwise push Windows temporary paths over MAX_PATH.
+    parent.join(format!(".p{}.{}.tmp", std::process::id(), nanos))
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2883,33 +2885,64 @@ fn publish_once(
     destination: &Path,
     expected_raw_sha: Option<&str>,
 ) -> Result<()> {
-    match fs::hard_link(temporary, destination) {
+    let validate_existing = || -> Result<bool> {
+        if let Some(expected) = expected_raw_sha {
+            let (actual, _, _) = validate_members_file(destination)?;
+            Ok(actual == expected)
+        } else {
+            Ok(fs::read(destination)? == fs::read(temporary)?)
+        }
+    };
+
+    if destination.exists() {
+        let identical = validate_existing()?;
+        fs::remove_file(temporary)?;
+        ensure!(
+            identical,
+            "refusing divergent existing immutable artifact: {}",
+            destination.display()
+        );
+        sync_directory(
+            destination
+                .parent()
+                .ok_or_else(|| anyhow!("immutable artifact has no parent"))?,
+        )?;
+        return Ok(());
+    }
+
+    match fs::rename(temporary, destination) {
         Ok(()) => {
-            fs::remove_file(temporary)?;
+            sync_directory(
+                destination
+                    .parent()
+                    .ok_or_else(|| anyhow!("immutable artifact has no parent"))?,
+            )?;
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if let Some(expected) = expected_raw_sha {
-                let (actual, _, _) = validate_members_file(destination)?;
-                ensure!(
-                    actual == expected,
-                    "refusing divergent existing immutable artifact: {}",
-                    destination.display()
-                );
-            } else {
-                let existing = fs::read(destination)?;
-                let pending = fs::read(temporary)?;
-                ensure!(
-                    existing == pending,
-                    "refusing divergent existing immutable artifact: {}",
-                    destination.display()
-                );
-            }
-            fs::remove_file(temporary)?;
+        Err(_error) if destination.exists() => {
+            let identical = validate_existing()?;
+            let _ = fs::remove_file(temporary);
+            ensure!(
+                identical,
+                "refusing divergent existing immutable artifact: {}",
+                destination.display()
+            );
+            sync_directory(
+                destination
+                    .parent()
+                    .ok_or_else(|| anyhow!("immutable artifact has no parent"))?,
+            )?;
             Ok(())
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("publish immutable artifact: {}", destination.display())),
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(error).with_context(|| {
+                format!(
+                    "rename synced immutable artifact into place: {}",
+                    destination.display()
+                )
+            })
+        }
     }
 }
 
@@ -2980,5 +3013,36 @@ impl<W: Write> Write for RawHashWriter<W> {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_publish_renames_synced_file_and_restarts_safely() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let destination = root.path().join(RESULT_PATH);
+
+        let first = temporary_path(root.path(), RESULT_PATH);
+        write_new_synced(&first, b"first\n")?;
+        publish_once(&first, &destination, None)?;
+        assert_eq!(fs::read(&destination)?, b"first\n");
+        assert!(!first.exists());
+
+        let same = temporary_path(root.path(), RESULT_PATH);
+        write_new_synced(&same, b"first\n")?;
+        publish_once(&same, &destination, None)?;
+        assert!(!same.exists());
+
+        let divergent = temporary_path(root.path(), RESULT_PATH);
+        write_new_synced(&divergent, b"different\n")?;
+        let error = publish_once(&divergent, &destination, None)
+            .expect_err("divergent immutable output must fail");
+        assert!(error.to_string().contains("refusing divergent existing"));
+        assert!(!divergent.exists());
+        assert_eq!(fs::read(&destination)?, b"first\n");
+        Ok(())
     }
 }
