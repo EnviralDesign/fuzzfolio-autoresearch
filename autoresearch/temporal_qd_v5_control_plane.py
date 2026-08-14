@@ -109,7 +109,22 @@ NATIVE_V5_LADDER_ARCHIVE_FREEZE_TRANSACTION_SCHEMA = (
 NATIVE_V5_LADDER_ARCHIVE_FREEZE_RECEIPT_SCHEMA = (
     "temporal_qd_v5_native_evidence_ladder_freeze_receipt_v3"
 )
-NATIVE_V5_LADDER_AUTHORITY_SCHEMA = "temporal_qd_v5_native_evidence_ladder_authority_v1"
+NATIVE_V5_LADDER_AUTHORITY_SCHEMA = "temporal_qd_v5_native_evidence_ladder_authority_v2"
+NATIVE_V5_LADDER_MATERIALIZATION_MANIFEST_SCHEMA = (
+    "temporal_qd_v5_native_evidence_ladder_materialization_manifest_v2"
+)
+NATIVE_V5_LADDER_MATERIALIZATION_RESULT_SCHEMA = (
+    "temporal_qd_v5_native_evidence_ladder_materialization_result_v2"
+)
+NATIVE_V5_LADDER_MATERIALIZATION_TRANSACTION_SCHEMA = (
+    "temporal_qd_v5_native_evidence_ladder_materialization_transaction_v2"
+)
+NATIVE_V5_LADDER_MATERIALIZATION_RECEIPT_SCHEMA = (
+    "temporal_qd_v5_native_evidence_ladder_materialization_receipt_v2"
+)
+NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND = (
+    "fast_ephemeral_finalizer_result"
+)
 EVOLVED_ATTEMPT_CHAIN_INPUT_SCHEMA = (
     "temporal_qd_v5_evolved_attempt_adapter_chain_input_v1"
 )
@@ -4193,12 +4208,24 @@ def _validated_native_v5_ladder_archive_authority(
     """Open only the small receipt authorizing an archive-native ladder stage."""
 
     authority = _mapping(value, name="native v5 ladder archive authority")
-    if set(authority) != {"kind", "receiptPath", "receiptSha256"}:
+    kind = authority.get("kind")
+    expected_authority_fields = {"kind", "receiptPath", "receiptSha256"}
+    if kind == "qd_archive_reducer_result":
+        expected_authority_fields |= {
+            "validationFreezeReceiptPath",
+            "validationFreezeReceiptSha256",
+            "validationTailAuthorityPath",
+            "validationTailAuthoritySha256",
+        }
+    if set(authority) != expected_authority_fields:
         raise TemporalQDV5ControlPlaneError(
             "native v5 ladder archive authority schema drifted"
         )
-    kind = authority.get("kind")
-    if kind not in {"generation_finalizer_commit", "qd_archive_reducer_result"}:
+    if kind not in {
+        "generation_finalizer_commit",
+        NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+        "qd_archive_reducer_result",
+    }:
         raise TemporalQDV5ControlPlaneError("native v5 ladder archive authority kind is invalid")
     receipt_path_value = authority.get("receiptPath")
     if not isinstance(receipt_path_value, str):
@@ -4236,6 +4263,34 @@ def _validated_native_v5_ladder_archive_authority(
         ):
             raise TemporalQDV5ControlPlaneError(
                 "native v5 ladder finalizer archive descriptor drifted"
+            )
+        _sha(archive.get("archiveSha256"), name="native v5 ladder archive identity")
+        _sha(archive.get("fileSha256"), name="native v5 ladder archive file identity")
+        _nonnegative(archive.get("bytes"), name="native v5 ladder archive byte length")
+    elif kind == NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND:
+        receipt = _self_hashed(
+            receipt,
+            field="resultSha256",
+            name="native v5 ladder fast-ephemeral finalizer result",
+        )
+        if (
+            receipt.get("schemaVersion") != FAST_EPHEMERAL_FINALIZER_RESULT_SCHEMA
+            or receipt.get("executionMode") != "fast-ephemeral-v1"
+            or receipt.get("resultSha256") != receipt_sha256
+        ):
+            raise TemporalQDV5ControlPlaneError(
+                "native v5 ladder fast-ephemeral result binding drifted"
+            )
+        archive = _mapping(
+            receipt.get("parentArchive"),
+            name="native v5 ladder fast-ephemeral archive",
+        )
+        if (
+            set(archive) != {"path", "archiveSha256", "bytes", "fileSha256"}
+            or archive.get("path") != "archive.json"
+        ):
+            raise TemporalQDV5ControlPlaneError(
+                "native v5 ladder fast-ephemeral archive descriptor drifted"
             )
         _sha(archive.get("archiveSha256"), name="native v5 ladder archive identity")
         _sha(archive.get("fileSha256"), name="native v5 ladder archive file identity")
@@ -4291,18 +4346,230 @@ def _validated_native_v5_ladder_archive_authority(
         _nonnegative(
             receipt.get("archiveSizeBytes"), name="native v5 ladder archive byte length"
         )
+        for path_field, sha_field in (
+            ("validationFreezeReceiptPath", "validationFreezeReceiptSha256"),
+            ("validationTailAuthorityPath", "validationTailAuthoritySha256"),
+        ):
+            if not isinstance(authority.get(path_field), str):
+                raise TemporalQDV5ControlPlaneError(
+                    f"native v5 ladder {path_field} is invalid"
+                )
+            _sha(authority.get(sha_field), name=f"native v5 ladder {sha_field}")
     generation = _positive(
         receipt.get("generationIndex"), name="native v5 ladder archive generation"
     )
     return (
         {
-            "kind": kind,
+            **authority,
             "receiptPath": str(receipt_path),
-            "receiptSha256": receipt_sha256,
         },
         receipt,
         generation,
     )
+
+
+def run_native_v5_evidence_ladder_materialization(
+    *,
+    runtime_authority: Mapping[str, Any],
+    rotating_evidence_contract: Mapping[str, Any],
+    rotating_evidence_materialization: Mapping[str, Any],
+    source_finalizer_authority: Mapping[str, Any],
+    panel_template_preparation: Mapping[str, Any],
+    construction_catalog: Mapping[str, Any],
+    stage_template_preparations: Mapping[str, Any],
+    worker_contract_sha256: str,
+    execution_engine_commit: str,
+    archive_policy_authority: Mapping[str, Any],
+    behavior_attribution_requirement: Mapping[str, Any],
+    output_root: Path | str,
+    timeout_seconds: int = 300,
+) -> dict[str, Any]:
+    """Certify the post-generation v5 ladder authority in Rust.
+
+    Python carries only bounded descriptors and compact receipts.  Candidate
+    selection and archive authentication remain entirely in Rust.
+    """
+
+    authority = _validate_runtime_authority(runtime_authority)
+    root = _real_directory(output_root, name="native v5 ladder materialization root")
+    source, _source_receipt, _generation = _validated_native_v5_ladder_archive_authority(
+        source_finalizer_authority
+    )
+    if source["kind"] not in {
+        "generation_finalizer_commit",
+        NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+    }:
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder materialization source is not a finalizer"
+        )
+    contract = _mapping(
+        rotating_evidence_contract, name="native v5 ladder rotating contract descriptor"
+    )
+    materialization = _mapping(
+        rotating_evidence_materialization,
+        name="native v5 ladder rotating materialization descriptor",
+    )
+    panel = _mapping(
+        panel_template_preparation,
+        name="native v5 ladder panel-template descriptor",
+    )
+    catalog = _mapping(
+        construction_catalog, name="native v5 ladder catalog descriptor"
+    )
+    stages = _mapping(
+        stage_template_preparations,
+        name="native v5 ladder stage-template descriptors",
+    )
+    if set(contract) != {"path", "rotatingEvidenceSha256"}:
+        raise TemporalQDV5ControlPlaneError("native v5 ladder contract descriptor drifted")
+    if set(materialization) != {"path", "materializationSha256"}:
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder rotating materialization descriptor drifted"
+        )
+    if set(panel) != {"path", "preparationSha256", "authorityId"}:
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder panel-template descriptor drifted"
+        )
+    if set(catalog) != {"path", "catalogSha256"}:
+        raise TemporalQDV5ControlPlaneError("native v5 ladder catalog descriptor drifted")
+    if set(stages) != {"validation", "scrutiny"}:
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder stage-template descriptor set drifted"
+        )
+    for name, descriptor in stages.items():
+        checked = _mapping(descriptor, name=f"native v5 ladder {name} template descriptor")
+        if set(checked) != {"path", "preparationSha256", "authorityId"}:
+            raise TemporalQDV5ControlPlaneError(
+                f"native v5 ladder {name} template descriptor drifted"
+            )
+    validation_descriptor = _mapping(
+        stages["validation"], name="native v5 ladder validation descriptor"
+    )
+    scrutiny_descriptor = _mapping(
+        stages["scrutiny"], name="native v5 ladder scrutiny descriptor"
+    )
+    for descriptor, fields, name in (
+        (contract, ("rotatingEvidenceSha256",), "rotating contract"),
+        (materialization, ("materializationSha256",), "rotating materialization"),
+        (panel, ("preparationSha256", "authorityId"), "panel template"),
+        (catalog, ("catalogSha256",), "construction catalog"),
+        (
+            validation_descriptor,
+            ("preparationSha256", "authorityId"),
+            "validation template",
+        ),
+        (
+            scrutiny_descriptor,
+            ("preparationSha256", "authorityId"),
+            "scrutiny template",
+        ),
+    ):
+        if not isinstance(descriptor.get("path"), str):
+            raise TemporalQDV5ControlPlaneError(f"native v5 ladder {name} path is invalid")
+        for field in fields:
+            _sha(descriptor.get(field), name=f"native v5 ladder {name} {field}")
+    _sha(worker_contract_sha256, name="native v5 ladder worker contract")
+    if (
+        not isinstance(execution_engine_commit, str)
+        or len(execution_engine_commit) != 40
+        or any(char not in "0123456789abcdef" for char in execution_engine_commit.lower())
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder execution-engine commit is invalid"
+        )
+    manifest = {
+        "schemaVersion": NATIVE_V5_LADDER_MATERIALIZATION_MANIFEST_SCHEMA,
+        "rotatingEvidenceContract": dict(contract),
+        "rotatingEvidenceMaterialization": dict(materialization),
+        "sourceFinalizerAuthority": source,
+        "panelTemplatePreparation": dict(panel),
+        "constructionCatalog": dict(catalog),
+        "stageTemplatePreparations": {
+            name: dict(_mapping(stages[name], name=f"native v5 ladder {name} descriptor"))
+            for name in ("validation", "scrutiny")
+        },
+        "workerContractSha256": worker_contract_sha256,
+        "executionEngineCommit": execution_engine_commit.lower(),
+        "archivePolicyAuthority": dict(
+            _mapping(archive_policy_authority, name="native v5 ladder archive policy")
+        ),
+        "behaviorAttributionRequirement": dict(
+            _mapping(
+                behavior_attribution_requirement,
+                name="native v5 ladder behavior requirement",
+            )
+        ),
+        "outputRoot": str(root),
+    }
+    manifest["manifestSha256"] = canonical_sha256(manifest)
+    manifest_path = _write_canonical_once(
+        root / "materialization-manifest.json",
+        manifest,
+        name="native v5 ladder materialization manifest",
+    )
+    binary = pinned_runtime_binary(runtime_authority=authority, role="campaignFreeze")
+    result = _run_pinned(
+        runtime_authority=authority,
+        role="campaignFreeze",
+        command=[str(binary), "--manifest", str(manifest_path)],
+        timeout_seconds=timeout_seconds,
+    )
+    expected_result_fields = {
+        "schemaVersion",
+        "manifestSha256",
+        "rotatingEvidenceSha256",
+        "sourceGenerationIndex",
+        "panelId",
+        "ladderAuthoritySha256",
+        "validationTemplatePreparationSha256",
+        "validationTemplateAuthorityId",
+        "scrutinyTemplatePreparationSha256",
+        "scrutinyTemplateAuthorityId",
+        "outputRoot",
+    }
+    if (
+        set(result) != expected_result_fields
+        or result.get("schemaVersion") != NATIVE_V5_LADDER_MATERIALIZATION_RESULT_SCHEMA
+        or result.get("manifestSha256") != manifest["manifestSha256"]
+        or result.get("outputRoot") != str(root)
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder materialization result drifted"
+        )
+    receipt = _self_hashed(
+        _read_bounded_pretty_object(
+            root / "materialization-receipt.json",
+            name="native v5 ladder materialization receipt",
+        ),
+        field="receiptSha256",
+        name="native v5 ladder materialization receipt",
+    )
+    if (
+        receipt.get("schemaVersion") != NATIVE_V5_LADDER_MATERIALIZATION_RECEIPT_SCHEMA
+        or receipt.get("manifestSha256") != manifest["manifestSha256"]
+        or receipt.get("ladderAuthoritySha256") != result.get("ladderAuthoritySha256")
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder materialization receipt drifted"
+        )
+    ladder = _self_hashed(
+        _read_bounded_pretty_object(
+            root / "ladder-authority.json", name="native v5 ladder authority"
+        ),
+        field="ladderAuthoritySha256",
+        name="native v5 ladder authority",
+    )
+    if (
+        ladder.get("schemaVersion") != NATIVE_V5_LADDER_AUTHORITY_SCHEMA
+        or ladder.get("ladderAuthoritySha256") != result.get("ladderAuthoritySha256")
+    ):
+        raise TemporalQDV5ControlPlaneError("native v5 ladder authority drifted")
+    return {
+        "manifestPath": str(manifest_path),
+        "result": result,
+        "receipt": receipt,
+        "ladderAuthority": ladder,
+    }
 
 
 def run_native_v5_evidence_ladder_archive_freeze(
@@ -4339,7 +4606,14 @@ def run_native_v5_evidence_ladder_archive_freeze(
         raise TemporalQDV5ControlPlaneError("native v5 ladder stage is invalid")
     limit = _positive(ladder_candidate_limit, name="native v5 ladder candidate limit")
     if (
-        (ladder_stage == "validation" and archive["kind"] != "generation_finalizer_commit")
+        (
+            ladder_stage == "validation"
+            and archive["kind"]
+            not in {
+                "generation_finalizer_commit",
+                NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+            }
+        )
         or (ladder_stage == "scrutiny" and archive["kind"] != "qd_archive_reducer_result")
     ):
         raise TemporalQDV5ControlPlaneError(
@@ -4397,10 +4671,18 @@ def run_native_v5_evidence_ladder_archive_freeze(
             "native v5 ladder stage authority binding drifted"
         )
     if not isinstance(campaign_role, str) or campaign_role not in {
-        "retained_parent_current_panel",
-        "prior_panel_backfill",
+        "evidence_ladder_validation",
+        "evidence_ladder_scrutiny",
     }:
         raise TemporalQDV5ControlPlaneError("native v5 ladder campaign role is invalid")
+    if (
+        stage_binding.get("stage") != ladder_stage
+        or stage_binding.get("sourceArchiveAuthorityKind") != archive["kind"]
+        or stage_binding.get("campaignRole") != campaign_role
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 ladder stage source/role binding drifted"
+        )
     if not isinstance(panel_id, str) or not panel_id:
         raise TemporalQDV5ControlPlaneError("native v5 ladder panel identity is invalid")
     if not isinstance(execution_engine_commit, str) or len(execution_engine_commit) != 40:
@@ -4499,6 +4781,8 @@ def run_native_v5_evidence_ladder_archive_freeze(
         "manifestSha256",
         "archiveAuthorityKind",
         "archiveAuthorityReceiptSha256",
+        "validationFreezeReceiptSha256",
+        "validationTailAuthoritySha256",
         "archiveSha256",
         "ladderStage",
         "ladderCandidateLimit",
@@ -4607,6 +4891,10 @@ def run_native_v5_evidence_ladder_archive_freeze(
         or result.get("manifestSha256") != manifest.get("manifestSha256")
         or result.get("archiveAuthorityKind") != archive["kind"]
         or result.get("archiveAuthorityReceiptSha256") != archive["receiptSha256"]
+        or result.get("validationFreezeReceiptSha256")
+        != receipt.get("validationFreezeReceiptSha256")
+        or result.get("validationTailAuthoritySha256")
+        != receipt.get("validationTailAuthoritySha256")
         or result.get("ladderStage") != ladder_stage
         or result.get("ladderCandidateLimit") != limit
         or result.get("archiveSha256") != receipt.get("archiveSha256")
@@ -5384,6 +5672,7 @@ def run_native_v5_archive_reducer(
     *,
     runtime_authority: Mapping[str, Any],
     tail_authority: Mapping[str, Any],
+    validation_freeze_receipt: Mapping[str, Any],
     output_root: Path | str,
     cell_capacity: int,
     archive_policy_authority: Mapping[str, Any],
@@ -5402,6 +5691,44 @@ def run_native_v5_archive_reducer(
     """
 
     authority = _validate_runtime_authority(runtime_authority)
+    freeze_reference = _mapping(
+        validation_freeze_receipt,
+        name="native v5 validation ladder-freeze receipt reference",
+    )
+    if set(freeze_reference) != {"receiptPath", "receiptSha256"}:
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 validation ladder-freeze receipt reference drifted"
+        )
+    freeze_path_value = freeze_reference.get("receiptPath")
+    if not isinstance(freeze_path_value, str):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 validation ladder-freeze receipt path is invalid"
+        )
+    freeze_path = _real_path(
+        freeze_path_value,
+        name="native v5 validation ladder-freeze receipt",
+    )
+    freeze_receipt = _self_hashed(
+        _read_bounded_pretty_object(
+            freeze_path,
+            name="native v5 validation ladder-freeze receipt",
+        ),
+        field="receiptSha256",
+        name="native v5 validation ladder-freeze receipt",
+    )
+    freeze_sha256 = _sha(
+        freeze_reference.get("receiptSha256"),
+        name="native v5 validation ladder-freeze receipt",
+    )
+    if (
+        freeze_receipt.get("schemaVersion")
+        != NATIVE_V5_LADDER_ARCHIVE_FREEZE_RECEIPT_SCHEMA
+        or freeze_receipt.get("ladderStage") != "validation"
+        or freeze_receipt.get("receiptSha256") != freeze_sha256
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 validation ladder-freeze receipt drifted"
+        )
     tail_reference = _mapping(tail_authority, name="native v5 tail authority reference")
     if set(tail_reference) != {"receiptPath", "receiptSha256"}:
         raise TemporalQDV5ControlPlaneError(
@@ -5430,6 +5757,14 @@ def run_native_v5_archive_reducer(
         runtime_authority_sha256=authority["authoritySha256"],
         generation_index=generation,
     )
+    if (
+        freeze_receipt.get("taskMatrixSha256") != tail_receipt.get("taskMatrixSha256")
+        or freeze_receipt.get("cohortPopulationSha256")
+        != tail_receipt.get("populationSha256")
+    ):
+        raise TemporalQDV5ControlPlaneError(
+            "native v5 validation freeze/tail provenance drifted"
+        )
     root = _real_directory(output_root, name="native v5 archive-reducer root")
     capacity = _positive(cell_capacity, name="native v5 archive cell capacity")
     if capacity > 32:
@@ -5576,6 +5911,10 @@ def run_native_v5_archive_reducer(
             "kind": "qd_archive_reducer_result",
             "receiptPath": str(result_path),
             "receiptSha256": result["resultSha256"],
+            "validationFreezeReceiptPath": str(freeze_path),
+            "validationFreezeReceiptSha256": freeze_sha256,
+            "validationTailAuthorityPath": sealed_tail["receiptPath"],
+            "validationTailAuthoritySha256": sealed_tail["receiptSha256"],
         },
         "tailAuthority": tail_receipt,
         "tailAuthorityPath": sealed_tail["receiptPath"],
@@ -5612,6 +5951,10 @@ __all__ = [
     "NATIVE_V5_LADDER_ARCHIVE_FREEZE_TRANSACTION_SCHEMA",
     "NATIVE_V5_LADDER_ARCHIVE_FREEZE_RECEIPT_SCHEMA",
     "NATIVE_V5_LADDER_AUTHORITY_SCHEMA",
+    "NATIVE_V5_LADDER_MATERIALIZATION_MANIFEST_SCHEMA",
+    "NATIVE_V5_LADDER_MATERIALIZATION_RESULT_SCHEMA",
+    "NATIVE_V5_LADDER_MATERIALIZATION_TRANSACTION_SCHEMA",
+    "NATIVE_V5_LADDER_MATERIALIZATION_RECEIPT_SCHEMA",
     "TAIL_AUTHORITY_RECEIPT_SCHEMA",
     "TemporalQDV5ControlPlaneError",
     "assemble_native_v5_funnel_reduction_source",
@@ -5630,6 +5973,7 @@ __all__ = [
     "run_native_v5_fast_ephemeral_generation_finalizer",
     "run_native_v5_rotating_prefinalizer",
     "run_native_v5_campaign_freeze",
+    "run_native_v5_evidence_ladder_materialization",
     "run_native_v5_evidence_ladder_archive_freeze",
     "run_native_gateway_dispatch",
 ]

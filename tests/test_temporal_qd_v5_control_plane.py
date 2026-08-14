@@ -2252,6 +2252,9 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
     template_sha = canonical_sha256({})
     catalog_sha = canonical_sha256({})
     stage = {
+        "stage": "validation",
+        "sourceArchiveAuthorityKind": "generation_finalizer_commit",
+        "campaignRole": "evidence_ladder_validation",
         "candidateLimit": 1,
         "templatePreparationPath": str(template.resolve()),
         "templatePreparationSha256": template_sha,
@@ -2303,7 +2306,7 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             "outputRoot": str(output_root),
             "executionEngineCommit": "a" * 40,
             "workerContractSha256": _sha("worker-contract"),
-            "campaignRole": "retained_parent_current_panel",
+            "campaignRole": "evidence_ladder_validation",
             "panelId": "panel-validation",
             "rotatingEvidence": {"rotatingEvidenceSha256": _sha("rotating")},
             "archivePolicyAuthority": policy,
@@ -2333,7 +2336,7 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
                 "candidateCount": 1,
                 "windowCount": 1,
                 "taskCount": 1,
-                "campaignRole": "retained_parent_current_panel",
+                "campaignRole": "evidence_ladder_validation",
                 "outputInventory": inventory(
                     control._NATIVE_V5_FREEZE_TRANSACTION_INVENTORY_PATHS,
                     tag="native-transaction",
@@ -2468,6 +2471,12 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             "manifestSha256": common["manifestSha256"],
             "archiveAuthorityKind": common["archiveAuthorityKind"],
             "archiveAuthorityReceiptSha256": common["archiveAuthorityReceiptSha256"],
+            "validationFreezeReceiptSha256": common[
+                "validationFreezeReceiptSha256"
+            ],
+            "validationTailAuthoritySha256": common[
+                "validationTailAuthoritySha256"
+            ],
             "archiveSha256": common["archiveSha256"],
             "ladderStage": common["ladderStage"],
             "ladderCandidateLimit": common["ladderCandidateLimit"],
@@ -2503,7 +2512,7 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
         rotating_evidence={"rotatingEvidenceSha256": _sha("rotating")},
         archive_policy_authority=policy,
         behavior_attribution_requirement=behavior,
-        campaign_role="retained_parent_current_panel",
+        campaign_role="evidence_ladder_validation",
         panel_id="panel-validation",
     )
     assert handoff["receipt"]["receiptSha256"]
@@ -2528,7 +2537,7 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             rotating_evidence={"rotatingEvidenceSha256": _sha("rotating")},
             archive_policy_authority=policy,
             behavior_attribution_requirement=behavior,
-            campaign_role="retained_parent_current_panel",
+            campaign_role="evidence_ladder_validation",
             panel_id="panel-validation",
         )
 
@@ -2550,7 +2559,7 @@ def test_native_v3_ladder_freeze_reopens_only_sealed_control_documents(
             rotating_evidence={"rotatingEvidenceSha256": _sha("rotating")},
             archive_policy_authority=policy,
             behavior_attribution_requirement=behavior,
-            campaign_role="retained_parent_current_panel",
+            campaign_role="evidence_ladder_validation",
             panel_id="panel-validation",
         )
 
@@ -2589,6 +2598,17 @@ def test_native_archive_reducer_accepts_only_a_compact_tail_authority(
     authority = _self_hashed(authority, "tailAuthoritySha256")
     authority_path = tail_root / "tail-authority.json"
     _write(authority_path, authority)
+    validation_freeze = _self_hashed(
+        {
+            "schemaVersion": control.NATIVE_V5_LADDER_ARCHIVE_FREEZE_RECEIPT_SCHEMA,
+            "ladderStage": "validation",
+            "taskMatrixSha256": authority["taskMatrixSha256"],
+            "cohortPopulationSha256": authority["populationSha256"],
+        },
+        "receiptSha256",
+    )
+    validation_freeze_path = tail_root / "validation-ladder-freeze-receipt.json"
+    _write_pretty(validation_freeze_path, validation_freeze)
     output_root = (tmp_path / "archive").resolve()
     output_root.mkdir()
     observed: dict[str, Any] = {}
@@ -2657,6 +2677,10 @@ def test_native_archive_reducer_accepts_only_a_compact_tail_authority(
             "receiptPath": str(authority_path),
             "receiptSha256": authority["tailAuthoritySha256"],
         },
+        validation_freeze_receipt={
+            "receiptPath": str(validation_freeze_path),
+            "receiptSha256": validation_freeze["receiptSha256"],
+        },
         output_root=output_root,
         cell_capacity=1,
         archive_policy_authority=policy,
@@ -2669,6 +2693,10 @@ def test_native_archive_reducer_accepts_only_a_compact_tail_authority(
         "kind": "qd_archive_reducer_result",
         "receiptPath": str(output_root / "archive-reduction-result.json"),
         "receiptSha256": reduced["result"]["resultSha256"],
+        "validationFreezeReceiptPath": str(validation_freeze_path),
+        "validationFreezeReceiptSha256": validation_freeze["receiptSha256"],
+        "validationTailAuthorityPath": str(authority_path),
+        "validationTailAuthoritySha256": authority["tailAuthoritySha256"],
     }
     assert not (tail_root / "tail-reduction-result.json").exists()
     assert not (tail_root / "evaluated-members.jsonl").exists()
@@ -2688,6 +2716,10 @@ def test_native_archive_reducer_accepts_only_a_compact_tail_authority(
             tail_authority={
                 "receiptPath": str(authority_path),
                 "receiptSha256": tampered["tailAuthoritySha256"],
+            },
+            validation_freeze_receipt={
+                "receiptPath": str(validation_freeze_path),
+                "receiptSha256": validation_freeze["receiptSha256"],
             },
             output_root=output_root,
             cell_capacity=1,
@@ -2728,12 +2760,17 @@ def test_native_ladder_reducer_authority_requires_the_exact_v1_result(
     )
     path = tmp_path / "archive-reduction-result.json"
     _write(path, result)
+    scrutiny_authority = {
+        "kind": "qd_archive_reducer_result",
+        "receiptPath": str(path.resolve()),
+        "receiptSha256": result["resultSha256"],
+        "validationFreezeReceiptPath": str((tmp_path / "validation-freeze.json").resolve()),
+        "validationFreezeReceiptSha256": _sha("validation-freeze"),
+        "validationTailAuthorityPath": str((tmp_path / "validation-tail.json").resolve()),
+        "validationTailAuthoritySha256": result["tailAuthoritySha256"],
+    }
     authority, receipt, generation = control._validated_native_v5_ladder_archive_authority(
-        {
-            "kind": "qd_archive_reducer_result",
-            "receiptPath": str(path.resolve()),
-            "receiptSha256": result["resultSha256"],
-        }
+        scrutiny_authority
     )
     assert authority["receiptSha256"] == result["resultSha256"]
     assert receipt["tailAuthoritySha256"] == result["tailAuthoritySha256"]
@@ -2749,11 +2786,138 @@ def test_native_ladder_reducer_authority_requires_the_exact_v1_result(
     with pytest.raises(control.TemporalQDV5ControlPlaneError, match="receipt drifted"):
         control._validated_native_v5_ladder_archive_authority(
             {
-                "kind": "qd_archive_reducer_result",
-                "receiptPath": str(path.resolve()),
+                **scrutiny_authority,
                 "receiptSha256": replaced["resultSha256"],
             }
         )
+
+
+def test_native_ladder_materialization_accepts_fast_finalizer_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    source_root = tmp_path / "fast-finalizer"
+    source_root.mkdir()
+    fast_result = _self_hashed(
+        {
+            "schemaVersion": control.FAST_EPHEMERAL_FINALIZER_RESULT_SCHEMA,
+            "executionMode": "fast-ephemeral-v1",
+            "generationIndex": 5,
+            "parentArchive": {
+                "path": "archive.json",
+                "archiveSha256": _sha("archive"),
+                "fileSha256": _sha("archive-file"),
+                "bytes": 123,
+            },
+        },
+        "resultSha256",
+    )
+    result_path = source_root / "fast-ephemeral-result.json"
+    _write(result_path, fast_result)
+    root = tmp_path / "ladder-materialization"
+    root.mkdir()
+    stages = {
+        name: {
+            "path": str((tmp_path / f"{name}.json").resolve()),
+            "preparationSha256": _sha(f"{name}-preparation"),
+            "authorityId": _sha(f"{name}-authority"),
+        }
+        for name in ("validation", "scrutiny")
+    }
+    ladder = _self_hashed(
+        {
+            "schemaVersion": control.NATIVE_V5_LADDER_AUTHORITY_SCHEMA,
+            "stageOrder": ["validation", "scrutiny"],
+            "stages": {
+                "validation": {
+                    "stage": "validation",
+                    "sourceArchiveAuthorityKind": control.NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+                },
+                "scrutiny": {
+                    "stage": "scrutiny",
+                    "sourceArchiveAuthorityKind": "qd_archive_reducer_result",
+                },
+            },
+        },
+        "ladderAuthoritySha256",
+    )
+
+    def fake_run_pinned(**kwargs: Any) -> dict[str, Any]:
+        manifest_path = Path(kwargs["command"][-1])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        result = {
+            "schemaVersion": control.NATIVE_V5_LADDER_MATERIALIZATION_RESULT_SCHEMA,
+            "manifestSha256": manifest["manifestSha256"],
+            "rotatingEvidenceSha256": _sha("rotating"),
+            "sourceGenerationIndex": 5,
+            "panelId": "panel-a",
+            "ladderAuthoritySha256": ladder["ladderAuthoritySha256"],
+            "validationTemplatePreparationSha256": stages["validation"]["preparationSha256"],
+            "validationTemplateAuthorityId": stages["validation"]["authorityId"],
+            "scrutinyTemplatePreparationSha256": stages["scrutiny"]["preparationSha256"],
+            "scrutinyTemplateAuthorityId": stages["scrutiny"]["authorityId"],
+            "outputRoot": str(root.resolve()),
+        }
+        receipt = _self_hashed(
+            {
+                "schemaVersion": control.NATIVE_V5_LADDER_MATERIALIZATION_RECEIPT_SCHEMA,
+                "manifestSha256": manifest["manifestSha256"],
+                "transactionSha256": _sha("transaction"),
+                "rotatingEvidenceSha256": result["rotatingEvidenceSha256"],
+                "sourceGenerationIndex": 5,
+                "panelId": "panel-a",
+                "sourceFinalizerReceiptSha256": fast_result["resultSha256"],
+                "ladderAuthoritySha256": ladder["ladderAuthoritySha256"],
+                "validationTemplatePreparationSha256": stages["validation"]["preparationSha256"],
+                "validationTemplateAuthorityId": stages["validation"]["authorityId"],
+                "scrutinyTemplatePreparationSha256": stages["scrutiny"]["preparationSha256"],
+                "scrutinyTemplateAuthorityId": stages["scrutiny"]["authorityId"],
+                "outputInventory": [],
+            },
+            "receiptSha256",
+        )
+        _write_pretty(root / "materialization-receipt.json", receipt)
+        _write_pretty(root / "ladder-authority.json", ladder)
+        return result
+
+    monkeypatch.setattr(control, "_run_pinned", fake_run_pinned)
+    handoff = control.run_native_v5_evidence_ladder_materialization(
+        runtime_authority=runtime,
+        rotating_evidence_contract={
+            "path": str((tmp_path / "rotating.json").resolve()),
+            "rotatingEvidenceSha256": _sha("rotating"),
+        },
+        rotating_evidence_materialization={
+            "path": str((tmp_path / "rotating-materialization.json").resolve()),
+            "materializationSha256": _sha("rotating-materialization"),
+        },
+        source_finalizer_authority={
+            "kind": control.NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+            "receiptPath": str(result_path.resolve()),
+            "receiptSha256": fast_result["resultSha256"],
+        },
+        panel_template_preparation={
+            "path": str((tmp_path / "panel.json").resolve()),
+            "preparationSha256": _sha("panel-preparation"),
+            "authorityId": _sha("panel-authority"),
+        },
+        construction_catalog={
+            "path": str((tmp_path / "catalog.json").resolve()),
+            "catalogSha256": _sha("catalog"),
+        },
+        stage_template_preparations=stages,
+        worker_contract_sha256=_sha("worker"),
+        execution_engine_commit="a" * 40,
+        archive_policy_authority={"policy": "fixture"},
+        behavior_attribution_requirement={"required": True},
+        output_root=root,
+    )
+    assert handoff["result"]["sourceGenerationIndex"] == 5
+    assert (
+        handoff["ladderAuthority"]["stages"]["validation"]
+        ["sourceArchiveAuthorityKind"]
+        == control.NATIVE_V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+    )
 
 
 def _legacy_native_ladder_freeze_fixture_is_retained_for_oracle_reference(

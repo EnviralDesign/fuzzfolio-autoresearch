@@ -55,6 +55,9 @@ pub const V5_LADDER_MATERIALIZATION_TRANSACTION_SCHEMA: &str =
     "temporal_qd_v5_native_evidence_ladder_materialization_transaction_v2";
 pub const V5_LADDER_MATERIALIZATION_RECEIPT_SCHEMA: &str =
     "temporal_qd_v5_native_evidence_ladder_materialization_receipt_v2";
+const V5_FAST_EPHEMERAL_FINALIZATION_RESULT_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_finalization_result_v1";
+const V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND: &str = "fast_ephemeral_finalizer_result";
 const AUTHORITY_SCHEMA: &str = "temporal_graph_candidate_window_authority_v1";
 const TASK_MANIFEST_SCHEMA: &str = "temporal_graph_candidate_window_manifest_v1";
 const CHECKPOINT_SCHEMA: &str = "temporal_graph_candidate_window_checkpoint_v1";
@@ -1940,10 +1943,14 @@ fn execute_v5_ladder_materialization_manifest(spec: &Map<String, Value>) -> Resu
     let finalizer = reopen_ladder_archive_authority(
         spec.get("sourceFinalizerAuthority")
             .ok_or_else(|| anyhow!("source finalizer authority missing"))?,
+        None,
     )?;
     ensure!(
-        finalizer.kind == "generation_finalizer_commit",
-        "v2 ladder materialization source is not a generation finalizer"
+        matches!(
+            finalizer.kind.as_str(),
+            "generation_finalizer_commit" | V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+        ),
+        "v2 ladder materialization source is not a supported generation finalizer"
     );
     let generation = object(&finalizer.archive, "source final archive")?
         .get("generationIndex")
@@ -2102,7 +2109,7 @@ fn execute_v5_ladder_materialization_manifest(spec: &Map<String, Value>) -> Resu
             12_u64,
             "validation",
             128_u64,
-            "generation_finalizer_commit",
+            finalizer.kind.as_str(),
             "evidence_ladder_validation",
         ),
         (
@@ -2680,10 +2687,23 @@ fn validate_v2_ladder_authority(value: &Value) -> Result<()> {
         "v2 ladder stages",
     )?;
     exact_keys(stages, &["validation", "scrutiny"], "v2 ladder stages")?;
+    let validation_source_kind = stages
+        .get("validation")
+        .and_then(Value::as_object)
+        .and_then(|binding| binding.get("sourceArchiveAuthorityKind"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("v2 ladder validation source kind missing"))?;
+    ensure!(
+        matches!(
+            validation_source_kind,
+            "generation_finalizer_commit" | V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+        ),
+        "v2 ladder validation source kind is unsupported"
+    );
     for (stage, source_kind, campaign_role, months, role, limit) in [
         (
             "validation",
-            "generation_finalizer_commit",
+            validation_source_kind,
             "evidence_ladder_validation",
             12_u64,
             "validation",
@@ -3011,12 +3031,24 @@ fn execute_v5_ladder_archive_freeze_manifest(spec: &Map<String, Value>) -> Resul
         .get("ladderCandidateLimit")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("ladder candidate limit is invalid"))? as usize;
+    let ladder_map = object(
+        spec.get("ladderAuthority")
+            .ok_or_else(|| anyhow!("sealed ladder authority missing"))?,
+        "sealed ladder authority",
+    )?;
+    let ladder_authority_sha = string(ladder_map, "ladderAuthoritySha256")?;
+    require_sha(ladder_authority_sha, "sealed ladder authority identity")?;
     let authority = reopen_ladder_archive_authority(
         spec.get("archiveAuthority")
             .ok_or_else(|| anyhow!("v3 archive authority missing"))?,
+        Some(ladder_authority_sha),
     )?;
     ensure!(
-        (stage == "validation" && authority.kind == "generation_finalizer_commit")
+        (stage == "validation"
+            && matches!(
+                authority.kind.as_str(),
+                "generation_finalizer_commit" | V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+            ))
             || (stage == "scrutiny" && authority.kind == "qd_archive_reducer_result"),
         "v3 ladder stage/archive authority kind binding drifted"
     );
@@ -3034,11 +3066,6 @@ fn execute_v5_ladder_archive_freeze_manifest(spec: &Map<String, Value>) -> Resul
         generation > 0,
         "authenticated archive generationIndex must be positive"
     );
-    let ladder_map = object(
-        spec.get("ladderAuthority")
-            .ok_or_else(|| anyhow!("sealed ladder authority missing"))?,
-        "sealed ladder authority",
-    )?;
     ensure!(
         ladder_map
             .get("sourceGenerationIndex")
@@ -3174,10 +3201,21 @@ fn ladder_stage_and_bindings(spec: &Map<String, Value>, verify_template: bool) -
         "sealed ladder stage limit drifted"
     );
     let expected_source_kind = if stage == "validation" {
-        "generation_finalizer_commit"
+        binding
+            .get("sourceArchiveAuthorityKind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("sealed ladder validation source kind missing"))?
     } else {
         "qd_archive_reducer_result"
     };
+    ensure!(
+        stage != "validation"
+            || matches!(
+                expected_source_kind,
+                "generation_finalizer_commit" | V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+            ),
+        "sealed ladder validation source kind is unsupported"
+    );
     let expected_role = if stage == "validation" {
         "evidence_ladder_validation"
     } else {
@@ -3249,10 +3287,16 @@ fn ladder_stage_and_bindings(spec: &Map<String, Value>, verify_template: bool) -
     Ok(stage)
 }
 
-fn reopen_ladder_archive_authority(value: &Value) -> Result<LadderArchiveAuthority> {
+fn reopen_ladder_archive_authority(
+    value: &Value,
+    expected_ladder_authority_sha256: Option<&str>,
+) -> Result<LadderArchiveAuthority> {
     let map = object(value, "v3 archive authority")?;
     let kind = string(map, "kind")?.to_owned();
-    if kind == "generation_finalizer_commit" {
+    if matches!(
+        kind.as_str(),
+        "generation_finalizer_commit" | V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+    ) {
         exact_keys(
             map,
             &["kind", "receiptPath", "receiptSha256"],
@@ -3320,6 +3364,35 @@ fn reopen_ladder_archive_authority(value: &Value) -> Result<LadderArchiveAuthori
                     .ok_or_else(|| anyhow!("generation finalizer parentArchive bytes invalid"))?,
             )
         }
+        V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND => {
+            ensure!(
+                string(receipt_map, "schemaVersion")?
+                    == V5_FAST_EPHEMERAL_FINALIZATION_RESULT_SCHEMA
+                    && string(receipt_map, "executionMode")? == "fast-ephemeral-v1"
+                    && canonical_sha256_without_object_field(&receipt, "resultSha256")?
+                        == receipt_sha
+                    && string(receipt_map, "resultSha256")? == receipt_sha,
+                "fast-ephemeral finalizer result identity drifted"
+            );
+            let descriptor = object(
+                receipt_map.get("parentArchive").ok_or_else(|| {
+                    anyhow!("fast-ephemeral finalizer result lacks parentArchive")
+                })?,
+                "fast-ephemeral finalizer parentArchive",
+            )?;
+            ensure!(
+                string(descriptor, "path")? == "archive.json",
+                "fast-ephemeral finalizer parentArchive path drifted"
+            );
+            (
+                string(descriptor, "archiveSha256")?.to_owned(),
+                string(descriptor, "fileSha256")?.to_owned(),
+                descriptor
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("fast-ephemeral parentArchive bytes invalid"))?,
+            )
+        }
         "qd_archive_reducer_result" => {
             ensure!(
                 string(receipt_map, "schemaVersion")?
@@ -3357,13 +3430,19 @@ fn reopen_ladder_archive_authority(value: &Value) -> Result<LadderArchiveAuthori
             && canonical_sha256_without_object_field(&archive, "archiveSha256")? == archive_sha,
         "archive authority archive semantic binding drifted"
     );
-    let (validation_freeze_receipt_sha256, validation_tail_authority_sha256) =
-        if kind == "qd_archive_reducer_result" {
-            let (freeze_sha, tail_sha) = validate_scrutiny_archive_provenance(map, receipt_map)?;
-            (Some(freeze_sha), Some(tail_sha))
-        } else {
-            (None, None)
-        };
+    let (validation_freeze_receipt_sha256, validation_tail_authority_sha256) = if kind
+        == "qd_archive_reducer_result"
+    {
+        let (freeze_sha, tail_sha) = validate_scrutiny_archive_provenance(
+            map,
+            receipt_map,
+            expected_ladder_authority_sha256
+                .ok_or_else(|| anyhow!("scrutiny archive authority lacks its ladder identity"))?,
+        )?;
+        (Some(freeze_sha), Some(tail_sha))
+    } else {
+        (None, None)
+    };
     Ok(LadderArchiveAuthority {
         kind,
         receipt_sha256: receipt_sha,
@@ -3379,7 +3458,12 @@ fn reopen_ladder_archive_authority(value: &Value) -> Result<LadderArchiveAuthori
 fn validate_scrutiny_archive_provenance(
     descriptor: &Map<String, Value>,
     reducer_receipt: &Map<String, Value>,
+    expected_ladder_authority_sha256: &str,
 ) -> Result<(String, String)> {
+    require_sha(
+        expected_ladder_authority_sha256,
+        "scrutiny ladder authority identity",
+    )?;
     let freeze_sha = string(descriptor, "validationFreezeReceiptSha256")?.to_owned();
     let tail_sha = string(descriptor, "validationTailAuthoritySha256")?.to_owned();
     require_sha(&freeze_sha, "validation ladder-freeze receipt")?;
@@ -3403,7 +3487,11 @@ fn validate_scrutiny_archive_provenance(
     ensure!(
         string(freeze_map, "schemaVersion")? == V5_LADDER_ARCHIVE_FREEZE_RECEIPT_SCHEMA
             && string(freeze_map, "ladderStage")? == "validation"
-            && string(freeze_map, "archiveAuthorityKind")? == "generation_finalizer_commit"
+            && matches!(
+                string(freeze_map, "archiveAuthorityKind")?,
+                "generation_finalizer_commit" | V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND
+            )
+            && string(freeze_map, "ladderAuthoritySha256")? == expected_ladder_authority_sha256
             && canonical_sha256_without_object_field(&freeze, "receiptSha256")? == freeze_sha
             && string(freeze_map, "receiptSha256")? == freeze_sha,
         "scrutiny source validation ladder-freeze receipt drifted"
@@ -5873,12 +5961,57 @@ mod tests {
         commit["commitSha256"] = Value::String(canonical_sha256(&commit).unwrap());
         let commit_path = root.path().join("generation-commit.json");
         write_canonical(&commit_path, &commit);
-        let finalizer = reopen_ladder_archive_authority(&json!({"kind":"generation_finalizer_commit","receiptPath":commit_path,"receiptSha256":commit["commitSha256"]})).unwrap();
+        let finalizer = reopen_ladder_archive_authority(&json!({"kind":"generation_finalizer_commit","receiptPath":commit_path,"receiptSha256":commit["commitSha256"]}), None).unwrap();
         assert_eq!(finalizer.archive_sha256, archive["archiveSha256"]);
         let selected = ladder_members_from_archive(&finalizer.archive, 1).unwrap();
         assert_eq!(
             validate_ladder_rich_member(selected[0].clone()).unwrap()["candidateId"],
             "retained-history"
+        );
+
+        let mut fast_result = json!({
+            "schemaVersion": V5_FAST_EPHEMERAL_FINALIZATION_RESULT_SCHEMA,
+            "executionMode": "fast-ephemeral-v1",
+            "parentArchive": {
+                "path": "archive.json",
+                "archiveSha256": archive["archiveSha256"],
+                "fileSha256": raw_sha,
+                "bytes": bytes,
+            },
+        });
+        fast_result["resultSha256"] = Value::String(canonical_sha256(&fast_result).unwrap());
+        let fast_result_path = root.path().join("fast-ephemeral-result.json");
+        write_canonical(&fast_result_path, &fast_result);
+        let fast_finalizer = reopen_ladder_archive_authority(
+            &json!({
+                "kind": V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+                "receiptPath": fast_result_path,
+                "receiptSha256": fast_result["resultSha256"],
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fast_finalizer.archive_sha256, archive["archiveSha256"]);
+
+        let mut forged_fast_result = fast_result.clone();
+        forged_fast_result["parentArchive"]["archiveSha256"] =
+            Value::String(test_sha("substituted-fast-archive"));
+        forged_fast_result["resultSha256"] = Value::String(
+            canonical_sha256_without_object_field(&forged_fast_result, "resultSha256").unwrap(),
+        );
+        let forged_fast_result_path = root.path().join("forged-fast-result.json");
+        write_canonical(&forged_fast_result_path, &forged_fast_result);
+        assert!(
+            reopen_ladder_archive_authority(
+                &json!({
+                    "kind": V5_FAST_EPHEMERAL_ARCHIVE_AUTHORITY_KIND,
+                    "receiptPath": forged_fast_result_path,
+                    "receiptSha256": forged_fast_result["resultSha256"],
+                }),
+                None
+            )
+            .is_err(),
+            "fast finalizer authority must bind the exact sibling archive"
         );
 
         let task_sha = test_sha("validation-task-matrix");
@@ -5887,6 +6020,7 @@ mod tests {
             "schemaVersion":V5_LADDER_ARCHIVE_FREEZE_RECEIPT_SCHEMA,
             "ladderStage":"validation",
             "archiveAuthorityKind":"generation_finalizer_commit",
+            "ladderAuthoritySha256":test_sha("ladder-authority-a"),
             "taskMatrixSha256":task_sha,
             "cohortPopulationSha256":population_sha,
         });
@@ -5907,30 +6041,52 @@ mod tests {
         reducer["resultSha256"] = Value::String(canonical_sha256(&reducer).unwrap());
         let reducer_path = root.path().join("archive-reduction-result.json");
         write_canonical(&reducer_path, &reducer);
-        let reduced = reopen_ladder_archive_authority(&json!({
-            "kind":"qd_archive_reducer_result",
-            "receiptPath":reducer_path,
-            "receiptSha256":reducer["resultSha256"],
-            "validationFreezeReceiptPath":validation_freeze_path,
-            "validationFreezeReceiptSha256":validation_freeze["receiptSha256"],
-            "validationTailAuthorityPath":tail_path,
-            "validationTailAuthoritySha256":tail["tailAuthoritySha256"],
-        }))
-        .unwrap();
-        assert_eq!(
-            reduced.archive_raw_sha256,
-            file_sha256(&archive_path).unwrap()
-        );
-        assert!(
-            reopen_ladder_archive_authority(&json!({
+        let reduced = reopen_ladder_archive_authority(
+            &json!({
                 "kind":"qd_archive_reducer_result",
                 "receiptPath":reducer_path,
                 "receiptSha256":reducer["resultSha256"],
                 "validationFreezeReceiptPath":validation_freeze_path,
                 "validationFreezeReceiptSha256":validation_freeze["receiptSha256"],
                 "validationTailAuthorityPath":tail_path,
-                "validationTailAuthoritySha256":test_sha("substituted-validation-tail"),
-            }))
+                "validationTailAuthoritySha256":tail["tailAuthoritySha256"],
+            }),
+            Some(test_sha("ladder-authority-a").as_str()),
+        )
+        .unwrap();
+        assert_eq!(
+            reduced.archive_raw_sha256,
+            file_sha256(&archive_path).unwrap()
+        );
+        assert!(
+            reopen_ladder_archive_authority(
+                &json!({
+                    "kind":"qd_archive_reducer_result",
+                    "receiptPath":reducer_path,
+                    "receiptSha256":reducer["resultSha256"],
+                    "validationFreezeReceiptPath":validation_freeze_path,
+                    "validationFreezeReceiptSha256":validation_freeze["receiptSha256"],
+                    "validationTailAuthorityPath":tail_path,
+                    "validationTailAuthoritySha256":tail["tailAuthoritySha256"],
+                }),
+                Some(test_sha("ladder-authority-b").as_str())
+            )
+            .is_err(),
+            "scrutiny must reject validation output from a different ladder authority"
+        );
+        assert!(
+            reopen_ladder_archive_authority(
+                &json!({
+                    "kind":"qd_archive_reducer_result",
+                    "receiptPath":reducer_path,
+                    "receiptSha256":reducer["resultSha256"],
+                    "validationFreezeReceiptPath":validation_freeze_path,
+                    "validationFreezeReceiptSha256":validation_freeze["receiptSha256"],
+                    "validationTailAuthorityPath":tail_path,
+                    "validationTailAuthoritySha256":test_sha("substituted-validation-tail"),
+                }),
+                Some(test_sha("ladder-authority-a").as_str())
+            )
             .is_err(),
             "scrutiny must reject a reducer detached from the validation tail"
         );
@@ -5944,10 +6100,13 @@ mod tests {
             .join(root.path().file_name().unwrap())
             .join("generation-commit.json");
         assert!(
-            reopen_ladder_archive_authority(&json!({
-                "kind":"generation_finalizer_commit", "receiptPath":traversing,
-                "receiptSha256":commit["commitSha256"],
-            }))
+            reopen_ladder_archive_authority(
+                &json!({
+                    "kind":"generation_finalizer_commit", "receiptPath":traversing,
+                    "receiptSha256":commit["commitSha256"],
+                }),
+                None
+            )
             .is_err()
         );
 
@@ -5970,10 +6129,13 @@ mod tests {
         );
         write_canonical(&commit_path, &forged_commit);
         assert!(
-            reopen_ladder_archive_authority(&json!({
-                "kind":"generation_finalizer_commit", "receiptPath":commit_path,
-                "receiptSha256":commit["commitSha256"],
-            }))
+            reopen_ladder_archive_authority(
+                &json!({
+                    "kind":"generation_finalizer_commit", "receiptPath":commit_path,
+                    "receiptSha256":commit["commitSha256"],
+                }),
+                None
+            )
             .is_err()
         );
     }
