@@ -17,3 +17,6 @@ sha2.workspace = true
 temporal-qd-contract = { path = "../qd-contract" }
 temporal-qd-kernel = { path = "../qd-kernel" }
 temporal-qd-runtime = { path = "../qd-runtime" }
+
+[dev-dependencies]
+flate2.workspace = true

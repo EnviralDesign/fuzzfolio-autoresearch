@@ -3,9 +3,11 @@
 //! This is not a relaxed durable transaction. It is a separate execution
 //! contract for disposable research runs: write the scientifically required
 //! selected evaluation population directly, write a compact identity ledger,
-//! then publish one completion marker. A crash leaves an incomplete directory
-//! which must be discarded; this module never adopts or repairs it.
+//! retain only the selected G0 records/deltas needed to authenticate G2
+//! parents, then publish one completion marker. A crash leaves an incomplete
+//! directory which must be discarded; this module never adopts or repairs it.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -27,7 +29,10 @@ use temporal_qd_kernel::v5_publication::{
     V5G0PublicationFragments, V5G0StreamedArtifact,
     prepare_v5_g0_publication_stream_from_fresh_transaction,
 };
-use temporal_qd_kernel::v5_transaction::execute_v5_g0_transaction_with_progress;
+use temporal_qd_kernel::v5_transaction::{
+    V5G0TransactionResult, compact_delta_object_relative_path,
+    compact_record_object_relative_path, execute_v5_g0_transaction_with_progress,
+};
 
 use crate::v5_proposal_contract::V5ProposalManifest;
 
@@ -230,6 +235,137 @@ fn duration_ms(duration: Duration) -> Result<u64> {
     u64::try_from(duration.as_millis()).context("convert fast-ephemeral duration")
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectedG0ParentPublication {
+    encoded_bytes: u64,
+    object_count: u64,
+}
+
+fn insert_selected_g0_parent_object(
+    objects: &mut BTreeMap<String, Vec<u8>>,
+    relative_path: String,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    match objects.entry(relative_path) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(bytes);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &bytes => {}
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            bail!(
+                "fast-ephemeral selected G0 parent object path collision: {}",
+                entry.key()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Retain only the evaluation-width compact closure needed by the G2 parent
+/// selector. The archive later names each record by `proposalEntrySha256`; the
+/// record names its exact proposal delta. No attempt journal, accepted-pool
+/// staging, rich candidate, or unselected construction object is persisted.
+fn publish_selected_g0_parent_objects(
+    output_root: &Path,
+    transaction: &V5G0TransactionResult,
+) -> Result<SelectedG0ParentPublication> {
+    let selected = transaction
+        .selected_projection_index
+        .as_ref()
+        .ok_or_else(|| anyhow!("fast-ephemeral G0 transaction lacks selected projections"))?;
+    selected
+        .to_value()
+        .context("validate fast-ephemeral selected projection index")?;
+
+    if transaction.accepted_records.len() != transaction.accepted_proposal_deltas.len() {
+        bail!("fast-ephemeral accepted G0 records/deltas have different counts");
+    }
+    let mut accepted = BTreeMap::new();
+    for (record, delta) in transaction
+        .accepted_records
+        .iter()
+        .zip(transaction.accepted_proposal_deltas.iter())
+    {
+        let record_sha256 = record
+            .record_sha256()
+            .context("identify fast-ephemeral compact G0 parent record")?;
+        if accepted
+            .insert(record_sha256.clone(), (record, delta))
+            .is_some()
+        {
+            bail!("fast-ephemeral G0 transaction repeats compact record {record_sha256}");
+        }
+    }
+
+    let mut objects = BTreeMap::new();
+    for projection in &selected.projections {
+        let (record, delta) = accepted
+            .get(&projection.record_sha256)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "fast-ephemeral selected projection lacks compact record {}",
+                    projection.record_sha256
+                )
+            })?;
+        projection
+            .verify_against_record(record)
+            .context("bind fast-ephemeral selected projection to compact record")?;
+        if delta.get("deltaSha256").and_then(Value::as_str)
+            != Some(record.proposal_delta_sha256.as_str())
+        {
+            bail!(
+                "fast-ephemeral compact G0 parent record/delta identity drifted for {}",
+                record.candidate_id
+            );
+        }
+
+        let record_value = record
+            .to_value()
+            .context("encode fast-ephemeral compact G0 parent record")?;
+        let record_bytes = canonical_json_line(&record_value)
+            .context("encode fast-ephemeral compact G0 parent record bytes")?;
+        insert_selected_g0_parent_object(
+            &mut objects,
+            compact_record_object_relative_path(&projection.record_sha256)
+                .context("derive fast-ephemeral compact G0 parent record path")?,
+            record_bytes,
+        )?;
+
+        let delta_bytes = canonical_json_line(delta)
+            .context("encode fast-ephemeral compact G0 parent delta bytes")?;
+        insert_selected_g0_parent_object(
+            &mut objects,
+            compact_delta_object_relative_path(&record.proposal_delta_sha256)
+                .context("derive fast-ephemeral compact G0 parent delta path")?,
+            delta_bytes,
+        )?;
+    }
+
+    let mut encoded_bytes = 0_u64;
+    for (relative_path, bytes) in &objects {
+        let path = output_root.join(relative_path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("fast-ephemeral selected parent object lacks a parent path"))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create fast-ephemeral selected parent object directory: {}",
+                parent.display()
+            )
+        })?;
+        write_new(&path, bytes, "fast-ephemeral selected G0 parent object")?;
+        encoded_bytes = encoded_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow!("fast-ephemeral selected parent byte count overflowed"))?;
+    }
+
+    Ok(SelectedG0ParentPublication {
+        encoded_bytes,
+        object_count: objects.len() as u64,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_g0(
     output_root: &Path,
@@ -327,6 +463,12 @@ pub(crate) fn execute_g0(
             &mut memory,
         )
         .context("materialize fast-ephemeral selected candidates")?;
+    let selected_parent_publication =
+        publish_selected_g0_parent_objects(output_root, &transaction)
+            .context("publish fast-ephemeral selected G0 parent closure")?;
+    if selected_parent_publication.object_count == 0 {
+        bail!("fast-ephemeral selected G0 parent closure is empty");
+    }
 
     // Population identity is required by the evaluation-population schema,
     // but the duplicate population document is not scientifically consumed
@@ -502,6 +644,7 @@ pub(crate) fn execute_g0(
             evaluation_receipt
                 .encoded_bytes
                 .checked_add(ledger_bytes.len() as u64)
+                .and_then(|bytes| bytes.checked_add(selected_parent_publication.encoded_bytes))
                 .ok_or_else(|| anyhow!("fast-ephemeral byte telemetry overflow"))?,
         ),
         parallel_workers: Some(manifest.thread_cap),
@@ -789,4 +932,10 @@ pub(crate) fn execute_evolved(
     });
     progress.finish(None);
     super::write_stdout_json(&result)
+}
+
+
+#[cfg(test)]
+mod tests {
+    include!("v5_fast_ephemeral_tests.rs");
 }
