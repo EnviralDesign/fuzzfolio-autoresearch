@@ -436,6 +436,43 @@ def test_lab_gateway_lake_503_without_retry_header_preserves_attempt_budget() ->
     assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 1
 
 
+def test_lab_gateway_capacity_overload_requeues_without_opening_global_circuit() -> None:
+    gateway = PlayHandLabGateway(LabGatewayConfig(lake_timeout_retry_after_seconds=4.0))
+    for index in range(2):
+        gateway.enqueue(
+            LabTask(
+                task_id=f"task-{index}",
+                lane_id="lane-1",
+                attempt_id=f"attempt-{index}",
+                max_attempts=1,
+            )
+        )
+        gateway.register_worker(f"worker-{index}")
+
+    claim = gateway.claim("worker-0")
+    failed = gateway.fail(
+        "worker-0",
+        claim["lease_id"],
+        error=(
+            "LakeWindowOverloaded: lake window attestation retry deadline exceeded "
+            "(lake_capacity_overload)"
+        ),
+        error_type="LakeWindowOverloaded",
+        retryable=True,
+        retry_after_seconds=2.5,
+    )
+
+    next_claim = gateway.claim("worker-1")
+    snapshot = gateway.snapshot()
+    assert failed["status"] == "requeued"
+    assert failed["attempt_budget_preserved"] is True
+    assert failed["retry_after_seconds"] == 2.5
+    assert next_claim["status"] == "leased"
+    assert snapshot["lake_circuit_state"] == "closed"
+    assert snapshot["metrics"]["lake_capacity_overload_requeues"] == 1
+    assert snapshot["metrics"]["lake_circuit_breaker_activations"] == 0
+
+
 def test_lab_gateway_lake_409_without_retry_header_uses_mutation_cadence() -> None:
     gateway = PlayHandLabGateway(
         LabGatewayConfig(lake_mutation_retry_after_seconds=900.0)

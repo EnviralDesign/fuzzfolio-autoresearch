@@ -152,6 +152,19 @@ def _is_lake_service_unavailable(error: str) -> bool:
     )
 
 
+def _is_lake_capacity_overload(error: str, error_type: str | None = None) -> bool:
+    normalized = str(error or "").strip().lower()
+    normalized_type = str(error_type or "").strip().lower()
+    if normalized_type in {"lakewindowoverloaded", "remotelakeoverloaded"}:
+        return True
+    return _is_lake_window_request(normalized) and (
+        "lake_capacity_overload" in normalized
+        or "capacity_overload" in normalized
+        or "lake data-plane admission is saturated" in normalized
+        or "429 too many requests" in normalized
+    )
+
+
 def _is_lake_mutation_conflict(error: str) -> bool:
     normalized = str(error or "").strip().lower()
     return _is_lake_window_request(normalized) and (
@@ -180,6 +193,7 @@ def _retry_delay_for_failure(
     *,
     error: str,
     retry_after_seconds: float | None,
+    error_type: str | None,
     config: "LabGatewayConfig",
 ) -> float:
     explicit = _parse_positive_float(retry_after_seconds)
@@ -187,6 +201,8 @@ def _retry_delay_for_failure(
         return explicit
 
     normalized = str(error or "").strip().lower()
+    if _is_lake_capacity_overload(normalized, error_type):
+        return max(float(config.lake_timeout_retry_after_seconds), 0.0)
     if (
         "remote market data lake is mutating" in normalized
         or "retry after the mutation completes" in normalized
@@ -203,10 +219,11 @@ def _retry_delay_for_failure(
     return 0.0
 
 
-def _failure_preserves_attempt_budget(error: str) -> bool:
+def _failure_preserves_attempt_budget(error: str, error_type: str | None = None) -> bool:
     normalized = str(error or "").strip().lower()
     return (
-        "remote market data lake is mutating" in normalized
+        _is_lake_capacity_overload(normalized, error_type)
+        or "remote market data lake is mutating" in normalized
         or "retry after the mutation completes" in normalized
         or _is_lake_mutation_conflict(normalized)
         or _is_lake_service_unavailable(normalized)
@@ -560,6 +577,7 @@ class PlayHandLabGateway:
             "lake_circuit_breaker_probe_failures": 0,
             "lake_circuit_breaker_collapsed_failures": 0,
             "lake_circuit_breaker_recoveries": 0,
+            "lake_capacity_overload_requeues": 0,
             "slot_limited_claims": 0,
             "incompatible_claims": 0,
             "results_acked": 0,
@@ -966,9 +984,15 @@ class PlayHandLabGateway:
             retry_delay = _retry_delay_for_failure(
                 error=error,
                 retry_after_seconds=retry_after_seconds,
+                error_type=error_type,
                 config=self.config,
             )
-            preserve_attempt_budget = bool(retryable and retry_delay > 0 and _failure_preserves_attempt_budget(error))
+            lake_capacity_overload = _is_lake_capacity_overload(error, error_type)
+            preserve_attempt_budget = bool(
+                retryable
+                and retry_delay > 0
+                and _failure_preserves_attempt_budget(error, error_type)
+            )
             if retryable and (task.attempt_number < task.max_attempts or preserve_attempt_budget):
                 if preserve_attempt_budget and task.attempt_number > 0:
                     task.attempt_number -= 1
@@ -979,7 +1003,7 @@ class PlayHandLabGateway:
                 self._metrics["failures_requeued"] += 1
                 if retry_delay > 0:
                     self._metrics["retry_delayed_requeues"] += 1
-                if preserve_attempt_budget:
+                if preserve_attempt_budget and not lake_capacity_overload:
                     self._open_lake_circuit_locked(
                         now=now,
                         retry_delay=retry_delay,
@@ -988,6 +1012,9 @@ class PlayHandLabGateway:
                     task.available_at = self._lake_retry_not_before
                     if lake_health_probe:
                         self._metrics["lake_circuit_breaker_probe_failures"] += 1
+                    self._metrics["retry_preserved_attempt_requeues"] += 1
+                elif preserve_attempt_budget:
+                    self._metrics["lake_capacity_overload_requeues"] += 1
                     self._metrics["retry_preserved_attempt_requeues"] += 1
                 return {
                     "status": "requeued",

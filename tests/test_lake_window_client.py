@@ -79,6 +79,7 @@ def _configure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(client.LAKE_WINDOW_RETRY_MAX_SECONDS_ENV, "60")
     monkeypatch.setenv(client.LAKE_WINDOW_RETRY_BASE_SECONDS_ENV, "1")
     monkeypatch.setenv(client.LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS_ENV, "5")
+    monkeypatch.setattr(client, "_retry_jitter_seconds", lambda *args, **kwargs: 0.0)
 
 
 def test_resolve_lake_window_binding_verifies_receipt_and_memoizes(
@@ -190,6 +191,63 @@ def test_retry_after_header_controls_mutation_backoff(
     )
 
     assert sleeps == [7.0]
+
+
+def test_capacity_overload_retries_with_retry_after_and_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    receipt = _receipt(request)
+    responses = [
+        _response(
+            429,
+            json_payload={"detail": "Lake data-plane admission is saturated"},
+            headers={
+                "Retry-After": "3",
+                "X-Lake-Error-Code": "lake_capacity_overload",
+                "X-Lake-Retry-Reason": "capacity_overload",
+            },
+        ),
+        _response(200, json_payload=receipt),
+    ]
+    sleeps: list[float] = []
+    _configure(monkeypatch)
+    monkeypatch.setattr(client, "_retry_jitter_seconds", lambda *args, **kwargs: 0.75)
+    monkeypatch.setattr(client.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client.httpx, "post", lambda *args, **kwargs: responses.pop(0))
+
+    binding = client.resolve_lake_window_binding(
+        request,
+        legacy_selection_manifest_sha256="sha256:" + "d" * 64,
+    )
+
+    assert binding.window_semantic_sha256 == receipt["window_semantic_sha256"]
+    assert sleeps == [3.75]
+
+
+def test_legacy_503_is_overload_only_with_explicit_capacity_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    _configure(monkeypatch)
+    monkeypatch.setenv(client.LAKE_WINDOW_RETRY_MAX_SECONDS_ENV, "0")
+    monkeypatch.setattr(
+        client.httpx,
+        "post",
+        lambda *args, **kwargs: _response(
+            503,
+            json_payload={"detail": "Lake data-plane admission is saturated"},
+            headers={"X-Lake-Retry-Reason": "capacity_overload", "Retry-After": "2"},
+        ),
+    )
+
+    with pytest.raises(client.LakeWindowOverloaded) as raised:
+        client.resolve_lake_window_binding(
+            request,
+            legacy_selection_manifest_sha256="sha256:" + "d" * 64,
+        )
+
+    assert raised.value.retry_after_seconds == 2.0
 
 
 def test_transport_failure_retries_idempotent_attestation_request(

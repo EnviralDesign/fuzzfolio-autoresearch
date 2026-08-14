@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import threading
 import time
 from pathlib import Path
@@ -32,6 +33,16 @@ DEFAULT_LAKE_WINDOW_RETRY_MAX_SECONDS = 2 * 60 * 60.0
 DEFAULT_LAKE_WINDOW_RETRY_BASE_SECONDS = 2.0
 DEFAULT_LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS = 30.0
 _RETRYABLE_HTTP_STATUS_CODES = frozenset({425, 429, 502, 503, 504})
+
+
+class LakeWindowOverloaded(RuntimeError):
+    """The lake is healthy but its bounded data-plane admission is full."""
+
+    retryable = True
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 def _lake_credentials() -> tuple[str, str]:
@@ -159,6 +170,19 @@ def _retryable_attestation_response(response: httpx.Response) -> bool:
     )
 
 
+def _capacity_overload_response(response: httpx.Response) -> bool:
+    status = int(response.status_code)
+    error_code = str(response.headers.get("X-Lake-Error-Code") or "").strip().lower()
+    retry_reason = str(response.headers.get("X-Lake-Retry-Reason") or "").strip().lower()
+    contract = str(response.headers.get("X-Lake-Overload-Contract") or "").strip().lower()
+    explicit = (
+        error_code == "lake_capacity_overload"
+        or retry_reason == "capacity_overload"
+        or contract == "lake_capacity_overload_v1"
+    )
+    return status == 429 or (status == 503 and explicit)
+
+
 def _retry_after_seconds(response: httpx.Response) -> float | None:
     raw = str(response.headers.get("Retry-After") or "").strip()
     if not raw:
@@ -180,6 +204,13 @@ def _retry_backoff_seconds(attempt: int, *, base_seconds: float, max_delay_secon
         return 0.0
     exponent = min(max(int(attempt) - 1, 0), 16)
     return min(base_seconds * (2**exponent), max_delay_seconds)
+
+
+def _retry_jitter_seconds(delay: float, *, max_delay_seconds: float) -> float:
+    if delay <= 0 or max_delay_seconds <= 0:
+        return 0.0
+    width = min(max(delay * 0.5, 0.25), max_delay_seconds)
+    return random.uniform(0.0, width)
 
 
 def resolve_lake_window_binding(
@@ -255,6 +286,11 @@ def resolve_lake_window_binding(
                 f"after {attempt} attempt(s) and {elapsed:.1f}s "
                 f"(status={status_text}): {detail}"
             )
+            if response is not None and _capacity_overload_response(response):
+                raise LakeWindowOverloaded(
+                    message,
+                    retry_after_seconds=_retry_after_seconds(response),
+                )
             if transport_error is not None:
                 raise RuntimeError(message) from transport_error
             raise RuntimeError(message)
@@ -272,6 +308,10 @@ def resolve_lake_window_binding(
                 base_seconds=retry_base_seconds,
                 max_delay_seconds=retry_max_delay_seconds,
             )
+        )
+        delay += _retry_jitter_seconds(
+            delay,
+            max_delay_seconds=retry_max_delay_seconds,
         )
         remaining = max(retry_max_seconds - elapsed, 0.0)
         delay = min(max(delay, 0.0), remaining)
