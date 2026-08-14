@@ -637,7 +637,7 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
     root = tmp_path.resolve()
     proposal_root = root / "generations" / "generation-0001" / "proposal"
     evaluation_population = proposal_root / "evaluation-population.json"
-    identity_ledger = proposal_root / "identity-ledger.json"
+    identity_ledger = proposal_root / "v5-native" / "identity-ledger.json"
     state: dict[str, Any] = {
         "stage": "generation_proposal",
         "uniqueCandidatesEvaluated": 0,
@@ -655,6 +655,7 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
         },
         "identityLedger": {
             "absolutePath": str(identity_ledger),
+            "relativePath": "v5-native/identity-ledger.json",
             "semanticSha256": _sha("ledger-semantic"),
             "fileSha256": _sha("ledger-file"),
             "byteLength": 99,
@@ -743,11 +744,6 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
             "artifacts": {},
         },
     )
-    monkeypatch.setattr(
-        supervisor,
-        "_native_v5_identity_ledger_descriptor",
-        lambda value, **_kwargs: dict(value),
-    )
     monkeypatch.setattr(supervisor, "_save_state", lambda *_args: None)
     forbidden = lambda *_args, **_kwargs: pytest.fail(
         "fast-ephemeral path entered durable generation finalization"
@@ -777,9 +773,12 @@ def test_fast_ephemeral_generation_uses_only_the_direct_rotating_path(
     assert state["uniqueCandidatesEvaluated"] == 1
     assert state["workerTasksCompleted"] == 3
     assert state["currentGenerationIndex"] == 2
-    assert state[supervisor.NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY] == adapter[
-        "identityLedger"
-    ]
+    assert state[supervisor.NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY] == {
+        "absolutePath": str(identity_ledger),
+        "semanticSha256": _sha("ledger-semantic"),
+        "fileSha256": _sha("ledger-file"),
+        "byteLength": 99,
+    }
 
 
 def test_v5_legacy_construction_apis_reject_before_work_but_named_oracle_survives(

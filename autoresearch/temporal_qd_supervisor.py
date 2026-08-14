@@ -2667,11 +2667,11 @@ def _complete_native_v5_generation_fast_ephemeral(
             "workerTasksCompleted": int(state.get("workerTasksCompleted") or 0)
             + task_count,
             "completedGenerations": completed,
-            NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY: _native_v5_identity_ledger_descriptor(
-                adapter["identityLedger"],
+            NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY: _native_v5_identity_ledger_descriptor_from_adapter(
+                adapter=adapter,
+                root=root,
+                generation_index=generation_index,
                 name="fast-ephemeral committed identity ledger",
-                expected_path=_native_v5_proposal_root(root, generation_index)
-                / "identity-ledger.json",
             ),
         }
     )
