@@ -23,6 +23,7 @@ use temporal_qd_contract::{
 
 use crate::{
     CONTRACT_VERSION,
+    factory::ParentReference,
     g0_funnel::{reproduction_allocation_accounting, validate_reproduction_allocation},
     journal::AcceptedReference,
     proposal::{CandidateIdentityLedger, IdentityLedger},
@@ -30,14 +31,29 @@ use crate::{
     v5::{
         V5_PROPOSAL_FUNNEL_ENTRY_SCHEMA, V5AttemptOutcomeAudit, V5EvolvedAcceptedMaterial,
         V5FunnelAdmission, V5ProposalAttemptRecord, V5SharedConstructionAuthority,
-        materialize_v5_evolved_rich_candidate, v5_funnel_candidate_projection,
-        v5_native_object_relative_path,
+        materialize_v5_evolved_rich_candidate, parent_reference_from_v5_evolved_material,
+        v5_funnel_candidate_projection, v5_native_object_relative_path,
     },
     v5_evolved_transaction::{
         V5EvolvedAcceptedReplaySink, V5EvolvedTransactionError, V5EvolvedTransactionRequest,
         V5EvolvedTransactionResult, replay_v5_evolved_transaction_with_accepted_sink,
     },
 };
+
+/// Optional one-pass sink for accepted compiler-owned parent references.
+/// Fast-ephemeral publication persists these while the verified material is
+/// already live; durable publication uses the no-op implementation below.
+pub trait V5EvolvedParentReferenceSink {
+    fn write_parent_reference(&mut self, reference: &ParentReference) -> std::io::Result<()>;
+}
+
+struct NoopV5EvolvedParentReferenceSink;
+
+impl V5EvolvedParentReferenceSink for NoopV5EvolvedParentReferenceSink {
+    fn write_parent_reference(&mut self, _reference: &ParentReference) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Self-hashed, cap-free publication authority for a later-generation v5
 /// transaction.  The outer manifest remains execution telemetry and may bind
@@ -2455,8 +2471,24 @@ impl<'a> V5EvolvedPublicationStream<'a> {
         &self,
         sink: &mut S,
     ) -> Result<V5EvolvedPublicationFragments> {
-        struct FragmentReplaySink<'a, S> {
+        let mut parent_sink = NoopV5EvolvedParentReferenceSink;
+        self.materialize_accepted_fragments_and_parents(sink, &mut parent_sink)
+    }
+
+    /// Fast-ephemeral variant of evolved publication. It writes the next-
+    /// generation parent handoff during the existing single replay, avoiding
+    /// a second population-wide compiler pass.
+    pub fn materialize_accepted_fragments_and_parents<
+        S: V5EvolvedPublicationFragmentSink,
+        P: V5EvolvedParentReferenceSink,
+    >(
+        &self,
+        sink: &mut S,
+        parent_sink: &mut P,
+    ) -> Result<V5EvolvedPublicationFragments> {
+        struct FragmentReplaySink<'a, S, P> {
             sink: &'a mut S,
+            parent_sink: &'a mut P,
             transaction: &'a V5EvolvedTransactionResult,
             accepted_references: &'a [AcceptedReference],
             accepted_attempt_entry_sha256s: &'a [String],
@@ -2470,7 +2502,9 @@ impl<'a> V5EvolvedPublicationStream<'a> {
             journal: FragmentAccumulator,
         }
 
-        impl<S: V5EvolvedPublicationFragmentSink> FragmentReplaySink<'_, S> {
+        impl<S: V5EvolvedPublicationFragmentSink, P: V5EvolvedParentReferenceSink>
+            FragmentReplaySink<'_, S, P>
+        {
             fn append_attempt(
                 &mut self,
                 attempt: &V5ProposalAttemptRecord,
@@ -2548,6 +2582,9 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                             )
                         })?;
                     let rich = materialize_v5_evolved_rich_candidate(authority, material)?;
+                    let parent_reference =
+                        parent_reference_from_v5_evolved_material(&material.parent_material)?;
+                    self.parent_sink.write_parent_reference(&parent_reference)?;
                     #[cfg(test)]
                     materialization_test_observer::observe_rich_materialization();
                     let evaluation =
@@ -2566,8 +2603,8 @@ impl<'a> V5EvolvedPublicationStream<'a> {
             }
         }
 
-        impl<S: V5EvolvedPublicationFragmentSink> V5EvolvedAcceptedReplaySink
-            for FragmentReplaySink<'_, S>
+        impl<S: V5EvolvedPublicationFragmentSink, P: V5EvolvedParentReferenceSink>
+            V5EvolvedAcceptedReplaySink for FragmentReplaySink<'_, S, P>
         {
             fn observe_attempt(
                 &mut self,
@@ -2599,6 +2636,7 @@ impl<'a> V5EvolvedPublicationStream<'a> {
 
         let mut replay_sink = FragmentReplaySink {
             sink,
+            parent_sink,
             transaction: self.transaction,
             accepted_references: &self.accepted_references,
             accepted_attempt_entry_sha256s: &self.accepted_attempt_entry_sha256s,
@@ -3865,6 +3903,16 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct ParentCollector(Vec<ParentReference>);
+
+    impl V5EvolvedParentReferenceSink for ParentCollector {
+        fn write_parent_reference(&mut self, reference: &ParentReference) -> std::io::Result<()> {
+            self.0.push(reference.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct EmptyParents;
 
     impl ParentSelector for EmptyParents {
@@ -4428,9 +4476,18 @@ mod tests {
 
         let (fragments, receipt, pair_config, identity_ledger, population, evaluation, journal) = {
             let mut private = InMemoryFragments::default();
+            let mut parents = ParentCollector::default();
             let fragments = stream
-                .materialize_accepted_fragments(&mut private)
+                .materialize_accepted_fragments_and_parents(&mut private, &mut parents)
                 .expect("materialize exactly two accepted candidates");
+            assert_eq!(parents.0.len(), 2);
+            let authority =
+                V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
+                    .expect("parse evolved parent authority");
+            for parent in &parents.0 {
+                crate::v5::verify_v5_evolved_parent_reference(&authority, parent)
+                    .expect("recompile streamed evolved parent");
+            }
             assert_eq!(
                 materialization_test_observer::ACCEPTED_SINK_VISITS
                     .load(std::sync::atomic::Ordering::SeqCst),

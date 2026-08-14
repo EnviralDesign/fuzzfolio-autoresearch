@@ -29,6 +29,7 @@ use temporal_qd_contract::{
 use temporal_qd_kernel::v5::{
     V5AttemptJournal, V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5SelectedProjection,
     V5SharedConstructionAuthority, parent_reference_from_v5_compact_record,
+    verify_v5_evolved_parent_reference,
 };
 use temporal_qd_kernel::{
     factory::ParentReference,
@@ -3355,6 +3356,203 @@ fn native_v5_archive_candidate_ids(archive: &Value) -> Result<BTreeSet<String>> 
     Ok(candidate_ids)
 }
 
+/// Open the single-file rolling parent handoff emitted by fast-ephemeral
+/// publication. The stream may contain the current proposal plus parents
+/// carried from the preceding archive, but only candidates named by the
+/// committed archive are recompiled and admitted into the next selector.
+fn native_v5_fast_ephemeral_parent_references(
+    manifest: &V5ProposalManifest,
+    archive: &V5EvolvedInputDocument,
+) -> Result<BTreeMap<String, ParentReference>> {
+    if manifest.generation_index < 2 {
+        bail!("fast-ephemeral parent recovery requires generation two or later");
+    }
+    let finalization_root = archive
+        .path
+        .parent()
+        .filter(|path| {
+            path.file_name().and_then(|value| value.to_str()) == Some("native-finalization")
+        })
+        .ok_or_else(|| anyhow!("fast-ephemeral parent archive is outside native-finalization"))?;
+    if archive.path.file_name().and_then(|value| value.to_str()) != Some("archive.json") {
+        bail!("fast-ephemeral parent archive has an unexpected filename");
+    }
+    let generation_root = finalization_root
+        .parent()
+        .ok_or_else(|| anyhow!("fast-ephemeral parent archive lacks a generation root"))?;
+    let stream_path = safe_existing_file(
+        &generation_root.join(format!(
+            "proposal/{}",
+            v5_fast_ephemeral::PARENT_MATERIAL_PATH
+        )),
+        "fast-ephemeral parent material stream",
+    )?;
+    let authority = V5SharedConstructionAuthority::from_shared_object(&manifest.frozen_authority)
+        .context("open sealed fast-ephemeral parent reconstruction authority")?;
+
+    let mut archive_candidates = BTreeMap::<String, Value>::new();
+    for cell in archive
+        .value
+        .get("cells")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("fast-ephemeral parent archive cells are invalid"))?
+    {
+        for member in cell
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("fast-ephemeral parent archive members are invalid"))?
+        {
+            let candidate = member
+                .get("candidate")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("fast-ephemeral parent archive member lacks candidate"))?;
+            let candidate_id = candidate
+                .get("candidateId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("fast-ephemeral parent archive candidate lacks ID"))?;
+            if archive_candidates
+                .insert(candidate_id.to_owned(), Value::Object(candidate.clone()))
+                .is_some()
+            {
+                bail!("fast-ephemeral parent archive repeats a candidate");
+            }
+        }
+    }
+    if archive_candidates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let file = fs::File::open(&stream_path).with_context(|| {
+        format!(
+            "open fast-ephemeral parent material stream: {}",
+            stream_path.display()
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut seen = BTreeSet::new();
+    let mut references = BTreeMap::new();
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        let read = reader
+            .by_ref()
+            .take((v5_fast_ephemeral::MAX_PARENT_MATERIAL_ROW_BYTES + 1) as u64)
+            .read_until(b'\n', &mut raw)
+            .context("read fast-ephemeral parent material row")?;
+        if read == 0 {
+            break;
+        }
+        if raw.len() > v5_fast_ephemeral::MAX_PARENT_MATERIAL_ROW_BYTES {
+            bail!("fast-ephemeral parent material row exceeds its byte budget");
+        }
+        if raw.last() != Some(&b'\n') || raw.contains(&b'\r') {
+            bail!("fast-ephemeral parent material row is not canonical LF JSONL");
+        }
+        let value: Value =
+            serde_json::from_slice(&raw).context("parse fast-ephemeral parent material row")?;
+        if canonical_json_line(&value)? != raw {
+            bail!("fast-ephemeral parent material row is not canonical JSON plus LF");
+        }
+        let fields = value
+            .as_object()
+            .ok_or_else(|| anyhow!("fast-ephemeral parent material row is not an object"))?;
+        let expected = [
+            "schemaVersion",
+            "candidateId",
+            "pairIdentitySha256",
+            "pairPayload",
+            "rowSha256",
+        ];
+        if fields.len() != expected.len()
+            || expected.iter().any(|key| !fields.contains_key(*key))
+            || fields.get("schemaVersion").and_then(Value::as_str)
+                != Some(v5_fast_ephemeral::PARENT_MATERIAL_ROW_SCHEMA)
+        {
+            bail!("fast-ephemeral parent material row shape is incompatible");
+        }
+        let candidate_id = fields
+            .get("candidateId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && *value == value.trim())
+            .ok_or_else(|| anyhow!("fast-ephemeral parent material candidate ID is invalid"))?;
+        if !seen.insert(candidate_id.to_owned()) {
+            bail!("fast-ephemeral parent material repeats a candidate");
+        }
+        let supplied_row_sha256 = fields
+            .get("rowSha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("fast-ephemeral parent material lacks row identity"))?;
+        let mut semantic = fields.clone();
+        semantic.remove("rowSha256");
+        if canonical_sha256(&Value::Object(semantic))? != supplied_row_sha256 {
+            bail!("fast-ephemeral parent material row identity drifted");
+        }
+
+        let Some(archive_candidate) = archive_candidates.get(candidate_id) else {
+            continue;
+        };
+        let pair_identity_sha256 = fields
+            .get("pairIdentitySha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("fast-ephemeral parent material lacks pair identity"))?
+            .to_owned();
+        let pair_payload = fields
+            .get("pairPayload")
+            .cloned()
+            .ok_or_else(|| anyhow!("fast-ephemeral parent material lacks pair payload"))?;
+        let record_value = pair_payload
+            .get("acceptedRecord")
+            .ok_or_else(|| anyhow!("fast-ephemeral parent payload lacks accepted record"))?;
+        let record = V5CompactAcceptedRecord::from_value(record_value)
+            .context("validate fast-ephemeral parent compact record")?;
+        let record_sha256 = record
+            .record_sha256()
+            .context("identify fast-ephemeral parent compact record")?;
+        if record.candidate_id != candidate_id
+            || record.pair_identity_sha256 != pair_identity_sha256
+            || archive_candidate
+                .get("candidateIdentitySha256")
+                .and_then(Value::as_str)
+                != Some(record.candidate_identity_sha256.as_str())
+            || archive_candidate
+                .get("programSha256")
+                .and_then(Value::as_str)
+                != Some(record.compiled.program_sha256.as_str())
+            || archive_candidate
+                .get("sourceProfileSha256")
+                .and_then(Value::as_str)
+                != Some(record.compiled.raw_pair_sha256.as_str())
+            || archive_candidate
+                .get("profileSnapshotSha256")
+                .and_then(Value::as_str)
+                != Some(record.compiled.profile_snapshot_sha256.as_str())
+            || archive_candidate
+                .get("proposalEntrySha256")
+                .and_then(Value::as_str)
+                != Some(record_sha256.as_str())
+        {
+            bail!("fast-ephemeral archive candidate drifts from its parent material");
+        }
+        let reference = ParentReference {
+            pair_identity_sha256,
+            candidate_id: candidate_id.to_owned(),
+            pair_payload,
+            selection_audit: None,
+        };
+        verify_v5_evolved_parent_reference(&authority, &reference)
+            .context("recompile fast-ephemeral archive parent material")?;
+        references.insert(candidate_id.to_owned(), reference);
+    }
+    if references.len() != archive_candidates.len()
+        || archive_candidates
+            .keys()
+            .any(|candidate_id| !references.contains_key(candidate_id))
+    {
+        bail!("fast-ephemeral parent material stream lacks an archive candidate");
+    }
+    Ok(references)
+}
+
 fn validate_native_v5_self_hash(value: &Value, field: &str, label: &str) -> Result<String> {
     let supplied = value
         .get(field)
@@ -3569,12 +3767,14 @@ fn native_v5_evolved_parent_references(
 /// intentionally restored from the public compact G0 ledger; G3+ restores
 /// only the dedicated evolved ledger facade.  Batch never falls back to a
 /// generic JSON ledger or a previous generation's private schedule receipt.
-fn v5_evolved_transaction_request(
+fn v5_evolved_transaction_request_with_parent_references(
     manifest: &V5ProposalManifest,
+    fast_ephemeral: bool,
 ) -> Result<(
     V5EvolvedTransactionRequest,
     RuntimeParentSelector,
     temporal_qd_kernel::proposal::CandidateIdentityLedger,
+    BTreeMap<String, ParentReference>,
 )> {
     if manifest.generation_kind != "evolved" || manifest.generation_index < 2 {
         bail!("native v5 typed later-generation transaction requires an evolved generation >= 2");
@@ -3599,27 +3799,20 @@ fn v5_evolved_transaction_request(
     // authenticated archive.  This is especially important for a G0 frontier
     // whose cumulative economics are all direction-ineligible: it is a valid
     // all-immigrant G1 authority, not a corrupt archive.
-    let parents = if manifest.generation_index == 2 {
-        native_v5_g0_parent_references(manifest, &parent_archive).and_then(|references| {
-            RuntimeParentSelector::from_native_v5_archive(
-                &parent_archive.value,
-                &references,
-                &manifest.generation_config_sha256,
-                true,
-            )
-            .map_err(Into::into)
-        })
+    let parent_references = if fast_ephemeral {
+        native_v5_fast_ephemeral_parent_references(manifest, &parent_archive)
+    } else if manifest.generation_index == 2 {
+        native_v5_g0_parent_references(manifest, &parent_archive)
     } else {
-        native_v5_evolved_parent_references(manifest, &parent_archive).and_then(|references| {
-            RuntimeParentSelector::from_native_v5_archive(
-                &parent_archive.value,
-                &references,
-                &manifest.generation_config_sha256,
-                true,
-            )
-            .map_err(Into::into)
-        })
+        native_v5_evolved_parent_references(manifest, &parent_archive)
     }
+    .context("open typed native v5 evolved parent material")?;
+    let parents = RuntimeParentSelector::from_native_v5_archive(
+        &parent_archive.value,
+        &parent_references,
+        &manifest.generation_config_sha256,
+        true,
+    )
     .context("open typed native v5 evolved parent selector")?;
     let parent_schedule = v5_evolved_effective_parent_schedule(
         configured_parent_schedule,
@@ -3677,7 +3870,30 @@ fn v5_evolved_transaction_request(
         identity_ledger_state_sha256: canonical_sha256(&ledger.compact_state())
             .context("identify native v5 evolved identity ledger state")?,
     };
+    Ok((request, parents, ledger, parent_references))
+}
+
+fn v5_evolved_transaction_request(
+    manifest: &V5ProposalManifest,
+) -> Result<(
+    V5EvolvedTransactionRequest,
+    RuntimeParentSelector,
+    temporal_qd_kernel::proposal::CandidateIdentityLedger,
+)> {
+    let (request, parents, ledger, _) =
+        v5_evolved_transaction_request_with_parent_references(manifest, false)?;
     Ok((request, parents, ledger))
+}
+
+fn v5_fast_ephemeral_evolved_transaction_request(
+    manifest: &V5ProposalManifest,
+) -> Result<(
+    V5EvolvedTransactionRequest,
+    RuntimeParentSelector,
+    temporal_qd_kernel::proposal::CandidateIdentityLedger,
+    BTreeMap<String, ParentReference>,
+)> {
+    v5_evolved_transaction_request_with_parent_references(manifest, true)
 }
 
 /// Rebuild only the cap-bearing control request needed by the evolved public

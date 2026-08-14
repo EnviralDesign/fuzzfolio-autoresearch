@@ -8383,6 +8383,16 @@ pub(crate) fn load_v5_evolved_parent(
     parent_material_from_reconstructed_pair(authority, &projection, pair, record, proposal_delta)
 }
 
+/// Independently recompile and validate one opaque parent reference without
+/// exposing its compiler-owned material. Fast-ephemeral readers use this at
+/// the archive boundary before a reference can enter the runtime selector.
+pub fn verify_v5_evolved_parent_reference(
+    authority: &V5SharedConstructionAuthority,
+    parent: &ParentReference,
+) -> Result<()> {
+    load_v5_evolved_parent(authority, parent).map(|_| ())
+}
+
 /// Compiler-owned, ephemeral pair state used only between structural steps.
 /// It is intentionally not a compact accepted record: every instance is
 /// rebuilt from program bytes and sealed authority before it may drive the

@@ -31,7 +31,7 @@ use crate::{
         V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5Error, V5FunnelAdmission,
         V5ProposalAttemptRecord, V5SelectedProjection, V5SharedConstructionAuthority,
         build_v5_g0_accepted_material, materialize_selected_v5_g0_rich_candidate,
-        verify_reconstruct_compact_g0_record,
+        parent_reference_from_v5_compact_record, verify_reconstruct_compact_g0_record,
     },
     v5_publication::{V5G0PublicationInputs, V5G0PublicationPlan},
 };
@@ -1400,6 +1400,10 @@ pub struct V5SelectedG0Materialization {
     /// by a later write-neutral publication plan.  It is self-hashed and
     /// binds the selected projection and immutable compact-record object.
     pub publication_precomputed_row: Value,
+    /// Opaque compiler-owned parent handoff for the next fast-ephemeral
+    /// generation. It is emitted during the same selected-only replay as the
+    /// rich evaluation row, avoiding a second reconstruction pass.
+    pub parent_reference: ParentReference,
 }
 
 /// Reconstruct one selected compact G0 record for evaluation/publication.
@@ -1423,6 +1427,8 @@ pub fn materialize_selected_v5_g0_record(
         compact_delta,
         compact_record,
     )?;
+    let parent_reference =
+        parent_reference_from_v5_compact_record(authority, compact_delta, compact_record)?;
     let compact_record_sha256 = compact_record.record_sha256()?;
     let selected_projection_sha256 = exact_sha(
         selected_projection
@@ -1607,6 +1613,7 @@ pub fn materialize_selected_v5_g0_record(
     Ok(V5SelectedG0Materialization {
         rich_evaluation_candidate,
         publication_precomputed_row: Value::Object(row_fields),
+        parent_reference,
     })
 }
 
@@ -4353,14 +4360,40 @@ mod tests {
 
         let stream = prepare_v5_g0_publication_stream(&request, &result)
             .expect("prepare compact selected-only publication stream");
+        struct ParentCollector(Vec<ParentReference>);
+        impl crate::v5_publication::V5G0ParentReferenceSink for ParentCollector {
+            fn write_parent_reference(
+                &mut self,
+                reference: &ParentReference,
+            ) -> std::io::Result<()> {
+                self.0.push(reference.clone());
+                Ok(())
+            }
+        }
         let mut fragment_storage = InMemoryFragments::default();
+        let mut parents = ParentCollector(Vec::new());
         let fragment_receipt = stream
-            .materialize_selected_fragments(&mut fragment_storage)
+            .materialize_selected_fragments_and_parents_parallel(
+                1,
+                None,
+                &mut fragment_storage,
+                &mut parents,
+            )
             .expect("materialize exactly one selected-only fragment pass");
         assert_eq!(
             fragment_receipt.population_candidates.row_count,
             stream.selected_count() as u64,
         );
+        assert_eq!(parents.0.len(), stream.selected_count());
+        for parent in &parents.0 {
+            parent.validate().expect("validate streamed G0 parent");
+            super::super::v5::verify_v5_evolved_parent_reference(
+                &V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
+                    .expect("parse fixture parent authority"),
+                parent,
+            )
+            .expect("recompile streamed G0 parent");
+        }
 
         let mut pair_config = Vec::new();
         let mut population = Vec::new();

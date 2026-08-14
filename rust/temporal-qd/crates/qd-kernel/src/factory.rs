@@ -59,7 +59,7 @@ fn nonempty(value: &str, label: &str) -> Result<()> {
 
 /// Opaque parent material.  The Rust scheduler owns its identity/order, but
 /// only the native authority is allowed to interpret `pair_payload`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ParentReference {
     pub pair_identity_sha256: String,
     pub candidate_id: String,

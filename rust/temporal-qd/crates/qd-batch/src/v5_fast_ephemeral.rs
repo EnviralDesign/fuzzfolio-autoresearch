@@ -6,6 +6,7 @@
 //! then publish one completion marker. A crash leaves an incomplete directory
 //! which must be discarded; this module never adopts or repairs it.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -16,15 +17,17 @@ use temporal_qd_contract::{
     Map, NativeProgress, NativeProgressHandle, NativeProgressSection, Value, canonical_json_line,
     canonical_sha256,
 };
+use temporal_qd_kernel::factory::ParentReference;
 use temporal_qd_kernel::v5_evolved_publication::{
-    V5EvolvedPublicationFragmentKind, V5EvolvedPublicationFragmentSink,
-    V5EvolvedPublicationFragmentSource, V5EvolvedPublicationFragments, V5EvolvedPublicationInputs,
-    V5EvolvedPublicationPlan, V5EvolvedStreamedArtifact, prepare_v5_evolved_publication_stream,
+    V5EvolvedParentReferenceSink, V5EvolvedPublicationFragmentKind,
+    V5EvolvedPublicationFragmentSink, V5EvolvedPublicationFragmentSource,
+    V5EvolvedPublicationFragments, V5EvolvedPublicationInputs, V5EvolvedPublicationPlan,
+    V5EvolvedStreamedArtifact, prepare_v5_evolved_publication_stream,
 };
 use temporal_qd_kernel::v5_evolved_transaction::execute_v5_evolved_transaction_with_progress;
 use temporal_qd_kernel::v5_publication::{
-    V5G0PublicationFragmentKind, V5G0PublicationFragmentSink, V5G0PublicationFragmentSource,
-    V5G0PublicationFragments, V5G0StreamedArtifact,
+    V5G0ParentReferenceSink, V5G0PublicationFragmentKind, V5G0PublicationFragmentSink,
+    V5G0PublicationFragmentSource, V5G0PublicationFragments, V5G0StreamedArtifact,
     prepare_v5_g0_publication_stream_from_fresh_transaction,
 };
 use temporal_qd_kernel::v5_transaction::execute_v5_g0_transaction_with_progress;
@@ -39,6 +42,101 @@ const STATUS_PATH: &str = "STATUS.json";
 const COMPLETE_PATH: &str = "COMPLETE.json";
 const EVALUATION_POPULATION_PATH: &str = "evaluation-population.json";
 const IDENTITY_LEDGER_PATH: &str = "identity-ledger.json";
+pub(crate) const PARENT_MATERIAL_PATH: &str = "parent-material.jsonl";
+pub(crate) const PARENT_MATERIAL_ROW_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_parent_material_v1";
+pub(crate) const MAX_PARENT_MATERIAL_ROW_BYTES: usize = 8 * 1024 * 1024;
+
+struct ParentMaterialWriter {
+    writer: BufWriter<fs::File>,
+    seen_candidate_ids: BTreeSet<String>,
+    row_count: u64,
+    byte_count: u64,
+}
+
+impl ParentMaterialWriter {
+    fn create(path: &Path) -> Result<Self> {
+        Ok(Self {
+            writer: create_new_writer(path, "fast-ephemeral parent material")?,
+            seen_candidate_ids: BTreeSet::new(),
+            row_count: 0,
+            byte_count: 0,
+        })
+    }
+
+    fn append(&mut self, reference: &ParentReference) -> Result<()> {
+        reference
+            .validate()
+            .context("validate fast-ephemeral parent reference")?;
+        if reference.selection_audit.is_some() {
+            bail!("fast-ephemeral parent material cannot retain a selection audit");
+        }
+        if !self
+            .seen_candidate_ids
+            .insert(reference.candidate_id.clone())
+        {
+            bail!("fast-ephemeral parent material repeats a candidate");
+        }
+        let semantic = Value::Object(Map::from_iter([
+            (
+                "schemaVersion".to_owned(),
+                Value::String(PARENT_MATERIAL_ROW_SCHEMA.to_owned()),
+            ),
+            (
+                "candidateId".to_owned(),
+                Value::String(reference.candidate_id.clone()),
+            ),
+            (
+                "pairIdentitySha256".to_owned(),
+                Value::String(reference.pair_identity_sha256.clone()),
+            ),
+            ("pairPayload".to_owned(), reference.pair_payload.clone()),
+        ]));
+        let mut fields = semantic
+            .as_object()
+            .expect("constructed fast-ephemeral parent row")
+            .clone();
+        fields.insert(
+            "rowSha256".to_owned(),
+            Value::String(canonical_sha256(&semantic)?),
+        );
+        let bytes = canonical_json_line(&Value::Object(fields))?;
+        if bytes.len() > MAX_PARENT_MATERIAL_ROW_BYTES {
+            bail!("fast-ephemeral parent material row exceeds its byte budget");
+        }
+        self.writer
+            .write_all(&bytes)
+            .context("write fast-ephemeral parent material row")?;
+        self.row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("fast-ephemeral parent row count overflow"))?;
+        self.byte_count = self
+            .byte_count
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow!("fast-ephemeral parent byte count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(u64, u64)> {
+        self.writer
+            .flush()
+            .context("flush fast-ephemeral parent material")?;
+        Ok((self.row_count, self.byte_count))
+    }
+}
+
+impl V5G0ParentReferenceSink for ParentMaterialWriter {
+    fn write_parent_reference(&mut self, reference: &ParentReference) -> io::Result<()> {
+        self.append(reference).map_err(io::Error::other)
+    }
+}
+
+impl V5EvolvedParentReferenceSink for ParentMaterialWriter {
+    fn write_parent_reference(&mut self, reference: &ParentReference) -> io::Result<()> {
+        self.append(reference).map_err(io::Error::other)
+    }
+}
 
 #[derive(Default)]
 struct MemoryFragments {
@@ -246,6 +344,7 @@ pub(crate) fn execute_g0(
         COMPLETE_PATH,
         EVALUATION_POPULATION_PATH,
         IDENTITY_LEDGER_PATH,
+        PARENT_MATERIAL_PATH,
         "v5-native",
         "internal",
     ] {
@@ -320,13 +419,19 @@ pub(crate) fn execute_g0(
         bail!("fast-ephemeral selected evaluation width drifted");
     }
     let mut memory = MemoryFragments::default();
+    let mut parent_writer = ParentMaterialWriter::create(&output_root.join(PARENT_MATERIAL_PATH))?;
     let fragments: V5G0PublicationFragments = stream
-        .materialize_selected_fragments_parallel(
+        .materialize_selected_fragments_and_parents_parallel(
             manifest.thread_cap,
             Some(progress_handle),
             &mut memory,
+            &mut parent_writer,
         )
         .context("materialize fast-ephemeral selected candidates")?;
+    let (parent_row_count, parent_byte_count) = parent_writer.finish()?;
+    if parent_row_count != manifest.evaluation_population_size {
+        bail!("fast-ephemeral G0 parent material width drifted");
+    }
 
     // Population identity is required by the evaluation-population schema,
     // but the duplicate population document is not scientifically consumed
@@ -502,6 +607,7 @@ pub(crate) fn execute_g0(
             evaluation_receipt
                 .encoded_bytes
                 .checked_add(ledger_bytes.len() as u64)
+                .and_then(|bytes| bytes.checked_add(parent_byte_count))
                 .ok_or_else(|| anyhow!("fast-ephemeral byte telemetry overflow"))?,
         ),
         parallel_workers: Some(manifest.thread_cap),
@@ -509,6 +615,66 @@ pub(crate) fn execute_g0(
     });
     progress.finish(None);
     super::write_stdout_json(&result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "temporal-qd-fast-ephemeral-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ))
+    }
+
+    fn reference(candidate_id: &str) -> ParentReference {
+        ParentReference {
+            pair_identity_sha256: format!("sha256:{}", "1".repeat(64)),
+            candidate_id: candidate_id.to_owned(),
+            pair_payload: Value::Object(Map::from_iter([(
+                "opaque".to_owned(),
+                Value::String("compiler-owned".to_owned()),
+            )])),
+            selection_audit: None,
+        }
+    }
+
+    #[test]
+    fn parent_material_writer_is_canonical_self_hashed_and_rejects_duplicates() {
+        let root = test_root("parent-writer");
+        fs::create_dir(&root).expect("create test root");
+        let path = root.join(PARENT_MATERIAL_PATH);
+        let mut writer = ParentMaterialWriter::create(&path).expect("create parent writer");
+        writer.append(&reference("candidate-a")).expect("write row");
+        assert!(writer.append(&reference("candidate-a")).is_err());
+        let (rows, bytes) = writer.finish().expect("finish parent writer");
+        assert_eq!(rows, 1);
+
+        let raw = fs::read(&path).expect("read parent stream");
+        assert_eq!(bytes, raw.len() as u64);
+        assert_eq!(raw.last(), Some(&b'\n'));
+        assert!(!raw.contains(&b'\r'));
+        let value: Value = serde_json::from_slice(&raw).expect("parse parent row");
+        assert_eq!(canonical_json_line(&value).expect("canonical row"), raw);
+        let supplied = value
+            .get("rowSha256")
+            .and_then(Value::as_str)
+            .expect("row identity");
+        let mut semantic = value.as_object().expect("row object").clone();
+        semantic.remove("rowSha256");
+        assert_eq!(
+            canonical_sha256(&Value::Object(semantic)).expect("identify row"),
+            supplied
+        );
+        fs::remove_dir_all(root).expect("remove test root");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -526,6 +692,7 @@ pub(crate) fn execute_evolved(
         COMPLETE_PATH,
         EVALUATION_POPULATION_PATH,
         IDENTITY_LEDGER_PATH,
+        PARENT_MATERIAL_PATH,
         "v5-native",
         "internal",
     ] {
@@ -572,8 +739,8 @@ pub(crate) fn execute_evolved(
         None,
     );
     let construction_started = Instant::now();
-    let (request, mut parents, mut identity_ledger) =
-        super::v5_evolved_transaction_request(manifest)?;
+    let (request, mut parents, mut identity_ledger, prior_parent_references) =
+        super::v5_fast_ephemeral_evolved_transaction_request(manifest)?;
     let transaction = execute_v5_evolved_transaction_with_progress(
         request.clone(),
         &mut parents,
@@ -615,9 +782,22 @@ pub(crate) fn execute_evolved(
         bail!("fast-ephemeral evolved accepted width drifted");
     }
     let mut memory = MemoryFragments::default();
+    let mut parent_writer = ParentMaterialWriter::create(&output_root.join(PARENT_MATERIAL_PATH))?;
+    for reference in prior_parent_references.values() {
+        parent_writer.append(reference)?;
+    }
     let fragments: V5EvolvedPublicationFragments = stream
-        .materialize_accepted_fragments(&mut memory)
+        .materialize_accepted_fragments_and_parents(&mut memory, &mut parent_writer)
         .context("materialize fast-ephemeral evolved accepted candidates")?;
+    let (parent_row_count, parent_byte_count) = parent_writer.finish()?;
+    if parent_row_count
+        != manifest
+            .requested_count
+            .checked_add(prior_parent_references.len() as u64)
+            .ok_or_else(|| anyhow!("fast-ephemeral evolved parent count overflow"))?
+    {
+        bail!("fast-ephemeral evolved parent material width drifted");
+    }
 
     let population_receipt = stream
         .write_population_from_fragments(&fragments, &mut memory, &mut io::sink())
@@ -782,6 +962,7 @@ pub(crate) fn execute_evolved(
             evaluation_receipt
                 .encoded_bytes
                 .checked_add(ledger_receipt.encoded_bytes)
+                .and_then(|bytes| bytes.checked_add(parent_byte_count))
                 .ok_or_else(|| anyhow!("fast-ephemeral evolved byte telemetry overflow"))?,
         ),
         parallel_workers: Some(manifest.thread_cap),

@@ -18,6 +18,7 @@ use temporal_qd_contract::{
 };
 
 use crate::{
+    factory::ParentReference,
     g0_funnel::{reproduction_allocation_accounting, validate_reproduction_allocation},
     journal::AcceptedReference,
     publication::{PublicationPolicy, PublicationRequest},
@@ -28,6 +29,22 @@ use crate::{
         materialize_selected_v5_g0_record, verify_v5_g0_transaction_replay_with_authority,
     },
 };
+
+/// Optional one-pass sink for the compiler-owned parent references that a
+/// fast-ephemeral successor needs. Durable publication uses the no-op sink;
+/// the fast path writes one compact JSONL stream alongside its evaluation
+/// population without reconstructing selected candidates twice.
+pub trait V5G0ParentReferenceSink {
+    fn write_parent_reference(&mut self, reference: &ParentReference) -> std::io::Result<()>;
+}
+
+struct NoopV5G0ParentReferenceSink;
+
+impl V5G0ParentReferenceSink for NoopV5G0ParentReferenceSink {
+    fn write_parent_reference(&mut self, _reference: &ParentReference) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 pub const V5_G0_PUBLICATION_PLAN_SCHEMA: &str = "temporal_qd_v5_g0_publication_plan_v1";
 pub const V5_G0_PUBLICATION_REQUEST_SCHEMA: &str = "temporal_qd_v5_g0_publication_request_v1";
@@ -1511,6 +1528,28 @@ impl<'a> V5G0PublicationStream<'a> {
         progress: Option<&NativeProgressHandle>,
         sink: &mut S,
     ) -> Result<V5G0PublicationFragments> {
+        let mut parent_sink = NoopV5G0ParentReferenceSink;
+        self.materialize_selected_fragments_and_parents_parallel(
+            thread_cap,
+            progress,
+            sink,
+            &mut parent_sink,
+        )
+    }
+
+    /// Fast-ephemeral variant of selected publication. Parent references are
+    /// emitted in the same deterministic selected order and during the same
+    /// bounded materialization pass as the four public fragments.
+    pub fn materialize_selected_fragments_and_parents_parallel<
+        S: V5G0PublicationFragmentSink,
+        P: V5G0ParentReferenceSink,
+    >(
+        &self,
+        thread_cap: u64,
+        progress: Option<&NativeProgressHandle>,
+        sink: &mut S,
+        parent_sink: &mut P,
+    ) -> Result<V5G0PublicationFragments> {
         if !(1..=8).contains(&thread_cap) {
             return Err(contract(
                 "v5 selected materialization thread cap must be in 1..=8",
@@ -1526,6 +1565,7 @@ impl<'a> V5G0PublicationStream<'a> {
             FragmentAccumulator::new(V5G0PublicationFragmentKind::GenerationJournalBindings);
 
         let mut append = |materialization: &V5SelectedG0Materialization| -> Result<()> {
+            parent_sink.write_parent_reference(&materialization.parent_reference)?;
             population.append(sink, &materialization.rich_evaluation_candidate)?;
             let row = &materialization.publication_precomputed_row;
             let evaluation_candidate =
