@@ -24,7 +24,7 @@ use temporal_qd_kernel::v5_evolved_publication::{
     V5EvolvedPublicationFragments, V5EvolvedPublicationInputs, V5EvolvedPublicationPlan,
     V5EvolvedStreamedArtifact, prepare_v5_evolved_publication_stream,
 };
-use temporal_qd_kernel::v5_evolved_transaction::execute_v5_evolved_transaction_with_progress;
+use temporal_qd_kernel::v5_evolved_transaction::execute_v5_evolved_transaction_fast_ephemeral_with_progress;
 use temporal_qd_kernel::v5_publication::{
     V5G0ParentReferenceSink, V5G0PublicationFragmentKind, V5G0PublicationFragmentSink,
     V5G0PublicationFragmentSource, V5G0PublicationFragments, V5G0StreamedArtifact,
@@ -741,7 +741,7 @@ pub(crate) fn execute_evolved(
     let construction_started = Instant::now();
     let (request, mut parents, mut identity_ledger, prior_parent_references) =
         super::v5_fast_ephemeral_evolved_transaction_request(manifest)?;
-    let transaction = execute_v5_evolved_transaction_with_progress(
+    let transaction = execute_v5_evolved_transaction_fast_ephemeral_with_progress(
         request.clone(),
         &mut parents,
         &mut identity_ledger,
@@ -786,6 +786,9 @@ pub(crate) fn execute_evolved(
     for reference in prior_parent_references.values() {
         parent_writer.append(reference)?;
     }
+    // This traversal is the mandatory independent compiler replay for the
+    // fast-ephemeral transaction. It must succeed before either the invocation
+    // result or COMPLETE marker is written.
     let fragments: V5EvolvedPublicationFragments = stream
         .materialize_accepted_fragments_and_parents(&mut memory, &mut parent_writer)
         .context("materialize fast-ephemeral evolved accepted candidates")?;

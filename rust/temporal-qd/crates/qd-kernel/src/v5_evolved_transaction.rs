@@ -8,9 +8,15 @@
 //! below rather than admitting a fixture, Python process, Dashboard bridge,
 //! or a caller-provided candidate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
-use temporal_qd_contract::{ContractError, Map, NativeProgressHandle, Value, canonical_sha256};
+use temporal_qd_contract::{
+    ContractError, Map, NativeProgressHandle, NativeProgressSection, Value, canonical_sha256,
+};
 
 use crate::{
     factory::{ParentReference, ProposalIntent},
@@ -67,6 +73,30 @@ pub const V5_EVOLVED_PARENT_SNAPSHOT_INVENTORY_SCHEMA: &str =
 /// Per-attempt references into the deterministic parent snapshot inventory.
 pub const V5_EVOLVED_ATTEMPT_SNAPSHOT_REFS_SCHEMA: &str =
     "temporal_qd_v5_evolved_attempt_snapshot_refs_v1";
+
+/// Immediate constructor verification policy. This is operational execution
+/// policy only: neither variant participates in proposal, transaction, or
+/// population identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V5ImmediateConstructionReplayPolicy {
+    /// Durable/default behavior: independently reconstruct every proposal
+    /// before duplicate and ledger admission.
+    IndependentReplayV1,
+    /// Fast-ephemeral behavior: defer the independent reconstruction to the
+    /// mandatory publication replay which runs before the completion marker.
+    DeferredToFastEphemeralPublicationV1,
+}
+
+impl V5ImmediateConstructionReplayPolicy {
+    fn telemetry_section_name(self) -> &'static str {
+        match self {
+            Self::IndependentReplayV1 => "evolved_immediate_replay_independent_v1",
+            Self::DeferredToFastEphemeralPublicationV1 => {
+                "evolved_immediate_replay_deferred_to_publication_v1"
+            }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum V5EvolvedTransactionError {
@@ -1928,7 +1958,7 @@ pub(crate) struct V5EvolvedConstructionOutcome {
 /// constructor directly; no caller can inject fixture admission, Python, or
 /// an arbitrary materializer.
 #[cfg(test)]
-trait V5EvolvedConstructionEngine {
+trait V5EvolvedConstructionEngine: Send {
     fn construct(
         &mut self,
         authority: &V5SharedConstructionAuthority,
@@ -3409,7 +3439,7 @@ struct NativeV5EvolvedConstructionEngine;
 
 impl NativeV5EvolvedConstructionEngine {
     fn construct(
-        &mut self,
+        &self,
         authority: &V5SharedConstructionAuthority,
         request: &V5EvolvedTransactionRequest,
         planned: &PlannedProposal,
@@ -4941,24 +4971,314 @@ pub fn verify_v5_evolved_transaction_replay(
 }
 
 /// Execute scheduling, ordinal merge, local duplicate detection, and global
-/// ledger admission using a sealed construction engine.  The concrete native
-/// engine is intentionally wired in a small lower section once the v5 core
-/// exposes its compiler-owned parent/materializer types.
-fn execute_with_constructor<F>(
+/// ledger admission using a sealed construction engine. Construction is
+/// performed in bounded optimistic waves; all semantic state is re-planned and
+/// committed in exact proposal-ordinal order.
+#[derive(Clone, Copy)]
+struct V5EvolvedExecutionOptions {
+    immediate_replay_policy: V5ImmediateConstructionReplayPolicy,
+    capture_parent_snapshots: bool,
+}
+
+impl V5EvolvedExecutionOptions {
+    const fn durable() -> Self {
+        Self {
+            immediate_replay_policy: V5ImmediateConstructionReplayPolicy::IndependentReplayV1,
+            capture_parent_snapshots: true,
+        }
+    }
+
+    const fn fast_ephemeral() -> Self {
+        Self {
+            immediate_replay_policy:
+                V5ImmediateConstructionReplayPolicy::DeferredToFastEphemeralPublicationV1,
+            capture_parent_snapshots: true,
+        }
+    }
+
+    #[cfg(test)]
+    const fn scheduler_test() -> Self {
+        Self {
+            immediate_replay_policy:
+                V5ImmediateConstructionReplayPolicy::DeferredToFastEphemeralPublicationV1,
+            capture_parent_snapshots: false,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct V5EvolvedExecutionTelemetry {
+    plan_wall: Duration,
+    construct_wall: Duration,
+    immediate_replay_wall: Duration,
+    snapshot_wall: Duration,
+    admission_ledger_wall: Duration,
+    state_commit_wall: Duration,
+    planned_count: u64,
+    constructed_count: u64,
+    immediate_replay_count: u64,
+    snapshot_count: u64,
+    committed_count: u64,
+    wave_count: u64,
+    speculative_discarded_count: u64,
+    peak_active_workers: u64,
+    peak_in_flight: u64,
+}
+
+#[derive(Default)]
+struct V5ConstructionActivity {
+    active: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl V5ConstructionActivity {
+    fn worker_started(&self) {
+        let active = self
+            .active
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let mut observed = self.peak.load(Ordering::Relaxed);
+        while active > observed {
+            match self.peak.compare_exchange_weak(
+                observed,
+                active,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn worker_finished(&self) {
+        let _ = self
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+}
+
+struct V5ConstructionWorkerGuard<'a> {
+    activity: &'a V5ConstructionActivity,
+    progress: Option<NativeProgressHandle>,
+}
+
+impl<'a> V5ConstructionWorkerGuard<'a> {
+    fn new(activity: &'a V5ConstructionActivity, progress: Option<&NativeProgressHandle>) -> Self {
+        activity.worker_started();
+        if let Some(progress) = progress {
+            progress.worker_started();
+        }
+        Self {
+            activity,
+            progress: progress.cloned(),
+        }
+    }
+}
+
+impl Drop for V5ConstructionWorkerGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.worker_finished();
+        }
+        self.activity.worker_finished();
+    }
+}
+
+fn exact_parent_reference(left: &ParentReference, right: &ParentReference) -> bool {
+    left.pair_identity_sha256 == right.pair_identity_sha256
+        && left.candidate_id == right.candidate_id
+        && left.pair_payload == right.pair_payload
+        && left.selection_audit == right.selection_audit
+}
+
+fn exact_side(left: &Side, right: &Side) -> bool {
+    matches!(
+        (left, right),
+        (&Side::Long, &Side::Long) | (&Side::Short, &Side::Short)
+    )
+}
+
+fn exact_planned_proposal(left: &PlannedProposal, right: &PlannedProposal) -> bool {
+    if left.proposal_ordinal != right.proposal_ordinal {
+        return false;
+    }
+    match (&left.intent, &right.intent) {
+        (
+            ProposalIntent::RichImmigrant {
+                proposal_seed: left_proposal_seed,
+                long_seed: left_long_seed,
+                short_seed: left_short_seed,
+            },
+            ProposalIntent::RichImmigrant {
+                proposal_seed: right_proposal_seed,
+                long_seed: right_long_seed,
+                short_seed: right_short_seed,
+            },
+        ) => {
+            left_proposal_seed == right_proposal_seed
+                && left_long_seed == right_long_seed
+                && left_short_seed == right_short_seed
+        }
+        (
+            ProposalIntent::StructuralMutation {
+                proposal_seed: left_seed,
+                parent: left_parent,
+                mutation_depth: left_depth,
+            },
+            ProposalIntent::StructuralMutation {
+                proposal_seed: right_seed,
+                parent: right_parent,
+                mutation_depth: right_depth,
+            },
+        ) => {
+            left_seed == right_seed
+                && left_depth == right_depth
+                && exact_parent_reference(left_parent, right_parent)
+        }
+        (
+            ProposalIntent::SameSideCrossover {
+                proposal_seed: left_seed,
+                side: left_side,
+                parent: left_parent,
+                mate: left_mate,
+                mate_selection_attempts: left_attempts,
+            },
+            ProposalIntent::SameSideCrossover {
+                proposal_seed: right_seed,
+                side: right_side,
+                parent: right_parent,
+                mate: right_mate,
+                mate_selection_attempts: right_attempts,
+            },
+        ) => {
+            left_seed == right_seed
+                && exact_side(left_side, right_side)
+                && exact_parent_reference(left_parent, right_parent)
+                && exact_parent_reference(left_mate, right_mate)
+                && left_attempts == right_attempts
+        }
+        _ => false,
+    }
+}
+
+/// Advance only the state read by `ProposalPlanner` under the temporary wave
+/// assumption that this proposal will be accepted. No identity, ledger,
+/// journal, disposition, or publication state is fabricated here.
+fn assume_speculative_acceptance(
+    state: &mut ProposalState,
+    planned: &PlannedProposal,
+) -> Result<()> {
+    if state.next_proposal_ordinal != planned.proposal_ordinal {
+        return Err(contract(
+            "v5 evolved speculative planner ordinal diverged from planning state",
+        ));
+    }
+    state.next_proposal_ordinal = planned
+        .proposal_ordinal
+        .checked_add(1)
+        .ok_or_else(|| contract("v5 evolved speculative proposal ordinal overflowed"))?;
+    let origin_kind = planned.intent.origin_kind().to_owned();
+    let accepted = state
+        .origin_accepted_counts
+        .entry(origin_kind.clone())
+        .or_default();
+    *accepted = accepted
+        .checked_add(1)
+        .ok_or_else(|| contract("v5 evolved speculative accepted count overflowed"))?;
+    if origin_kind == "random_immigrant" {
+        state.immigrant_accepted = state
+            .immigrant_accepted
+            .checked_add(1)
+            .ok_or_else(|| contract("v5 evolved speculative immigrant count overflowed"))?;
+    }
+    Ok(())
+}
+
+fn record_evolved_execution_sections(
+    progress: Option<&NativeProgressHandle>,
+    telemetry: &V5EvolvedExecutionTelemetry,
+    replay_policy: V5ImmediateConstructionReplayPolicy,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    progress.record_section(NativeProgressSection {
+        name: "evolved_plan".to_owned(),
+        wall: telemetry.plan_wall,
+        completed_work_units: Some(telemetry.planned_count),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: "evolved_construct".to_owned(),
+        wall: telemetry.construct_wall,
+        completed_work_units: Some(telemetry.constructed_count),
+        parallel_workers: Some(telemetry.peak_active_workers),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: replay_policy.telemetry_section_name().to_owned(),
+        wall: telemetry.immediate_replay_wall,
+        completed_work_units: Some(telemetry.immediate_replay_count),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: "evolved_snapshot".to_owned(),
+        wall: telemetry.snapshot_wall,
+        completed_work_units: Some(telemetry.snapshot_count),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: "evolved_admission_ledger".to_owned(),
+        wall: telemetry.admission_ledger_wall,
+        completed_work_units: Some(telemetry.committed_count),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: "evolved_state_commit".to_owned(),
+        wall: telemetry.state_commit_wall,
+        completed_work_units: Some(telemetry.committed_count),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: "evolved_speculative_discard".to_owned(),
+        wall: Duration::from_secs(0),
+        completed_work_units: Some(telemetry.speculative_discarded_count),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress.record_section(NativeProgressSection {
+        name: "evolved_waves".to_owned(),
+        wall: Duration::from_secs(0),
+        completed_work_units: Some(telemetry.wave_count),
+        parallel_workers: Some(telemetry.peak_in_flight),
+        ..NativeProgressSection::default()
+    });
+}
+
+fn execute_with_constructor_and_telemetry<F>(
     request: V5EvolvedTransactionRequest,
     parents: &mut dyn ParentSelector,
     ledger: &mut dyn IdentityLedger,
-    verify_native_replay: bool,
+    options: V5EvolvedExecutionOptions,
     progress: Option<&NativeProgressHandle>,
-    mut construct: F,
-) -> Result<V5EvolvedTransactionResult>
+    construct: F,
+) -> Result<(V5EvolvedTransactionResult, V5EvolvedExecutionTelemetry)>
 where
-    F: FnMut(
-        &V5SharedConstructionAuthority,
-        &V5EvolvedTransactionRequest,
-        &PlannedProposal,
-        u64,
-    ) -> Result<V5EvolvedConstructionOutcome>,
+    F: Fn(
+            &V5SharedConstructionAuthority,
+            &V5EvolvedTransactionRequest,
+            &PlannedProposal,
+            u64,
+        ) -> Result<V5EvolvedConstructionOutcome>
+        + Sync,
 {
     request.validate_shape()?;
     let authority = V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)?;
@@ -5018,70 +5338,238 @@ where
     let mut parent_snapshots = BTreeMap::new();
     let mut attempt_snapshot_refs = Vec::new();
     let mut crossover_attempts = 0_u64;
+    let activity = V5ConstructionActivity::default();
+    let mut telemetry = V5EvolvedExecutionTelemetry::default();
+
     while (records.len() as u64) < request.target_accepted
         && (attempts.len() as u64) < request.max_attempts
     {
-        let planned = planner.plan_next(&mut state)?;
-        if matches!(&planned.intent, ProposalIntent::SameSideCrossover { .. }) {
-            crossover_attempts = crossover_attempts
-                .checked_add(1)
-                .ok_or_else(|| contract("v5 evolved crossover attempt counter overflowed"))?;
+        let remaining_target = request.target_accepted.saturating_sub(records.len() as u64);
+        let remaining_attempts = request.max_attempts.saturating_sub(attempts.len() as u64);
+        let wave_width = request
+            .thread_cap
+            .min(remaining_target)
+            .min(remaining_attempts) as usize;
+        if wave_width == 0 {
+            break;
         }
-        let birth_ordinal = records.len() as u64;
-        let outcome = construct(&authority, &request, &planned, birth_ordinal)?;
-        if let Some(progress) = progress {
-            progress.advance_constructed(1);
+        telemetry.wave_count = telemetry.wave_count.saturating_add(1);
+        telemetry.peak_in_flight = telemetry.peak_in_flight.max(wave_width as u64);
+
+        let selector_checkpoint = planner.parents.compact_state();
+        let mut planning_state = state.clone();
+        let base_birth_ordinal = records.len() as u64;
+        let planning_started = Instant::now();
+        let planning_result = (|| -> Result<Vec<(PlannedProposal, u64)>> {
+            let mut wave = Vec::with_capacity(wave_width);
+            for offset in 0..wave_width {
+                let planned = planner.plan_next(&mut planning_state)?;
+                let birth_ordinal = base_birth_ordinal
+                    .checked_add(offset as u64)
+                    .ok_or_else(|| contract("v5 evolved speculative birth ordinal overflowed"))?;
+                assume_speculative_acceptance(&mut planning_state, &planned)?;
+                wave.push((planned, birth_ordinal));
+            }
+            Ok(wave)
+        })();
+        telemetry.plan_wall += planning_started.elapsed();
+        let restore_result = planner
+            .parents
+            .restore_compact_state(&selector_checkpoint)
+            .map_err(V5EvolvedTransactionError::from);
+        if let Err(error) = restore_result {
+            return Err(error);
         }
-        if verify_native_replay {
-            verify_native_construction_replay(
-                &authority,
-                &request,
-                &planned,
-                birth_ordinal,
-                &outcome,
-            )?;
-            attempt_snapshot_refs.push(snapshot_refs_for_native_outcome(
-                &request,
-                &planned,
-                &outcome,
-                &mut parent_snapshots,
-            )?);
+        if planner.parents.compact_state() != selector_checkpoint {
+            return Err(contract(
+                "v5 evolved parent selector failed to restore its speculative checkpoint",
+            ));
         }
-        let delta = outcome.delta.clone().ok_or_else(|| {
-            contract("v5 evolved constructor omitted its required all-attempt compact delta")
-        })?;
-        let (attempt, audit, accepted) =
-            admitted_attempt(&request, &authority, &state, ledger, &planned, outcome)?;
-        let accepted_proposal = accepted.as_ref().map(|record| AcceptedProposal {
-            candidate_id: record.candidate_id.clone(),
-            candidate_identity_sha256: record.candidate_identity_sha256.clone(),
-            executable_semantic_sha256: record.executable_semantic_sha256.clone(),
-            descriptor_projection: Some(record.descriptor_projection.clone()),
-        });
-        state.observe_compact_attempt(
-            attempt.proposal_ordinal,
-            &attempt.origin_kind,
-            &attempt.disposition,
-            &attempt.attempt_sha256()?,
-            accepted_proposal.as_ref(),
-        )?;
-        deltas.push(delta);
-        let accepted_now = accepted.is_some();
-        if let Some(record) = accepted {
-            records.push(record);
+        let wave = planning_result?;
+        telemetry.planned_count = telemetry.planned_count.saturating_add(wave.len() as u64);
+
+        let construction_started = Instant::now();
+        let wave_results = if wave.len() == 1 {
+            let (planned, birth_ordinal) = &wave[0];
+            let _worker = V5ConstructionWorkerGuard::new(&activity, progress);
+            let result = construct(&authority, &request, planned, *birth_ordinal);
+            if result.is_ok() {
+                if let Some(progress) = progress {
+                    progress.advance_constructed(1);
+                }
+            }
+            vec![result]
+        } else {
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(wave.len());
+                for (planned, birth_ordinal) in &wave {
+                    let progress = progress.cloned();
+                    let activity = &activity;
+                    let authority = &authority;
+                    let request = &request;
+                    let construct = &construct;
+                    handles.push(scope.spawn(move || {
+                        let _worker = V5ConstructionWorkerGuard::new(activity, progress.as_ref());
+                        let result = construct(authority, request, planned, *birth_ordinal);
+                        if result.is_ok() {
+                            if let Some(progress) = &progress {
+                                progress.advance_constructed(1);
+                            }
+                        }
+                        result
+                    }));
+                }
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    match handle.join() {
+                        Ok(result) => results.push(result),
+                        Err(_) => {
+                            results.push(Err(contract("v5 evolved construction worker panicked")))
+                        }
+                    }
+                }
+                results
+            })
+        };
+        telemetry.construct_wall += construction_started.elapsed();
+        telemetry.peak_active_workers = telemetry
+            .peak_active_workers
+            .max(activity.peak.load(Ordering::Relaxed));
+        if activity.active.load(Ordering::Relaxed) != 0 {
+            return Err(contract(
+                "v5 evolved construction workers did not return to zero",
+            ));
         }
-        if let Some(progress) = progress {
-            progress.advance_attempted(1);
-            if accepted_now {
-                progress.advance_accepted(1);
-                progress.set_completed_work_units(records.len() as u64);
-            } else {
-                progress.advance_rejected(1);
+
+        let mut outcomes = Vec::with_capacity(wave_results.len());
+        let mut first_error = None;
+        for result in wave_results {
+            match result {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        audits.push(audit);
-        attempts.push(attempt);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if outcomes.len() != wave.len() {
+            return Err(contract(
+                "v5 evolved construction wave did not return one outcome per plan",
+            ));
+        }
+        telemetry.constructed_count = telemetry
+            .constructed_count
+            .saturating_add(outcomes.len() as u64);
+
+        let wave_len = wave.len();
+        for (index, ((speculative, birth_ordinal), outcome)) in
+            wave.into_iter().zip(outcomes).enumerate()
+        {
+            let plan_started = Instant::now();
+            let authoritative = planner.plan_next(&mut state)?;
+            telemetry.plan_wall += plan_started.elapsed();
+            telemetry.planned_count = telemetry.planned_count.saturating_add(1);
+            if !exact_planned_proposal(&speculative, &authoritative) {
+                return Err(contract(
+                    "v5 evolved speculative plan diverged from authoritative serial re-plan",
+                ));
+            }
+            if matches!(
+                &authoritative.intent,
+                ProposalIntent::SameSideCrossover { .. }
+            ) {
+                crossover_attempts = crossover_attempts
+                    .checked_add(1)
+                    .ok_or_else(|| contract("v5 evolved crossover attempt counter overflowed"))?;
+            }
+
+            if options.immediate_replay_policy
+                == V5ImmediateConstructionReplayPolicy::IndependentReplayV1
+            {
+                let replay_started = Instant::now();
+                verify_native_construction_replay(
+                    &authority,
+                    &request,
+                    &authoritative,
+                    birth_ordinal,
+                    &outcome,
+                )?;
+                telemetry.immediate_replay_wall += replay_started.elapsed();
+                telemetry.immediate_replay_count =
+                    telemetry.immediate_replay_count.saturating_add(1);
+            }
+            if options.capture_parent_snapshots {
+                let snapshot_started = Instant::now();
+                attempt_snapshot_refs.push(snapshot_refs_for_native_outcome(
+                    &request,
+                    &authoritative,
+                    &outcome,
+                    &mut parent_snapshots,
+                )?);
+                telemetry.snapshot_wall += snapshot_started.elapsed();
+                telemetry.snapshot_count = telemetry.snapshot_count.saturating_add(1);
+            }
+            let delta = outcome.delta.clone().ok_or_else(|| {
+                contract("v5 evolved constructor omitted its required all-attempt compact delta")
+            })?;
+
+            let admission_started = Instant::now();
+            let (attempt, audit, accepted) = admitted_attempt(
+                &request,
+                &authority,
+                &state,
+                ledger,
+                &authoritative,
+                outcome,
+            )?;
+            telemetry.admission_ledger_wall += admission_started.elapsed();
+
+            let accepted_proposal = accepted.as_ref().map(|record| AcceptedProposal {
+                candidate_id: record.candidate_id.clone(),
+                candidate_identity_sha256: record.candidate_identity_sha256.clone(),
+                executable_semantic_sha256: record.executable_semantic_sha256.clone(),
+                descriptor_projection: Some(record.descriptor_projection.clone()),
+            });
+            let commit_started = Instant::now();
+            state.observe_compact_attempt(
+                attempt.proposal_ordinal,
+                &attempt.origin_kind,
+                &attempt.disposition,
+                &attempt.attempt_sha256()?,
+                accepted_proposal.as_ref(),
+            )?;
+            deltas.push(delta);
+            let accepted_now = accepted.is_some();
+            if let Some(record) = accepted {
+                records.push(record);
+            }
+            audits.push(audit);
+            attempts.push(attempt);
+            telemetry.state_commit_wall += commit_started.elapsed();
+            telemetry.committed_count = telemetry.committed_count.saturating_add(1);
+
+            if let Some(progress) = progress {
+                progress.advance_attempted(1);
+                if accepted_now {
+                    progress.advance_accepted(1);
+                    progress.set_completed_work_units(records.len() as u64);
+                } else {
+                    progress.advance_rejected(1);
+                }
+            }
+            if !accepted_now {
+                telemetry.speculative_discarded_count = telemetry
+                    .speculative_discarded_count
+                    .saturating_add((wave_len - index - 1) as u64);
+                break;
+            }
+        }
     }
+
     // Parent selection occurs inside `ProposalPlanner`; extract the mutable
     // selector after the loop so its exact final state is sealed in the result.
     let final_parent_selector_state = planner.parents.compact_state();
@@ -5132,17 +5620,19 @@ where
         final_identity_ledger_state,
     };
     let parent_snapshot_inventory =
-        verify_native_replay.then_some(V5EvolvedParentSnapshotInventory {
-            generation_index: request.generation_index,
-            generation_config_sha256: request.generation_config_sha256.clone(),
-            shared_authority_sha256: authority.shared_authority_sha256.clone(),
-            source_parent_archive_input_binding_sha256: request
-                .parent_archive_input_binding_sha256
-                .clone(),
-            source_parent_archive_semantic_sha256: request.parent_selector_state_sha256.clone(),
-            snapshots: parent_snapshots.into_values().collect(),
-            attempt_snapshot_refs,
-        });
+        options
+            .capture_parent_snapshots
+            .then_some(V5EvolvedParentSnapshotInventory {
+                generation_index: request.generation_index,
+                generation_config_sha256: request.generation_config_sha256.clone(),
+                shared_authority_sha256: authority.shared_authority_sha256.clone(),
+                source_parent_archive_input_binding_sha256: request
+                    .parent_archive_input_binding_sha256
+                    .clone(),
+                source_parent_archive_semantic_sha256: request.parent_selector_state_sha256.clone(),
+                snapshots: parent_snapshots.into_values().collect(),
+                attempt_snapshot_refs,
+            });
     let result = V5EvolvedTransactionResult {
         generation_index: request.generation_index,
         generation_config_sha256: request.generation_config_sha256,
@@ -5170,13 +5660,35 @@ where
         parent_snapshot_inventory,
     };
     result.verify_replay()?;
-    Ok(result)
+    record_evolved_execution_sections(progress, &telemetry, options.immediate_replay_policy);
+    Ok((result, telemetry))
+}
+
+fn execute_with_constructor<F>(
+    request: V5EvolvedTransactionRequest,
+    parents: &mut dyn ParentSelector,
+    ledger: &mut dyn IdentityLedger,
+    options: V5EvolvedExecutionOptions,
+    progress: Option<&NativeProgressHandle>,
+    construct: F,
+) -> Result<V5EvolvedTransactionResult>
+where
+    F: Fn(
+            &V5SharedConstructionAuthority,
+            &V5EvolvedTransactionRequest,
+            &PlannedProposal,
+            u64,
+        ) -> Result<V5EvolvedConstructionOutcome>
+        + Sync,
+{
+    execute_with_constructor_and_telemetry(request, parents, ledger, options, progress, construct)
+        .map(|(result, _)| result)
 }
 
 /// Execute the write-neutral native later-generation v5 transaction.
 ///
 /// The only construction implementation bound here is the sealed Rust
-/// compiler/operator engine above.  Parent and ledger trait objects supply
+/// compiler/operator engine above. Parent and ledger trait objects supply
 /// already-opened in-memory state, but cannot inject a candidate builder.
 pub fn execute_v5_evolved_transaction(
     request: V5EvolvedTransactionRequest,
@@ -5187,21 +5699,68 @@ pub fn execute_v5_evolved_transaction(
 }
 
 /// Execute an evolved transaction with optional operational progress. The
-/// handle observes counters only and cannot influence scheduler decisions.
+/// durable/default path keeps the historical independent constructor replay.
 pub fn execute_v5_evolved_transaction_with_progress(
     request: V5EvolvedTransactionRequest,
     parents: &mut dyn ParentSelector,
     ledger: &mut dyn IdentityLedger,
     progress: Option<&NativeProgressHandle>,
 ) -> Result<V5EvolvedTransactionResult> {
-    let mut engine = NativeV5EvolvedConstructionEngine;
+    let engine = NativeV5EvolvedConstructionEngine;
     execute_with_constructor(
         request,
         parents,
         ledger,
-        true,
+        V5EvolvedExecutionOptions::durable(),
         progress,
         |authority, request, planned, birth_ordinal| {
+            engine.construct(authority, request, planned, birth_ordinal)
+        },
+    )
+}
+
+/// Fast-ephemeral-only evolved construction. It preserves the exact serial
+/// scheduler, duplicate, ledger, and transaction semantics while deferring the
+/// expensive independent constructor replay to the mandatory publication
+/// replay. The caller must not publish a completion marker until that replay
+/// has succeeded.
+pub fn execute_v5_evolved_transaction_fast_ephemeral_with_progress(
+    request: V5EvolvedTransactionRequest,
+    parents: &mut dyn ParentSelector,
+    ledger: &mut dyn IdentityLedger,
+    progress: Option<&NativeProgressHandle>,
+) -> Result<V5EvolvedTransactionResult> {
+    let engine = NativeV5EvolvedConstructionEngine;
+    execute_with_constructor(
+        request,
+        parents,
+        ledger,
+        V5EvolvedExecutionOptions::fast_ephemeral(),
+        progress,
+        |authority, request, planned, birth_ordinal| {
+            engine.construct(authority, request, planned, birth_ordinal)
+        },
+    )
+}
+
+#[cfg(test)]
+fn execute_with_engine_and_telemetry(
+    request: V5EvolvedTransactionRequest,
+    parents: &mut dyn ParentSelector,
+    ledger: &mut dyn IdentityLedger,
+    engine: &mut dyn V5EvolvedConstructionEngine,
+) -> Result<(V5EvolvedTransactionResult, V5EvolvedExecutionTelemetry)> {
+    let engine = std::sync::Mutex::new(engine);
+    execute_with_constructor_and_telemetry(
+        request,
+        parents,
+        ledger,
+        V5EvolvedExecutionOptions::scheduler_test(),
+        None,
+        |authority, request, planned, birth_ordinal| {
+            let mut engine = engine
+                .lock()
+                .map_err(|_| contract("v5 evolved test construction engine lock poisoned"))?;
             engine.construct(authority, request, planned, birth_ordinal)
         },
     )
@@ -5214,21 +5773,18 @@ fn execute_with_engine(
     ledger: &mut dyn IdentityLedger,
     engine: &mut dyn V5EvolvedConstructionEngine,
 ) -> Result<V5EvolvedTransactionResult> {
-    execute_with_constructor(
-        request,
-        parents,
-        ledger,
-        false,
-        None,
-        |authority, request, planned, birth_ordinal| {
-            engine.construct(authority, request, planned, birth_ordinal)
-        },
-    )
+    execute_with_engine_and_telemetry(request, parents, ledger, engine).map(|(result, _)| result)
 }
 
 #[cfg(test)]
 mod scheduler_tests {
-    use std::io::Read;
+    use std::{
+        io::Read,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64 as TestAtomicU64, Ordering as TestOrdering},
+        },
+    };
 
     use flate2::read::GzDecoder;
 
@@ -5327,7 +5883,15 @@ mod scheduler_tests {
             &mut self,
             state: &Value,
         ) -> std::result::Result<(), ProposalError> {
+            let draws = state.get("draws").and_then(Value::as_u64).ok_or_else(|| {
+                ProposalError::Contract(
+                    "v5 evolved scheduler test parent checkpoint lacks draws".to_owned(),
+                )
+            })?;
+            let previous = self.draws;
+            self.draws = draws;
             if state != &self.compact_state() {
+                self.draws = previous;
                 return Err(ProposalError::Contract(
                     "v5 evolved scheduler test parent state drifted".to_owned(),
                 ));
@@ -5442,6 +6006,118 @@ mod scheduler_tests {
         }
     }
 
+    fn rejecting_outcome(
+        authority: &V5SharedConstructionAuthority,
+        request: &V5EvolvedTransactionRequest,
+        planned: &PlannedProposal,
+    ) -> Result<V5EvolvedConstructionOutcome> {
+        let (lineage_refs, delta, stage) = match &planned.intent {
+            ProposalIntent::RichImmigrant { .. } => {
+                let delta = rejected_delta(authority, request, planned, None, None, None, None);
+                (
+                    V5AttemptLineageRefs {
+                        parent: None,
+                        mate: None,
+                        parent_selection_receipt_sha256: None,
+                        operator_plan_sha256: None,
+                        operator_application_sha256: None,
+                        operator_trace_sha256: None,
+                        step_index: None,
+                    },
+                    delta,
+                    "pre_plan",
+                )
+            }
+            ProposalIntent::StructuralMutation {
+                parent,
+                mutation_depth,
+                ..
+            } => {
+                let receipt = selection_receipt("structural_offspring", parent, None);
+                let receipt_value = receipt.to_value()?;
+                let parent_reference = attempt_parent_reference(parent);
+                let delta = rejected_delta(
+                    authority,
+                    request,
+                    planned,
+                    Some(parent_reference.clone()),
+                    None,
+                    Some(receipt_value),
+                    Some(*mutation_depth),
+                );
+                (
+                    V5AttemptLineageRefs {
+                        parent: Some(parent_reference),
+                        mate: None,
+                        parent_selection_receipt_sha256: Some(receipt.receipt_sha256()?),
+                        operator_plan_sha256: Some(canonical_sha256(
+                            delta
+                                .terminal_operator_plan
+                                .as_ref()
+                                .expect("test terminal plan"),
+                        )?),
+                        operator_application_sha256: None,
+                        operator_trace_sha256: Some(canonical_sha256(
+                            delta
+                                .terminal_operator_trace
+                                .as_ref()
+                                .expect("test terminal trace"),
+                        )?),
+                        step_index: Some(0),
+                    },
+                    delta,
+                    "operator_plan",
+                )
+            }
+            ProposalIntent::SameSideCrossover { parent, mate, .. } => {
+                let receipt = selection_receipt("same_side_crossover", parent, Some(mate));
+                let receipt_value = receipt.to_value()?;
+                let parent_reference = attempt_parent_reference(parent);
+                let mate_reference = attempt_parent_reference(mate);
+                let delta = rejected_delta(
+                    authority,
+                    request,
+                    planned,
+                    Some(parent_reference.clone()),
+                    Some(mate_reference.clone()),
+                    Some(receipt_value),
+                    None,
+                );
+                (
+                    V5AttemptLineageRefs {
+                        parent: Some(parent_reference),
+                        mate: Some(mate_reference),
+                        parent_selection_receipt_sha256: Some(receipt.receipt_sha256()?),
+                        operator_plan_sha256: Some(canonical_sha256(
+                            delta
+                                .terminal_operator_plan
+                                .as_ref()
+                                .expect("test terminal plan"),
+                        )?),
+                        operator_application_sha256: None,
+                        operator_trace_sha256: Some(canonical_sha256(
+                            delta
+                                .terminal_operator_trace
+                                .as_ref()
+                                .expect("test terminal trace"),
+                        )?),
+                        step_index: Some(0),
+                    },
+                    delta,
+                    "operator_plan",
+                )
+            }
+        };
+        Ok(V5EvolvedConstructionOutcome {
+            delta: Some(delta),
+            lineage_refs,
+            disposition: "rejected".to_owned(),
+            reason_code: "operation_rejected".to_owned(),
+            stage: stage.to_owned(),
+            accepted: None,
+        })
+    }
+
     #[derive(Default)]
     struct RejectingEngine {
         scheduled_kinds: Vec<String>,
@@ -5458,112 +6134,10 @@ mod scheduler_tests {
         ) -> Result<V5EvolvedConstructionOutcome> {
             self.scheduled_kinds
                 .push(planned_scheduled_kind(&planned.intent).to_owned());
-            let (lineage_refs, delta, stage) = match &planned.intent {
-                ProposalIntent::RichImmigrant { .. } => {
-                    let delta = rejected_delta(authority, request, planned, None, None, None, None);
-                    (
-                        V5AttemptLineageRefs {
-                            parent: None,
-                            mate: None,
-                            parent_selection_receipt_sha256: None,
-                            operator_plan_sha256: None,
-                            operator_application_sha256: None,
-                            operator_trace_sha256: None,
-                            step_index: None,
-                        },
-                        delta,
-                        "pre_plan",
-                    )
-                }
-                ProposalIntent::StructuralMutation {
-                    parent,
-                    mutation_depth,
-                    ..
-                } => {
-                    self.mutation_depths.push(*mutation_depth);
-                    let receipt = selection_receipt("structural_offspring", parent, None);
-                    let receipt_value = receipt.to_value()?;
-                    let parent_reference = attempt_parent_reference(parent);
-                    let delta = rejected_delta(
-                        authority,
-                        request,
-                        planned,
-                        Some(parent_reference.clone()),
-                        None,
-                        Some(receipt_value),
-                        Some(*mutation_depth),
-                    );
-                    (
-                        V5AttemptLineageRefs {
-                            parent: Some(parent_reference),
-                            mate: None,
-                            parent_selection_receipt_sha256: Some(receipt.receipt_sha256()?),
-                            operator_plan_sha256: Some(canonical_sha256(
-                                delta
-                                    .terminal_operator_plan
-                                    .as_ref()
-                                    .expect("test terminal plan"),
-                            )?),
-                            operator_application_sha256: None,
-                            operator_trace_sha256: Some(canonical_sha256(
-                                delta
-                                    .terminal_operator_trace
-                                    .as_ref()
-                                    .expect("test terminal trace"),
-                            )?),
-                            step_index: Some(0),
-                        },
-                        delta,
-                        "operator_plan",
-                    )
-                }
-                ProposalIntent::SameSideCrossover { parent, mate, .. } => {
-                    let receipt = selection_receipt("same_side_crossover", parent, Some(mate));
-                    let receipt_value = receipt.to_value()?;
-                    let parent_reference = attempt_parent_reference(parent);
-                    let mate_reference = attempt_parent_reference(mate);
-                    let delta = rejected_delta(
-                        authority,
-                        request,
-                        planned,
-                        Some(parent_reference.clone()),
-                        Some(mate_reference.clone()),
-                        Some(receipt_value),
-                        None,
-                    );
-                    (
-                        V5AttemptLineageRefs {
-                            parent: Some(parent_reference),
-                            mate: Some(mate_reference),
-                            parent_selection_receipt_sha256: Some(receipt.receipt_sha256()?),
-                            operator_plan_sha256: Some(canonical_sha256(
-                                delta
-                                    .terminal_operator_plan
-                                    .as_ref()
-                                    .expect("test terminal plan"),
-                            )?),
-                            operator_application_sha256: None,
-                            operator_trace_sha256: Some(canonical_sha256(
-                                delta
-                                    .terminal_operator_trace
-                                    .as_ref()
-                                    .expect("test terminal trace"),
-                            )?),
-                            step_index: Some(0),
-                        },
-                        delta,
-                        "operator_plan",
-                    )
-                }
-            };
-            Ok(V5EvolvedConstructionOutcome {
-                delta: Some(delta),
-                lineage_refs,
-                disposition: "rejected".to_owned(),
-                reason_code: "operation_rejected".to_owned(),
-                stage: stage.to_owned(),
-                accepted: None,
-            })
+            if let ProposalIntent::StructuralMutation { mutation_depth, .. } = &planned.intent {
+                self.mutation_depths.push(*mutation_depth);
+            }
+            rejecting_outcome(authority, request, planned)
         }
     }
 
@@ -5988,36 +6562,360 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn cap_one_and_eight_have_the_same_ordered_retry_semantics() {
+    fn caps_one_two_and_eight_have_exact_ordered_retry_semantics() {
+        let mut semantic_values = Vec::new();
+        for thread_cap in [1_u64, 2, 8] {
+            let mut parents = TestParentSelector::new();
+            let mut ledger = ledger();
+            let mut engine = RejectingEngine::default();
+            let (result, telemetry) = execute_with_engine_and_telemetry(
+                request(thread_cap, &parents, &ledger),
+                &mut parents,
+                &mut ledger,
+                &mut engine,
+            )
+            .expect("bounded evolved scheduler harness");
+
+            assert_eq!(result.thread_cap, thread_cap);
+            assert_eq!(result.attempts.len(), 7);
+            assert_eq!(telemetry.committed_count, 7);
+            assert!(telemetry.peak_in_flight <= thread_cap);
+            if thread_cap == 1 {
+                assert_eq!(telemetry.speculative_discarded_count, 0);
+                assert_eq!(telemetry.constructed_count, telemetry.committed_count);
+            } else {
+                assert!(telemetry.speculative_discarded_count > 0);
+                assert!(telemetry.constructed_count > telemetry.committed_count);
+            }
+            semantic_values.push(result.to_value().expect("semantic transaction value"));
+        }
+
+        assert_eq!(semantic_values[0], semantic_values[1]);
+        assert_eq!(semantic_values[0], semantic_values[2]);
+    }
+
+    #[test]
+    fn first_rejection_discards_speculative_suffix_before_authoritative_replan() {
         let mut serial_parents = TestParentSelector::new();
         let mut serial_ledger = ledger();
         let mut serial_engine = RejectingEngine::default();
-        let serial = execute_with_engine(
+        let (serial, serial_telemetry) = execute_with_engine_and_telemetry(
             request(1, &serial_parents, &serial_ledger),
             &mut serial_parents,
             &mut serial_ledger,
             &mut serial_engine,
         )
-        .expect("serial evolved scheduler harness");
+        .expect("serial rejection oracle");
 
-        let mut capped_parents = TestParentSelector::new();
-        let mut capped_ledger = ledger();
-        let mut capped_engine = RejectingEngine::default();
-        let capped = execute_with_engine(
-            request(8, &capped_parents, &capped_ledger),
-            &mut capped_parents,
-            &mut capped_ledger,
-            &mut capped_engine,
+        let mut parallel_parents = TestParentSelector::new();
+        let mut parallel_ledger = ledger();
+        let mut parallel_engine = RejectingEngine::default();
+        let (parallel, parallel_telemetry) = execute_with_engine_and_telemetry(
+            request(8, &parallel_parents, &parallel_ledger),
+            &mut parallel_parents,
+            &mut parallel_ledger,
+            &mut parallel_engine,
         )
-        .expect("cap-eight evolved scheduler harness");
+        .expect("parallel rejection executor");
 
-        assert_eq!(serial.thread_cap, 1);
-        assert_eq!(capped.thread_cap, 8);
         assert_eq!(
-            serial.to_value().expect("serial semantic value"),
-            capped.to_value().expect("cap-eight semantic value"),
-            "the bounded cap must not change ordinal merge or semantic identity",
+            serial.to_value().expect("serial value"),
+            parallel.to_value().expect("parallel value"),
         );
+        assert_eq!(serial_telemetry.speculative_discarded_count, 0);
+        assert!(parallel_telemetry.speculative_discarded_count > 0);
+        assert_eq!(
+            parallel.attempts.len() as u64,
+            parallel_telemetry.committed_count
+        );
+        assert_eq!(
+            parallel.schedule_state_receipt.final_parent_selector_state,
+            serial.schedule_state_receipt.final_parent_selector_state,
+        );
+        assert_eq!(
+            parallel.schedule_state_receipt.final_identity_ledger_state,
+            serial.schedule_state_receipt.final_identity_ledger_state,
+        );
+    }
+
+    #[test]
+    fn constructor_wave_has_real_bounded_concurrency_without_wall_clock_assertions() {
+        let mut parents = TestParentSelector::new();
+        let mut ledger = ledger();
+        let mut bounded_request = request(8, &parents, &ledger);
+        bounded_request.max_attempts = 2;
+        let first_wave_barrier = Arc::new(Barrier::new(2));
+        let construction_calls = Arc::new(TestAtomicU64::new(0));
+
+        let (_, telemetry) = execute_with_constructor_and_telemetry(
+            bounded_request,
+            &mut parents,
+            &mut ledger,
+            V5EvolvedExecutionOptions::scheduler_test(),
+            None,
+            {
+                let first_wave_barrier = Arc::clone(&first_wave_barrier);
+                let construction_calls = Arc::clone(&construction_calls);
+                move |authority, request, planned, _birth_ordinal| {
+                    let call = construction_calls.fetch_add(1, TestOrdering::SeqCst);
+                    if call < 2 {
+                        first_wave_barrier.wait();
+                    }
+                    rejecting_outcome(authority, request, planned)
+                }
+            },
+        )
+        .expect("bounded parallel construction witness");
+
+        assert!(telemetry.peak_active_workers > 1);
+        assert!(telemetry.peak_active_workers <= 8);
+        assert!(telemetry.peak_in_flight <= 8);
+        assert_eq!(telemetry.committed_count, 2);
+        assert_eq!(telemetry.speculative_discarded_count, 1);
+        assert_eq!(telemetry.constructed_count, 3);
+        assert_eq!(construction_calls.load(TestOrdering::SeqCst), 3);
+    }
+
+    #[test]
+    fn progress_worker_guard_releases_active_count_on_every_drop_path() {
+        let activity = V5ConstructionActivity::default();
+        assert_eq!(activity.active.load(Ordering::Relaxed), 0);
+        {
+            let _first = V5ConstructionWorkerGuard::new(&activity, None);
+            assert_eq!(activity.active.load(Ordering::Relaxed), 1);
+            {
+                let _second = V5ConstructionWorkerGuard::new(&activity, None);
+                assert_eq!(activity.active.load(Ordering::Relaxed), 2);
+                assert_eq!(activity.peak.load(Ordering::Relaxed), 2);
+            }
+            assert_eq!(activity.active.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(activity.active.load(Ordering::Relaxed), 0);
+        assert_eq!(activity.peak.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn construction_error_joins_the_entire_wave_without_partial_commit_or_deadlock() {
+        let mut parents = TestParentSelector::new();
+        let mut ledger = ledger();
+        let mut bounded_request = request(8, &parents, &ledger);
+        bounded_request.max_attempts = 2;
+        let first_wave_barrier = Arc::new(Barrier::new(2));
+        let construction_calls = Arc::new(TestAtomicU64::new(0));
+
+        let error = execute_with_constructor_and_telemetry(
+            bounded_request,
+            &mut parents,
+            &mut ledger,
+            V5EvolvedExecutionOptions::scheduler_test(),
+            None,
+            {
+                let first_wave_barrier = Arc::clone(&first_wave_barrier);
+                let construction_calls = Arc::clone(&construction_calls);
+                move |authority, request, planned, _birth_ordinal| {
+                    let call = construction_calls.fetch_add(1, TestOrdering::SeqCst);
+                    first_wave_barrier.wait();
+                    if call == 0 {
+                        Err(contract("intentional parallel construction failure"))
+                    } else {
+                        rejecting_outcome(authority, request, planned)
+                    }
+                }
+            },
+        )
+        .expect_err("one worker failure must abort the uncommitted wave");
+
+        assert!(
+            error
+                .to_string()
+                .contains("intentional parallel construction failure")
+        );
+        assert_eq!(construction_calls.load(TestOrdering::SeqCst), 2);
+        assert_eq!(
+            parents.draws, 0,
+            "speculative selector draws must be restored"
+        );
+        assert_eq!(
+            ledger.compact_state().get("proposalCount"),
+            Some(&Value::from(0_u64)),
+        );
+    }
+
+    fn real_immigrant_fixture(
+        thread_cap: u64,
+    ) -> (
+        V5EvolvedTransactionRequest,
+        ExplicitParentRing,
+        CandidateIdentityLedger,
+    ) {
+        let parents = ExplicitParentRing::new(Vec::new()).expect("empty parent ring");
+        let ledger = ledger();
+        let config_sha256 = sha(object([(
+            "schemaVersion",
+            Value::String("temporal_qd_v5_evolved_replay_policy_test_v1".to_owned()),
+        )]));
+        let mut request = direct_native_request(config_sha256);
+        request.thread_cap = thread_cap;
+        request.parent_selector_state_sha256 = sha(parents.compact_state());
+        request.identity_ledger_identity_sha256 = sha(ledger.identity().clone());
+        request.identity_ledger_state_sha256 = sha(ledger.compact_state());
+        (request, parents, ledger)
+    }
+
+    fn global_duplicate_immigrant_fixture(
+        thread_cap: u64,
+    ) -> (
+        V5EvolvedTransactionRequest,
+        ExplicitParentRing,
+        CandidateIdentityLedger,
+    ) {
+        let (mut request, parents, base_ledger) = real_immigrant_fixture(thread_cap);
+        request.target_accepted = 2;
+        request.max_attempts = 6;
+        let authority =
+            V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
+                .expect("duplicate fixture authority");
+        let proposal_seed = v5_proposal_seed(&request.generation_config_sha256, 0)
+            .expect("duplicate fixture proposal seed");
+        let planned = PlannedProposal {
+            proposal_ordinal: 0,
+            intent: ProposalIntent::RichImmigrant {
+                long_seed: immigrant_side_seed(&proposal_seed, Side::Long),
+                short_seed: immigrant_side_seed(&proposal_seed, Side::Short),
+                proposal_seed,
+            },
+        };
+        let outcome = NativeV5EvolvedConstructionEngine
+            .construct(&authority, &request, &planned, 0)
+            .expect("duplicate fixture native immigrant");
+        let duplicate_identity = outcome
+            .accepted
+            .expect("duplicate fixture immigrant must materialize")
+            .record
+            .candidate_identity_sha256;
+        let ledger =
+            CandidateIdentityLedger::new(base_ledger.identity().clone(), vec![duplicate_identity])
+                .expect("duplicate fixture identity ledger");
+        request.identity_ledger_identity_sha256 = sha(ledger.identity().clone());
+        request.identity_ledger_state_sha256 = sha(ledger.compact_state());
+        (request, parents, ledger)
+    }
+
+    #[test]
+    fn global_duplicate_rejection_discards_suffix_and_matches_serial() {
+        let mut values = Vec::new();
+        let mut discard_counts = Vec::new();
+        for thread_cap in [1_u64, 8] {
+            let (request, mut parents, mut ledger) = global_duplicate_immigrant_fixture(thread_cap);
+            let engine = NativeV5EvolvedConstructionEngine;
+            let (result, telemetry) = execute_with_constructor_and_telemetry(
+                request,
+                &mut parents,
+                &mut ledger,
+                V5EvolvedExecutionOptions::fast_ephemeral(),
+                None,
+                |authority, request, planned, birth_ordinal| {
+                    engine.construct(authority, request, planned, birth_ordinal)
+                },
+            )
+            .expect("global duplicate exact-parity transaction");
+
+            assert!(result.target_reached);
+            assert_eq!(result.attempts[0].disposition, "rejected");
+            assert_eq!(
+                result.attempts[0].reason_code,
+                "duplicate_candidate_identity_global",
+            );
+            assert_eq!(result.outcome_audits[0].stage, "identity_ledger");
+            values.push(result.to_value().expect("global duplicate semantic value"));
+            discard_counts.push(telemetry.speculative_discarded_count);
+        }
+        assert_eq!(values[0], values[1]);
+        assert_eq!(discard_counts[0], 0);
+        assert!(discard_counts[1] > 0);
+    }
+
+    #[test]
+    fn native_accepted_population_is_identical_across_thread_caps() {
+        let mut semantic_values = Vec::new();
+        let mut serial_replay = None;
+        for thread_cap in [1_u64, 2, 8] {
+            let (mut request, mut parents, mut ledger) = real_immigrant_fixture(thread_cap);
+            request.target_accepted = 2;
+            request.max_attempts = 8;
+            let engine = NativeV5EvolvedConstructionEngine;
+            let (result, telemetry) = execute_with_constructor_and_telemetry(
+                request.clone(),
+                &mut parents,
+                &mut ledger,
+                V5EvolvedExecutionOptions::fast_ephemeral(),
+                None,
+                |authority, request, planned, birth_ordinal| {
+                    engine.construct(authority, request, planned, birth_ordinal)
+                },
+            )
+            .expect("native accepted parallel transaction");
+
+            assert!(result.target_reached);
+            assert_eq!(result.accepted_records.len(), 2);
+            assert!(telemetry.peak_in_flight <= thread_cap);
+            let semantic = result.to_value().expect("native accepted semantic value");
+            if thread_cap == 1 {
+                serial_replay = Some((request, result));
+            }
+            semantic_values.push(semantic);
+        }
+
+        assert_eq!(semantic_values[0], semantic_values[1]);
+        assert_eq!(semantic_values[0], semantic_values[2]);
+        let (request, result) = serial_replay.expect("serial accepted replay oracle");
+        verify_v5_evolved_transaction_replay(&request, &result)
+            .expect("native accepted serial transaction offline replays");
+    }
+
+    #[test]
+    fn fast_ephemeral_defers_only_immediate_replay_and_remains_offline_replayable() {
+        let (durable_request, mut durable_parents, mut durable_ledger) = real_immigrant_fixture(1);
+        let durable_engine = NativeV5EvolvedConstructionEngine;
+        let (durable, durable_telemetry) = execute_with_constructor_and_telemetry(
+            durable_request.clone(),
+            &mut durable_parents,
+            &mut durable_ledger,
+            V5EvolvedExecutionOptions::durable(),
+            None,
+            |authority, request, planned, birth_ordinal| {
+                durable_engine.construct(authority, request, planned, birth_ordinal)
+            },
+        )
+        .expect("durable replay-policy oracle");
+
+        let (fast_request, mut fast_parents, mut fast_ledger) = real_immigrant_fixture(1);
+        let fast_engine = NativeV5EvolvedConstructionEngine;
+        let (fast, fast_telemetry) = execute_with_constructor_and_telemetry(
+            fast_request.clone(),
+            &mut fast_parents,
+            &mut fast_ledger,
+            V5EvolvedExecutionOptions::fast_ephemeral(),
+            None,
+            |authority, request, planned, birth_ordinal| {
+                fast_engine.construct(authority, request, planned, birth_ordinal)
+            },
+        )
+        .expect("fast-ephemeral replay policy");
+
+        assert_eq!(
+            durable_telemetry.immediate_replay_count,
+            durable.attempts.len() as u64,
+        );
+        assert_eq!(fast_telemetry.immediate_replay_count, 0);
+        assert!(fast.parent_snapshot_inventory.is_some());
+        assert_eq!(
+            durable.to_value().expect("durable semantic value"),
+            fast.to_value().expect("fast semantic value"),
+            "execution-only replay policy must not alter transaction semantics",
+        );
+        verify_v5_evolved_transaction_replay(&fast_request, &fast)
+            .expect("deferred fast-ephemeral transaction must pass full offline replay");
     }
 
     #[test]
