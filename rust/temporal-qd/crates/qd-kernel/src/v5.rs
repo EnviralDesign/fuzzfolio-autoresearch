@@ -10,7 +10,10 @@
 //! genome assembly.  The compact journal and later operator families build on
 //! the exact same program envelope rather than adding a one-off G0 shortcut.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Mutex, OnceLock},
+};
 
 use temporal_qd_contract::{ContractError, Map, Value, canonical_json, canonical_sha256};
 
@@ -4881,6 +4884,21 @@ impl V5OperatorAuthorityProjection {
         direction: &str,
     ) -> Result<crate::v5_operators::V5OperatorAuthority> {
         let side = self.side(direction)?;
+        // `temporal-qd-batch` admits exactly one manifest and then exits, so
+        // this process-global cache is generation scoped in production. The
+        // full shared-authority hash prevents cross-authority reuse in test
+        // processes that intentionally execute several transactions.
+        type OperatorAuthorityCache =
+            Mutex<BTreeMap<(String, String), crate::v5_operators::V5OperatorAuthority>>;
+        static CACHE: OnceLock<OperatorAuthorityCache> = OnceLock::new();
+        let cache_key = (self.shared_authority_sha256.clone(), side.direction.clone());
+        let mut cache = CACHE
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| invalid("v5 operator authority cache lock was poisoned"))?;
+        if let Some(authority) = cache.get(&cache_key) {
+            return Ok(authority.clone());
+        }
         let instrument = text(
             required(
                 &side.grammar_context,
@@ -4906,7 +4924,7 @@ impl V5OperatorAuthorityProjection {
                 "v5 operator authority construction failed: {error}"
             ))
         })?;
-        authority
+        let authority = authority
             .with_legacy_selection_static(
                 &side.catalog_sha256,
                 &side.resource_operator_spec_sha256,
@@ -4918,7 +4936,9 @@ impl V5OperatorAuthorityProjection {
                 invalid(format!(
                     "v5 operator legacy selection authority failed: {error}"
                 ))
-            })
+            })?;
+        cache.insert(cache_key, authority.clone());
+        Ok(authority)
     }
 }
 
@@ -8603,21 +8623,15 @@ fn rebuild_runtime_pair(
 }
 
 impl V5SealedEvolvedPairRecompiler {
-    /// Start a sealed step compiler from an archive parent.  Re-wrapping the
-    /// material as a parent reference and loading it is deliberate: callers
-    /// cannot hand a cached profile/state to this boundary without passing
-    /// the same compact-record/delta reconstruction gate as archive input.
-    pub(crate) fn from_parent(
+    fn from_verified_parent_owned(
         authority: &V5SharedConstructionAuthority,
-        parent: &V5EvolvedParentMaterial,
+        parent: V5EvolvedParentMaterial,
         proposal_seed: &str,
     ) -> Result<Self> {
         let proposal_seed = sha256_text(
             &Value::String(proposal_seed.to_owned()),
             "v5 evolved recompiler proposal seed",
         )?;
-        let parent_reference = parent_reference_from_v5_evolved_material(parent)?;
-        let parent = load_v5_evolved_parent(authority, &parent_reference)?;
         let projection = authority.operator_authority_projection()?;
         Ok(Self {
             authority: authority.clone(),
@@ -8634,6 +8648,28 @@ impl V5SealedEvolvedPairRecompiler {
                 short_state: parent.short_state,
             },
         })
+    }
+
+    /// Start a sealed step compiler from an archive parent. Durable callers
+    /// deliberately reconstruct the reference again at this boundary.
+    pub(crate) fn from_parent(
+        authority: &V5SharedConstructionAuthority,
+        parent: &V5EvolvedParentMaterial,
+        proposal_seed: &str,
+    ) -> Result<Self> {
+        let parent_reference = parent_reference_from_v5_evolved_material(parent)?;
+        let parent = load_v5_evolved_parent(authority, &parent_reference)?;
+        Self::from_verified_parent_owned(authority, parent, proposal_seed)
+    }
+
+    /// Fast-ephemeral seam for opaque material already reconstructed by
+    /// `load_v5_evolved_parent` under this exact transaction authority.
+    pub(crate) fn from_verified_parent(
+        authority: &V5SharedConstructionAuthority,
+        parent: &V5EvolvedParentMaterial,
+        proposal_seed: &str,
+    ) -> Result<Self> {
+        Self::from_verified_parent_owned(authority, parent.clone(), proposal_seed)
     }
 
     /// Alias retained for transaction code that prefers constructor spelling.
@@ -8804,6 +8840,26 @@ impl V5SealedEvolvedPairRecompiler {
         })
     }
 
+    /// Fast-ephemeral transition: compile once and retain that exact admitted
+    /// runtime instead of compiling the identical delta once for evidence and
+    /// again for advancement. Durable callers keep the two-pass API above.
+    pub(crate) fn advance_evolved_operator_once(
+        &self,
+        delta: &crate::v5_operators::V5EvolvedOperatorDelta,
+    ) -> Result<(Self, crate::v5_operators::V5RecompiledEvolvedPair)> {
+        let runtime = self.recompile_operator_runtime(delta)?;
+        let output = Self::recompiled_output(&runtime, &delta.side)?;
+        Ok((
+            Self {
+                authority: self.authority.clone(),
+                projection: self.projection.clone(),
+                proposal_seed: self.proposal_seed.clone(),
+                runtime,
+            },
+            output,
+        ))
+    }
+
     fn recompile_crossover_runtime(
         &self,
         donor: &V5EvolvedParentMaterial,
@@ -8924,6 +8980,27 @@ impl V5SealedEvolvedPairRecompiler {
             proposal_seed: self.proposal_seed.clone(),
             runtime: self.recompile_crossover_runtime(donor, delta)?,
         })
+    }
+
+    /// Fast-ephemeral crossover transition: retain the exact runtime produced
+    /// for direct evidence instead of compiling the identical child again to
+    /// advance the recipient state. Durable callers keep the two-pass API.
+    pub(crate) fn advance_same_side_crossover_once(
+        &self,
+        donor: &V5EvolvedParentMaterial,
+        delta: &crate::v5_operators::V5EvolvedSameSideCrossoverDelta,
+    ) -> Result<(Self, crate::v5_operators::V5RecompiledEvolvedPair)> {
+        let runtime = self.recompile_crossover_runtime(donor, delta)?;
+        let output = Self::recompiled_output(&runtime, &delta.side)?;
+        Ok((
+            Self {
+                authority: self.authority.clone(),
+                projection: self.projection.clone(),
+                proposal_seed: self.proposal_seed.clone(),
+                runtime,
+            },
+            output,
+        ))
     }
 }
 

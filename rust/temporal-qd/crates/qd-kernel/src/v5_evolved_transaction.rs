@@ -10,7 +10,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -37,12 +40,29 @@ use crate::{
         parent_reference_from_v5_evolved_material,
     },
     v5_operators::{
-        V5EvolvedOperatorDelta, V5EvolvedOperatorExecution, V5EvolvedSameSideCrossoverExecution,
+        V5EvolvedChildAdmission, V5EvolvedOperatorDelta, V5EvolvedOperatorExecution,
+        V5EvolvedPairStepResult, V5EvolvedSameSideCrossoverExecution, V5EvolvedSideState,
         V5OperatorDisposition, attempt_evolved_same_side_crossover_from_states,
+        execute_evolved_operator_selection_with_admission,
         execute_evolved_operator_step_from_state, proposal_side_for_seed,
         select_evolved_operator_choice_from_state,
     },
 };
+
+/// Fast-ephemeral construction defers the expensive child profile admission
+/// to the immediately following sealed pair rebuild. That rebuild compiles
+/// and validates the same child and is the only state allowed to advance.
+struct V5FastEphemeralDeferredChildAdmission;
+
+impl V5EvolvedChildAdmission for V5FastEphemeralDeferredChildAdmission {
+    fn admit_evolved_child(
+        &self,
+        _operator_id: &str,
+        _child_program: &Value,
+    ) -> crate::v5_operators::Result<()> {
+        Ok(())
+    }
+}
 
 /// The immutable schema for a compact later-generation transaction result.
 pub const V5_EVOLVED_TRANSACTION_SCHEMA: &str = "temporal_qd_v5_evolved_transaction_v1";
@@ -2870,11 +2890,148 @@ fn mutation_selection_failure(
     )
 }
 
+fn execute_fast_ephemeral_operator_step_once(
+    state: &V5EvolvedSideState,
+    authority: &crate::v5_operators::V5OperatorAuthority,
+    selection: crate::v5_operators::V5EvolvedOperatorSelection,
+    recompiler: &V5SealedEvolvedPairRecompiler,
+) -> Result<(
+    V5EvolvedPairStepResult,
+    Option<V5SealedEvolvedPairRecompiler>,
+)> {
+    let replay_selection = selection.clone();
+    let operator_execution = execute_evolved_operator_selection_with_admission(
+        &state.pair_identity_sha256,
+        &state.program,
+        authority,
+        &state.compiled_profile,
+        selection,
+        &V5FastEphemeralDeferredChildAdmission,
+    )
+    .map_err(|error| contract(error.to_string()))?;
+    let delta = operator_execution.delta.clone();
+    if operator_execution.disposition != V5OperatorDisposition::Accepted {
+        return Ok((
+            V5EvolvedPairStepResult {
+                disposition: operator_execution.disposition,
+                reason_code: operator_execution.reason_code.clone(),
+                reason_detail: object([(
+                    "operatorResult",
+                    operator_execution.result.value.clone(),
+                )]),
+                operator_execution,
+                delta,
+                next_side_state: None,
+            },
+            None,
+        ));
+    }
+    let delta_ref = delta.as_ref().ok_or_else(|| {
+        contract("accepted evolved operator execution omitted its side-local delta")
+    })?;
+    match recompiler.advance_evolved_operator_once(delta_ref) {
+        Ok((advanced, recompiled)) => {
+            if recompiled.pair_identity_sha256 == state.pair_identity_sha256 {
+                return Err(contract(
+                    "pair recompiler reused the parent pair identity for an evolved child",
+                ));
+            }
+            let next_side_state = match V5EvolvedSideState::from_recompiled_pair(
+                recompiled.pair_identity_sha256,
+                recompiled.module_identity_sha256,
+                authority,
+                delta_ref.child_program.clone(),
+                recompiled.compiled_profile,
+            ) {
+                Ok(next_side_state) => next_side_state,
+                Err(error) => {
+                    return Ok((
+                        V5EvolvedPairStepResult {
+                            disposition: V5OperatorDisposition::Rejected,
+                            reason_code: "pair_recompile_rejected".to_owned(),
+                            reason_detail: Value::String(error.to_string()),
+                            operator_execution,
+                            delta,
+                            next_side_state: None,
+                        },
+                        None,
+                    ));
+                }
+            };
+            Ok((
+                V5EvolvedPairStepResult {
+                    disposition: V5OperatorDisposition::Accepted,
+                    reason_code: "accepted".to_owned(),
+                    reason_detail: object([
+                        ("kind", Value::String("pair_recompiled".to_owned())),
+                        (
+                            "childPairIdentitySha256",
+                            Value::String(next_side_state.pair_identity_sha256.clone()),
+                        ),
+                    ]),
+                    operator_execution,
+                    delta,
+                    next_side_state: Some(next_side_state),
+                },
+                Some(advanced),
+            ))
+        }
+        Err(error) => {
+            // A failed sealed rebuild is rare. Re-run the historical child
+            // admission only on this error path so an invalid child retains
+            // the exact durable rejection code/detail instead of being
+            // relabeled as a pair-recompile failure. Successful fast-path
+            // children still pay for one compile, not two.
+            let verified_execution = execute_evolved_operator_selection_with_admission(
+                &state.pair_identity_sha256,
+                &state.program,
+                authority,
+                &state.compiled_profile,
+                replay_selection,
+                recompiler,
+            )
+            .map_err(|admission_error| contract(admission_error.to_string()))?;
+            let verified_delta = verified_execution.delta.clone();
+            if verified_execution.disposition != V5OperatorDisposition::Accepted {
+                return Ok((
+                    V5EvolvedPairStepResult {
+                        disposition: verified_execution.disposition,
+                        reason_code: verified_execution.reason_code.clone(),
+                        reason_detail: object([(
+                            "operatorResult",
+                            verified_execution.result.value.clone(),
+                        )]),
+                        operator_execution: verified_execution,
+                        delta: verified_delta,
+                        next_side_state: None,
+                    },
+                    None,
+                ));
+            }
+            Ok((
+                V5EvolvedPairStepResult {
+                    disposition: V5OperatorDisposition::Rejected,
+                    reason_code: "pair_recompile_rejected".to_owned(),
+                    reason_detail: Value::String(
+                        crate::v5_operators::V5OperatorError::Invalid(error.to_string())
+                            .to_string(),
+                    ),
+                    operator_execution: verified_execution,
+                    delta: verified_delta,
+                    next_side_state: None,
+                },
+                None,
+            ))
+        }
+    }
+}
+
 fn construct_sealed_mutation(
     authority: &V5SharedConstructionAuthority,
     request: &V5EvolvedTransactionRequest,
     planned: &PlannedProposal,
     birth_ordinal: u64,
+    parent_cache: Option<&V5VerifiedParentCache>,
 ) -> Result<V5EvolvedConstructionOutcome> {
     let (scheduled_parent, depth) = match &planned.intent {
         ProposalIntent::StructuralMutation {
@@ -2888,7 +3045,7 @@ fn construct_sealed_mutation(
             ));
         }
     };
-    let parent = load_v5_evolved_parent(authority, scheduled_parent)?;
+    let parent = load_parent_for_construction(parent_cache, authority, scheduled_parent)?;
     let receipt = parent_selection_receipt_for_planned(planned, &parent, None)?;
     let proposal_seed = planned.intent.proposal_seed();
     let side = proposal_side_for_seed(proposal_seed).map_err(|error| {
@@ -2898,8 +3055,11 @@ fn construct_sealed_mutation(
     })?;
     let projection = authority.operator_authority_projection()?;
     let operator_authority = projection.operator_authority(side)?;
-    let mut recompiler =
-        V5SealedEvolvedPairRecompiler::from_parent(authority, &parent, proposal_seed)?;
+    let mut recompiler = if parent_cache.is_some() {
+        V5SealedEvolvedPairRecompiler::from_verified_parent(authority, &parent, proposal_seed)?
+    } else {
+        V5SealedEvolvedPairRecompiler::from_parent(authority, &parent, proposal_seed)?
+    };
     let mut current_state = recompiler.state_for_side(side)?;
     let mut long_program = parent.long_program.clone();
     let mut short_program = parent.short_program.clone();
@@ -2934,13 +3094,25 @@ fn construct_sealed_mutation(
                 );
             }
         };
-        let pair_step = match execute_evolved_operator_step_from_state(
-            &current_state,
-            &operator_authority,
-            selection,
-            &recompiler,
-            &recompiler,
-        ) {
+        let step_result = if parent_cache.is_some() {
+            execute_fast_ephemeral_operator_step_once(
+                &current_state,
+                &operator_authority,
+                selection,
+                &recompiler,
+            )
+        } else {
+            execute_evolved_operator_step_from_state(
+                &current_state,
+                &operator_authority,
+                selection,
+                &recompiler,
+                &recompiler,
+            )
+            .map(|result| (result, None))
+            .map_err(|error| contract(error.to_string()))
+        };
+        let (pair_step, fast_advanced) = match step_result {
             Ok(result) => result,
             Err(error) => {
                 return mutation_selection_failure(
@@ -2994,7 +3166,11 @@ fn construct_sealed_mutation(
                 let expected_next_state = pair_step.next_side_state.as_ref().ok_or_else(|| {
                     contract("accepted v5 evolved mutation step omits recompiled side state")
                 })?;
-                let advanced = match recompiler.advance_evolved_operator(delta) {
+                let advanced_result = match fast_advanced {
+                    Some(advanced) => Ok(advanced),
+                    None => recompiler.advance_evolved_operator(delta),
+                };
+                let advanced = match advanced_result {
                     Ok(advanced) => advanced,
                     Err(error) => {
                         let reason_code = "pair_recompile_rejected";
@@ -3115,7 +3291,7 @@ fn construct_sealed_mutation(
         V5EvolvedBuildKind::Mutation,
         &parent,
         None,
-        parent.clone(),
+        (*parent).clone(),
         None,
         &receipt,
         Some(depth),
@@ -3155,6 +3331,7 @@ fn construct_sealed_crossover(
     request: &V5EvolvedTransactionRequest,
     planned: &PlannedProposal,
     birth_ordinal: u64,
+    parent_cache: Option<&V5VerifiedParentCache>,
 ) -> Result<V5EvolvedConstructionOutcome> {
     let (scheduled_parent, scheduled_mate, scheduled_side) = match &planned.intent {
         ProposalIntent::SameSideCrossover {
@@ -3166,8 +3343,8 @@ fn construct_sealed_crossover(
             ));
         }
     };
-    let primary = load_v5_evolved_parent(authority, scheduled_parent)?;
-    let mate = load_v5_evolved_parent(authority, scheduled_mate)?;
+    let primary = load_parent_for_construction(parent_cache, authority, scheduled_parent)?;
+    let mate = load_parent_for_construction(parent_cache, authority, scheduled_mate)?;
     let receipt = parent_selection_receipt_for_planned(planned, &primary, Some(&mate))?;
     let proposal_seed = planned.intent.proposal_seed();
     let side = proposal_side_for_seed(proposal_seed).map_err(|error| {
@@ -3235,91 +3412,150 @@ fn construct_sealed_crossover(
                 &mut long_program,
                 &mut short_program,
             )?;
-            let recompiler =
-                V5SealedEvolvedPairRecompiler::from_parent(authority, recipient, proposal_seed)?;
-            let direct = match recompiler.recompile_same_side_crossover_pair(donor, delta) {
-                Ok(recompiled) => recompiled,
-                Err(error) => {
-                    let reason_code = "pair_recompile_rejected";
-                    steps.push(structural_failure_step_value(
-                        1,
-                        "same_side_crossover",
-                        "pair_recompile",
-                        "rejected",
-                        reason_code,
-                        Value::String(error.to_string()),
-                    )?);
-                    let trace = ordered_operator_trace(
-                        "same_side_crossover",
-                        &steps,
-                        1,
-                        "rejected",
-                        reason_code,
-                        &terminal_plan,
-                        Some(&terminal_application),
-                    )?;
-                    return structural_terminal_outcome(
-                        authority,
-                        request,
-                        planned,
-                        &primary,
-                        Some(&mate),
-                        &receipt,
-                        None,
-                        long_program,
-                        short_program,
-                        steps,
-                        terminal_plan,
-                        Some(terminal_application),
-                        trace,
-                        "rejected",
-                        reason_code,
-                        "compile",
-                        1,
-                    );
-                }
+            let recompiler = if parent_cache.is_some() {
+                V5SealedEvolvedPairRecompiler::from_verified_parent(
+                    authority,
+                    recipient,
+                    proposal_seed,
+                )?
+            } else {
+                V5SealedEvolvedPairRecompiler::from_parent(authority, recipient, proposal_seed)?
             };
-            let advanced = match recompiler.advance_same_side_crossover(donor, delta) {
-                Ok(advanced) => advanced,
-                Err(error) => {
-                    let reason_code = "pair_recompile_rejected";
-                    steps.push(structural_failure_step_value(
-                        1,
-                        "same_side_crossover",
-                        "pair_recompile",
-                        "rejected",
-                        reason_code,
-                        Value::String(error.to_string()),
-                    )?);
-                    let trace = ordered_operator_trace(
-                        "same_side_crossover",
-                        &steps,
-                        1,
-                        "rejected",
-                        reason_code,
-                        &terminal_plan,
-                        Some(&terminal_application),
-                    )?;
-                    return structural_terminal_outcome(
-                        authority,
-                        request,
-                        planned,
-                        &primary,
-                        Some(&mate),
-                        &receipt,
-                        None,
-                        long_program,
-                        short_program,
-                        steps,
-                        terminal_plan,
-                        Some(terminal_application),
-                        trace,
-                        "rejected",
-                        reason_code,
-                        "compile",
-                        1,
-                    );
+            let fast_advanced = if parent_cache.is_some() {
+                match recompiler.advance_same_side_crossover_once(donor, delta) {
+                    Ok(result) => Some(result),
+                    Err(error) => {
+                        let reason_code = "pair_recompile_rejected";
+                        steps.push(structural_failure_step_value(
+                            1,
+                            "same_side_crossover",
+                            "pair_recompile",
+                            "rejected",
+                            reason_code,
+                            Value::String(error.to_string()),
+                        )?);
+                        let trace = ordered_operator_trace(
+                            "same_side_crossover",
+                            &steps,
+                            1,
+                            "rejected",
+                            reason_code,
+                            &terminal_plan,
+                            Some(&terminal_application),
+                        )?;
+                        return structural_terminal_outcome(
+                            authority,
+                            request,
+                            planned,
+                            &primary,
+                            Some(&mate),
+                            &receipt,
+                            None,
+                            long_program,
+                            short_program,
+                            steps,
+                            terminal_plan,
+                            Some(terminal_application),
+                            trace,
+                            "rejected",
+                            reason_code,
+                            "compile",
+                            1,
+                        );
+                    }
                 }
+            } else {
+                None
+            };
+            let direct = match fast_advanced.as_ref() {
+                Some((_, direct)) => direct.clone(),
+                None => match recompiler.recompile_same_side_crossover_pair(donor, delta) {
+                    Ok(recompiled) => recompiled,
+                    Err(error) => {
+                        let reason_code = "pair_recompile_rejected";
+                        steps.push(structural_failure_step_value(
+                            1,
+                            "same_side_crossover",
+                            "pair_recompile",
+                            "rejected",
+                            reason_code,
+                            Value::String(error.to_string()),
+                        )?);
+                        let trace = ordered_operator_trace(
+                            "same_side_crossover",
+                            &steps,
+                            1,
+                            "rejected",
+                            reason_code,
+                            &terminal_plan,
+                            Some(&terminal_application),
+                        )?;
+                        return structural_terminal_outcome(
+                            authority,
+                            request,
+                            planned,
+                            &primary,
+                            Some(&mate),
+                            &receipt,
+                            None,
+                            long_program,
+                            short_program,
+                            steps,
+                            terminal_plan,
+                            Some(terminal_application),
+                            trace,
+                            "rejected",
+                            reason_code,
+                            "compile",
+                            1,
+                        );
+                    }
+                },
+            };
+            let advanced = match fast_advanced {
+                Some((advanced, _)) => advanced,
+                None => match recompiler.advance_same_side_crossover(donor, delta) {
+                    Ok(advanced) => advanced,
+                    Err(error) => {
+                        let reason_code = "pair_recompile_rejected";
+                        steps.push(structural_failure_step_value(
+                            1,
+                            "same_side_crossover",
+                            "pair_recompile",
+                            "rejected",
+                            reason_code,
+                            Value::String(error.to_string()),
+                        )?);
+                        let trace = ordered_operator_trace(
+                            "same_side_crossover",
+                            &steps,
+                            1,
+                            "rejected",
+                            reason_code,
+                            &terminal_plan,
+                            Some(&terminal_application),
+                        )?;
+                        return structural_terminal_outcome(
+                            authority,
+                            request,
+                            planned,
+                            &primary,
+                            Some(&mate),
+                            &receipt,
+                            None,
+                            long_program,
+                            short_program,
+                            steps,
+                            terminal_plan,
+                            Some(terminal_application),
+                            trace,
+                            "rejected",
+                            reason_code,
+                            "compile",
+                            1,
+                        );
+                    }
+                },
             };
             let advanced_state = advanced.state_for_side(side)?;
             if advanced_state.pair_identity_sha256 != direct.pair_identity_sha256
@@ -3435,9 +3671,31 @@ fn construct_sealed_crossover(
 /// no caller can substitute fixtures, Python, a subprocess, or an arbitrary
 /// materializer for the sealed v5 compiler path.
 #[derive(Default)]
-struct NativeV5EvolvedConstructionEngine;
+struct NativeV5EvolvedConstructionEngine {
+    parent_cache: Option<Arc<V5VerifiedParentCache>>,
+}
 
 impl NativeV5EvolvedConstructionEngine {
+    fn durable() -> Self {
+        Self::default()
+    }
+
+    fn fast_ephemeral() -> Self {
+        Self {
+            parent_cache: Some(Arc::new(V5VerifiedParentCache::default())),
+        }
+    }
+
+    fn parent_cache_telemetry(&self) -> Option<(u64, u64, Duration)> {
+        self.parent_cache.as_ref().map(|cache| {
+            (
+                cache.hits.load(Ordering::Relaxed),
+                cache.misses.load(Ordering::Relaxed),
+                Duration::from_nanos(cache.verification_nanos.load(Ordering::Relaxed)),
+            )
+        })
+    }
+
     fn construct(
         &self,
         authority: &V5SharedConstructionAuthority,
@@ -3449,12 +3707,20 @@ impl NativeV5EvolvedConstructionEngine {
             ProposalIntent::RichImmigrant { .. } => {
                 construct_sealed_immigrant(authority, request, planned, birth_ordinal)
             }
-            ProposalIntent::StructuralMutation { .. } => {
-                construct_sealed_mutation(authority, request, planned, birth_ordinal)
-            }
-            ProposalIntent::SameSideCrossover { .. } => {
-                construct_sealed_crossover(authority, request, planned, birth_ordinal)
-            }
+            ProposalIntent::StructuralMutation { .. } => construct_sealed_mutation(
+                authority,
+                request,
+                planned,
+                birth_ordinal,
+                self.parent_cache.as_deref(),
+            ),
+            ProposalIntent::SameSideCrossover { .. } => construct_sealed_crossover(
+                authority,
+                request,
+                planned,
+                birth_ordinal,
+                self.parent_cache.as_deref(),
+            ),
         }
     }
 }
@@ -3478,10 +3744,10 @@ fn verify_native_construction_replay(
             construct_sealed_immigrant(authority, request, planned, birth_ordinal)?
         }
         ProposalIntent::StructuralMutation { .. } => {
-            construct_sealed_mutation(authority, request, planned, birth_ordinal)?
+            construct_sealed_mutation(authority, request, planned, birth_ordinal, None)?
         }
         ProposalIntent::SameSideCrossover { .. } => {
-            construct_sealed_crossover(authority, request, planned, birth_ordinal)?
+            construct_sealed_crossover(authority, request, planned, birth_ordinal, None)?
         }
     };
     let same_delta = match (&outcome.delta, &replayed.delta) {
@@ -4623,7 +4889,7 @@ impl V5EvolvedTransactionResult {
             let planned = offline_planned_proposal_from_snapshot(
                 authority, inventory, &snapshots, attempt, delta, refs,
             )?;
-            let replayed = NativeV5EvolvedConstructionEngine.construct(
+            let replayed = NativeV5EvolvedConstructionEngine::durable().construct(
                 authority,
                 request,
                 &planned,
@@ -5029,6 +5295,101 @@ struct V5EvolvedExecutionTelemetry {
 struct V5ConstructionActivity {
     active: AtomicU64,
     peak: AtomicU64,
+}
+
+type V5VerifiedParentCacheCell =
+    OnceLock<std::result::Result<Arc<V5EvolvedParentMaterial>, String>>;
+
+/// Generation-scoped, authority-bound cache for opaque parent material. The
+/// complete selector reference is the key and each distinct parent is
+/// reconstructed once; concurrent requests single-flight through `OnceLock`.
+#[derive(Default)]
+struct V5VerifiedParentCache {
+    entries: Mutex<BTreeMap<String, Arc<V5VerifiedParentCacheCell>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    verification_nanos: AtomicU64,
+}
+
+impl V5VerifiedParentCache {
+    fn key(shared_authority_sha256: &str, parent: &ParentReference) -> Result<String> {
+        Ok(canonical_sha256(&object([
+            (
+                "sharedAuthoritySha256",
+                Value::String(shared_authority_sha256.to_owned()),
+            ),
+            (
+                "pairIdentitySha256",
+                Value::String(parent.pair_identity_sha256.clone()),
+            ),
+            ("candidateId", Value::String(parent.candidate_id.clone())),
+            ("pairPayload", parent.pair_payload.clone()),
+        ]))?)
+    }
+
+    fn load(
+        &self,
+        authority: &V5SharedConstructionAuthority,
+        parent: &ParentReference,
+    ) -> Result<Arc<V5EvolvedParentMaterial>> {
+        // Selection evidence is draw-specific and must be validated on every
+        // use, but it does not change the immutable parent compiler material.
+        // Keeping it out of the cache key lets repeated selections of the
+        // same archive member share one reconstruction without allowing an
+        // invalid selection receipt to bypass its own admission gate.
+        parent
+            .validate()
+            .map_err(|error| contract(format!("v5 evolved parent reference: {error}")))?;
+        let key = Self::key(&authority.shared_authority_sha256, parent)?;
+        let (cell, inserted) = {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| contract("v5 evolved verified-parent cache lock was poisoned"))?;
+            match entries.get(&key) {
+                Some(cell) => (Arc::clone(cell), false),
+                None => {
+                    let cell = Arc::new(OnceLock::new());
+                    entries.insert(key, Arc::clone(&cell));
+                    (cell, true)
+                }
+            }
+        };
+        if inserted {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        let loaded = cell.get_or_init(|| {
+            let started = Instant::now();
+            let result = load_v5_evolved_parent(authority, parent)
+                .map(Arc::new)
+                .map_err(|error| error.to_string());
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let _ = self.verification_nanos.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |value| Some(value.saturating_add(nanos)),
+            );
+            result
+        });
+        loaded.clone().map_err(|error| {
+            contract(format!(
+                "v5 evolved verified-parent cache reconstruction failed: {error}"
+            ))
+        })
+    }
+}
+
+fn load_parent_for_construction(
+    cache: Option<&V5VerifiedParentCache>,
+    authority: &V5SharedConstructionAuthority,
+    parent: &ParentReference,
+) -> Result<Arc<V5EvolvedParentMaterial>> {
+    match cache {
+        Some(cache) => cache.load(authority, parent),
+        None => Ok(Arc::new(load_v5_evolved_parent(authority, parent)?)),
+    }
 }
 
 impl V5ConstructionActivity {
@@ -5706,7 +6067,7 @@ pub fn execute_v5_evolved_transaction_with_progress(
     ledger: &mut dyn IdentityLedger,
     progress: Option<&NativeProgressHandle>,
 ) -> Result<V5EvolvedTransactionResult> {
-    let engine = NativeV5EvolvedConstructionEngine;
+    let engine = NativeV5EvolvedConstructionEngine::durable();
     execute_with_constructor(
         request,
         parents,
@@ -5730,8 +6091,8 @@ pub fn execute_v5_evolved_transaction_fast_ephemeral_with_progress(
     ledger: &mut dyn IdentityLedger,
     progress: Option<&NativeProgressHandle>,
 ) -> Result<V5EvolvedTransactionResult> {
-    let engine = NativeV5EvolvedConstructionEngine;
-    execute_with_constructor(
+    let engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
+    let result = execute_with_constructor(
         request,
         parents,
         ledger,
@@ -5740,7 +6101,26 @@ pub fn execute_v5_evolved_transaction_fast_ephemeral_with_progress(
         |authority, request, planned, birth_ordinal| {
             engine.construct(authority, request, planned, birth_ordinal)
         },
-    )
+    )?;
+    if let (Some(progress), Some((hits, misses, verification_wall))) =
+        (progress, engine.parent_cache_telemetry())
+    {
+        progress.record_section(NativeProgressSection {
+            name: "evolved_parent_cache_verification".to_owned(),
+            wall: verification_wall,
+            completed_work_units: Some(misses),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+        progress.record_section(NativeProgressSection {
+            name: "evolved_parent_cache_hits".to_owned(),
+            wall: Duration::ZERO,
+            completed_work_units: Some(hits),
+            parallel_workers: Some(1),
+            ..NativeProgressSection::default()
+        });
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -6287,8 +6667,47 @@ mod scheduler_tests {
                 mutation_depth: 1,
             },
         };
-        let outcome = construct_sealed_mutation(&authority, &request, &planned, 0)
-            .expect("sealed native mutation path");
+        let durable_outcome = construct_sealed_mutation(&authority, &request, &planned, 0, None)
+            .expect("sealed durable native mutation path");
+        let cache = V5VerifiedParentCache::default();
+        let outcome = construct_sealed_mutation(&authority, &request, &planned, 0, Some(&cache))
+            .expect("sealed fast-ephemeral native mutation path");
+        assert_eq!(outcome.disposition, durable_outcome.disposition);
+        assert_eq!(outcome.reason_code, durable_outcome.reason_code);
+        assert_eq!(outcome.stage, durable_outcome.stage);
+        assert_eq!(outcome.lineage_refs, durable_outcome.lineage_refs);
+        assert_eq!(
+            outcome
+                .delta
+                .as_ref()
+                .expect("fast mutation delta")
+                .to_value()
+                .expect("encode fast mutation delta"),
+            durable_outcome
+                .delta
+                .as_ref()
+                .expect("durable mutation delta")
+                .to_value()
+                .expect("encode durable mutation delta"),
+            "deferred fast admission must preserve the exact durable mutation delta",
+        );
+        assert_eq!(
+            outcome
+                .accepted
+                .as_ref()
+                .expect("fast accepted mutation")
+                .record
+                .to_value()
+                .expect("encode fast accepted mutation"),
+            durable_outcome
+                .accepted
+                .as_ref()
+                .expect("durable accepted mutation")
+                .record
+                .to_value()
+                .expect("encode durable accepted mutation"),
+            "deferred fast admission must preserve the exact durable accepted record",
+        );
         assert_eq!(outcome.disposition, "accepted");
         let delta = outcome
             .delta
@@ -6403,6 +6822,48 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn fast_ephemeral_parent_cache_key_binds_material_not_draw_audit() {
+        let config_sha256 = sha(object([(
+            "schemaVersion",
+            Value::String("temporal_qd_v5_evolved_parent_cache_probe_v1".to_owned()),
+        )]));
+        let authority = sealed_authority();
+        let parent = sealed_g0_parent(&authority, &config_sha256, 0);
+        let original = V5VerifiedParentCache::key(&authority.shared_authority_sha256, &parent)
+            .expect("exact parent cache key");
+
+        let mut relabeled = parent.clone();
+        relabeled.candidate_id.push_str("-substituted");
+        assert_ne!(
+            original,
+            V5VerifiedParentCache::key(&authority.shared_authority_sha256, &relabeled)
+                .expect("relabeled parent cache key")
+        );
+        let mut payload_substitution = parent.clone();
+        payload_substitution.pair_payload = object([("substituted", Value::Bool(true))]);
+        assert_ne!(
+            original,
+            V5VerifiedParentCache::key(&authority.shared_authority_sha256, &payload_substitution,)
+                .expect("payload-substituted parent cache key")
+        );
+        let mut audit_substitution = parent;
+        audit_substitution.selection_audit = Some(object([("substituted", Value::Bool(true))]));
+        assert_eq!(
+            original,
+            V5VerifiedParentCache::key(&authority.shared_authority_sha256, &audit_substitution)
+                .expect("audit-substituted parent cache key")
+        );
+        assert_ne!(
+            original,
+            V5VerifiedParentCache::key(
+                &sha(object([("differentAuthority", Value::Bool(true))])),
+                &audit_substitution,
+            )
+            .expect("authority-substituted parent cache key")
+        );
+    }
+
+    #[test]
     fn sealed_mutation_snapshot_replays_after_source_archive_is_unavailable() {
         let (request, result) = sealed_native_mutation_result();
         let encoded = result.to_value().expect("encode self-contained result");
@@ -6486,8 +6947,47 @@ mod scheduler_tests {
         let mut request = direct_native_request(config_sha256);
         request.identity_ledger_identity_sha256 = sha(ledger.identity().clone());
         request.identity_ledger_state_sha256 = sha(ledger.compact_state());
-        let outcome = construct_sealed_crossover(&authority, &request, &planned, 0)
-            .expect("sealed real crossover terminal");
+        let durable_outcome = construct_sealed_crossover(&authority, &request, &planned, 0, None)
+            .expect("sealed durable crossover terminal");
+        let cache = V5VerifiedParentCache::default();
+        let outcome = construct_sealed_crossover(&authority, &request, &planned, 0, Some(&cache))
+            .expect("sealed fast-ephemeral crossover terminal");
+        assert_eq!(outcome.disposition, durable_outcome.disposition);
+        assert_eq!(outcome.reason_code, durable_outcome.reason_code);
+        assert_eq!(outcome.stage, durable_outcome.stage);
+        assert_eq!(outcome.lineage_refs, durable_outcome.lineage_refs);
+        assert_eq!(
+            outcome
+                .delta
+                .as_ref()
+                .expect("fast crossover delta")
+                .to_value()
+                .expect("encode fast crossover delta"),
+            durable_outcome
+                .delta
+                .as_ref()
+                .expect("durable crossover delta")
+                .to_value()
+                .expect("encode durable crossover delta"),
+            "one-pass fast crossover must preserve the exact durable delta",
+        );
+        assert_eq!(
+            outcome
+                .accepted
+                .as_ref()
+                .expect("fast accepted crossover")
+                .record
+                .to_value()
+                .expect("encode fast accepted crossover"),
+            durable_outcome
+                .accepted
+                .as_ref()
+                .expect("durable accepted crossover")
+                .record
+                .to_value()
+                .expect("encode durable accepted crossover"),
+            "one-pass fast crossover must preserve the exact durable accepted record",
+        );
         let delta = outcome
             .delta
             .clone()
@@ -6785,7 +7285,7 @@ mod scheduler_tests {
                 proposal_seed,
             },
         };
-        let outcome = NativeV5EvolvedConstructionEngine
+        let outcome = NativeV5EvolvedConstructionEngine::durable()
             .construct(&authority, &request, &planned, 0)
             .expect("duplicate fixture native immigrant");
         let duplicate_identity = outcome
@@ -6807,7 +7307,7 @@ mod scheduler_tests {
         let mut discard_counts = Vec::new();
         for thread_cap in [1_u64, 8] {
             let (request, mut parents, mut ledger) = global_duplicate_immigrant_fixture(thread_cap);
-            let engine = NativeV5EvolvedConstructionEngine;
+            let engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
             let (result, telemetry) = execute_with_constructor_and_telemetry(
                 request,
                 &mut parents,
@@ -6843,7 +7343,7 @@ mod scheduler_tests {
             let (mut request, mut parents, mut ledger) = real_immigrant_fixture(thread_cap);
             request.target_accepted = 2;
             request.max_attempts = 8;
-            let engine = NativeV5EvolvedConstructionEngine;
+            let engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
             let (result, telemetry) = execute_with_constructor_and_telemetry(
                 request.clone(),
                 &mut parents,
@@ -6876,7 +7376,7 @@ mod scheduler_tests {
     #[test]
     fn fast_ephemeral_defers_only_immediate_replay_and_remains_offline_replayable() {
         let (durable_request, mut durable_parents, mut durable_ledger) = real_immigrant_fixture(1);
-        let durable_engine = NativeV5EvolvedConstructionEngine;
+        let durable_engine = NativeV5EvolvedConstructionEngine::durable();
         let (durable, durable_telemetry) = execute_with_constructor_and_telemetry(
             durable_request.clone(),
             &mut durable_parents,
@@ -6890,7 +7390,7 @@ mod scheduler_tests {
         .expect("durable replay-policy oracle");
 
         let (fast_request, mut fast_parents, mut fast_ledger) = real_immigrant_fixture(1);
-        let fast_engine = NativeV5EvolvedConstructionEngine;
+        let fast_engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
         let (fast, fast_telemetry) = execute_with_constructor_and_telemetry(
             fast_request.clone(),
             &mut fast_parents,
