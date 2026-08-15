@@ -3,7 +3,7 @@ use std::{env, fs, path::PathBuf, time::Duration};
 use anyhow::{Result, bail, ensure};
 use temporal_qd_contract::{NativeProgress, NativeProgressSpec};
 use temporal_qd_gateway_dispatch::{
-    DispatchMode, GatewayDispatchRequest, GatewayRuntimeOptions,
+    DEFAULT_MAX_HTTP_RESPONSE_BYTES, DispatchMode, GatewayDispatchRequest, GatewayRuntimeOptions,
     execute_gateway_dispatch_with_progress,
 };
 
@@ -37,7 +37,7 @@ fn run() -> Result<()> {
     let mut enqueue_batch_size = 128_usize;
     let mut result_batch_size = 128_usize;
     let mut max_request_bytes = 64 * 1024 * 1024_usize;
-    let mut max_response_bytes = 64 * 1024 * 1024_usize;
+    let mut max_response_bytes = DEFAULT_MAX_HTTP_RESPONSE_BYTES;
     let mut maintenance_probe_interval_millis = 30_000_u64;
     let mut maintenance_timeout_seconds = 12 * 60 * 60_u64;
 

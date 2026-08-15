@@ -57,7 +57,12 @@ const FAILURES_DIR: &str = "failures";
 const EXECUTION_RECEIPT_NAME: &str = "execution-receipt.json";
 const MAX_SAFE_BATCH: usize = 1_000;
 const MAX_RESULT_BATCH: usize = 1_024;
-const MAX_HTTP_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+// Explicit canonical-JSON transport budget for one gateway response.  This is
+// independent from the worker's pickle-file bound: those encodings do not have
+// a stable size ratio.  Production reads one result at a time and fails closed
+// if one canonical completion exceeds this budget.
+pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: usize = 192 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchMode {
@@ -100,8 +105,8 @@ impl GatewayDispatchRequest {
             poll_interval: Duration::from_millis(250),
             enqueue_batch_size: 128,
             result_batch_size: 128,
-            max_request_bytes: MAX_HTTP_BYTES,
-            max_response_bytes: MAX_HTTP_BYTES,
+            max_request_bytes: MAX_HTTP_REQUEST_BYTES,
+            max_response_bytes: DEFAULT_MAX_HTTP_RESPONSE_BYTES,
             maintenance_probe_interval: Duration::from_secs(30),
             maintenance_timeout: Duration::from_secs(12 * 60 * 60),
         }
@@ -140,15 +145,14 @@ impl GatewayDispatchRequest {
             (1..=MAX_RESULT_BATCH).contains(&self.result_batch_size),
             "result batch size must be between 1 and {MAX_RESULT_BATCH}"
         );
-        for (label, value) in [
-            ("maximum request bytes", self.max_request_bytes),
-            ("maximum response bytes", self.max_response_bytes),
-        ] {
-            ensure!(
-                (1..=MAX_HTTP_BYTES).contains(&value),
-                "{label} must be between 1 and {MAX_HTTP_BYTES}"
-            );
-        }
+        ensure!(
+            (1..=MAX_HTTP_REQUEST_BYTES).contains(&self.max_request_bytes),
+            "maximum request bytes must be between 1 and {MAX_HTTP_REQUEST_BYTES}"
+        );
+        ensure!(
+            (1..=DEFAULT_MAX_HTTP_RESPONSE_BYTES).contains(&self.max_response_bytes),
+            "maximum response bytes must be between 1 and {DEFAULT_MAX_HTTP_RESPONSE_BYTES}"
+        );
         Ok(())
     }
 }
@@ -487,16 +491,20 @@ fn read_results_adaptively(
             }
             Err(error) => return Err(error),
         };
-        let map = object(&body, "gateway results response")?;
-        let results = field(map, "results")?
-            .as_array()
-            .ok_or_else(|| anyhow!("gateway results response lacks results array"))?;
+        let mut body = body;
+        let map = body
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("gateway results response must be an object"))?;
+        let results = match map.remove("results") {
+            Some(Value::Array(results)) => results,
+            _ => bail!("gateway results response lacks results array"),
+        };
         ensure!(
             results.len() <= batch_limit,
             "gateway returned more results than requested"
         );
         *limit_hint = batch_limit;
-        return Ok(results.clone());
+        return Ok(results);
     }
 }
 
@@ -526,8 +534,23 @@ fn parse_http_json(
     if status != StatusCode::OK {
         bail!("gateway {endpoint} returned HTTP {status}");
     }
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_response_bytes as u64)
+    {
+        return Err(GatewayResponseTooLarge {
+            endpoint: endpoint.to_owned(),
+            max_response_bytes,
+        }
+        .into());
+    }
+    let announced_length = response.content_length();
     let mut reader = response;
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        announced_length
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0),
+    );
     let mut chunk = [0_u8; 64 * 1024];
     loop {
         let count = reader.read(&mut chunk)?;

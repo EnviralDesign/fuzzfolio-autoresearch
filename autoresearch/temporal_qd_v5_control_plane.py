@@ -4994,7 +4994,7 @@ def run_native_gateway_dispatch(
     enqueue_batch_size: int = 128,
     result_batch_size: int = 1,
     max_request_bytes: int = 64 * 1024 * 1024,
-    max_response_bytes: int = 64 * 1024 * 1024,
+    max_response_bytes: int = 192 * 1024 * 1024,
     maintenance_probe_interval_millis: int = 30_000,
     maintenance_timeout_seconds: int = 12 * 60 * 60,
 ) -> dict[str, Any]:
