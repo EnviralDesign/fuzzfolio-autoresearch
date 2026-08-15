@@ -53,6 +53,10 @@ DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS = 180.0
 DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS = 30.0
 DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS = 45.0
 DEFAULT_MAX_RESULT_BACKLOG_BYTES = 2 * 1024 * 1024 * 1024
+_REMOTE_LAKE_MUTATION_ERROR_TYPE = "RemoteLakeMutationInProgress"
+_REMOTE_LAKE_MUTATION_ERROR_MESSAGE = (
+    "Remote market data lake is mutating; retry after the advertised delay"
+)
 DEFAULT_RESULT_BACKPRESSURE_BYTES = 1024 * 1024 * 1024
 LAB_DEEP_REPLAY_QUEUE = "QUEUE:deep_replay_jobs"
 LAB_DEEP_REPLAY_DETAIL_QUEUE = "QUEUE:deep_replay_detail_jobs"
@@ -165,14 +169,42 @@ def _is_lake_capacity_overload(error: str, error_type: str | None = None) -> boo
     )
 
 
+def _normalized_exception_type(error_type: str | None) -> str:
+    normalized = str(error_type or "").strip()
+    return normalized.rsplit(".", 1)[-1] if normalized else ""
+
+
+def _known_remote_lake_mutation_failure(
+    *,
+    error: str,
+    error_type: str | None,
+) -> bool:
+    normalized_error = " ".join(str(error or "").split())
+    normalized_type = _normalized_exception_type(error_type)
+    direct_message = _REMOTE_LAKE_MUTATION_ERROR_MESSAGE
+    isolated_message = (
+        f"{_REMOTE_LAKE_MUTATION_ERROR_TYPE}: "
+        f"{_REMOTE_LAKE_MUTATION_ERROR_MESSAGE}"
+    )
+    if normalized_type == _REMOTE_LAKE_MUTATION_ERROR_TYPE:
+        return normalized_error in {direct_message, isolated_message}
+    return not normalized_type and normalized_error == isolated_message
+
+
 def _is_lake_mutation_conflict(
     *,
+    error: str,
+    error_type: str | None,
     lake_error_code: str | None,
     retry_reason: str | None,
 ) -> bool:
-    return (
+    structured = (
         str(lake_error_code or "").strip().lower() == "lake_mutation_in_progress"
         and str(retry_reason or "").strip().lower() == "mutation"
+    )
+    return structured or _known_remote_lake_mutation_failure(
+        error=error,
+        error_type=error_type,
     )
 
 
@@ -200,18 +232,25 @@ def _retry_delay_for_failure(
     retry_reason: str | None,
     config: "LabGatewayConfig",
 ) -> float:
+    lake_mutation_conflict = _is_lake_mutation_conflict(
+        error=error,
+        error_type=error_type,
+        lake_error_code=lake_error_code,
+        retry_reason=retry_reason,
+    )
     explicit = _parse_positive_float(retry_after_seconds)
+    if lake_mutation_conflict:
+        return max(
+            float(config.lake_mutation_retry_after_seconds),
+            explicit or 0.0,
+            0.0,
+        )
     if explicit is not None:
         return explicit
 
     normalized = str(error or "").strip().lower()
     if _is_lake_capacity_overload(normalized, error_type):
         return max(float(config.lake_timeout_retry_after_seconds), 0.0)
-    if _is_lake_mutation_conflict(
-        lake_error_code=lake_error_code,
-        retry_reason=retry_reason,
-    ):
-        return max(float(config.lake_mutation_retry_after_seconds), 0.0)
     if _is_lake_service_unavailable(normalized):
         # Older frozen workers can lose the lake's Retry-After header when
         # requests.raise_for_status() constructs the failure.  Preserve the
@@ -233,6 +272,8 @@ def _failure_preserves_attempt_budget(
     return (
         _is_lake_capacity_overload(normalized, error_type)
         or _is_lake_mutation_conflict(
+            error=error,
+            error_type=error_type,
             lake_error_code=lake_error_code,
             retry_reason=retry_reason,
         )
@@ -1032,6 +1073,8 @@ class PlayHandLabGateway:
             )
             lake_capacity_overload = _is_lake_capacity_overload(error, error_type)
             lake_mutation_conflict = _is_lake_mutation_conflict(
+                error=error,
+                error_type=error_type,
                 lake_error_code=lake_error_code,
                 retry_reason=retry_reason,
             )
@@ -1727,6 +1770,16 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                     error_repr=(
                         str(payload["error_repr"])
                         if payload.get("error_repr") is not None
+                        else None
+                    ),
+                    lake_error_code=(
+                        str(payload["lake_error_code"])
+                        if payload.get("lake_error_code") is not None
+                        else None
+                    ),
+                    retry_reason=(
+                        str(payload["retry_reason"])
+                        if payload.get("retry_reason") is not None
                         else None
                     ),
                     terminal_result=(
