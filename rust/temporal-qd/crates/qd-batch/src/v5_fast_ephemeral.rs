@@ -973,6 +973,7 @@ pub(crate) fn execute_evolved(
         name: "evolved_publication_replay".to_owned(),
         wall: publication_replay_elapsed,
         completed_work_units: Some(transaction.attempts.len() as u64),
+        bytes_processed: Some(parent_byte_count),
         parallel_workers: Some(1),
         ..NativeProgressSection::default()
     });
@@ -984,7 +985,6 @@ pub(crate) fn execute_evolved(
             evaluation_receipt
                 .encoded_bytes
                 .checked_add(ledger_receipt.encoded_bytes)
-                .and_then(|bytes| bytes.checked_add(parent_byte_count))
                 .ok_or_else(|| anyhow!("fast-ephemeral evolved byte telemetry overflow"))?,
         ),
         parallel_workers: Some(1),

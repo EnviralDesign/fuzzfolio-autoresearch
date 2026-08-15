@@ -3889,8 +3889,19 @@ mod tests {
     use super::*;
     use crate::{
         factory::ParentReference,
-        proposal::{CandidateIdentityLedger, IdentityLedger, ParentSelector, ProposalError},
-        v5_evolved_transaction::execute_v5_evolved_transaction,
+        proposal::{
+            CandidateIdentityLedger, ExplicitParentRing, IdentityLedger, ParentSelector,
+            ProposalError,
+        },
+        schedule::{RotatingParentSchedule, accepted_quota_immigrant_count},
+        v5::{
+            build_v5_g0_accepted_material, parent_reference_from_v5_compact_record,
+            v5_proposal_seed,
+        },
+        v5_evolved_transaction::{
+            execute_v5_evolved_transaction,
+            execute_v5_evolved_transaction_fast_ephemeral_with_progress,
+        },
     };
 
     fn sha(value: Value) -> String {
@@ -4185,6 +4196,54 @@ mod tests {
         config
     }
 
+    fn structural_generation_config(
+        generation_index: u64,
+        target_accepted: u64,
+        max_attempts: u64,
+    ) -> Value {
+        let mut config = fixture_generation_config(generation_index, target_accepted, max_attempts);
+        let desired_immigrants = accepted_quota_immigrant_count(target_accepted, true);
+        let allocation_semantic = object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_reproduction_allocation_v2".to_owned()),
+            ),
+            ("targetAcceptedCandidates", Value::from(target_accepted)),
+            (
+                "desiredAcceptedOffspringCount",
+                Value::from(target_accepted - desired_immigrants),
+            ),
+            (
+                "desiredAcceptedImmigrantCount",
+                Value::from(desired_immigrants),
+            ),
+        ]);
+        let mut allocation = allocation_semantic
+            .as_object()
+            .expect("structural allocation object")
+            .clone();
+        allocation.insert(
+            "allocationSha256".to_owned(),
+            Value::String(
+                canonical_sha256(&allocation_semantic).expect("structural allocation identity"),
+            ),
+        );
+        let fields = config
+            .as_object_mut()
+            .expect("structural generation config object");
+        fields.insert(
+            "reproductionAllocation".to_owned(),
+            Value::Object(allocation),
+        );
+        fields.remove("configSha256");
+        let config_sha256 = canonical_sha256(&config).expect("structural generation identity");
+        config
+            .as_object_mut()
+            .expect("structural generation config object")
+            .insert("configSha256".to_owned(), Value::String(config_sha256));
+        config
+    }
+
     fn input_binding(kind: &str, path_suffix: &str) -> Value {
         let file_sha256 = sha(object([("kind", Value::String(format!("{kind}:file")))]));
         let semantic_sha256 = sha(object([(
@@ -4362,6 +4421,202 @@ mod tests {
         publication_fixture_with_limits(thread_cap, 2, 2)
     }
 
+    fn structural_publication_fixture(
+        thread_cap: u64,
+    ) -> (
+        V5EvolvedTransactionRequest,
+        V5EvolvedPublicationInputs,
+        ExplicitParentRing,
+        CandidateIdentityLedger,
+    ) {
+        // Two accepted candidates require one offspring and one immigrant;
+        // the accepted-quota scheduler makes ordinal zero structural.
+        let target_accepted = 2;
+        let max_attempts = 8;
+        let shared_authority = shared_authority_fixture();
+        let authority = V5SharedConstructionAuthority::from_shared_object(&shared_authority)
+            .expect("parse structural publication authority");
+        let parent_config_sha256 = sha(object([(
+            "fixture",
+            Value::String("structural publication parents".to_owned()),
+        )]));
+        let parent_references = (0_u64..2)
+            .map(|ordinal| {
+                let seed = v5_proposal_seed(&parent_config_sha256, ordinal)
+                    .expect("derive structural parent proposal seed");
+                let material =
+                    build_v5_g0_accepted_material(&authority, 1, ordinal, ordinal, &seed)
+                        .expect("construct structural publication parent");
+                parent_reference_from_v5_compact_record(
+                    &authority,
+                    &material.proposal_delta,
+                    &material.record,
+                )
+                .expect("seal structural publication parent")
+            })
+            .collect();
+        let parents = ExplicitParentRing::new(parent_references)
+            .expect("construct structural publication parent ring");
+        let generation_config = structural_generation_config(2, target_accepted, max_attempts);
+        let generation_config_sha256 = generation_config
+            .get("configSha256")
+            .and_then(Value::as_str)
+            .expect("structural generation config identity")
+            .to_owned();
+        let parent_archive = input_binding("parentArchive", "structural-parent-archive");
+        let identity_ledger = input_binding("identityLedger", "structural-identity-ledger");
+        let inputs = object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_native_v5_proposal_inputs_v1".to_owned()),
+            ),
+            ("parentArchive", parent_archive.clone()),
+            ("identityLedger", identity_ledger.clone()),
+        ]);
+        let execution_authority = execution_authority(&shared_authority, &generation_config_sha256);
+        let publication_inputs = V5EvolvedPublicationInputs::from_manifest_values(
+            &generation_config,
+            &Value::String("lf".to_owned()),
+            &execution_authority,
+            &inputs,
+        )
+        .expect("parse structural evolved publication inputs");
+        let ledger = CandidateIdentityLedger::new(
+            object([(
+                "schemaVersion",
+                Value::String(
+                    "temporal_qd_v5_evolved_structural_publication_test_ledger_v1".to_owned(),
+                ),
+            )]),
+            Vec::<String>::new(),
+        )
+        .expect("construct structural candidate ledger");
+        let request = V5EvolvedTransactionRequest {
+            shared_authority,
+            generation_config_sha256,
+            parent_archive_input_binding_sha256: parent_archive
+                .get("bindingSha256")
+                .and_then(Value::as_str)
+                .expect("structural parent input binding identity")
+                .to_owned(),
+            identity_ledger_input_binding_sha256: identity_ledger
+                .get("bindingSha256")
+                .and_then(Value::as_str)
+                .expect("structural ledger input binding identity")
+                .to_owned(),
+            generation_index: 2,
+            target_accepted,
+            max_attempts,
+            evaluation_width: target_accepted,
+            thread_cap,
+            parent_schedule: Some(
+                RotatingParentSchedule::from_counts(2, 2)
+                    .expect("construct structural parent schedule"),
+            ),
+            parent_selector_state_sha256: sha(parents.compact_state()),
+            identity_ledger_identity_sha256: sha(ledger.identity().clone()),
+            identity_ledger_state_sha256: sha(ledger.compact_state()),
+        };
+        (request, publication_inputs, parents, ledger)
+    }
+
+    #[derive(Debug)]
+    struct PublishedStructuralBundle {
+        fragment_receipt: Value,
+        publication_receipt: V5EvolvedPublicationReceipt,
+        pair_config: Vec<u8>,
+        identity_ledger: Vec<u8>,
+        population: Vec<u8>,
+        evaluation: Vec<u8>,
+        journal: Vec<u8>,
+        parent_material: Vec<u8>,
+    }
+
+    fn canonical_parent_material(references: &[ParentReference]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for reference in references {
+            assert!(reference.selection_audit.is_none());
+            let semantic = object([
+                (
+                    "schemaVersion",
+                    Value::String("temporal_qd_v5_fast_ephemeral_parent_material_v1".to_owned()),
+                ),
+                ("candidateId", Value::String(reference.candidate_id.clone())),
+                (
+                    "pairIdentitySha256",
+                    Value::String(reference.pair_identity_sha256.clone()),
+                ),
+                ("pairPayload", reference.pair_payload.clone()),
+            ]);
+            let mut fields = semantic
+                .as_object()
+                .expect("canonical parent material row")
+                .clone();
+            fields.insert(
+                "rowSha256".to_owned(),
+                Value::String(canonical_sha256(&semantic).expect("parent material row identity")),
+            );
+            write_canonical_json(&Value::Object(fields), &mut bytes)
+                .expect("encode canonical parent material row");
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn publish_structural_bundle(
+        request: &V5EvolvedTransactionRequest,
+        inputs: &V5EvolvedPublicationInputs,
+        transaction: &V5EvolvedTransactionResult,
+    ) -> PublishedStructuralBundle {
+        let plan = V5EvolvedPublicationPlan::derive(request, inputs)
+            .expect("derive structural publication plan");
+        let stream = prepare_v5_evolved_publication_stream(request, transaction, &plan)
+            .expect("prepare structural publication stream");
+        let mut private = InMemoryFragments::default();
+        let mut parents = ParentCollector::default();
+        let fragments = stream
+            .materialize_accepted_fragments_and_parents(&mut private, &mut parents)
+            .expect("materialize structural publication fragments and parents");
+        let mut pair_config = Vec::new();
+        let mut identity_ledger = Vec::new();
+        let mut population = Vec::new();
+        let mut evaluation = Vec::new();
+        let mut journal = Vec::new();
+        let publication_receipt = stream
+            .write_bundle_from_fragments(
+                &fragments,
+                &mut private,
+                &mut pair_config,
+                &mut identity_ledger,
+                &mut population,
+                &mut evaluation,
+                &mut journal,
+            )
+            .expect("assemble structural publication bundle");
+        let verified = stream
+            .verify_bundle_from_fragments(
+                &fragments,
+                &mut private,
+                &mut Cursor::new(pair_config.clone()),
+                &mut Cursor::new(identity_ledger.clone()),
+                &mut Cursor::new(population.clone()),
+                &mut Cursor::new(evaluation.clone()),
+                &mut Cursor::new(journal.clone()),
+            )
+            .expect("verify structural publication bundle");
+        assert_eq!(verified, publication_receipt);
+        PublishedStructuralBundle {
+            fragment_receipt: fragments.to_value().expect("encode fragment receipt"),
+            publication_receipt,
+            pair_config,
+            identity_ledger,
+            population,
+            evaluation,
+            journal,
+            parent_material: canonical_parent_material(&parents.0),
+        }
+    }
+
     fn complete_two_immigrant_transaction(
         thread_cap: u64,
     ) -> (
@@ -4460,6 +4715,62 @@ mod tests {
         fields.remove(field).expect("self-hash field present");
         let digest = canonical_sha256(&Value::Object(fields.clone())).expect("recompute self hash");
         fields.insert(field.to_owned(), Value::String(digest));
+    }
+
+    #[test]
+    fn structural_publication_is_byte_identical_for_durable_and_fast() {
+        let _guard = materialization_lock()
+            .lock()
+            .expect("serialize structural publication materialization");
+        let (request, inputs, parents, ledger) = structural_publication_fixture(1);
+        let mut durable_parents = parents.clone();
+        let mut durable_ledger = ledger.clone();
+        let durable = execute_v5_evolved_transaction(
+            request.clone(),
+            &mut durable_parents,
+            &mut durable_ledger,
+        )
+        .expect("execute durable structural transaction");
+        let mut fast_parents = parents;
+        let mut fast_ledger = ledger;
+        let fast = execute_v5_evolved_transaction_fast_ephemeral_with_progress(
+            request.clone(),
+            &mut fast_parents,
+            &mut fast_ledger,
+            None,
+        )
+        .expect("execute fast-ephemeral structural transaction");
+
+        assert!(durable.target_reached && fast.target_reached);
+        assert!(durable.proposal_deltas.iter().any(|delta| {
+            delta.scheduled_kind == "structural_offspring"
+                && delta.terminal_disposition == "accepted"
+        }));
+        assert_eq!(
+            durable.to_value().expect("encode durable transaction"),
+            fast.to_value().expect("encode fast transaction"),
+            "fast construction must preserve the complete durable transaction",
+        );
+
+        let durable_bundle = publish_structural_bundle(&request, &inputs, &durable);
+        let fast_bundle = publish_structural_bundle(&request, &inputs, &fast);
+        assert_eq!(
+            durable_bundle.fragment_receipt,
+            fast_bundle.fragment_receipt
+        );
+        assert_eq!(
+            durable_bundle.publication_receipt,
+            fast_bundle.publication_receipt
+        );
+        assert_eq!(durable_bundle.pair_config, fast_bundle.pair_config);
+        assert_eq!(durable_bundle.identity_ledger, fast_bundle.identity_ledger);
+        assert_eq!(durable_bundle.population, fast_bundle.population);
+        assert_eq!(durable_bundle.evaluation, fast_bundle.evaluation);
+        assert_eq!(durable_bundle.journal, fast_bundle.journal);
+        assert_eq!(
+            durable_bundle.parent_material, fast_bundle.parent_material,
+            "mandatory replay must publish the same canonical next-generation parent rows",
+        );
     }
 
     #[test]
