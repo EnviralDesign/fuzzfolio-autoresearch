@@ -2752,6 +2752,42 @@ fn construct_sealed_structural_accept(
     terminal_operator_trace: Value,
     step_index: u64,
 ) -> Result<V5EvolvedConstructionOutcome> {
+    // Every individual structural step can be valid while a multi-step
+    // mutation sequence still returns the targeted side to the original
+    // parent program.  That aggregate outcome is a no-op proposal, not a
+    // malformed accepted candidate.  Keep the accepted-material invariant
+    // strict and journal the complete step evidence as a terminal no-op.
+    if long_program == build_parent.long_program && short_program == build_parent.short_program {
+        let reason_code = "structural_aggregate_no_op";
+        let no_op_trace = ordered_operator_trace(
+            planned_scheduled_kind(&planned.intent),
+            &steps,
+            step_index,
+            "no_op",
+            reason_code,
+            &terminal_operator_plan,
+            Some(&terminal_operator_application),
+        )?;
+        return structural_terminal_outcome(
+            authority,
+            request,
+            planned,
+            journal_parent,
+            journal_mate,
+            receipt,
+            mutation_depth,
+            long_program,
+            short_program,
+            steps,
+            terminal_operator_plan,
+            Some(terminal_operator_application),
+            no_op_trace,
+            "no_op",
+            reason_code,
+            "operator_apply",
+            step_index,
+        );
+    }
     let delta = proposal_delta_for_attempt(
         authority,
         request,
@@ -6593,6 +6629,78 @@ mod scheduler_tests {
             &material.record,
         )
         .expect("bind authenticated G0 compact parent")
+    }
+
+    #[test]
+    fn aggregate_structural_reversion_is_journaled_as_no_op() {
+        let config_sha256 = sha(object([(
+            "schemaVersion",
+            Value::String("temporal_qd_v5_evolved_aggregate_no_op_probe_v1".to_owned()),
+        )]));
+        let authority = sealed_authority();
+        let parent_reference = sealed_g0_parent(&authority, &config_sha256, 0);
+        let parent = load_v5_evolved_parent(&authority, &parent_reference)
+            .expect("load authenticated aggregate-no-op parent");
+        let request = direct_native_request(config_sha256.clone());
+        let planned = PlannedProposal {
+            proposal_ordinal: 0,
+            intent: ProposalIntent::StructuralMutation {
+                proposal_seed: v5_proposal_seed(&config_sha256, 0)
+                    .expect("derive aggregate-no-op proposal seed"),
+                parent: parent_reference,
+                mutation_depth: 2,
+            },
+        };
+        let receipt = parent_selection_receipt_for_planned(&planned, &parent, None)
+            .expect("bind aggregate-no-op parent receipt");
+        let accepted_step = construct_sealed_mutation(&authority, &request, &planned, 0, None)
+            .expect("construct evidence-bearing mutation probe");
+        let accepted_delta = accepted_step
+            .delta
+            .expect("mutation probe must retain its delta");
+        let terminal_plan = accepted_delta
+            .terminal_operator_plan
+            .expect("mutation probe must retain terminal plan");
+        let terminal_application = accepted_delta
+            .terminal_operator_application
+            .expect("mutation probe must retain terminal application");
+        let terminal_trace = accepted_delta
+            .terminal_operator_trace
+            .expect("mutation probe must retain terminal trace");
+
+        let outcome = construct_sealed_structural_accept(
+            &authority,
+            &request,
+            &planned,
+            0,
+            V5EvolvedBuildKind::Mutation,
+            &parent,
+            None,
+            parent.clone(),
+            None,
+            &receipt,
+            Some(2),
+            parent.long_program.clone(),
+            parent.short_program.clone(),
+            accepted_delta.steps,
+            terminal_plan,
+            terminal_application,
+            terminal_trace,
+            1,
+        )
+        .expect("aggregate structural reversion must not abort construction");
+
+        assert_eq!(outcome.disposition, "no_op");
+        assert_eq!(outcome.reason_code, "structural_aggregate_no_op");
+        assert_eq!(outcome.stage, "operator_apply");
+        assert!(outcome.accepted.is_none());
+        let delta = outcome
+            .delta
+            .expect("aggregate no-op must retain exact evidence");
+        assert_eq!(delta.terminal_disposition, "no_op");
+        assert_eq!(delta.terminal_reason_code, "structural_aggregate_no_op");
+        assert_eq!(delta.long_program, parent.long_program);
+        assert_eq!(delta.short_program, parent.short_program);
     }
 
     fn direct_native_request(config_sha256: String) -> V5EvolvedTransactionRequest {
