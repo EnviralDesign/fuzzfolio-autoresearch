@@ -791,8 +791,13 @@ pub(crate) fn execute_evolved(
     // fast-ephemeral transaction. It must succeed before either the invocation
     // result or COMPLETE marker is written.
     let publication_replay_started = Instant::now();
+    let replay_progress = progress_handle.is_enabled().then_some(progress_handle);
     let fragments: V5EvolvedPublicationFragments = stream
-        .materialize_accepted_fragments_and_parents(&mut memory, &mut parent_writer)
+        .materialize_accepted_fragments_and_parents_with_progress(
+            &mut memory,
+            &mut parent_writer,
+            replay_progress,
+        )
         .context("materialize fast-ephemeral evolved accepted candidates")?;
     let (parent_row_count, parent_byte_count) = parent_writer.finish()?;
     let publication_replay_elapsed = publication_replay_started.elapsed();
@@ -974,7 +979,7 @@ pub(crate) fn execute_evolved(
         wall: publication_replay_elapsed,
         completed_work_units: Some(transaction.attempts.len() as u64),
         bytes_processed: Some(parent_byte_count),
-        parallel_workers: Some(1),
+        parallel_workers: None,
         ..NativeProgressSection::default()
     });
     progress_handle.record_section(NativeProgressSection {

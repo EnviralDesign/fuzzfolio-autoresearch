@@ -265,6 +265,10 @@ impl Drop for NativeProgress {
 }
 
 impl NativeProgressHandle {
+    pub fn is_enabled(&self) -> bool {
+        self.shared.enabled
+    }
+
     pub fn set_generation(&self, generation_kind: Option<&str>, generation_index: Option<u64>) {
         if let Ok(mut context) = self.shared.context.lock() {
             context.generation_kind = generation_kind.map(str::to_owned);
@@ -386,7 +390,7 @@ impl NativeProgressHandle {
     }
 
     pub fn record_section(&self, section: NativeProgressSection) {
-        if section.name.trim().is_empty() {
+        if !self.shared.enabled || section.name.trim().is_empty() {
             return;
         }
         if let Ok(mut sections) = self.shared.sections.lock() {
@@ -878,7 +882,21 @@ mod tests {
             false,
             sink,
         );
-        progress.handle().advance_completed(1);
+        let handle = progress.handle();
+        assert!(!handle.is_enabled());
+        handle.advance_completed(1);
+        handle.record_section(NativeProgressSection::wall(
+            "disabled_section",
+            Duration::from_secs(1),
+        ));
+        assert!(
+            handle
+                .shared
+                .sections
+                .lock()
+                .expect("read disabled sections")
+                .is_empty()
+        );
         progress.finish(None);
         assert!(lines.lock().expect("read disabled output").is_empty());
     }

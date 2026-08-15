@@ -4278,6 +4278,35 @@ impl V5EvolvedAcceptedReplaySink for NoopV5EvolvedAcceptedReplaySink {
     }
 }
 
+/// Operational timings and bounded-concurrency accounting for one offline
+/// transaction replay. None of these fields participate in transaction or
+/// publication identity.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct V5EvolvedOfflineReplayTelemetry {
+    pub(crate) semantic_validation_wall: Duration,
+    pub(crate) planning_wall: Duration,
+    pub(crate) snapshot_reconstruction_wall: Duration,
+    pub(crate) snapshot_reconstruction_worker_sum: Duration,
+    pub(crate) construction_wall: Duration,
+    pub(crate) construction_worker_sum: Duration,
+    pub(crate) verification_wall: Duration,
+    pub(crate) sink_wall: Duration,
+    pub(crate) snapshot_count: u64,
+    pub(crate) attempt_count: u64,
+    pub(crate) accepted_count: u64,
+    pub(crate) snapshot_wave_count: u64,
+    pub(crate) construction_wave_count: u64,
+    pub(crate) peak_active_workers: u64,
+}
+
+fn replay_timer(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+fn replay_elapsed(started: Option<Instant>) -> Duration {
+    started.map_or(Duration::ZERO, |started| started.elapsed())
+}
+
 impl V5EvolvedTransactionResult {
     fn semantic_value(&self) -> Result<Value> {
         if self.generation_index < 2
@@ -4850,8 +4879,17 @@ impl V5EvolvedTransactionResult {
         &self,
         request: &V5EvolvedTransactionRequest,
         authority: &V5SharedConstructionAuthority,
+        thread_cap: u64,
+        collect_telemetry: bool,
         sink: &mut dyn V5EvolvedAcceptedReplaySink,
-    ) -> Result<()> {
+    ) -> Result<V5EvolvedOfflineReplayTelemetry> {
+        let mut telemetry = V5EvolvedOfflineReplayTelemetry::default();
+        let semantic_validation_started = replay_timer(collect_telemetry);
+        if !(1..=8).contains(&thread_cap) {
+            return Err(contract(
+                "v5 evolved offline replay thread cap must be between one and eight",
+            ));
+        }
         self.verify_replay()?;
         if self.generation_index != request.generation_index
             || self.generation_config_sha256 != request.generation_config_sha256
@@ -4914,62 +4952,189 @@ impl V5EvolvedTransactionResult {
                 "v5 evolved offline replay durable object counts drifted",
             ));
         }
-        // Snapshot objects are immutable and content-addressed. Reconstruct
-        // each distinct parent once for this replay, while still checking the
-        // attempt-specific reference on every use below. The construction
-        // engine independently retains its own verified-parent cache so each
-        // distinct selector payload also crosses that boundary only once.
-        let mut verified_snapshot_references = BTreeMap::new();
+        telemetry.semantic_validation_wall = replay_elapsed(semantic_validation_started);
+
+        // Snapshot objects are immutable and content-addressed. They are
+        // reconstructed serially on first use during ordered planning below,
+        // preserving the cap-one callback and failure boundary while still
+        // caching each distinct source parent exactly once.
         let replay_engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
         let replay_parent_cache = replay_engine
             .parent_cache
             .as_deref()
             .expect("fast-ephemeral replay engine owns a verified-parent cache");
-        let mut birth_ordinal = 0_u64;
-        for (attempt, audit) in self.attempts.iter().zip(&self.outcome_audits) {
-            let delta = deltas.get(&attempt.proposal_ordinal).ok_or_else(|| {
-                contract("v5 evolved offline replay attempt names missing delta ordinal")
-            })?;
-            let refs = snapshot_refs
-                .get(&attempt.proposal_ordinal)
-                .ok_or_else(|| {
-                    contract("v5 evolved offline replay attempt names missing snapshot references")
-                })?;
-            let planned = offline_planned_proposal_from_snapshot(
-                authority,
-                inventory,
-                &snapshots,
-                &mut verified_snapshot_references,
-                replay_parent_cache,
-                attempt,
-                delta,
-                refs,
-            )?;
-            let replayed = replay_engine.construct(authority, request, &planned, birth_ordinal)?;
-            verify_offline_replayed_outcome(attempt, audit, delta, &replayed, &records)?;
-            // Preserve the durable proposal ordinal even when no rich
-            // candidate exists.  Publication uses this hook to emit a
-            // candidate-free funnel attempt rather than silently shortening
-            // the pre-finalizer's proposal ledger.
-            sink.observe_attempt(authority, attempt, audit, replayed.accepted.as_ref())?;
-            if attempt.accepted_record_sha256.is_some() {
-                let material = replayed.accepted.as_ref().ok_or_else(|| {
-                    contract(
-                        "v5 evolved offline accepted attempt omitted reconstructed accepted material",
+        let mut verified_snapshot_references = BTreeMap::new();
+
+        // Planning remains serial and ordinal ordered. Each plan/construct/
+        // verify/sink wave is bounded by the cap, so rich accepted material
+        // cannot accumulate to population size. The birth ordinal is the
+        // durable accepted count in the strict prefix, already sealed by the
+        // transaction and independent of worker completion order.
+        let construction_activity = V5ConstructionActivity::default();
+        let mut planned_birth_ordinal = 0_u64;
+        let mut replayed_birth_count = 0_u64;
+        for attempt_wave_start in (0..self.attempts.len()).step_by(thread_cap as usize) {
+            let attempt_wave_end = self
+                .attempts
+                .len()
+                .min(attempt_wave_start.saturating_add(thread_cap as usize));
+            let planning_started = replay_timer(collect_telemetry);
+            let snapshot_count_before_wave = telemetry.snapshot_count;
+            let snapshot_wall_before_wave = telemetry.snapshot_reconstruction_wall;
+            let mut plans = Vec::with_capacity(attempt_wave_end - attempt_wave_start);
+            let mut deferred_planning_error = None;
+            for attempt_index in attempt_wave_start..attempt_wave_end {
+                let attempt = &self.attempts[attempt_index];
+                let planned = (|| {
+                    let delta = deltas.get(&attempt.proposal_ordinal).ok_or_else(|| {
+                        contract("v5 evolved offline replay attempt names missing delta ordinal")
+                    })?;
+                    let refs = snapshot_refs.get(&attempt.proposal_ordinal).ok_or_else(|| {
+                        contract(
+                            "v5 evolved offline replay attempt names missing snapshot references",
+                        )
+                    })?;
+                    offline_planned_proposal_from_snapshot(
+                        authority,
+                        inventory,
+                        &snapshots,
+                        &mut verified_snapshot_references,
+                        replay_parent_cache,
+                        &mut telemetry,
+                        collect_telemetry,
+                        attempt,
+                        delta,
+                        refs,
                     )
+                })();
+                let planned = match planned {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        deferred_planning_error = Some(error);
+                        break;
+                    }
+                };
+                plans.push((attempt_index, planned, planned_birth_ordinal));
+                if attempt.accepted_record_sha256.is_some() {
+                    planned_birth_ordinal =
+                        planned_birth_ordinal.checked_add(1).ok_or_else(|| {
+                            contract("v5 evolved offline replay birth ordinal overflowed")
+                        })?;
+                }
+            }
+            if telemetry.snapshot_count != snapshot_count_before_wave {
+                telemetry.snapshot_wave_count = telemetry.snapshot_wave_count.saturating_add(1);
+                telemetry.peak_active_workers = telemetry.peak_active_workers.max(1);
+            }
+            telemetry.planning_wall += replay_elapsed(planning_started).saturating_sub(
+                telemetry
+                    .snapshot_reconstruction_wall
+                    .saturating_sub(snapshot_wall_before_wave),
+            );
+
+            if !plans.is_empty() {
+                telemetry.construction_wave_count =
+                    telemetry.construction_wave_count.saturating_add(1);
+            }
+            let construction_started = replay_timer(collect_telemetry);
+            let wave_results = if plans.is_empty() {
+                Vec::new()
+            } else if plans.len() == 1 {
+                let (_, planned, birth_ordinal) = &plans[0];
+                let _worker = V5ConstructionWorkerGuard::new(&construction_activity, None);
+                let worker_started = replay_timer(collect_telemetry);
+                let result = replay_engine.construct(authority, request, planned, *birth_ordinal);
+                vec![(result, replay_elapsed(worker_started))]
+            } else {
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(plans.len());
+                    for (_, planned, birth_ordinal) in &plans {
+                        let activity = &construction_activity;
+                        let replay_engine = &replay_engine;
+                        handles.push(scope.spawn(move || {
+                            let _worker = V5ConstructionWorkerGuard::new(activity, None);
+                            let worker_started = replay_timer(collect_telemetry);
+                            let result = replay_engine.construct(
+                                authority,
+                                request,
+                                planned,
+                                *birth_ordinal,
+                            );
+                            (result, replay_elapsed(worker_started))
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|handle| match handle.join() {
+                            Ok(result) => result,
+                            Err(_) => (
+                                Err(contract("v5 evolved offline construction worker panicked")),
+                                Duration::ZERO,
+                            ),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            telemetry.construction_wall += replay_elapsed(construction_started);
+
+            // All workers have joined before the first result is inspected.
+            // `plans` and `wave_results` retain proposal order, making `?`
+            // report the lowest-ordinal construction failure in the wave.
+            for ((attempt_index, _, _), (result, worker_wall)) in
+                plans.into_iter().zip(wave_results)
+            {
+                telemetry.construction_worker_sum += worker_wall;
+                let replayed = result?;
+                let attempt = &self.attempts[attempt_index];
+                let audit = &self.outcome_audits[attempt_index];
+                let delta = deltas.get(&attempt.proposal_ordinal).ok_or_else(|| {
+                    contract("v5 evolved offline replay attempt names missing delta ordinal")
                 })?;
-                sink.accept(authority, material)?;
-                birth_ordinal = birth_ordinal.checked_add(1).ok_or_else(|| {
-                    contract("v5 evolved offline replay birth ordinal overflowed")
-                })?;
+                let verification_started = replay_timer(collect_telemetry);
+                verify_offline_replayed_outcome(attempt, audit, delta, &replayed, &records)?;
+                telemetry.verification_wall += replay_elapsed(verification_started);
+                // Preserve the durable proposal ordinal even when no rich
+                // candidate exists. Publication uses this hook to emit a
+                // candidate-free funnel attempt rather than shortening the
+                // pre-finalizer's proposal ledger.
+                let sink_started = replay_timer(collect_telemetry);
+                sink.observe_attempt(authority, attempt, audit, replayed.accepted.as_ref())?;
+                if attempt.accepted_record_sha256.is_some() {
+                    let material = replayed.accepted.as_ref().ok_or_else(|| {
+                        contract(
+                            "v5 evolved offline accepted attempt omitted reconstructed accepted material",
+                        )
+                    })?;
+                    sink.accept(authority, material)?;
+                    replayed_birth_count =
+                        replayed_birth_count.checked_add(1).ok_or_else(|| {
+                            contract("v5 evolved offline replay birth ordinal overflowed")
+                        })?;
+                }
+                telemetry.sink_wall += replay_elapsed(sink_started);
+                telemetry.attempt_count = telemetry.attempt_count.saturating_add(1);
+            }
+            if let Some(error) = deferred_planning_error {
+                return Err(error);
             }
         }
-        if birth_ordinal != self.accepted_records.len() as u64 {
+        telemetry.peak_active_workers = telemetry
+            .peak_active_workers
+            .max(construction_activity.peak.load(Ordering::Relaxed));
+        if construction_activity.active.load(Ordering::Relaxed) != 0 {
+            return Err(contract(
+                "v5 evolved offline construction workers did not return to zero",
+            ));
+        }
+        if replayed_birth_count != self.accepted_records.len() as u64
+            || planned_birth_ordinal != replayed_birth_count
+        {
             return Err(contract(
                 "v5 evolved offline replay accepted birth count drifted",
             ));
         }
-        Ok(())
+        telemetry.accepted_count = replayed_birth_count;
+        Ok(telemetry)
     }
 }
 
@@ -4985,9 +5150,57 @@ pub(crate) fn replay_v5_evolved_transaction_with_accepted_sink(
     result: &V5EvolvedTransactionResult,
     sink: &mut dyn V5EvolvedAcceptedReplaySink,
 ) -> Result<()> {
+    replay_v5_evolved_transaction_with_accepted_sink_internal(request, result, 1, false, sink)
+        .map(|_| ())
+}
+
+/// Cap-aware operational variant of the offline replay boundary. Only sealed
+/// attempt construction uses the supplied worker bound; snapshot
+/// reconstruction, planning, verification, and every sink callback remain
+/// strictly ordered.
+pub(crate) fn replay_v5_evolved_transaction_with_accepted_sink_and_cap(
+    request: &V5EvolvedTransactionRequest,
+    result: &V5EvolvedTransactionResult,
+    thread_cap: u64,
+    sink: &mut dyn V5EvolvedAcceptedReplaySink,
+) -> Result<V5EvolvedOfflineReplayTelemetry> {
+    replay_v5_evolved_transaction_with_accepted_sink_internal(
+        request, result, thread_cap, true, sink,
+    )
+}
+
+pub(crate) fn replay_v5_evolved_transaction_with_accepted_sink_and_cap_without_telemetry(
+    request: &V5EvolvedTransactionRequest,
+    result: &V5EvolvedTransactionResult,
+    thread_cap: u64,
+    sink: &mut dyn V5EvolvedAcceptedReplaySink,
+) -> Result<()> {
+    replay_v5_evolved_transaction_with_accepted_sink_internal(
+        request, result, thread_cap, false, sink,
+    )
+    .map(|_| ())
+}
+
+fn replay_v5_evolved_transaction_with_accepted_sink_internal(
+    request: &V5EvolvedTransactionRequest,
+    result: &V5EvolvedTransactionResult,
+    thread_cap: u64,
+    collect_telemetry: bool,
+    sink: &mut dyn V5EvolvedAcceptedReplaySink,
+) -> Result<V5EvolvedOfflineReplayTelemetry> {
+    let validation_started = replay_timer(collect_telemetry);
     request.validate_shape()?;
     let authority = V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)?;
-    result.verify_offline_replay_with_authority_and_accepted_sink(request, &authority, sink)
+    let request_validation_wall = replay_elapsed(validation_started);
+    let mut telemetry = result.verify_offline_replay_with_authority_and_accepted_sink(
+        request,
+        &authority,
+        thread_cap,
+        collect_telemetry,
+        sink,
+    )?;
+    telemetry.semantic_validation_wall += request_validation_wall;
+    Ok(telemetry)
 }
 
 /// Recover only the archive-retained children from a sealed evolved
@@ -5049,6 +5262,8 @@ fn snapshot_parent_reference_for_offline_replay(
     snapshots: &BTreeMap<String, &V5EvolvedParentSnapshot>,
     verified_references: &mut BTreeMap<String, ParentReference>,
     replay_parent_cache: &V5VerifiedParentCache,
+    telemetry: &mut V5EvolvedOfflineReplayTelemetry,
+    collect_telemetry: bool,
     snapshot_ref: &V5EvolvedParentSnapshotRef,
     expected_attempt_reference: &V5AttemptParentReference,
     label: &str,
@@ -5062,6 +5277,7 @@ fn snapshot_parent_reference_for_offline_replay(
     if let Some(reference) = verified_references.get(&snapshot_ref.parent_snapshot_sha256) {
         return Ok(reference.clone());
     }
+    let snapshot_started = replay_timer(collect_telemetry);
     let material = load_v5_evolved_parent_from_snapshot(authority, snapshot)?;
     if material.attempt_reference != *expected_attempt_reference
         || material.pair_identity_sha256 != snapshot.parent_reference.pair_identity_sha256
@@ -5073,6 +5289,10 @@ fn snapshot_parent_reference_for_offline_replay(
     }
     let reference = snapshot.parent_reference_for_replay()?;
     replay_parent_cache.seed_verified(authority, &reference, material)?;
+    let elapsed = replay_elapsed(snapshot_started);
+    telemetry.snapshot_reconstruction_wall += elapsed;
+    telemetry.snapshot_reconstruction_worker_sum += elapsed;
+    telemetry.snapshot_count = telemetry.snapshot_count.saturating_add(1);
     verified_references.insert(
         snapshot_ref.parent_snapshot_sha256.clone(),
         reference.clone(),
@@ -5086,6 +5306,8 @@ fn offline_planned_proposal_from_snapshot(
     snapshots: &BTreeMap<String, &V5EvolvedParentSnapshot>,
     verified_references: &mut BTreeMap<String, ParentReference>,
     replay_parent_cache: &V5VerifiedParentCache,
+    telemetry: &mut V5EvolvedOfflineReplayTelemetry,
+    collect_telemetry: bool,
     attempt: &V5ProposalAttemptRecord,
     delta: &V5EvolvedProposalDelta,
     snapshot_refs: &V5EvolvedAttemptSnapshotRefs,
@@ -5133,6 +5355,8 @@ fn offline_planned_proposal_from_snapshot(
                 snapshots,
                 verified_references,
                 replay_parent_cache,
+                telemetry,
+                collect_telemetry,
                 snapshot_ref,
                 attempt_parent,
                 "mutation parent",
@@ -5164,6 +5388,8 @@ fn offline_planned_proposal_from_snapshot(
                 snapshots,
                 verified_references,
                 replay_parent_cache,
+                telemetry,
+                collect_telemetry,
                 parent_ref,
                 attempt_parent,
                 "crossover parent",
@@ -5173,6 +5399,8 @@ fn offline_planned_proposal_from_snapshot(
                 snapshots,
                 verified_references,
                 replay_parent_cache,
+                telemetry,
+                collect_telemetry,
                 mate_ref,
                 attempt_mate,
                 "crossover mate",
@@ -7660,8 +7888,91 @@ mod scheduler_tests {
         assert_eq!(semantic_values[0], semantic_values[1]);
         assert_eq!(semantic_values[0], semantic_values[2]);
         let (request, result) = serial_replay.expect("serial accepted replay oracle");
-        verify_v5_evolved_transaction_replay(&request, &result)
-            .expect("native accepted serial transaction offline replays");
+        let mut serial_sink = NoopV5EvolvedAcceptedReplaySink;
+        let serial_telemetry = replay_v5_evolved_transaction_with_accepted_sink_and_cap(
+            &request,
+            &result,
+            1,
+            &mut serial_sink,
+        )
+        .expect("native accepted cap-one transaction offline replays");
+        let mut parallel_sink = NoopV5EvolvedAcceptedReplaySink;
+        let parallel_telemetry = replay_v5_evolved_transaction_with_accepted_sink_and_cap(
+            &request,
+            &result,
+            8,
+            &mut parallel_sink,
+        )
+        .expect("native accepted cap-eight transaction offline replays");
+        assert_eq!(serial_telemetry.attempt_count, result.attempts.len() as u64);
+        assert_eq!(
+            parallel_telemetry.attempt_count,
+            result.attempts.len() as u64
+        );
+        assert_eq!(serial_telemetry.accepted_count, 2);
+        assert_eq!(parallel_telemetry.accepted_count, 2);
+        assert_eq!(serial_telemetry.construction_wave_count, 2);
+        assert_eq!(parallel_telemetry.construction_wave_count, 1);
+        assert_eq!(serial_telemetry.peak_active_workers, 1);
+        assert!((1..=8).contains(&parallel_telemetry.peak_active_workers));
+        assert_eq!(serial_telemetry.snapshot_count, 0);
+        assert_eq!(parallel_telemetry.snapshot_count, 0);
+    }
+
+    #[test]
+    fn bounded_offline_replay_preserves_lowest_ordinal_sink_error() {
+        struct FailingOrderedSink {
+            seen: Vec<u64>,
+        }
+
+        impl V5EvolvedAcceptedReplaySink for FailingOrderedSink {
+            fn observe_attempt(
+                &mut self,
+                _authority: &V5SharedConstructionAuthority,
+                attempt: &V5ProposalAttemptRecord,
+                _audit: &V5AttemptOutcomeAudit,
+                _material: Option<&V5CoreEvolvedAcceptedMaterial>,
+            ) -> Result<()> {
+                self.seen.push(attempt.proposal_ordinal);
+                Err(contract("ordered replay sink failure at ordinal zero"))
+            }
+
+            fn accept(
+                &mut self,
+                _authority: &V5SharedConstructionAuthority,
+                _material: &V5CoreEvolvedAcceptedMaterial,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (request, mut parents, mut ledger) = real_immigrant_fixture(1);
+        let transaction = execute_v5_evolved_transaction_fast_ephemeral_with_progress(
+            request.clone(),
+            &mut parents,
+            &mut ledger,
+            None,
+        )
+        .expect("construct ordered replay error fixture");
+        let mut serial = FailingOrderedSink { seen: Vec::new() };
+        let serial_error = replay_v5_evolved_transaction_with_accepted_sink_and_cap(
+            &request,
+            &transaction,
+            1,
+            &mut serial,
+        )
+        .expect_err("cap-one replay must surface sink failure");
+        let mut parallel = FailingOrderedSink { seen: Vec::new() };
+        let parallel_error = replay_v5_evolved_transaction_with_accepted_sink_and_cap(
+            &request,
+            &transaction,
+            8,
+            &mut parallel,
+        )
+        .expect_err("cap-eight replay must surface the same sink failure");
+        assert_eq!(serial_error.to_string(), parallel_error.to_string());
+        assert_eq!(serial.seen, vec![0]);
+        assert_eq!(parallel.seen, vec![0]);
     }
 
     #[test]

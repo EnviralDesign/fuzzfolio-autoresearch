@@ -14,11 +14,12 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
+    time::{Duration, Instant},
 };
 
 use temporal_qd_contract::{
-    CanonicalSha256Writer, ContractError, Map, Value, canonical_sha256,
-    canonical_sha256_without_object_field, write_canonical_json,
+    CanonicalSha256Writer, ContractError, Map, NativeProgressHandle, NativeProgressSection, Value,
+    canonical_sha256, canonical_sha256_without_object_field, write_canonical_json,
 };
 
 use crate::{
@@ -37,6 +38,8 @@ use crate::{
     v5_evolved_transaction::{
         V5EvolvedAcceptedReplaySink, V5EvolvedTransactionError, V5EvolvedTransactionRequest,
         V5EvolvedTransactionResult, replay_v5_evolved_transaction_with_accepted_sink,
+        replay_v5_evolved_transaction_with_accepted_sink_and_cap,
+        replay_v5_evolved_transaction_with_accepted_sink_and_cap_without_telemetry,
     },
 };
 
@@ -1599,6 +1602,12 @@ struct FragmentAccumulator {
     row_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FragmentAppendTelemetry {
+    serialization_wall: Duration,
+    sink_wait_wall: Duration,
+}
+
 impl FragmentAccumulator {
     fn new(kind: V5EvolvedPublicationFragmentKind) -> Self {
         Self {
@@ -1637,6 +1646,46 @@ impl FragmentAccumulator {
             .checked_add(1)
             .ok_or_else(|| contract("v5 evolved publication fragment row count overflow"))?;
         Ok(())
+    }
+
+    fn append_with_telemetry<S: V5EvolvedPublicationFragmentSink>(
+        &mut self,
+        sink: &mut S,
+        value: &Value,
+    ) -> Result<FragmentAppendTelemetry> {
+        let mut telemetry = FragmentAppendTelemetry::default();
+        let serialization_started = Instant::now();
+        let mut row = Vec::new();
+        write_canonical_json(value, &mut row)?;
+        telemetry.serialization_wall += serialization_started.elapsed();
+        if !self.first {
+            let sink_started = Instant::now();
+            sink.write_fragment(self.kind, b",")?;
+            telemetry.sink_wait_wall += sink_started.elapsed();
+            let serialization_started = Instant::now();
+            self.hash.write_all(b",")?;
+            self.encoded_bytes = self
+                .encoded_bytes
+                .checked_add(1)
+                .ok_or_else(|| contract("v5 evolved publication fragment byte count overflow"))?;
+            telemetry.serialization_wall += serialization_started.elapsed();
+        }
+        self.first = false;
+        let sink_started = Instant::now();
+        sink.write_fragment(self.kind, &row)?;
+        telemetry.sink_wait_wall += sink_started.elapsed();
+        let serialization_started = Instant::now();
+        self.hash.write_all(&row)?;
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(row.len() as u64)
+            .ok_or_else(|| contract("v5 evolved publication fragment byte count overflow"))?;
+        self.row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| contract("v5 evolved publication fragment row count overflow"))?;
+        telemetry.serialization_wall += serialization_started.elapsed();
+        Ok(telemetry)
     }
 
     fn finish(self) -> Result<V5EvolvedPublicationFragment> {
@@ -2486,6 +2535,39 @@ impl<'a> V5EvolvedPublicationStream<'a> {
         sink: &mut S,
         parent_sink: &mut P,
     ) -> Result<V5EvolvedPublicationFragments> {
+        self.materialize_accepted_fragments_and_parents_internal(sink, parent_sink, 1, None)
+    }
+
+    /// Operational fast-publication entry point. Constructor work is bounded
+    /// by the request thread cap while verification and every sink callback
+    /// remain strictly proposal-ordinal ordered.
+    pub fn materialize_accepted_fragments_and_parents_with_progress<
+        S: V5EvolvedPublicationFragmentSink,
+        P: V5EvolvedParentReferenceSink,
+    >(
+        &self,
+        sink: &mut S,
+        parent_sink: &mut P,
+        progress: Option<&NativeProgressHandle>,
+    ) -> Result<V5EvolvedPublicationFragments> {
+        self.materialize_accepted_fragments_and_parents_internal(
+            sink,
+            parent_sink,
+            self.request.thread_cap,
+            progress,
+        )
+    }
+
+    fn materialize_accepted_fragments_and_parents_internal<
+        S: V5EvolvedPublicationFragmentSink,
+        P: V5EvolvedParentReferenceSink,
+    >(
+        &self,
+        sink: &mut S,
+        parent_sink: &mut P,
+        replay_thread_cap: u64,
+        progress: Option<&NativeProgressHandle>,
+    ) -> Result<V5EvolvedPublicationFragments> {
         struct FragmentReplaySink<'a, S, P> {
             sink: &'a mut S,
             parent_sink: &'a mut P,
@@ -2496,6 +2578,10 @@ impl<'a> V5EvolvedPublicationStream<'a> {
             next_accepted: usize,
             rich_live: u64,
             peak_rich_live: u64,
+            collect_telemetry: bool,
+            rich_materialize_wall: Duration,
+            serialization_wall: Duration,
+            sink_wait_wall: Duration,
             population: FragmentAccumulator,
             evaluation: FragmentAccumulator,
             funnel: FragmentAccumulator,
@@ -2516,10 +2602,16 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                         "v5 evolved publication replay attempt ordinal is not contiguous",
                     ));
                 }
-                self.funnel.append(
-                    self.sink,
-                    &evolved_funnel_attempt_entry(attempt, audit, material)?,
-                )?;
+                let serialization_started = self.collect_telemetry.then(Instant::now);
+                let entry = evolved_funnel_attempt_entry(attempt, audit, material)?;
+                if let Some(started) = serialization_started {
+                    self.serialization_wall += started.elapsed();
+                    let append = self.funnel.append_with_telemetry(self.sink, &entry)?;
+                    self.serialization_wall += append.serialization_wall;
+                    self.sink_wait_wall += append.sink_wait_wall;
+                } else {
+                    self.funnel.append(self.sink, &entry)?;
+                }
                 self.next_attempt_ordinal = self
                     .next_attempt_ordinal
                     .checked_add(1)
@@ -2581,18 +2673,44 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                                 "v5 evolved replay accepted material lacks proposal attempt identity",
                             )
                         })?;
+                    let rich_started = self.collect_telemetry.then(Instant::now);
                     let rich = materialize_v5_evolved_rich_candidate(authority, material)?;
+                    if let Some(started) = rich_started {
+                        self.rich_materialize_wall += started.elapsed();
+                    }
+                    let serialization_started = self.collect_telemetry.then(Instant::now);
                     let parent_reference =
                         parent_reference_from_v5_evolved_material(&material.parent_material)?;
+                    if let Some(started) = serialization_started {
+                        self.serialization_wall += started.elapsed();
+                    }
+                    let sink_started = self.collect_telemetry.then(Instant::now);
                     self.parent_sink.write_parent_reference(&parent_reference)?;
+                    if let Some(started) = sink_started {
+                        self.sink_wait_wall += started.elapsed();
+                    }
                     #[cfg(test)]
                     materialization_test_observer::observe_rich_materialization();
+                    let serialization_started = self.collect_telemetry.then(Instant::now);
                     let evaluation =
                         evolved_evaluation_candidate(&rich, reference, attempt_entry_sha256)?;
                     let journal = evolved_journal_binding(&evaluation)?;
-                    self.population.append(self.sink, &rich)?;
-                    self.evaluation.append(self.sink, &evaluation)?;
-                    self.journal.append(self.sink, &journal)?;
+                    if let Some(started) = serialization_started {
+                        self.serialization_wall += started.elapsed();
+                        for append in [
+                            self.population.append_with_telemetry(self.sink, &rich)?,
+                            self.evaluation
+                                .append_with_telemetry(self.sink, &evaluation)?,
+                            self.journal.append_with_telemetry(self.sink, &journal)?,
+                        ] {
+                            self.serialization_wall += append.serialization_wall;
+                            self.sink_wait_wall += append.sink_wait_wall;
+                        }
+                    } else {
+                        self.population.append(self.sink, &rich)?;
+                        self.evaluation.append(self.sink, &evaluation)?;
+                        self.journal.append(self.sink, &journal)?;
+                    }
                     self.next_accepted = self.next_accepted.checked_add(1).ok_or_else(|| {
                         contract("v5 evolved publication accepted material counter overflowed")
                     })?;
@@ -2644,6 +2762,10 @@ impl<'a> V5EvolvedPublicationStream<'a> {
             next_accepted: 0,
             rich_live: 0,
             peak_rich_live: 0,
+            collect_telemetry: progress.is_some(),
+            rich_materialize_wall: Duration::ZERO,
+            serialization_wall: Duration::ZERO,
+            sink_wait_wall: Duration::ZERO,
             population: FragmentAccumulator::new(
                 V5EvolvedPublicationFragmentKind::PopulationCandidates,
             ),
@@ -2657,11 +2779,30 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                 V5EvolvedPublicationFragmentKind::GenerationJournalBindings,
             ),
         };
-        replay_v5_evolved_transaction_with_accepted_sink(
-            self.request,
-            self.transaction,
-            &mut replay_sink,
-        )?;
+        let replay_telemetry = if progress.is_none() {
+            if replay_thread_cap == 1 {
+                replay_v5_evolved_transaction_with_accepted_sink(
+                    self.request,
+                    self.transaction,
+                    &mut replay_sink,
+                )?;
+            } else {
+                replay_v5_evolved_transaction_with_accepted_sink_and_cap_without_telemetry(
+                    self.request,
+                    self.transaction,
+                    replay_thread_cap,
+                    &mut replay_sink,
+                )?;
+            }
+            None
+        } else {
+            Some(replay_v5_evolved_transaction_with_accepted_sink_and_cap(
+                self.request,
+                self.transaction,
+                replay_thread_cap,
+                &mut replay_sink,
+            )?)
+        };
         if replay_sink.next_attempt_ordinal != self.proposal_attempt_count() as u64
             || replay_sink.next_accepted != self.accepted_count()
             || replay_sink.peak_rich_live != 1
@@ -2670,6 +2811,10 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                 "v5 evolved publication one-pass materialization count/live-state drifted",
             ));
         }
+        let rich_materialize_wall = replay_sink.rich_materialize_wall;
+        let mut serialization_wall = replay_sink.serialization_wall;
+        let sink_wait_wall = replay_sink.sink_wait_wall;
+        let fragment_finish_started = progress.map(|_| Instant::now());
         let fragments = V5EvolvedPublicationFragments {
             accepted_candidate_count: self.accepted_count() as u64,
             proposal_attempt_count: self.proposal_attempt_count() as u64,
@@ -2682,6 +2827,73 @@ impl<'a> V5EvolvedPublicationStream<'a> {
             self.accepted_count() as u64,
             self.proposal_attempt_count() as u64,
         )?;
+        if let Some(started) = fragment_finish_started {
+            serialization_wall += started.elapsed();
+        }
+        if let Some(progress) = progress {
+            let replay_telemetry = replay_telemetry.as_ref().ok_or_else(|| {
+                contract("bounded v5 evolved publication replay omitted operational telemetry")
+            })?;
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_planning".to_owned(),
+                wall: replay_telemetry
+                    .semantic_validation_wall
+                    .saturating_add(replay_telemetry.planning_wall),
+                completed_work_units: Some(replay_telemetry.attempt_count),
+                parallel_workers: Some(1),
+                ..NativeProgressSection::default()
+            });
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_snapshot_reconstruction".to_owned(),
+                wall: replay_telemetry.snapshot_reconstruction_wall,
+                completed_work_units: Some(replay_telemetry.snapshot_count),
+                parallel_workers: Some(1),
+                ..NativeProgressSection::default()
+            });
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_construct".to_owned(),
+                wall: replay_telemetry.construction_wall,
+                completed_work_units: Some(replay_telemetry.attempt_count),
+                parallel_workers: Some(replay_telemetry.peak_active_workers),
+                ..NativeProgressSection::default()
+            });
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_verify".to_owned(),
+                wall: replay_telemetry.verification_wall,
+                completed_work_units: Some(replay_telemetry.attempt_count),
+                parallel_workers: Some(1),
+                ..NativeProgressSection::default()
+            });
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_rich_materialize".to_owned(),
+                wall: rich_materialize_wall,
+                completed_work_units: Some(self.accepted_count() as u64),
+                parallel_workers: Some(1),
+                ..NativeProgressSection::default()
+            });
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_serialization".to_owned(),
+                wall: serialization_wall,
+                completed_work_units: Some(
+                    (self.accepted_count() as u64)
+                        .saturating_mul(3)
+                        .saturating_add(self.proposal_attempt_count() as u64),
+                ),
+                parallel_workers: Some(1),
+                ..NativeProgressSection::default()
+            });
+            progress.record_section(NativeProgressSection {
+                name: "evolved_replay_sink_wait".to_owned(),
+                wall: sink_wait_wall,
+                completed_work_units: Some(
+                    (self.accepted_count() as u64)
+                        .saturating_mul(4)
+                        .saturating_add(self.proposal_attempt_count() as u64),
+                ),
+                parallel_workers: Some(1),
+                ..NativeProgressSection::default()
+            });
+        }
         Ok(fragments)
     }
 
@@ -4567,6 +4779,7 @@ mod tests {
         request: &V5EvolvedTransactionRequest,
         inputs: &V5EvolvedPublicationInputs,
         transaction: &V5EvolvedTransactionResult,
+        bounded_replay: bool,
     ) -> PublishedStructuralBundle {
         let plan = V5EvolvedPublicationPlan::derive(request, inputs)
             .expect("derive structural publication plan");
@@ -4574,9 +4787,16 @@ mod tests {
             .expect("prepare structural publication stream");
         let mut private = InMemoryFragments::default();
         let mut parents = ParentCollector::default();
-        let fragments = stream
-            .materialize_accepted_fragments_and_parents(&mut private, &mut parents)
-            .expect("materialize structural publication fragments and parents");
+        let fragments = if bounded_replay {
+            stream.materialize_accepted_fragments_and_parents_with_progress(
+                &mut private,
+                &mut parents,
+                None,
+            )
+        } else {
+            stream.materialize_accepted_fragments_and_parents(&mut private, &mut parents)
+        }
+        .expect("materialize structural publication fragments and parents");
         let mut pair_config = Vec::new();
         let mut identity_ledger = Vec::new();
         let mut population = Vec::new();
@@ -4733,8 +4953,10 @@ mod tests {
         .expect("execute durable structural transaction");
         let mut fast_parents = parents;
         let mut fast_ledger = ledger;
+        let mut fast_request = request.clone();
+        fast_request.thread_cap = 8;
         let fast = execute_v5_evolved_transaction_fast_ephemeral_with_progress(
-            request.clone(),
+            fast_request.clone(),
             &mut fast_parents,
             &mut fast_ledger,
             None,
@@ -4752,8 +4974,8 @@ mod tests {
             "fast construction must preserve the complete durable transaction",
         );
 
-        let durable_bundle = publish_structural_bundle(&request, &inputs, &durable);
-        let fast_bundle = publish_structural_bundle(&request, &inputs, &fast);
+        let durable_bundle = publish_structural_bundle(&request, &inputs, &durable, false);
+        let fast_bundle = publish_structural_bundle(&fast_request, &inputs, &fast, true);
         assert_eq!(
             durable_bundle.fragment_receipt,
             fast_bundle.fragment_receipt
