@@ -4020,7 +4020,21 @@ fn validate_catalog_bound_resources(
 
 fn validate_generated_cooldown_closure(program: &Value) -> Result<()> {
     let nodes = rows_by_id(&node_rows(program)?, "node")?;
-    let mut allowed = BTreeSet::new();
+    for node in node_rows(program)? {
+        let mut walked = Vec::new();
+        guard_walk(
+            required(&node, "guard", "node guard owner")?,
+            Vec::new(),
+            &mut walked,
+        )?;
+        if walked.iter().any(|(_, value)| {
+            object_get(value, "kind").and_then(Value::as_str) == Some("action_cooldown_elapsed")
+        }) {
+            return Err(invalid(
+                "action cooldown must be owned by its authored management edge",
+            ));
+        }
+    }
     for edge in edge_rows(program)? {
         let target = text(required(&edge, "target", "edge")?, "edge target")?;
         let target_is_management = nodes
@@ -4028,16 +4042,13 @@ fn validate_generated_cooldown_closure(program: &Value) -> Result<()> {
             .and_then(|node| object_get(node, "zone"))
             .and_then(Value::as_str)
             == Some("management");
-        if target_is_management
+        let expected_transition = (target_is_management
             && object_get(&edge, "effect")
                 .and_then(Value::as_str)
-                .is_some()
-        {
-            allowed.insert(format!("e_{}", row_id(&edge, "management edge")?));
-        }
-    }
-    for owner in node_rows(program)?.into_iter().chain(edge_rows(program)?) {
-        let guard = required(&owner, "guard", "guard owner")?;
+                .is_some())
+        .then(|| row_id(&edge, "management edge").map(|id| format!("e_{id}")))
+        .transpose()?;
+        let guard = required(&edge, "guard", "edge guard owner")?;
         let mut walked = Vec::new();
         guard_walk(guard, Vec::new(), &mut walked)?;
         for (_, value) in walked {
@@ -4049,14 +4060,14 @@ fn validate_generated_cooldown_closure(program: &Value) -> Result<()> {
                 required(&value, "transitionId", "action cooldown guard")?,
                 "action cooldown transition ID",
             )?;
-            if !allowed.contains(&transition)
+            if expected_transition.as_deref() != Some(transition.as_str())
                 || as_u64(
                     required(&value, "actionOrdinal", "action cooldown guard")?,
                     "action cooldown action ordinal",
                 )? != 0
             {
                 return Err(invalid(
-                    "action cooldown does not close over an authored repeatable management action",
+                    "action cooldown does not name its containing authored management action",
                 ));
             }
         }
@@ -11134,28 +11145,36 @@ mod dashboard_schema_oracle_tests {
         .expect("edge array")
         .push(edge);
         assert!(validate_generated_cooldown_closure(&cooldown_program).is_ok());
-        let edges = required_mut(
-            map_mut(&mut cooldown_program, "program").expect("program"),
-            "edges",
-            "program",
-        )
-        .expect("edges");
-        let probe = edges
-            .as_array_mut()
-            .expect("edge array")
-            .last_mut()
-            .expect("probe edge");
-        let guard = required_mut(
-            map_mut(probe, "probe edge").expect("probe edge object"),
-            "guard",
-            "probe edge",
-        )
-        .expect("probe guard");
-        map_mut(guard, "probe guard").expect("guard object").insert(
-            "transitionId".to_owned(),
-            Value::String("e_missing".to_owned()),
-        );
+        let set_probe_transition = |program: &mut Value, transition_id: &str| {
+            let edges = required_mut(
+                map_mut(program, "program").expect("program"),
+                "edges",
+                "program",
+            )
+            .expect("edges");
+            let probe = edges
+                .as_array_mut()
+                .expect("edge array")
+                .last_mut()
+                .expect("probe edge");
+            let guard = required_mut(
+                map_mut(probe, "probe edge").expect("probe edge object"),
+                "guard",
+                "probe edge",
+            )
+            .expect("probe guard");
+            map_mut(guard, "probe guard").expect("guard object").insert(
+                "transitionId".to_owned(),
+                Value::String(transition_id.to_owned()),
+            );
+        };
+        set_probe_transition(&mut cooldown_program, "e_missing");
         assert!(validate_generated_cooldown_closure(&cooldown_program).is_err());
+        set_probe_transition(&mut cooldown_program, "e_hub_manage");
+        assert!(
+            validate_generated_cooldown_closure(&cooldown_program).is_err(),
+            "an existing cross-edge action must not satisfy containing-action closure",
+        );
     }
 
     #[test]

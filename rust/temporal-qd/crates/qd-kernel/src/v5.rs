@@ -1114,18 +1114,190 @@ pub fn validate_immigrant_program(program: &Value, side: &str) -> Result<()> {
     Ok(())
 }
 
-fn guard_all(values: impl IntoIterator<Item = Value>) -> Value {
+const DASHBOARD_MAX_GUARD_DEPTH: u64 = 4;
+const DASHBOARD_MAX_GUARDS_PER_COMPOSITE: usize = 8;
+
+fn compiled_guard_depth(guard: &Value) -> Result<u64> {
+    let fields = guard
+        .as_object()
+        .ok_or_else(|| invalid("v5 compiled guard must be an object"))?;
+    let kind = fields
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("v5 compiled guard lacks kind"))?;
+    let nested = match kind {
+        "all" | "any" => {
+            let children = fields
+                .get("guards")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("v5 compiled composite guard lacks ordered children"))?;
+            if children.is_empty() || children.len() > DASHBOARD_MAX_GUARDS_PER_COMPOSITE {
+                return Err(invalid(
+                    "v5 compiled composite guard exceeds Dashboard child bounds",
+                ));
+            }
+            children
+                .iter()
+                .map(compiled_guard_depth)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+        }
+        "not" => compiled_guard_depth(
+            fields
+                .get("guard")
+                .ok_or_else(|| invalid("v5 compiled negated guard lacks child"))?,
+        )?,
+        "predicate_edge" | "consecutive_true" => compiled_guard_depth(
+            fields
+                .get("predicate")
+                .ok_or_else(|| invalid("v5 compiled predicate wrapper lacks child"))?,
+        )?,
+        _ => 0,
+    };
+    Ok(1 + nested)
+}
+
+/// Flatten associative conjunctions without reordering their operands.  The
+/// authored genome depth budget does not include conjunctions introduced by
+/// lowering (source + edge + target, and the position-existence gate).  Only
+/// normalize when those wrappers would exceed Dashboard's native depth cap so
+/// existing shallow compiled identities remain stable.
+fn flatten_compiled_conjunctions(value: Value) -> Result<Value> {
+    match value {
+        Value::Object(mut fields) => {
+            let kind = fields
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("v5 compiled guard lacks kind"))?
+                .to_owned();
+            if matches!(kind.as_str(), "all" | "any") {
+                let children = fields
+                    .remove("guards")
+                    .and_then(|value| value.as_array().cloned())
+                    .ok_or_else(|| invalid("v5 compiled composite guard lacks ordered children"))?;
+                let mut normalized = children
+                    .into_iter()
+                    .map(flatten_compiled_conjunctions)
+                    .collect::<Result<Vec<_>>>()?;
+                if kind == "all" {
+                    let mut flattened = Vec::new();
+                    for child in normalized {
+                        if child.get("kind").and_then(Value::as_str) == Some("all") {
+                            flattened.extend(
+                                child
+                                    .get("guards")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned(),
+                            );
+                        } else {
+                            flattened.push(child);
+                        }
+                    }
+                    normalized = flattened;
+                }
+                if normalized.is_empty() || normalized.len() > DASHBOARD_MAX_GUARDS_PER_COMPOSITE {
+                    return Err(invalid(
+                        "v5 compiled composite guard exceeds Dashboard child bounds",
+                    ));
+                }
+                fields.insert("guards".to_owned(), array(normalized));
+            }
+            let child_key = match kind.as_str() {
+                "not" => Some("guard"),
+                "predicate_edge" | "consecutive_true" => Some("predicate"),
+                _ => None,
+            };
+            if let Some(key) = child_key {
+                let child = fields.remove(key).ok_or_else(|| {
+                    invalid(format!("v5 compiled {kind} guard lacks nested child"))
+                })?;
+                fields.insert(key.to_owned(), flatten_compiled_conjunctions(child)?);
+            }
+            Ok(Value::Object(fields))
+        }
+        _ => Err(invalid("v5 compiled guard must be an object")),
+    }
+}
+
+fn guard_all(values: impl IntoIterator<Item = Value>) -> Result<Value> {
     let mut guards = values
         .into_iter()
         .filter(|value| value.as_object().is_none_or(|map| !map.is_empty()))
         .collect::<Vec<_>>();
-    match guards.len() {
+    let guard = match guards.len() {
         0 => object([("kind", Value::String("always".to_owned()))]),
         1 => guards.remove(0),
         _ => object([
             ("kind", Value::String("all".to_owned())),
             ("guards", array(guards)),
         ]),
+    };
+    if compiled_guard_depth(&guard)? <= DASHBOARD_MAX_GUARD_DEPTH {
+        return Ok(guard);
+    }
+    let guard = flatten_compiled_conjunctions(guard)?;
+    if compiled_guard_depth(&guard)? > DASHBOARD_MAX_GUARD_DEPTH {
+        return Err(invalid(
+            "v5 compiled guard depth exceeds Dashboard maximum of 4",
+        ));
+    }
+    Ok(guard)
+}
+
+/// Rewrite only cooldown references owned by the authored management edge
+/// currently being expanded.  One-shot lowering can replace `e_edge` with
+/// phase-specific executable transitions; arbitrary strings and cooldowns for
+/// other authored actions must remain untouched.
+fn rewrite_containing_action_cooldown(
+    value: &Value,
+    authored_transition_id: &str,
+    compiled_transition_id: &str,
+) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let is_owned_cooldown = fields.get("kind").and_then(Value::as_str)
+                == Some("action_cooldown_elapsed")
+                && fields.get("transitionId").and_then(Value::as_str)
+                    == Some(authored_transition_id);
+            Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, item)| {
+                        if is_owned_cooldown && key == "transitionId" {
+                            (
+                                key.clone(),
+                                Value::String(compiled_transition_id.to_owned()),
+                            )
+                        } else {
+                            (
+                                key.clone(),
+                                rewrite_containing_action_cooldown(
+                                    item,
+                                    authored_transition_id,
+                                    compiled_transition_id,
+                                ),
+                            )
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        Value::Array(rows) => Value::Array(
+            rows.iter()
+                .map(|item| {
+                    rewrite_containing_action_cooldown(
+                        item,
+                        authored_transition_id,
+                        compiled_transition_id,
+                    )
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
     }
 }
 
@@ -1417,7 +1589,7 @@ fn compile_v5_profile_body(program: &Value) -> Result<Value> {
             clone_value(required(source, "guard", "v5 source node")?)?,
             clone_value(required(edge, "guard", "v5 edge")?)?,
             clone_value(required(target, "guard", "v5 target node")?)?,
-        ]);
+        ])?;
         match (target_zone, target_kind) {
             ("entry", "entry") => {
                 let plan_id = array_ref(
@@ -1440,7 +1612,7 @@ fn compile_v5_profile_body(program: &Value) -> Result<Value> {
                             ("expected", Value::Bool(false)),
                         ]),
                         guard,
-                    ]),
+                    ])?,
                     vec![object([
                         ("kind", Value::String("enter_next_open".to_owned())),
                         ("managementPlanId", Value::String(plan_id.to_owned())),
@@ -1482,23 +1654,29 @@ fn compile_v5_profile_body(program: &Value) -> Result<Value> {
                     let suffix = has_one_shot_break_even
                         .then(|| format!("_be{phase}"))
                         .unwrap_or_default();
+                    let authored_transition_id = format!("e_{id}");
+                    let compiled_transition_id = format!("{authored_transition_id}{suffix}");
                     let pending = if has_one_shot_break_even {
                         format!("{pending_base}_be{phase}")
                     } else {
                         pending_base.clone()
                     };
                     transitions.push(compiled_transition(
-                        format!("e_{id}{suffix}"),
+                        compiled_transition_id.clone(),
                         hub_states[phase].to_owned(),
                         pending.clone(),
                         priority,
-                        guard_all([
-                            object([
-                                ("kind", Value::String("position_exists".to_owned())),
-                                ("expected", Value::Bool(true)),
-                            ]),
-                            guard.clone(),
-                        ]),
+                        rewrite_containing_action_cooldown(
+                            &guard_all([
+                                object([
+                                    ("kind", Value::String("position_exists".to_owned())),
+                                    ("expected", Value::Bool(true)),
+                                ]),
+                                guard.clone(),
+                            ])?,
+                            &authored_transition_id,
+                            &compiled_transition_id,
+                        ),
                         vec![management_action(effect)?],
                         "evolvable.management.request",
                         "decision",
@@ -1561,7 +1739,7 @@ fn compile_v5_profile_body(program: &Value) -> Result<Value> {
                                 ("expected", Value::Bool(true)),
                             ]),
                             guard.clone(),
-                        ]),
+                        ])?,
                         vec![object([(
                             "kind",
                             Value::String("exit_next_open".to_owned()),
@@ -1707,7 +1885,7 @@ fn compile_v5_profile_body(program: &Value) -> Result<Value> {
                     ("kind", Value::String("state_age_at_least".to_owned())),
                     ("events", Value::from(timeout)),
                 ]),
-            ]),
+            ])?,
             Vec::new(),
             "evolvable.recovery.timeout",
             "decision",
@@ -13268,6 +13446,293 @@ mod tests {
             );
             assert_eq!(destination("exit_rejected_be1"), Some("position_hub_be1"));
         }
+    }
+
+    #[test]
+    fn v5_cooldowns_name_every_final_phase_specific_containing_transition() {
+        fn cooldown_transition_ids(value: &Value, output: &mut Vec<String>) {
+            match value {
+                Value::Object(fields) => {
+                    if fields.get("kind").and_then(Value::as_str) == Some("action_cooldown_elapsed")
+                    {
+                        output.push(
+                            fields
+                                .get("transitionId")
+                                .and_then(Value::as_str)
+                                .expect("cooldown transition ID")
+                                .to_owned(),
+                        );
+                    }
+                    for child in fields.values() {
+                        cooldown_transition_ids(child, output);
+                    }
+                }
+                Value::Array(rows) => {
+                    for child in rows {
+                        cooldown_transition_ids(child, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let fixture = actual_v5_golden();
+        let pair = fixture.get("pair").expect("fixture pair");
+        let long_program = pair
+            .get("long")
+            .and_then(|module| module.get("program"))
+            .expect("fixture long program");
+        let mut short_program = pair
+            .get("short")
+            .and_then(|module| module.get("program"))
+            .cloned()
+            .expect("fixture short program");
+        let cooldown_guard = |transition_id: &str| {
+            object([
+                ("kind", Value::String("all".to_owned())),
+                (
+                    "guards",
+                    array([
+                        object([("kind", Value::String("always".to_owned()))]),
+                        object([
+                            ("kind", Value::String("action_cooldown_elapsed".to_owned())),
+                            ("transitionId", Value::String(transition_id.to_owned())),
+                            ("actionOrdinal", Value::from(0)),
+                            ("evaluations", Value::from(3)),
+                        ]),
+                    ]),
+                ),
+            ])
+        };
+        let edges = short_program
+            .get_mut("edges")
+            .and_then(Value::as_array_mut)
+            .expect("short edges");
+        let management_index = edges
+            .iter()
+            .position(|edge| edge.get("id").and_then(Value::as_str) == Some("hub_manage"))
+            .expect("short management edge");
+        edges[management_index]["guard"] = cooldown_guard("e_hub_manage");
+        let mut repeatable = clone_value(&edges[management_index]).expect("repeatable edge clone");
+        repeatable["id"] = Value::String("hub_manage_repeat".to_owned());
+        repeatable["effect"] = Value::String("set_target_next_open".to_owned());
+        repeatable["guard"] = cooldown_guard("e_hub_manage_repeat");
+        edges.push(repeatable);
+
+        let long_profile = compile_immigrant_profile(long_program).expect("compile long profile");
+        let short_profile =
+            compile_v5_profile_body(&short_program).expect("compile short cooldown profile");
+        let compiled = compile_bidirectional_profile(
+            &long_profile,
+            &short_profile,
+            "qd_cooldown_regression",
+            &ModuleSourceIdentities {
+                profile_snapshot_sha256: "sha256:long-profile".to_owned(),
+                program_sha256: "sha256:long-program".to_owned(),
+            },
+            &ModuleSourceIdentities {
+                profile_snapshot_sha256: "sha256:short-profile".to_owned(),
+                program_sha256: "sha256:short-program".to_owned(),
+            },
+        )
+        .expect("compile bidirectional cooldown profile");
+        let transitions = compiled
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("compiled transitions");
+        for expected_id in [
+            "short_e_hub_manage_be0",
+            "short_e_hub_manage_repeat_be0",
+            "short_e_hub_manage_repeat_be1",
+        ] {
+            let request = transitions
+                .iter()
+                .find(|transition| {
+                    transition.get("id").and_then(Value::as_str) == Some(expected_id)
+                })
+                .expect("final phase-specific request transition");
+            let mut cooldown_ids = Vec::new();
+            cooldown_transition_ids(
+                request.get("guard").expect("management request guard"),
+                &mut cooldown_ids,
+            );
+            assert_eq!(cooldown_ids, [expected_id]);
+        }
+    }
+
+    #[test]
+    fn v5_compiler_flattens_only_overdepth_conjunctions_and_fails_closed_otherwise() {
+        let fixture = actual_v5_golden();
+        let mut program = fixture
+            .get("pair")
+            .and_then(|pair| pair.get("long"))
+            .and_then(|module| module.get("program"))
+            .cloned()
+            .expect("fixture long program");
+        let setup = program
+            .get_mut("nodes")
+            .and_then(Value::as_array_mut)
+            .expect("program nodes")
+            .iter_mut()
+            .find(|node| node.get("id").and_then(Value::as_str) == Some("setup"))
+            .expect("setup node");
+        setup["guard"] = object([
+            ("kind", Value::String("all".to_owned())),
+            (
+                "guards",
+                array([
+                    object([
+                        ("kind", Value::String("state_age_at_least".to_owned())),
+                        ("events", Value::from(1)),
+                    ]),
+                    object([
+                        ("kind", Value::String("consecutive_true".to_owned())),
+                        (
+                            "predicate",
+                            object([
+                                ("kind", Value::String("utc_time_window".to_owned())),
+                                ("startMinute", Value::from(0)),
+                                ("endMinute", Value::from(1439)),
+                                (
+                                    "weekdays",
+                                    array((0_u64..=6).map(Value::from).collect::<Vec<_>>()),
+                                ),
+                            ]),
+                        ),
+                        ("evaluations", Value::from(5)),
+                    ]),
+                ]),
+            ),
+        ]);
+        let entry_edge = program
+            .get_mut("edges")
+            .and_then(Value::as_array_mut)
+            .expect("program edges")
+            .iter_mut()
+            .find(|edge| edge.get("id").and_then(Value::as_str) == Some("setup_entry"))
+            .expect("entry edge");
+        entry_edge["guard"] = object([("kind", Value::String("always".to_owned()))]);
+
+        let profile = compile_immigrant_profile(&program).expect("compile depth regression");
+        let transition = profile
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("compiled transitions")
+            .iter()
+            .find(|transition| {
+                transition.get("id").and_then(Value::as_str) == Some("e_setup_entry")
+            })
+            .expect("compiled entry transition");
+        let guard = transition.get("guard").expect("compiled entry guard");
+        assert_eq!(
+            compiled_guard_depth(guard).expect("valid compiled guard"),
+            3
+        );
+        assert_eq!(
+            guard
+                .get("guards")
+                .and_then(Value::as_array)
+                .expect("flattened conjunction")
+                .iter()
+                .map(|item| item.get("kind").and_then(Value::as_str).unwrap_or(""))
+                .collect::<Vec<_>>(),
+            [
+                "position_exists",
+                "state_age_at_least",
+                "consecutive_true",
+                "always",
+            ],
+            "normalization must preserve left-to-right conjunction ordering",
+        );
+
+        let irreducible = object([
+            ("kind", Value::String("consecutive_true".to_owned())),
+            (
+                "predicate",
+                object([
+                    ("kind", Value::String("consecutive_true".to_owned())),
+                    (
+                        "predicate",
+                        object([
+                            ("kind", Value::String("consecutive_true".to_owned())),
+                            (
+                                "predicate",
+                                object([("kind", Value::String("always".to_owned()))]),
+                            ),
+                            ("evaluations", Value::from(2)),
+                        ]),
+                    ),
+                    ("evaluations", Value::from(2)),
+                ]),
+            ),
+            ("evaluations", Value::from(2)),
+        ]);
+        let error = guard_all([
+            irreducible,
+            object([("kind", Value::String("always".to_owned()))]),
+        ])
+        .expect_err("irreducible compiled depth must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("compiled guard depth exceeds Dashboard maximum")
+        );
+
+        let malformed = object([
+            ("kind", Value::String("all".to_owned())),
+            ("guards", Value::String("not-an-array".to_owned())),
+        ]);
+        assert!(
+            guard_all([malformed]).is_err(),
+            "normalization must not erase malformed composite children",
+        );
+
+        let eight_leaves = object([
+            ("kind", Value::String("all".to_owned())),
+            (
+                "guards",
+                array((0..8).map(|_| object([("kind", Value::String("always".to_owned()))]))),
+            ),
+        ]);
+        let depth_trigger = object([
+            ("kind", Value::String("all".to_owned())),
+            (
+                "guards",
+                array([
+                    eight_leaves,
+                    object([
+                        ("kind", Value::String("all".to_owned())),
+                        (
+                            "guards",
+                            array([
+                                object([
+                                    ("kind", Value::String("consecutive_true".to_owned())),
+                                    (
+                                        "predicate",
+                                        object([("kind", Value::String("always".to_owned()))]),
+                                    ),
+                                    ("evaluations", Value::from(2)),
+                                ]),
+                                object([("kind", Value::String("always".to_owned()))]),
+                            ]),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        assert!(
+            guard_all([
+                object([
+                    ("kind", Value::String("position_exists".to_owned())),
+                    ("expected", Value::Bool(false)),
+                ]),
+                depth_trigger,
+            ])
+            .is_err(),
+            "depth normalization must fail closed rather than exceed Dashboard's width cap",
+        );
     }
 
     #[test]
