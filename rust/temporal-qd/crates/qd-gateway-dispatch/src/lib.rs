@@ -235,6 +235,7 @@ pub struct HttpGatewayClient {
     bearer_token: Option<String>,
     max_request_bytes: usize,
     max_response_bytes: usize,
+    result_batch_limit_hint: usize,
 }
 
 impl HttpGatewayClient {
@@ -265,6 +266,7 @@ impl HttpGatewayClient {
                 .map(ToOwned::to_owned),
             max_request_bytes: request.max_request_bytes,
             max_response_bytes: request.max_response_bytes,
+            result_batch_limit_hint: request.result_batch_size,
         })
     }
 
@@ -316,6 +318,24 @@ struct GatewayMaintenance {
     status: StatusCode,
     retry_after: Option<Duration>,
 }
+
+#[derive(Debug)]
+struct GatewayResponseTooLarge {
+    endpoint: String,
+    max_response_bytes: usize,
+}
+
+impl fmt::Display for GatewayResponseTooLarge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "gateway {} response exceeds configured byte bound of {} bytes",
+            self.endpoint, self.max_response_bytes
+        )
+    }
+}
+
+impl StdError for GatewayResponseTooLarge {}
 
 impl fmt::Display for GatewayMaintenance {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -434,21 +454,49 @@ impl GatewayClient for HttpGatewayClient {
     }
 
     fn read_results(&mut self, limit: usize) -> Result<Vec<Value>> {
-        let body = self.get_json("results", &[("limit", limit.to_string())])?;
-        let map = object(&body, "gateway results response")?;
-        let results = field(map, "results")?
-            .as_array()
-            .ok_or_else(|| anyhow!("gateway results response lacks results array"))?;
-        ensure!(
-            results.len() <= limit,
-            "gateway returned more results than requested"
-        );
-        Ok(results.clone())
+        let mut limit_hint = self.result_batch_limit_hint;
+        let result = read_results_adaptively(limit, &mut limit_hint, |batch_limit| {
+            self.get_json("results", &[("limit", batch_limit.to_string())])
+        });
+        self.result_batch_limit_hint = limit_hint;
+        result
     }
 
     fn ack_results(&mut self, lease_ids: &[String]) -> Result<u64> {
         let body = self.post_json("results/ack", json!({"lease_ids": lease_ids}))?;
         unsigned(object(&body, "gateway acknowledgement response")?, "acked")
+    }
+}
+
+fn read_results_adaptively(
+    requested_limit: usize,
+    limit_hint: &mut usize,
+    mut fetch: impl FnMut(usize) -> Result<Value>,
+) -> Result<Vec<Value>> {
+    ensure!(requested_limit > 0, "gateway result limit must be positive");
+    let mut batch_limit = requested_limit.min((*limit_hint).max(1));
+    loop {
+        let body = match fetch(batch_limit) {
+            Ok(body) => body,
+            Err(error)
+                if error.downcast_ref::<GatewayResponseTooLarge>().is_some() && batch_limit > 1 =>
+            {
+                batch_limit = (batch_limit / 2).max(1);
+                *limit_hint = batch_limit;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let map = object(&body, "gateway results response")?;
+        let results = field(map, "results")?
+            .as_array()
+            .ok_or_else(|| anyhow!("gateway results response lacks results array"))?;
+        ensure!(
+            results.len() <= batch_limit,
+            "gateway returned more results than requested"
+        );
+        *limit_hint = batch_limit;
+        return Ok(results.clone());
     }
 }
 
@@ -486,13 +534,17 @@ fn parse_http_json(
         if count == 0 {
             break;
         }
-        ensure!(
-            bytes
-                .len()
-                .checked_add(count)
-                .is_some_and(|size| size <= max_response_bytes),
-            "gateway {endpoint} response exceeds configured byte bound"
-        );
+        if !bytes
+            .len()
+            .checked_add(count)
+            .is_some_and(|size| size <= max_response_bytes)
+        {
+            return Err(GatewayResponseTooLarge {
+                endpoint: endpoint.to_owned(),
+                max_response_bytes,
+            }
+            .into());
+        }
         bytes.extend_from_slice(&chunk[..count]);
     }
     serde_json::from_slice(&bytes).with_context(|| format!("parse gateway {endpoint} response"))
@@ -3388,6 +3440,56 @@ mod tests {
         request.maintenance_probe_interval = Duration::from_millis(10);
         request.maintenance_timeout = Duration::from_secs(1);
         request
+    }
+
+    #[test]
+    fn oversized_result_batches_shrink_once_and_reuse_the_safe_limit() -> Result<()> {
+        let mut hint = 128_usize;
+        let mut attempted = Vec::new();
+        let results = read_results_adaptively(128, &mut hint, |limit| {
+            attempted.push(limit);
+            if limit > 4 {
+                return Err(GatewayResponseTooLarge {
+                    endpoint: "results".to_owned(),
+                    max_response_bytes: 64 * 1024 * 1024,
+                }
+                .into());
+            }
+            Ok(
+                json!({"results":(0..limit).map(|index| json!({"index":index})).collect::<Vec<_>>() }),
+            )
+        })?;
+        assert_eq!(attempted, vec![128, 64, 32, 16, 8, 4]);
+        assert_eq!(results.len(), 4);
+        assert_eq!(hint, 4);
+
+        attempted.clear();
+        let results = read_results_adaptively(128, &mut hint, |limit| {
+            attempted.push(limit);
+            Ok(
+                json!({"results":(0..limit).map(|index| json!({"index":index})).collect::<Vec<_>>() }),
+            )
+        })?;
+        assert_eq!(attempted, vec![4]);
+        assert_eq!(results.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_single_result_remains_fail_closed() {
+        let mut hint = 8_usize;
+        let mut attempted = Vec::new();
+        let error = read_results_adaptively(8, &mut hint, |limit| {
+            attempted.push(limit);
+            Err(GatewayResponseTooLarge {
+                endpoint: "results".to_owned(),
+                max_response_bytes: 64 * 1024 * 1024,
+            }
+            .into())
+        })
+        .expect_err("one oversized completion must remain fatal");
+        assert_eq!(attempted, vec![8, 4, 2, 1]);
+        assert!(format!("{error:#}").contains("configured byte bound"));
     }
 
     #[test]
