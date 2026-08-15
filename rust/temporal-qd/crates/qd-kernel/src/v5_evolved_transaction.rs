@@ -9,6 +9,7 @@
 //! or a caller-provided candidate.
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, OnceLock,
@@ -40,27 +41,202 @@ use crate::{
         parent_reference_from_v5_evolved_material,
     },
     v5_operators::{
-        V5EvolvedChildAdmission, V5EvolvedOperatorDelta, V5EvolvedOperatorExecution,
-        V5EvolvedPairStepResult, V5EvolvedSameSideCrossoverExecution, V5EvolvedSideState,
-        V5OperatorDisposition, attempt_evolved_same_side_crossover_from_states,
-        execute_evolved_operator_selection_with_admission,
-        execute_evolved_operator_step_from_state, proposal_side_for_seed,
-        select_evolved_operator_choice_from_state,
+        V5AdmittedEvolvedOperatorSelection, V5EvolvedChildAdmission, V5EvolvedOperatorDelta,
+        V5EvolvedOperatorExecution, V5EvolvedPairStepResult, V5EvolvedSameSideCrossoverExecution,
+        V5EvolvedSideState, V5OperatorDisposition, attempt_evolved_same_side_crossover_from_states,
+        execute_admitted_evolved_operator_selection,
+        execute_admitted_evolved_operator_step_from_state,
+        execute_evolved_operator_selection_with_admission, proposal_side_for_seed,
+        select_admitted_evolved_operator_choice_from_state,
     },
 };
 
-/// Fast-ephemeral construction defers the expensive child profile admission
-/// to the immediately following sealed pair rebuild. That rebuild compiles
-/// and validates the same child and is the only state allowed to advance.
-struct V5FastEphemeralDeferredChildAdmission;
+#[derive(Default)]
+struct V5EvolvedAdmissionTelemetry {
+    vocabulary_enumerations: AtomicU64,
+    speculative_full_pair_admissions: AtomicU64,
+    changed_side_probes: AtomicU64,
+    selected_rebuilds: AtomicU64,
+    fallback_sweeps: AtomicU64,
+    changed_side_probe_nanos: AtomicU64,
+    rejection_histogram: Mutex<BTreeMap<String, u64>>,
+}
 
-impl V5EvolvedChildAdmission for V5FastEphemeralDeferredChildAdmission {
+impl V5EvolvedAdmissionTelemetry {
+    fn classify_rejection(error: &str) -> &'static str {
+        if error.contains("semantic.guard_depth_exceeded") {
+            "guardDepthExceeded"
+        } else if error.contains("semantic.action_cooldown_wrong_occurrence") {
+            "actionCooldownWrongOccurrence"
+        } else if error.contains("semantic.action_cooldown_wrong_event_class") {
+            "actionCooldownWrongEventClass"
+        } else if error.contains("semantic.action_cooldown_unknown_action") {
+            "actionCooldownUnknownAction"
+        } else if error.contains("semantic.action_cooldown_terminal_action") {
+            "actionCooldownTerminalAction"
+        } else {
+            "other"
+        }
+    }
+
+    fn counters(&self) -> BTreeMap<String, u64> {
+        let mut counters = BTreeMap::from([
+            (
+                "vocabularyEnumerations".to_owned(),
+                self.vocabulary_enumerations.load(Ordering::Relaxed),
+            ),
+            (
+                "speculativeFullPairAdmissions".to_owned(),
+                self.speculative_full_pair_admissions
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "changedSideProbes".to_owned(),
+                self.changed_side_probes.load(Ordering::Relaxed),
+            ),
+            (
+                "selectedRebuilds".to_owned(),
+                self.selected_rebuilds.load(Ordering::Relaxed),
+            ),
+            (
+                "fallbackSweeps".to_owned(),
+                self.fallback_sweeps.load(Ordering::Relaxed),
+            ),
+        ]);
+        if let Ok(histogram) = self.rejection_histogram.lock() {
+            for (reason, count) in histogram.iter() {
+                counters.insert(format!("rejection.{reason}"), *count);
+            }
+        }
+        counters
+    }
+}
+
+/// Per-construction telemetry shard. Candidate admission is hot and runs in
+/// bounded parallel workers, so recording directly into shared atomics (and a
+/// shared histogram mutex) materially perturbs the work being measured. Each
+/// proposal accumulates locally and merges once on drop, including all early
+/// return paths. The entire shard is absent when progress telemetry is off.
+struct V5EvolvedAdmissionSample<'a> {
+    aggregate: &'a V5EvolvedAdmissionTelemetry,
+    vocabulary_enumerations: Cell<u64>,
+    speculative_full_pair_admissions: Cell<u64>,
+    changed_side_probes: Cell<u64>,
+    selected_rebuilds: Cell<u64>,
+    fallback_sweeps: Cell<u64>,
+    changed_side_probe_nanos: Cell<u64>,
+    rejection_histogram: RefCell<BTreeMap<&'static str, u64>>,
+}
+
+impl<'a> V5EvolvedAdmissionSample<'a> {
+    fn new(aggregate: &'a V5EvolvedAdmissionTelemetry) -> Self {
+        Self {
+            aggregate,
+            vocabulary_enumerations: Cell::new(0),
+            speculative_full_pair_admissions: Cell::new(0),
+            changed_side_probes: Cell::new(0),
+            selected_rebuilds: Cell::new(0),
+            fallback_sweeps: Cell::new(0),
+            changed_side_probe_nanos: Cell::new(0),
+            rejection_histogram: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    fn increment(cell: &Cell<u64>) {
+        cell.set(cell.get().saturating_add(1));
+    }
+
+    fn observe_rejection(&self, error: &str) {
+        let reason = V5EvolvedAdmissionTelemetry::classify_rejection(error);
+        let mut histogram = self.rejection_histogram.borrow_mut();
+        let count = histogram.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn add_probe_wall(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.changed_side_probe_nanos
+            .set(self.changed_side_probe_nanos.get().saturating_add(nanos));
+    }
+}
+
+impl Drop for V5EvolvedAdmissionSample<'_> {
+    fn drop(&mut self) {
+        for (target, source) in [
+            (
+                &self.aggregate.vocabulary_enumerations,
+                &self.vocabulary_enumerations,
+            ),
+            (
+                &self.aggregate.speculative_full_pair_admissions,
+                &self.speculative_full_pair_admissions,
+            ),
+            (
+                &self.aggregate.changed_side_probes,
+                &self.changed_side_probes,
+            ),
+            (&self.aggregate.selected_rebuilds, &self.selected_rebuilds),
+            (&self.aggregate.fallback_sweeps, &self.fallback_sweeps),
+            (
+                &self.aggregate.changed_side_probe_nanos,
+                &self.changed_side_probe_nanos,
+            ),
+        ] {
+            target.fetch_add(source.get(), Ordering::Relaxed);
+        }
+        if let Ok(mut aggregate) = self.aggregate.rejection_histogram.lock() {
+            for (reason, count) in self.rejection_histogram.get_mut().iter() {
+                let aggregate_count = aggregate.entry((*reason).to_owned()).or_default();
+                *aggregate_count = aggregate_count.saturating_add(*count);
+            }
+        }
+    }
+}
+
+struct V5InstrumentedChildAdmission<'sample, 'aggregate> {
+    inner: &'sample V5SealedEvolvedPairRecompiler,
+    telemetry: &'sample V5EvolvedAdmissionSample<'aggregate>,
+}
+
+impl V5EvolvedChildAdmission for V5InstrumentedChildAdmission<'_, '_> {
     fn admit_evolved_child(
         &self,
-        _operator_id: &str,
-        _child_program: &Value,
+        operator_id: &str,
+        child_program: &Value,
     ) -> crate::v5_operators::Result<()> {
-        Ok(())
+        V5EvolvedAdmissionSample::increment(&self.telemetry.changed_side_probes);
+        let started = Instant::now();
+        let result = self.inner.admit_evolved_child(operator_id, child_program);
+        self.telemetry.add_probe_wall(started.elapsed());
+        if let Err(error) = &result {
+            self.telemetry.observe_rejection(&error.to_string());
+        }
+        result
+    }
+}
+
+struct V5FullPairChildAdmission<'sample, 'aggregate> {
+    inner: &'sample V5SealedEvolvedPairRecompiler,
+    telemetry: Option<&'sample V5EvolvedAdmissionSample<'aggregate>>,
+}
+
+impl V5EvolvedChildAdmission for V5FullPairChildAdmission<'_, '_> {
+    fn admit_evolved_child(
+        &self,
+        operator_id: &str,
+        child_program: &Value,
+    ) -> crate::v5_operators::Result<()> {
+        if let Some(telemetry) = self.telemetry {
+            V5EvolvedAdmissionSample::increment(&telemetry.speculative_full_pair_admissions);
+        }
+        let result = self
+            .inner
+            .admit_evolved_child_full_pair(operator_id, child_program)
+            .map_err(|error| crate::v5_operators::V5OperatorError::Invalid(error.to_string()));
+        if let (Some(telemetry), Err(error)) = (self.telemetry, &result) {
+            telemetry.observe_rejection(&error.to_string());
+        }
+        result
     }
 }
 
@@ -2931,20 +3107,20 @@ fn mutation_selection_failure(
 fn execute_fast_ephemeral_operator_step_once(
     state: &V5EvolvedSideState,
     authority: &crate::v5_operators::V5OperatorAuthority,
-    selection: crate::v5_operators::V5EvolvedOperatorSelection,
+    admitted: V5AdmittedEvolvedOperatorSelection,
     recompiler: &V5SealedEvolvedPairRecompiler,
+    admission_telemetry: Option<&V5EvolvedAdmissionSample<'_>>,
 ) -> Result<(
     V5EvolvedPairStepResult,
     Option<V5SealedEvolvedPairRecompiler>,
 )> {
-    let replay_selection = selection.clone();
-    let operator_execution = execute_evolved_operator_selection_with_admission(
+    let replay_selection = admitted.replay_selection();
+    let operator_execution = execute_admitted_evolved_operator_selection(
         &state.pair_identity_sha256,
         &state.program,
         authority,
         &state.compiled_profile,
-        selection,
-        &V5FastEphemeralDeferredChildAdmission,
+        admitted,
     )
     .map_err(|error| contract(error.to_string()))?;
     let delta = operator_execution.delta.clone();
@@ -3020,13 +3196,19 @@ fn execute_fast_ephemeral_operator_step_once(
             // the exact durable rejection code/detail instead of being
             // relabeled as a pair-recompile failure. Successful fast-path
             // children still pay for one compile, not two.
+            if let Some(telemetry) = admission_telemetry {
+                V5EvolvedAdmissionSample::increment(&telemetry.fallback_sweeps);
+            }
             let verified_execution = execute_evolved_operator_selection_with_admission(
                 &state.pair_identity_sha256,
                 &state.program,
                 authority,
                 &state.compiled_profile,
                 replay_selection,
-                recompiler,
+                &V5FullPairChildAdmission {
+                    inner: recompiler,
+                    telemetry: admission_telemetry,
+                },
             )
             .map_err(|admission_error| contract(admission_error.to_string()))?;
             let verified_delta = verified_execution.delta.clone();
@@ -3070,6 +3252,7 @@ fn construct_sealed_mutation(
     planned: &PlannedProposal,
     birth_ordinal: u64,
     parent_cache: Option<&V5VerifiedParentCache>,
+    admission_telemetry: Option<&V5EvolvedAdmissionTelemetry>,
 ) -> Result<V5EvolvedConstructionOutcome> {
     let (scheduled_parent, depth) = match &planned.intent {
         ProposalIntent::StructuralMutation {
@@ -3104,13 +3287,28 @@ fn construct_sealed_mutation(
     let mut steps = Vec::new();
     let mut terminal_plan = None;
     let mut terminal_application = None;
+    let admission_sample = admission_telemetry.map(V5EvolvedAdmissionSample::new);
 
     for step_index in 0..u64::from(depth) {
-        let selection = match select_evolved_operator_choice_from_state(
+        if let Some(telemetry) = admission_sample.as_ref() {
+            V5EvolvedAdmissionSample::increment(&telemetry.vocabulary_enumerations);
+        }
+        let instrumented_admission =
+            admission_sample
+                .as_ref()
+                .map(|telemetry| V5InstrumentedChildAdmission {
+                    inner: &recompiler,
+                    telemetry,
+                });
+        let admission: &dyn V5EvolvedChildAdmission = instrumented_admission
+            .as_ref()
+            .map(|admission| admission as &dyn V5EvolvedChildAdmission)
+            .unwrap_or(&recompiler);
+        let selection = match select_admitted_evolved_operator_choice_from_state(
             proposal_seed,
             &current_state,
             &operator_authority,
-            &recompiler,
+            admission,
         ) {
             Ok(selection) => selection,
             Err(error) => {
@@ -3132,19 +3330,22 @@ fn construct_sealed_mutation(
                 );
             }
         };
+        if let Some(telemetry) = admission_sample.as_ref() {
+            V5EvolvedAdmissionSample::increment(&telemetry.selected_rebuilds);
+        }
         let step_result = if parent_cache.is_some() {
             execute_fast_ephemeral_operator_step_once(
                 &current_state,
                 &operator_authority,
                 selection,
                 &recompiler,
+                admission_sample.as_ref(),
             )
         } else {
-            execute_evolved_operator_step_from_state(
+            execute_admitted_evolved_operator_step_from_state(
                 &current_state,
                 &operator_authority,
                 selection,
-                &recompiler,
                 &recompiler,
             )
             .map(|result| (result, None))
@@ -3711,6 +3912,7 @@ fn construct_sealed_crossover(
 #[derive(Default)]
 struct NativeV5EvolvedConstructionEngine {
     parent_cache: Option<Arc<V5VerifiedParentCache>>,
+    admission_telemetry: Option<Arc<V5EvolvedAdmissionTelemetry>>,
 }
 
 impl NativeV5EvolvedConstructionEngine {
@@ -3721,7 +3923,16 @@ impl NativeV5EvolvedConstructionEngine {
     fn fast_ephemeral() -> Self {
         Self {
             parent_cache: Some(Arc::new(V5VerifiedParentCache::default())),
+            admission_telemetry: None,
         }
+    }
+
+    fn enable_admission_telemetry(&mut self) {
+        self.admission_telemetry = Some(Arc::new(V5EvolvedAdmissionTelemetry::default()));
+    }
+
+    fn admission_telemetry(&self) -> Option<&V5EvolvedAdmissionTelemetry> {
+        self.admission_telemetry.as_deref()
     }
 
     fn parent_cache_telemetry(&self) -> Option<(u64, u64, Duration)> {
@@ -3751,6 +3962,7 @@ impl NativeV5EvolvedConstructionEngine {
                 planned,
                 birth_ordinal,
                 self.parent_cache.as_deref(),
+                self.admission_telemetry(),
             ),
             ProposalIntent::SameSideCrossover { .. } => construct_sealed_crossover(
                 authority,
@@ -3782,7 +3994,7 @@ fn verify_native_construction_replay(
             construct_sealed_immigrant(authority, request, planned, birth_ordinal)?
         }
         ProposalIntent::StructuralMutation { .. } => {
-            construct_sealed_mutation(authority, request, planned, birth_ordinal, None)?
+            construct_sealed_mutation(authority, request, planned, birth_ordinal, None, None)?
         }
         ProposalIntent::SameSideCrossover { .. } => {
             construct_sealed_crossover(authority, request, planned, birth_ordinal, None)?
@@ -6388,6 +6600,24 @@ where
         .map(|(result, _)| result)
 }
 
+fn record_admission_telemetry(
+    progress: Option<&NativeProgressHandle>,
+    telemetry: Option<&V5EvolvedAdmissionTelemetry>,
+) {
+    let (Some(progress), Some(telemetry)) = (progress, telemetry) else {
+        return;
+    };
+    let probe_count = telemetry.changed_side_probes.load(Ordering::Relaxed);
+    progress.record_section(NativeProgressSection {
+        name: "evolved_changed_side_admission".to_owned(),
+        wall: Duration::from_nanos(telemetry.changed_side_probe_nanos.load(Ordering::Relaxed)),
+        completed_work_units: Some(probe_count),
+        parallel_workers: None,
+        ..NativeProgressSection::default()
+    });
+    progress.emit_counters("evolved_admission", &telemetry.counters());
+}
+
 /// Execute the write-neutral native later-generation v5 transaction.
 ///
 /// The only construction implementation bound here is the sealed Rust
@@ -6409,8 +6639,11 @@ pub fn execute_v5_evolved_transaction_with_progress(
     ledger: &mut dyn IdentityLedger,
     progress: Option<&NativeProgressHandle>,
 ) -> Result<V5EvolvedTransactionResult> {
-    let engine = NativeV5EvolvedConstructionEngine::durable();
-    execute_with_constructor(
+    let mut engine = NativeV5EvolvedConstructionEngine::durable();
+    if progress.is_some_and(NativeProgressHandle::is_enabled) {
+        engine.enable_admission_telemetry();
+    }
+    let result = execute_with_constructor(
         request,
         parents,
         ledger,
@@ -6419,7 +6652,9 @@ pub fn execute_v5_evolved_transaction_with_progress(
         |authority, request, planned, birth_ordinal| {
             engine.construct(authority, request, planned, birth_ordinal)
         },
-    )
+    )?;
+    record_admission_telemetry(progress, engine.admission_telemetry());
+    Ok(result)
 }
 
 /// Fast-ephemeral-only evolved construction. It preserves the exact serial
@@ -6433,7 +6668,10 @@ pub fn execute_v5_evolved_transaction_fast_ephemeral_with_progress(
     ledger: &mut dyn IdentityLedger,
     progress: Option<&NativeProgressHandle>,
 ) -> Result<V5EvolvedTransactionResult> {
-    let engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
+    let mut engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
+    if progress.is_some_and(NativeProgressHandle::is_enabled) {
+        engine.enable_admission_telemetry();
+    }
     let result = execute_with_constructor(
         request,
         parents,
@@ -6462,6 +6700,7 @@ pub fn execute_v5_evolved_transaction_fast_ephemeral_with_progress(
             ..NativeProgressSection::default()
         });
     }
+    record_admission_telemetry(progress, engine.admission_telemetry());
     Ok(result)
 }
 
@@ -6522,6 +6761,33 @@ mod scheduler_tests {
 
     fn sha(value: Value) -> String {
         canonical_sha256(&value).expect("canonical test SHA-256")
+    }
+
+    #[test]
+    fn admission_telemetry_is_absent_until_enabled_and_shards_merge_once() {
+        let mut engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
+        assert!(engine.admission_telemetry().is_none());
+        engine.enable_admission_telemetry();
+        let aggregate = engine
+            .admission_telemetry()
+            .expect("explicitly enabled admission telemetry");
+        {
+            let shard = V5EvolvedAdmissionSample::new(aggregate);
+            V5EvolvedAdmissionSample::increment(&shard.vocabulary_enumerations);
+            V5EvolvedAdmissionSample::increment(&shard.changed_side_probes);
+            V5EvolvedAdmissionSample::increment(&shard.selected_rebuilds);
+            shard.add_probe_wall(Duration::from_nanos(17));
+            shard.observe_rejection("v5 evolved program admission failed: fixture rejection");
+        }
+        let counters = aggregate.counters();
+        assert_eq!(counters.get("vocabularyEnumerations"), Some(&1));
+        assert_eq!(counters.get("changedSideProbes"), Some(&1));
+        assert_eq!(counters.get("selectedRebuilds"), Some(&1));
+        assert_eq!(counters.get("rejection.other"), Some(&1));
+        assert_eq!(
+            aggregate.changed_side_probe_nanos.load(Ordering::Relaxed),
+            17
+        );
     }
 
     fn shared_authority_fixture() -> Value {
@@ -6959,8 +7225,9 @@ mod scheduler_tests {
         };
         let receipt = parent_selection_receipt_for_planned(&planned, &parent, None)
             .expect("bind aggregate-no-op parent receipt");
-        let accepted_step = construct_sealed_mutation(&authority, &request, &planned, 0, None)
-            .expect("construct evidence-bearing mutation probe");
+        let accepted_step =
+            construct_sealed_mutation(&authority, &request, &planned, 0, None, None)
+                .expect("construct evidence-bearing mutation probe");
         let accepted_delta = accepted_step
             .delta
             .expect("mutation probe must retain its delta");
@@ -7081,11 +7348,56 @@ mod scheduler_tests {
                 mutation_depth: 1,
             },
         };
-        let durable_outcome = construct_sealed_mutation(&authority, &request, &planned, 0, None)
-            .expect("sealed durable native mutation path");
+        let scheduled_parent = match &planned.intent {
+            ProposalIntent::StructuralMutation { parent, .. } => parent,
+            _ => unreachable!("constructed mutation intent"),
+        };
+        let parent_material = load_v5_evolved_parent(&authority, scheduled_parent)
+            .expect("load differential admission parent");
+        let side = proposal_side_for_seed(planned.intent.proposal_seed())
+            .expect("derive differential admission side");
+        let operator_authority = authority
+            .operator_authority_projection()
+            .expect("project differential admission authority")
+            .operator_authority(side)
+            .expect("select differential admission side authority");
+        let recompiler = V5SealedEvolvedPairRecompiler::from_verified_parent(
+            &authority,
+            &parent_material,
+            planned.intent.proposal_seed(),
+        )
+        .expect("start differential admission recompiler");
+        let state = recompiler
+            .state_for_side(side)
+            .expect("load differential admission state");
+        let probed = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
+            &state.program,
+            &operator_authority,
+            &state.compiled_profile,
+            &recompiler,
+        )
+        .expect("enumerate changed-side admission vocabulary");
+        let full = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
+            &state.program,
+            &operator_authority,
+            &state.compiled_profile,
+            &V5FullPairChildAdmission {
+                inner: &recompiler,
+                telemetry: None,
+            },
+        )
+        .expect("enumerate full-pair reference vocabulary");
+        assert_eq!(
+            probed, full,
+            "changed-side probe must preserve the exact full-pair admitted vocabulary",
+        );
+        let durable_outcome =
+            construct_sealed_mutation(&authority, &request, &planned, 0, None, None)
+                .expect("sealed durable native mutation path");
         let cache = V5VerifiedParentCache::default();
-        let outcome = construct_sealed_mutation(&authority, &request, &planned, 0, Some(&cache))
-            .expect("sealed fast-ephemeral native mutation path");
+        let outcome =
+            construct_sealed_mutation(&authority, &request, &planned, 0, Some(&cache), None)
+                .expect("sealed fast-ephemeral native mutation path");
         assert_eq!(outcome.disposition, durable_outcome.disposition);
         assert_eq!(outcome.reason_code, durable_outcome.reason_code);
         assert_eq!(outcome.stage, durable_outcome.stage);

@@ -10298,17 +10298,33 @@ pub(crate) fn select_evolved_operator_choice(
     )
 }
 
-/// Select from the exact Python legacy vocabulary after the transaction's
-/// full compiled-child admission gate has removed ineligible constructions.
-/// This is the production selection entry point for later generations.
-pub(crate) fn select_evolved_operator_choice_with_admission(
+/// Private currentness capability produced together with one deterministic
+/// selection. It binds the exact admitted choice to the parent pair, program,
+/// and compiled profile, allowing the immediate executor to avoid rebuilding
+/// the full vocabulary while rejecting stale or substituted state.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct V5AdmittedEvolvedOperatorSelection {
+    selection: V5EvolvedOperatorSelection,
+    admitted_choice: V5LegacyOperatorChoice,
+    parent_pair_identity_sha256: String,
+    parent_program_sha256: String,
+    compiled_profile_genome_sha256: String,
+}
+
+impl V5AdmittedEvolvedOperatorSelection {
+    pub(crate) fn replay_selection(&self) -> V5EvolvedOperatorSelection {
+        self.selection.clone()
+    }
+}
+
+fn select_admitted_evolved_operator_choice(
     proposal_seed: &str,
     parent_identity_sha256: &str,
     parent_program: &Value,
     authority: &V5OperatorAuthority,
     profile: &V5CompiledProfileView,
     admission: &dyn V5EvolvedChildAdmission,
-) -> Result<V5EvolvedOperatorSelection> {
+) -> Result<V5AdmittedEvolvedOperatorSelection> {
     let parent_identity_sha256 = sha256_identifier(
         &Value::String(parent_identity_sha256.to_owned()),
         "evolved operator selection parent identity SHA-256",
@@ -10416,7 +10432,7 @@ pub(crate) fn select_evolved_operator_choice_with_admission(
         ("proposalSeed", Value::String(proposal_seed.to_owned())),
         (
             "parentIdentitySha256",
-            Value::String(parent_identity_sha256),
+            Value::String(parent_identity_sha256.clone()),
         ),
         ("family", Value::String(family)),
         ("mutationClass", selected_class),
@@ -10441,11 +10457,39 @@ pub(crate) fn select_evolved_operator_choice_with_admission(
     let receipt_sha = sha(&receipt)?;
     map_mut(&mut receipt, "evolved operator selection receipt")?
         .insert("selectionSha256".to_owned(), Value::String(receipt_sha));
-    Ok(V5EvolvedOperatorSelection {
-        native_plan: choice.native_plan,
-        legacy_choice: choice.legacy_choice,
+    let selection = V5EvolvedOperatorSelection {
+        native_plan: choice.native_plan.clone(),
+        legacy_choice: choice.legacy_choice.clone(),
         receipt,
+    };
+    Ok(V5AdmittedEvolvedOperatorSelection {
+        selection,
+        admitted_choice: choice,
+        parent_pair_identity_sha256: parent_identity_sha256,
+        parent_program_sha256: sha(parent_program)?,
+        compiled_profile_genome_sha256: profile.genome_program_sha256().to_owned(),
     })
+}
+
+/// Select from the exact Python legacy vocabulary after the transaction's
+/// compiled-child admission gate has removed ineligible constructions.
+pub(crate) fn select_evolved_operator_choice_with_admission(
+    proposal_seed: &str,
+    parent_identity_sha256: &str,
+    parent_program: &Value,
+    authority: &V5OperatorAuthority,
+    profile: &V5CompiledProfileView,
+    admission: &dyn V5EvolvedChildAdmission,
+) -> Result<V5EvolvedOperatorSelection> {
+    Ok(select_admitted_evolved_operator_choice(
+        proposal_seed,
+        parent_identity_sha256,
+        parent_program,
+        authority,
+        profile,
+        admission,
+    )?
+    .selection)
 }
 
 /// Select from a pair-reidentified side state.  Later-generation callers
@@ -10460,6 +10504,23 @@ pub(crate) fn select_evolved_operator_choice_from_state(
 ) -> Result<V5EvolvedOperatorSelection> {
     state.validate_for_authority(authority)?;
     select_evolved_operator_choice_with_admission(
+        proposal_seed,
+        &state.pair_identity_sha256,
+        &state.program,
+        authority,
+        &state.compiled_profile,
+        admission,
+    )
+}
+
+pub(crate) fn select_admitted_evolved_operator_choice_from_state(
+    proposal_seed: &str,
+    state: &V5EvolvedSideState,
+    authority: &V5OperatorAuthority,
+    admission: &dyn V5EvolvedChildAdmission,
+) -> Result<V5AdmittedEvolvedOperatorSelection> {
+    state.validate_for_authority(authority)?;
+    select_admitted_evolved_operator_choice(
         proposal_seed,
         &state.pair_identity_sha256,
         &state.program,
@@ -10619,29 +10680,117 @@ pub(crate) fn execute_evolved_operator_selection_with_admission(
     }
 }
 
-/// Execute one selected operation and require a transaction-owned pair
-/// recompilation before returning state that can drive another selection.
-///
-/// A structural child can be accepted while the bidirectional pair compiler
-/// rejects it.  That is represented as a deterministic rejected pair-step,
-/// with the evolved delta/trace retained for the journal but without a next
-/// state, so callers cannot accidentally continue from the uncompiled child.
-pub(crate) fn execute_evolved_operator_step_from_state(
+/// Execute the exact admitted choice retained by the immediately preceding
+/// selection. The capability is private to this module and binds every state
+/// input that the historical currentness sweep re-derived, so no caller can
+/// substitute a merely self-hashed selection while skipping enumeration.
+pub(crate) fn execute_admitted_evolved_operator_selection(
+    parent_pair_identity_sha256: &str,
+    parent_program: &Value,
+    authority: &V5OperatorAuthority,
+    profile: &V5CompiledProfileView,
+    admitted: V5AdmittedEvolvedOperatorSelection,
+) -> Result<V5EvolvedOperatorExecution> {
+    let parent_pair_identity_sha256 = sha256_identifier(
+        &Value::String(parent_pair_identity_sha256.to_owned()),
+        "evolved admitted execution parent pair identity SHA-256",
+    )?;
+    validate_program(parent_program, authority)?;
+    if admitted.parent_pair_identity_sha256 != parent_pair_identity_sha256
+        || admitted.parent_program_sha256 != sha(parent_program)?
+        || admitted.compiled_profile_genome_sha256 != profile.genome_program_sha256()
+        || profile.genome_program_sha256() != sha(parent_program)?
+        || admitted.selection.native_plan != admitted.admitted_choice.native_plan
+        || admitted.selection.legacy_choice != admitted.admitted_choice.legacy_choice
+        || sha(&admitted.selection.legacy_choice)? != admitted.admitted_choice.legacy_choice_sha256
+    {
+        return Err(invalid(
+            "admitted evolved operator selection is stale, foreign, or substituted",
+        ));
+    }
+    let selection = admitted.selection;
+    let result_for = |disposition,
+                      reason_code: &str,
+                      detail: Value,
+                      application: Option<&V5OperatorApplication>| {
+        execution_result(
+            disposition,
+            authority,
+            parent_program,
+            &selection.native_plan,
+            reason_code,
+            detail,
+            application,
+        )
+    };
+    match apply_verified_operator_plan(
+        parent_program,
+        authority,
+        admitted.admitted_choice.native_plan,
+    ) {
+        Ok(application) => {
+            let trace = canonical_clone(required(
+                &application.audit,
+                "mutationTrace",
+                "evolved operator application",
+            )?)?;
+            let child_program_sha256 = sha(&application.child_program)?;
+            let delta = V5EvolvedOperatorDelta {
+                side: authority.side().to_owned(),
+                parent_pair_identity_sha256,
+                parent_program_sha256: sha(parent_program)?,
+                child_program: canonical_clone(&application.child_program)?,
+                child_program_sha256,
+                native_plan: canonical_clone(&selection.native_plan)?,
+                legacy_choice: canonical_clone(&selection.legacy_choice)?,
+                trace,
+            };
+            Ok(V5EvolvedOperatorExecution {
+                disposition: V5OperatorDisposition::Accepted,
+                reason_code: "accepted".to_owned(),
+                result: result_for(
+                    V5OperatorDisposition::Accepted,
+                    "accepted",
+                    object([("kind", Value::String("applied".to_owned()))]),
+                    Some(&application),
+                )?,
+                selection,
+                application: Some(application),
+                delta: Some(delta),
+            })
+        }
+        Err(error) => {
+            let no_op =
+                matches!(&error, V5OperatorError::Invalid(message) if message.contains("no-op"));
+            let disposition = if no_op {
+                V5OperatorDisposition::NoOp
+            } else {
+                V5OperatorDisposition::Rejected
+            };
+            let reason_code = if no_op { "no_op" } else { "operator_rejected" };
+            Ok(V5EvolvedOperatorExecution {
+                disposition,
+                reason_code: reason_code.to_owned(),
+                result: result_for(
+                    disposition,
+                    reason_code,
+                    Value::String(error.to_string()),
+                    None,
+                )?,
+                selection,
+                application: None,
+                delta: None,
+            })
+        }
+    }
+}
+
+fn finish_evolved_operator_step(
     state: &V5EvolvedSideState,
     authority: &V5OperatorAuthority,
-    selection: V5EvolvedOperatorSelection,
-    admission: &dyn V5EvolvedChildAdmission,
+    operator_execution: V5EvolvedOperatorExecution,
     recompiler: &dyn V5EvolvedPairRecompiler,
 ) -> Result<V5EvolvedPairStepResult> {
-    state.validate_for_authority(authority)?;
-    let operator_execution = execute_evolved_operator_selection_with_admission(
-        &state.pair_identity_sha256,
-        &state.program,
-        authority,
-        &state.compiled_profile,
-        selection,
-        admission,
-    )?;
     let delta = operator_execution.delta.clone();
     if operator_execution.disposition != V5OperatorDisposition::Accepted {
         return Ok(V5EvolvedPairStepResult {
@@ -10701,6 +10850,49 @@ pub(crate) fn execute_evolved_operator_step_from_state(
             next_side_state: None,
         }),
     }
+}
+
+/// Execute one selected operation and require a transaction-owned pair
+/// recompilation before returning state that can drive another selection.
+///
+/// A structural child can be accepted while the bidirectional pair compiler
+/// rejects it.  That is represented as a deterministic rejected pair-step,
+/// with the evolved delta/trace retained for the journal but without a next
+/// state, so callers cannot accidentally continue from the uncompiled child.
+pub(crate) fn execute_evolved_operator_step_from_state(
+    state: &V5EvolvedSideState,
+    authority: &V5OperatorAuthority,
+    selection: V5EvolvedOperatorSelection,
+    admission: &dyn V5EvolvedChildAdmission,
+    recompiler: &dyn V5EvolvedPairRecompiler,
+) -> Result<V5EvolvedPairStepResult> {
+    state.validate_for_authority(authority)?;
+    let operator_execution = execute_evolved_operator_selection_with_admission(
+        &state.pair_identity_sha256,
+        &state.program,
+        authority,
+        &state.compiled_profile,
+        selection,
+        admission,
+    )?;
+    finish_evolved_operator_step(state, authority, operator_execution, recompiler)
+}
+
+pub(crate) fn execute_admitted_evolved_operator_step_from_state(
+    state: &V5EvolvedSideState,
+    authority: &V5OperatorAuthority,
+    admitted: V5AdmittedEvolvedOperatorSelection,
+    recompiler: &dyn V5EvolvedPairRecompiler,
+) -> Result<V5EvolvedPairStepResult> {
+    state.validate_for_authority(authority)?;
+    let operator_execution = execute_admitted_evolved_operator_selection(
+        &state.pair_identity_sha256,
+        &state.program,
+        authority,
+        &state.compiled_profile,
+        admitted,
+    )?;
+    finish_evolved_operator_step(state, authority, operator_execution, recompiler)
 }
 
 #[cfg(test)]

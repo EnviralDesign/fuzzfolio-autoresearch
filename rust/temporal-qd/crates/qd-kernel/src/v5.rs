@@ -2661,6 +2661,68 @@ fn compile_side_v3(
     })
 }
 
+/// Prove that a freshly compiled side profile is inside the closed v2->v3
+/// namespace surface without materializing the v3 side. All deeper source
+/// references were already checked by `validate_program` before the v2
+/// profile was compiled. Prefixing is the only bidirectional transformation
+/// that can introduce a new side-local failure for that admitted profile.
+fn validate_bidirectional_side_namespace_closure(profile: &Value, side: &str) -> Result<()> {
+    if field(profile, "version").and_then(Value::as_str) != Some("v2")
+        || field(profile, "directionMode").and_then(Value::as_str) != Some(side)
+    {
+        return Err(invalid(
+            "v5 bidirectional probe requires a matching v2 side profile",
+        ));
+    }
+    let graph = required(profile, "graph", "v5 bidirectional probe profile")?;
+    for (field_name, label) in [
+        ("states", "state"),
+        ("evidenceGroups", "evidence group"),
+        ("eventBindings", "event binding"),
+        ("transitions", "transition"),
+    ] {
+        for row in array_ref(
+            required(graph, field_name, "v5 bidirectional probe graph")?,
+            "v5 bidirectional probe graph rows",
+        )? {
+            let _ = namespace_id(side, &row_id(row, label)?)?;
+        }
+    }
+    for indicator in array_ref(
+        required(profile, "indicators", "v5 bidirectional probe profile")?,
+        "v5 bidirectional probe indicators",
+    )? {
+        let _ = namespace_id(side, &indicator_id(indicator)?)?;
+    }
+    let library = required(profile, "executionConfig", "v5 bidirectional probe profile").and_then(
+        |value| {
+            required(
+                value,
+                "managementLibrary",
+                "v5 bidirectional probe execution config",
+            )
+        },
+    )?;
+    for plan in array_ref(
+        required(
+            library,
+            "plans",
+            "v5 bidirectional probe management library",
+        )?,
+        "v5 bidirectional probe management plans",
+    )? {
+        let _ = namespace_id(side, &row_id(plan, "management plan")?)?;
+    }
+    for binding in field(library, "scalarBindings")
+        .map(|value| array_ref(value, "v5 bidirectional probe scalar bindings"))
+        .transpose()?
+        .unwrap_or(&[])
+    {
+        let _ = namespace_id(side, &row_id(binding, "management scalar binding")?)?;
+    }
+    Ok(())
+}
+
 /// Closed native v2→v3 compiler for the generated v5 profile subset.  Its
 /// output shape intentionally mirrors the frozen Dashboard compiler; native
 /// validation remains a separate explicit step.
@@ -8878,6 +8940,54 @@ impl V5SealedEvolvedPairRecompiler {
     }
 
     fn admit_evolved_child_core(&self, operator_id: &str, child_program: &Value) -> Result<()> {
+        let _ = text(
+            &Value::String(operator_id.to_owned()),
+            "v5 evolved child operator ID",
+        )?;
+        let side = exact_side(&text(
+            required(child_program, "direction", "v5 evolved child program")?,
+            "v5 evolved child program direction",
+        )?)?;
+        let opposite_side = if side == "long" { "short" } else { "long" };
+        let child_program_sha256 = canonical_sha256(child_program)?;
+        let child_candidate_id =
+            v5_module_candidate_id(&self.proposal_seed, side, &child_program_sha256)?;
+        let child =
+            compile_v5_module_profile(child_program, &self.projection, side, &child_candidate_id)?;
+        validate_bidirectional_side_namespace_closure(&child.profile, side)?;
+        let opposite = &self.runtime.state(opposite_side)?.compiled_profile;
+        if required(&child.profile, "instruments", "v5 evolved child profile")?
+            != required(
+                opposite.profile(),
+                "instruments",
+                "v5 evolved opposite profile",
+            )?
+            || required(
+                required(&child.profile, "graph", "v5 evolved child profile")?,
+                "clockRequirement",
+                "v5 evolved child graph",
+            )? != required(
+                required(opposite.profile(), "graph", "v5 evolved opposite profile")?,
+                "clockRequirement",
+                "v5 evolved opposite graph",
+            )?
+        {
+            return Err(invalid(
+                "v5 evolved child is incompatible with the sealed opposite module",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reference admission retained for fallback error precedence and
+    /// differential tests. Normal selection must use the changed-side probe
+    /// above; only an unexpected selected rebuild failure pays this complete
+    /// two-module/pair compiler sweep.
+    pub(crate) fn admit_evolved_child_full_pair(
+        &self,
+        operator_id: &str,
+        child_program: &Value,
+    ) -> Result<()> {
         let _ = text(
             &Value::String(operator_id.to_owned()),
             "v5 evolved child operator ID",

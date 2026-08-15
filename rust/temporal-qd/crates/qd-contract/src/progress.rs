@@ -6,6 +6,7 @@
 //! fail open if the diagnostic stream is unavailable.
 
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     io::{self, Write},
     sync::{
@@ -23,6 +24,7 @@ pub const NATIVE_V5_PROGRESS_SCHEMA: &str = "temporal_qd_v5_native_progress_v1";
 pub const NATIVE_V5_STAGE_SUMMARY_SCHEMA: &str = "temporal_qd_v5_native_stage_summary_v1";
 pub const NATIVE_V5_STAGE_SUMMARY_TABLE_SCHEMA: &str =
     "temporal_qd_v5_native_stage_summary_table_v1";
+pub const NATIVE_V5_COUNTER_SUMMARY_SCHEMA: &str = "temporal_qd_v5_native_counter_summary_v1";
 pub const NATIVE_V5_PROGRESS_PREFIX: &str = "TEMPORAL_QD_V5_PROGRESS ";
 pub const NATIVE_V5_PROGRESS_ENABLED_ENV: &str = "TEMPORAL_QD_V5_PROGRESS";
 pub const NATIVE_V5_PROGRESS_CADENCE_ENV: &str = "TEMPORAL_QD_V5_PROGRESS_CADENCE_SECONDS";
@@ -398,6 +400,35 @@ impl NativeProgressHandle {
                 sections.push(section);
             }
         }
+    }
+
+    /// Emit one bounded operational counter set without mislabeling counts as
+    /// byte/file units or consuming the fixed stage-section budget.
+    pub fn emit_counters(&self, name: &str, counters: &BTreeMap<String, u64>) {
+        if !self.shared.enabled || name.trim().is_empty() {
+            return;
+        }
+        let counters = counters
+            .iter()
+            .take(32)
+            .map(|(key, value)| (bounded_name(key), Value::Number((*value).into())))
+            .collect::<serde_json::Map<_, _>>();
+        let context = match self.shared.context.lock() {
+            Ok(context) => context.clone(),
+            Err(_) => return,
+        };
+        emit_json(
+            &self.shared,
+            &json!({
+                "schemaVersion": NATIVE_V5_COUNTER_SUMMARY_SCHEMA,
+                "event": "native_v5_counter_summary",
+                "family": context.family,
+                "generationKind": context.generation_kind,
+                "generationIndex": context.generation_index,
+                "name": bounded_name(name),
+                "counters": counters,
+            }),
+        );
     }
 }
 
@@ -813,8 +844,28 @@ mod tests {
             parallel_workers: Some(1),
             ..NativeProgressSection::default()
         });
+        handle.emit_counters(
+            "evolved_admission",
+            &BTreeMap::from([
+                ("changedSideProbes".to_owned(), 128),
+                ("fallbackSweeps".to_owned(), 0),
+            ]),
+        );
         progress.finish(Some(Duration::from_millis(2)));
         let events = payloads(&lines);
+        let counters = events
+            .iter()
+            .find(|value| {
+                value.get("event").and_then(Value::as_str) == Some("native_v5_counter_summary")
+            })
+            .expect("counter summary");
+        assert_eq!(
+            counters
+                .get("counters")
+                .and_then(|value| value.get("changedSideProbes"))
+                .and_then(Value::as_u64),
+            Some(128),
+        );
         let summary = events
             .iter()
             .find(|value| {
@@ -889,6 +940,10 @@ mod tests {
             "disabled_section",
             Duration::from_secs(1),
         ));
+        handle.emit_counters(
+            "disabled_counters",
+            &BTreeMap::from([("changedSideProbes".to_owned(), 4_000)]),
+        );
         assert!(
             handle
                 .shared
