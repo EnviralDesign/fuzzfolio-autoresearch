@@ -781,6 +781,7 @@ pub(crate) fn execute_evolved(
     if stream.accepted_count() as u64 != manifest.requested_count {
         bail!("fast-ephemeral evolved accepted width drifted");
     }
+    let publication_prepare_elapsed = publication_started.elapsed();
     let mut memory = MemoryFragments::default();
     let mut parent_writer = ParentMaterialWriter::create(&output_root.join(PARENT_MATERIAL_PATH))?;
     for reference in prior_parent_references.values() {
@@ -789,10 +790,12 @@ pub(crate) fn execute_evolved(
     // This traversal is the mandatory independent compiler replay for the
     // fast-ephemeral transaction. It must succeed before either the invocation
     // result or COMPLETE marker is written.
+    let publication_replay_started = Instant::now();
     let fragments: V5EvolvedPublicationFragments = stream
         .materialize_accepted_fragments_and_parents(&mut memory, &mut parent_writer)
         .context("materialize fast-ephemeral evolved accepted candidates")?;
     let (parent_row_count, parent_byte_count) = parent_writer.finish()?;
+    let publication_replay_elapsed = publication_replay_started.elapsed();
     if parent_row_count
         != manifest
             .requested_count
@@ -802,6 +805,7 @@ pub(crate) fn execute_evolved(
         bail!("fast-ephemeral evolved parent material width drifted");
     }
 
+    let publication_assembly_started = Instant::now();
     let population_receipt = stream
         .write_population_from_fragments(&fragments, &mut memory, &mut io::sink())
         .context("derive fast-ephemeral evolved population identity")?;
@@ -833,6 +837,7 @@ pub(crate) fn execute_evolved(
         .flush()
         .context("flush fast-ephemeral evolved identity ledger")?;
     drop(ledger_writer);
+    let publication_assembly_elapsed = publication_assembly_started.elapsed();
     let publication_elapsed = publication_started.elapsed();
 
     let artifacts = Value::Object(Map::from_iter([
@@ -958,6 +963,34 @@ pub(crate) fn execute_evolved(
         ..NativeProgressSection::default()
     });
     progress_handle.record_section(NativeProgressSection {
+        name: "evolved_publication_prepare".to_owned(),
+        wall: publication_prepare_elapsed,
+        completed_work_units: Some(1),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress_handle.record_section(NativeProgressSection {
+        name: "evolved_publication_replay".to_owned(),
+        wall: publication_replay_elapsed,
+        completed_work_units: Some(transaction.attempts.len() as u64),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress_handle.record_section(NativeProgressSection {
+        name: "evolved_publication_assembly".to_owned(),
+        wall: publication_assembly_elapsed,
+        completed_work_units: Some(manifest.requested_count),
+        bytes_processed: Some(
+            evaluation_receipt
+                .encoded_bytes
+                .checked_add(ledger_receipt.encoded_bytes)
+                .and_then(|bytes| bytes.checked_add(parent_byte_count))
+                .ok_or_else(|| anyhow!("fast-ephemeral evolved byte telemetry overflow"))?,
+        ),
+        parallel_workers: Some(1),
+        ..NativeProgressSection::default()
+    });
+    progress_handle.record_section(NativeProgressSection {
         name: "ephemeral_publication".to_owned(),
         wall: publication_elapsed,
         completed_work_units: Some(manifest.requested_count),
@@ -968,7 +1001,7 @@ pub(crate) fn execute_evolved(
                 .and_then(|bytes| bytes.checked_add(parent_byte_count))
                 .ok_or_else(|| anyhow!("fast-ephemeral evolved byte telemetry overflow"))?,
         ),
-        parallel_workers: Some(manifest.thread_cap),
+        parallel_workers: Some(1),
         ..NativeProgressSection::default()
     });
     progress.finish(None);

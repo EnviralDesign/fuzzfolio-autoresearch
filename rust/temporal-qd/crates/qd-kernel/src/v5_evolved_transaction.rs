@@ -2641,6 +2641,7 @@ fn construct_sealed_immigrant(
         "accepted",
         "accepted",
     )?;
+    let delta_value = delta.to_value()?;
     let material = build_v5_evolved_accepted_material(
         authority,
         V5EvolvedAcceptedBuildInput {
@@ -2658,10 +2659,10 @@ fn construct_sealed_immigrant(
             operator_trace: None,
             terminal_operator_plan: None,
             terminal_operator_application: None,
-            proposal_delta: delta.to_value()?,
+            proposal_delta: delta_value.clone(),
         },
     )?;
-    if material.proposal_delta != delta.to_value()? {
+    if material.proposal_delta != delta_value {
         return Err(contract(
             "v5 evolved sealed immigrant materializer changed the exact proposal delta",
         ));
@@ -2805,6 +2806,7 @@ fn construct_sealed_structural_accept(
         "accepted",
         "accepted",
     )?;
+    let delta_value = delta.to_value()?;
     let material = build_v5_evolved_accepted_material(
         authority,
         V5EvolvedAcceptedBuildInput {
@@ -2822,10 +2824,10 @@ fn construct_sealed_structural_accept(
             operator_trace: Some(terminal_operator_trace.clone()),
             terminal_operator_plan: Some(terminal_operator_plan.clone()),
             terminal_operator_application: Some(terminal_operator_application.clone()),
-            proposal_delta: delta.to_value()?,
+            proposal_delta: delta_value.clone(),
         },
     )?;
-    if material.proposal_delta != delta.to_value()? {
+    if material.proposal_delta != delta_value {
         return Err(contract(
             "v5 evolved sealed structural materializer changed the exact proposal delta",
         ));
@@ -4912,6 +4914,17 @@ impl V5EvolvedTransactionResult {
                 "v5 evolved offline replay durable object counts drifted",
             ));
         }
+        // Snapshot objects are immutable and content-addressed. Reconstruct
+        // each distinct parent once for this replay, while still checking the
+        // attempt-specific reference on every use below. The construction
+        // engine independently retains its own verified-parent cache so each
+        // distinct selector payload also crosses that boundary only once.
+        let mut verified_snapshot_references = BTreeMap::new();
+        let replay_engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
+        let replay_parent_cache = replay_engine
+            .parent_cache
+            .as_deref()
+            .expect("fast-ephemeral replay engine owns a verified-parent cache");
         let mut birth_ordinal = 0_u64;
         for (attempt, audit) in self.attempts.iter().zip(&self.outcome_audits) {
             let delta = deltas.get(&attempt.proposal_ordinal).ok_or_else(|| {
@@ -4923,14 +4936,16 @@ impl V5EvolvedTransactionResult {
                     contract("v5 evolved offline replay attempt names missing snapshot references")
                 })?;
             let planned = offline_planned_proposal_from_snapshot(
-                authority, inventory, &snapshots, attempt, delta, refs,
-            )?;
-            let replayed = NativeV5EvolvedConstructionEngine::durable().construct(
                 authority,
-                request,
-                &planned,
-                birth_ordinal,
+                inventory,
+                &snapshots,
+                &mut verified_snapshot_references,
+                replay_parent_cache,
+                attempt,
+                delta,
+                refs,
             )?;
+            let replayed = replay_engine.construct(authority, request, &planned, birth_ordinal)?;
             verify_offline_replayed_outcome(attempt, audit, delta, &replayed, &records)?;
             // Preserve the durable proposal ordinal even when no rich
             // candidate exists.  Publication uses this hook to emit a
@@ -5032,6 +5047,8 @@ pub fn reconstruct_selected_parent_references(
 fn snapshot_parent_reference_for_offline_replay(
     authority: &V5SharedConstructionAuthority,
     snapshots: &BTreeMap<String, &V5EvolvedParentSnapshot>,
+    verified_references: &mut BTreeMap<String, ParentReference>,
+    replay_parent_cache: &V5VerifiedParentCache,
     snapshot_ref: &V5EvolvedParentSnapshotRef,
     expected_attempt_reference: &V5AttemptParentReference,
     label: &str,
@@ -5042,6 +5059,9 @@ fn snapshot_parent_reference_for_offline_replay(
         )));
     }
     let snapshot = V5EvolvedParentSnapshotInventory::resolve_ref(snapshots, snapshot_ref, label)?;
+    if let Some(reference) = verified_references.get(&snapshot_ref.parent_snapshot_sha256) {
+        return Ok(reference.clone());
+    }
     let material = load_v5_evolved_parent_from_snapshot(authority, snapshot)?;
     if material.attempt_reference != *expected_attempt_reference
         || material.pair_identity_sha256 != snapshot.parent_reference.pair_identity_sha256
@@ -5051,13 +5071,21 @@ fn snapshot_parent_reference_for_offline_replay(
             "v5 evolved offline {label} sealed loader drifted from snapshot identity"
         )));
     }
-    snapshot.parent_reference_for_replay().map_err(Into::into)
+    let reference = snapshot.parent_reference_for_replay()?;
+    replay_parent_cache.seed_verified(authority, &reference, material)?;
+    verified_references.insert(
+        snapshot_ref.parent_snapshot_sha256.clone(),
+        reference.clone(),
+    );
+    Ok(reference)
 }
 
 fn offline_planned_proposal_from_snapshot(
     authority: &V5SharedConstructionAuthority,
     inventory: &V5EvolvedParentSnapshotInventory,
     snapshots: &BTreeMap<String, &V5EvolvedParentSnapshot>,
+    verified_references: &mut BTreeMap<String, ParentReference>,
+    replay_parent_cache: &V5VerifiedParentCache,
     attempt: &V5ProposalAttemptRecord,
     delta: &V5EvolvedProposalDelta,
     snapshot_refs: &V5EvolvedAttemptSnapshotRefs,
@@ -5103,6 +5131,8 @@ fn offline_planned_proposal_from_snapshot(
             let parent = snapshot_parent_reference_for_offline_replay(
                 authority,
                 snapshots,
+                verified_references,
+                replay_parent_cache,
                 snapshot_ref,
                 attempt_parent,
                 "mutation parent",
@@ -5132,6 +5162,8 @@ fn offline_planned_proposal_from_snapshot(
             let parent = snapshot_parent_reference_for_offline_replay(
                 authority,
                 snapshots,
+                verified_references,
+                replay_parent_cache,
                 parent_ref,
                 attempt_parent,
                 "crossover parent",
@@ -5139,6 +5171,8 @@ fn offline_planned_proposal_from_snapshot(
             let mate = snapshot_parent_reference_for_offline_replay(
                 authority,
                 snapshots,
+                verified_references,
+                replay_parent_cache,
                 mate_ref,
                 attempt_mate,
                 "crossover mate",
@@ -5414,6 +5448,50 @@ impl V5VerifiedParentCache {
                 "v5 evolved verified-parent cache reconstruction failed: {error}"
             ))
         })
+    }
+
+    /// Seed material reconstructed from an authenticated offline snapshot so
+    /// the immediately following constructor does not compile the same
+    /// content-addressed parent again. The snapshot loader remains the source
+    /// of the material; this cache accepts it only after its opaque selector
+    /// payload and authority bindings reproduce exactly.
+    fn seed_verified(
+        &self,
+        authority: &V5SharedConstructionAuthority,
+        parent: &ParentReference,
+        material: V5EvolvedParentMaterial,
+    ) -> Result<()> {
+        parent
+            .validate()
+            .map_err(|error| contract(format!("v5 evolved parent reference: {error}")))?;
+        let reconstructed = parent_reference_from_v5_evolved_material(&material)?;
+        if material.accepted_record.shared_authority_sha256 != authority.shared_authority_sha256
+            || Self::key(&authority.shared_authority_sha256, parent)?
+                != Self::key(&authority.shared_authority_sha256, &reconstructed)?
+        {
+            return Err(contract(
+                "v5 evolved snapshot material does not bind the verified-parent cache key",
+            ));
+        }
+        let key = Self::key(&authority.shared_authority_sha256, parent)?;
+        let cell = {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| contract("v5 evolved verified-parent cache lock was poisoned"))?;
+            Arc::clone(
+                entries
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        match cell.set(Ok(Arc::new(material))) {
+            Ok(()) => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
     }
 }
 
@@ -7096,6 +7174,73 @@ mod scheduler_tests {
                 .expect("encode durable accepted crossover"),
             "one-pass fast crossover must preserve the exact durable accepted record",
         );
+        let primary = cache
+            .load(&authority, scheduled_parent)
+            .expect("reload cached crossover primary");
+        let mate = cache
+            .load(&authority, scheduled_mate)
+            .expect("reload cached crossover mate");
+        let side = proposal_side_for_seed(planned.intent.proposal_seed())
+            .expect("derive crossover test side");
+        let operator_authority = authority
+            .operator_authority_projection()
+            .expect("project crossover operator authority")
+            .operator_authority(side)
+            .expect("select crossover side authority");
+        let execution = attempt_evolved_same_side_crossover_from_states(
+            planned.intent.proposal_seed(),
+            if side == "long" {
+                &primary.long_state
+            } else {
+                &primary.short_state
+            },
+            if side == "long" {
+                &mate.long_state
+            } else {
+                &mate.short_state
+            },
+            &operator_authority,
+        );
+        let selection = execution
+            .selection
+            .as_ref()
+            .expect("accepted crossover test selection");
+        let crossover_delta = execution
+            .delta
+            .as_ref()
+            .expect("accepted crossover test delta");
+        let (recipient, donor) = crossover_recipient_and_donor(
+            &selection.recipient_pair_identity_sha256,
+            &selection.donor_pair_identity_sha256,
+            &primary,
+            &mate,
+        )
+        .expect("resolve crossover test recipient/donor");
+        let recompiler = V5SealedEvolvedPairRecompiler::from_verified_parent(
+            &authority,
+            recipient,
+            planned.intent.proposal_seed(),
+        )
+        .expect("start verified crossover test recompiler");
+        recompiler
+            .advance_same_side_crossover_once(donor, crossover_delta)
+            .expect("verified donor fast path must accept authentic cached material");
+        let mut tampered_donor = donor.clone();
+        if side == "long" {
+            tampered_donor.long_state.module_identity_sha256 =
+                sha(object([("tamperedDonorModule", Value::Bool(true))]));
+        } else {
+            tampered_donor.short_state.module_identity_sha256 =
+                sha(object([("tamperedDonorModule", Value::Bool(true))]));
+        }
+        assert!(
+            recompiler
+                .advance_same_side_crossover_once(&tampered_donor, crossover_delta)
+                .is_err(),
+            "verified-donor reuse must reject stale or substituted compiled state",
+        );
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 2);
+        assert!(cache.hits.load(Ordering::Relaxed) >= 2);
         let delta = outcome
             .delta
             .clone()
@@ -7368,6 +7513,44 @@ mod scheduler_tests {
         request.identity_ledger_identity_sha256 = sha(ledger.identity().clone());
         request.identity_ledger_state_sha256 = sha(ledger.compact_state());
         (request, parents, ledger)
+    }
+
+    #[test]
+    fn accepted_public_projection_reuses_only_its_exact_sealed_pair() {
+        let (request, _parents, _ledger) = real_immigrant_fixture(1);
+        let authority =
+            V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
+                .expect("parse accepted projection authority");
+        let proposal_seed = v5_proposal_seed(&request.generation_config_sha256, 0)
+            .expect("derive accepted projection seed");
+        let planned = PlannedProposal {
+            proposal_ordinal: 0,
+            intent: ProposalIntent::RichImmigrant {
+                long_seed: immigrant_side_seed(&proposal_seed, Side::Long),
+                short_seed: immigrant_side_seed(&proposal_seed, Side::Short),
+                proposal_seed,
+            },
+        };
+        let material = NativeV5EvolvedConstructionEngine::durable()
+            .construct(&authority, &request, &planned, 0)
+            .expect("construct accepted projection material")
+            .accepted
+            .expect("immigrant projection material must be accepted");
+        let first = crate::v5::materialize_v5_evolved_rich_candidate(&authority, &material)
+            .expect("project exact sealed pair");
+        let second = crate::v5::materialize_v5_evolved_rich_candidate(&authority, &material)
+            .expect("repeat exact sealed pair projection");
+        assert_eq!(
+            first, second,
+            "sealed projection bytes must be deterministic"
+        );
+
+        let mut substituted = material;
+        substituted.parent_material.long_program = Value::Null;
+        assert!(
+            crate::v5::materialize_v5_evolved_rich_candidate(&authority, &substituted).is_err(),
+            "sealed pair projection must reject detached program material",
+        );
     }
 
     fn global_duplicate_immigrant_fixture(

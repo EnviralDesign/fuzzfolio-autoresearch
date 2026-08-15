@@ -12,7 +12,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use temporal_qd_contract::{ContractError, Map, Value, canonical_json, canonical_sha256};
@@ -6753,6 +6753,11 @@ pub(crate) struct V5EvolvedParentMaterial {
     pub side_targeted_lineage: Vec<Value>,
     pub long_state: crate::v5_operators::V5EvolvedSideState,
     pub short_state: crate::v5_operators::V5EvolvedSideState,
+    /// Compiler-owned pair produced by the same sealed reconstruction that
+    /// populated the public compact record. Publication may project this
+    /// pair only while replay owns the opaque material; it is never serialized
+    /// or accepted as construction authority on a later invocation.
+    sealed_pair: Arc<V5ReconstructedPair>,
 }
 
 /// Offline, content-addressed witness for one selected evolved parent.
@@ -7568,6 +7573,7 @@ pub(crate) fn build_v5_evolved_accepted_material(
         side_targeted_lineage,
         long_state: long_state.clone(),
         short_state: short_state.clone(),
+        sealed_pair: Arc::new(pair.clone()),
     };
     let ledger_candidate = object([
         ("candidateId", Value::String(record.candidate_id.clone())),
@@ -8189,6 +8195,7 @@ fn parent_material_from_reconstructed_pair(
         side_targeted_lineage: pair.side_targeted_lineage.clone(),
         long_state,
         short_state,
+        sealed_pair: Arc::new(pair),
     })
 }
 
@@ -8865,6 +8872,20 @@ impl V5SealedEvolvedPairRecompiler {
         donor: &V5EvolvedParentMaterial,
         delta: &crate::v5_operators::V5EvolvedSameSideCrossoverDelta,
     ) -> Result<V5EvolvedPairRuntime> {
+        let donor_reference = parent_reference_from_v5_evolved_material(donor)?;
+        let donor = load_v5_evolved_parent(&self.authority, &donor_reference)?;
+        self.recompile_crossover_runtime_from_verified_donor(&donor, delta)
+    }
+
+    /// Rebuild a crossover child from donor material already reconstructed by
+    /// the generation-scoped verified-parent cache. The explicit compact,
+    /// program, module, and pair checks keep this fast seam fail-closed while
+    /// avoiding a second full donor compilation in fast-ephemeral execution.
+    fn recompile_crossover_runtime_from_verified_donor(
+        &self,
+        donor: &V5EvolvedParentMaterial,
+        delta: &crate::v5_operators::V5EvolvedSameSideCrossoverDelta,
+    ) -> Result<V5EvolvedPairRuntime> {
         let side = exact_side(&delta.side)?;
         let recipient_state = self.runtime.state(side)?;
         let recipient_program = self.runtime.program(side)?;
@@ -8878,8 +8899,6 @@ impl V5SealedEvolvedPairRecompiler {
                 "v5 evolved crossover delta does not bind the current recipient state",
             ));
         }
-        let donor_reference = parent_reference_from_v5_evolved_material(donor)?;
-        let donor = load_v5_evolved_parent(&self.authority, &donor_reference)?;
         let donor_state = match side {
             "long" => &donor.long_state,
             "short" => &donor.short_state,
@@ -8893,6 +8912,22 @@ impl V5SealedEvolvedPairRecompiler {
         if delta.donor_pair_identity_sha256 != donor.pair_identity_sha256
             || delta.donor_module_identity_sha256 != donor_state.module_identity_sha256
             || delta.donor_program_sha256 != canonical_sha256(donor_program)?
+            || donor.accepted_record.shared_authority_sha256
+                != self.authority.shared_authority_sha256
+            || donor.accepted_record.candidate_id != donor.candidate_id
+            || donor.accepted_record.candidate_identity_sha256 != donor.candidate_identity_sha256
+            || donor.accepted_record.pair_identity_sha256 != donor.pair_identity_sha256
+            || donor.long_state.pair_identity_sha256 != donor.pair_identity_sha256
+            || donor.short_state.pair_identity_sha256 != donor.pair_identity_sha256
+            || donor.long_state.program != donor.long_program
+            || donor.short_state.program != donor.short_program
+            || donor.long_state.module_identity_sha256
+                != donor.accepted_record.long.module_identity_sha256
+            || donor.short_state.module_identity_sha256
+                != donor.accepted_record.short.module_identity_sha256
+            || donor.sealed_pair.pair_identity_sha256 != donor.pair_identity_sha256
+            || donor.sealed_pair.long.program != donor.long_program
+            || donor.sealed_pair.short.program != donor.short_program
         {
             return Err(invalid(
                 "v5 evolved crossover delta does not bind the sealed donor state",
@@ -8990,7 +9025,7 @@ impl V5SealedEvolvedPairRecompiler {
         donor: &V5EvolvedParentMaterial,
         delta: &crate::v5_operators::V5EvolvedSameSideCrossoverDelta,
     ) -> Result<(Self, crate::v5_operators::V5RecompiledEvolvedPair)> {
-        let runtime = self.recompile_crossover_runtime(donor, delta)?;
+        let runtime = self.recompile_crossover_runtime_from_verified_donor(donor, delta)?;
         let output = Self::recompiled_output(&runtime, &delta.side)?;
         Ok((
             Self {
@@ -11505,33 +11540,14 @@ pub(crate) fn materialize_v5_evolved_rich_candidate(
             "v5 evolved rich materializer material does not bind compact record/delta",
         ));
     }
-    let projection = authority.operator_authority_projection()?;
     let parent = &material.parent_material;
-    let long = reconstructed_module_from_evolved_program(
-        authority,
-        &projection,
-        &record.proposal_seed,
-        "long",
-        &parent.long_program,
-        parent.long_module_lineage.clone(),
-    )?;
-    let short = reconstructed_module_from_evolved_program(
-        authority,
-        &projection,
-        &record.proposal_seed,
-        "short",
-        &parent.short_program,
-        parent.short_module_lineage.clone(),
-    )?;
-    let pair = finalize_evolved_reconstructed_pair(
-        authority,
-        &record.proposal_seed,
-        &record.origin_kind,
-        &proposal_delta_sha256,
-        long,
-        short,
-        parent.side_targeted_lineage.clone(),
-    )?;
+    // The accepted constructor immediately preceding this callback already
+    // rebuilt both modules and the pair from the authenticated delta and
+    // sealed authority. Keep that compiler-owned result inside the opaque
+    // replay material instead of compiling the identical accepted pair a
+    // second time merely to project public rows. Every durable identity is
+    // still checked below, and no cached pair crosses the replay boundary.
+    let pair = parent.sealed_pair.as_ref();
     if pair.candidate_id != record.candidate_id
         || pair.candidate_identity_sha256 != record.candidate_identity_sha256
         || pair.pair_identity_sha256 != record.pair_identity_sha256
@@ -11544,6 +11560,11 @@ pub(crate) fn materialize_v5_evolved_rich_candidate(
         || pair.short.compact_facts(&authority.short) != record.short
         || v5_compact_candidate_lineage(&pair) != record.lineage
         || v5_compact_funnel_summary(&pair)? != record.funnel_summary
+        || pair.long.program != parent.long_program
+        || pair.short.program != parent.short_program
+        || pair.long.lineage != parent.long_module_lineage
+        || pair.short.lineage != parent.short_module_lineage
+        || pair.side_targeted_lineage != parent.side_targeted_lineage
     {
         return Err(invalid(
             "v5 evolved rich materializer reconstructed compact facts drifted",
