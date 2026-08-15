@@ -12,11 +12,11 @@ use temporal_qd_runtime::{DashboardPort, RuntimeManifest, RuntimePairAuthority};
 
 const FIXTURE_ROOT: &str = "../../../../tests/fixtures/temporal_qd_runtime_oracle";
 const ORACLE_FIXTURE_FILE_SHA256: &str =
-    "bd0a8a20f7253f20d8d8d0de67f31aba2d69906d4012b625262ccc0ce52e6191";
+    "e546d62ee99fa58bdf27a882907d24b9d31ee3edce6bc3be9dc071ece0b6f337";
 const ORACLE_MANIFEST_FILE_SHA256: &str =
-    "57af8529b5024340e691c25a7538c80375d4814250a110165c62d4861bbe6c99";
+    "6a0167ff9c540673483d84fbf027f1ab3048e0264374b1f2b7b4bdfee2a6a598";
 const ORACLE_TRANSCRIPT_FILE_SHA256: &str =
-    "d9ccc1df5e1314b715167c30e35d065ebdca44451ee61305859d4a29d64f3124";
+    "6bdfaba890a58e138d73c0000384e48163a6c3fd9fa3636e3b13e3306a5487bb";
 const ORACLE_GENERATOR_SOURCE_SHA256: &str =
     "sha256:489d995a5d3f217255d21cd6c75b59982483782fa8876855df4ffa21cedab19f";
 
