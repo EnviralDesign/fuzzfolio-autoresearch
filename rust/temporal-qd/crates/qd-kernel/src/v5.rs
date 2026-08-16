@@ -3450,6 +3450,115 @@ fn collect_action_capability(
     Ok(())
 }
 
+/// Enforce the same directional break-even cardinality that the tail reducer
+/// retains as a final defense.  Native construction must reject this static
+/// profile defect before a candidate enters the fixed-width evaluation
+/// cohort; discovering it after all windows have run would otherwise shrink
+/// the proposal-current-panel member set at the campaign boundary.
+const DUPLICATE_BREAK_EVEN_EXECUTION_INVARIANT: &str = "duplicate_break_even_execution_invariant";
+
+fn validate_directional_break_even_cardinality(
+    profile: &Value,
+    transitions: &[Value],
+) -> Result<()> {
+    let graph = required(profile, "graph", "v5 temporal profile")?;
+    let mut owners: Vec<(String, BTreeSet<String>)> = Vec::new();
+    let paired = graph.get("entryArbitration").is_some();
+    if let Some(modules) = graph
+        .get("entryArbitration")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("modules"))
+        .and_then(Value::as_array)
+    {
+        for module in modules {
+            let Some(direction @ ("long" | "short")) =
+                module.get("direction").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(transition_ids) = module.get("transitionIds").and_then(Value::as_array) else {
+                continue;
+            };
+            owners.push((
+                direction.to_owned(),
+                transition_ids
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ));
+        }
+    }
+    if paired
+        && (owners.len() != 2
+            || !owners.iter().any(|(direction, _)| direction == "long")
+            || !owners.iter().any(|(direction, _)| direction == "short"))
+    {
+        return Err(invalid(format!(
+            "v5 native profile violates {DUPLICATE_BREAK_EVEN_EXECUTION_INVARIANT}: paired profile must expose exact long and short transition ownership"
+        )));
+    }
+    if owners.is_empty() {
+        if let Some(direction @ ("long" | "short")) =
+            profile.get("directionMode").and_then(Value::as_str)
+        {
+            owners.push((direction.to_owned(), BTreeSet::new()));
+        }
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for transition in transitions {
+        let break_even_count = transition
+            .get("actions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|action| {
+                action.get("kind").and_then(Value::as_str)
+                    == Some("move_stop_to_break_even_next_open")
+            })
+            .count();
+        if break_even_count == 0 {
+            continue;
+        }
+        let direction = if paired {
+            let transition_id = text(
+                required(transition, "id", "v5 break-even transition")?,
+                "v5 break-even transition ID",
+            )?;
+            let matching = owners
+                .iter()
+                .filter(|(_, transition_ids)| transition_ids.contains(&transition_id))
+                .map(|(direction, _)| direction.as_str())
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(invalid(format!(
+                    "v5 native profile violates {DUPLICATE_BREAK_EVEN_EXECUTION_INVARIANT}: break-even transition {transition_id} must belong to exactly one directional module"
+                )));
+            }
+            matching[0].to_owned()
+        } else {
+            owners
+                .first()
+                .map(|(direction, _)| direction.clone())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "v5 native profile violates {DUPLICATE_BREAK_EVEN_EXECUTION_INVARIANT}: break-even action lacks directional ownership"
+                    ))
+                })?
+        };
+        *counts.entry(direction).or_default() += break_even_count;
+    }
+    for direction in ["long", "short"] {
+        let count = counts.get(direction).copied().unwrap_or_default();
+        if count > 1 {
+            return Err(invalid(format!(
+                "v5 native profile violates {DUPLICATE_BREAK_EVEN_EXECUTION_INVARIANT} for {direction} module: count {count}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Produce the exact search-validation envelope for the closed native profile
 /// subset.  This is both an admission gate and the source of every frozen
 /// module/pair identity; callers must not supply their own report hashes.
@@ -3480,6 +3589,7 @@ pub fn validate_native_profile(profile: &Value, candidate_id: &str) -> Result<V5
         required(graph, "transitions", "v5 temporal graph")?,
         "v5 temporal graph transitions",
     )?;
+    validate_directional_break_even_cardinality(profile, transitions)?;
     let mut has_entry_action = false;
     for transition in transitions {
         collect_native_capabilities(
@@ -13367,6 +13477,204 @@ mod tests {
             actual.report, *expected,
             "native pair validation must be exact"
         );
+    }
+
+    #[test]
+    fn v5_native_admission_rejects_duplicate_break_even_per_direction() {
+        let fixture = actual_v5_golden();
+        let pair = fixture.get("pair").expect("fixture frozen pair");
+
+        let mut long_profile = pair
+            .get("long")
+            .and_then(|module| module.get("profile"))
+            .cloned()
+            .expect("fixture long profile");
+        let transitions = long_profile
+            .get_mut("graph")
+            .and_then(|graph| graph.get_mut("transitions"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture long transitions");
+        let break_even = transitions
+            .iter()
+            .flat_map(|transition| {
+                transition
+                    .get("actions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .find(|action| {
+                action.get("kind").and_then(Value::as_str)
+                    == Some("move_stop_to_break_even_next_open")
+            })
+            .cloned()
+            .expect("fixture break-even action");
+        transitions
+            .iter_mut()
+            .find_map(|transition| transition.get_mut("actions")?.as_array_mut())
+            .expect("fixture transition actions")
+            .push(break_even);
+        let error = validate_native_profile(&long_profile, "q_duplicate_break_even")
+            .expect_err("duplicate break-even profile must fail native admission");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate_break_even_execution_invariant"),
+            "unexpected compiler rejection: {error:#}"
+        );
+
+        let mut pair_profile = pair.get("profile").cloned().expect("fixture pair profile");
+        let short_states = pair_profile
+            .get("graph")
+            .and_then(|graph| graph.get("entryArbitration"))
+            .and_then(|entry| entry.get("modules"))
+            .and_then(Value::as_array)
+            .expect("fixture pair modules")
+            .iter()
+            .find(|module| module.get("direction").and_then(Value::as_str) == Some("short"))
+            .and_then(|module| module.get("stateIds"))
+            .and_then(Value::as_array)
+            .expect("fixture short state IDs")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let transitions = pair_profile
+            .get_mut("graph")
+            .and_then(|graph| graph.get_mut("transitions"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture pair transitions");
+        let long_break_even = transitions
+            .iter()
+            .flat_map(|transition| {
+                transition
+                    .get("actions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .find(|action| {
+                action.get("kind").and_then(Value::as_str)
+                    == Some("move_stop_to_break_even_next_open")
+            })
+            .cloned()
+            .expect("fixture pair break-even action");
+        let short_actions = transitions
+            .iter_mut()
+            .find(|transition| {
+                transition
+                    .get("sourceStateId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| short_states.contains(state))
+            })
+            .and_then(|transition| transition.get_mut("actions"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture short transition actions");
+        short_actions.push(long_break_even.clone());
+        let pair_transitions = pair_profile
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("fixture pair transitions");
+        validate_directional_break_even_cardinality(&pair_profile, pair_transitions)
+            .expect("one break-even action per direction remains valid");
+
+        let short_actions = pair_profile
+            .get_mut("graph")
+            .and_then(|graph| graph.get_mut("transitions"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture pair transitions")
+            .iter_mut()
+            .find(|transition| {
+                transition
+                    .get("sourceStateId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| short_states.contains(state))
+            })
+            .and_then(|transition| transition.get_mut("actions"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture short transition actions");
+        short_actions.push(long_break_even);
+        let pair_transitions = pair_profile
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("fixture pair transitions");
+        let error = validate_directional_break_even_cardinality(&pair_profile, pair_transitions)
+            .expect_err("two short-side break-even actions must fail native admission");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate_break_even_execution_invariant")
+        );
+
+        let base_pair_profile = pair.get("profile").cloned().expect("fixture pair profile");
+        let break_even_transition_id = base_pair_profile
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("fixture pair transitions")
+            .iter()
+            .find(|transition| {
+                transition
+                    .get("actions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|action| {
+                        action.get("kind").and_then(Value::as_str)
+                            == Some("move_stop_to_break_even_next_open")
+                    })
+            })
+            .and_then(|transition| transition.get("id"))
+            .and_then(Value::as_str)
+            .expect("fixture break-even transition ID")
+            .to_owned();
+
+        let mut unowned = base_pair_profile.clone();
+        for module in unowned
+            .get_mut("graph")
+            .and_then(|graph| graph.get_mut("entryArbitration"))
+            .and_then(|entry| entry.get_mut("modules"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture pair modules")
+        {
+            module
+                .get_mut("transitionIds")
+                .and_then(Value::as_array_mut)
+                .expect("fixture transition ownership")
+                .retain(|value| value.as_str() != Some(break_even_transition_id.as_str()));
+        }
+        let transitions = unowned
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("fixture pair transitions");
+        let error = validate_directional_break_even_cardinality(&unowned, transitions)
+            .expect_err("unowned break-even transition must fail closed");
+        assert!(error.to_string().contains("must belong to exactly one"));
+
+        let mut multiply_owned = base_pair_profile;
+        multiply_owned
+            .get_mut("graph")
+            .and_then(|graph| graph.get_mut("entryArbitration"))
+            .and_then(|entry| entry.get_mut("modules"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture pair modules")
+            .iter_mut()
+            .find(|module| module.get("direction").and_then(Value::as_str) == Some("short"))
+            .and_then(|module| module.get_mut("transitionIds"))
+            .and_then(Value::as_array_mut)
+            .expect("fixture short transition ownership")
+            .push(Value::String(break_even_transition_id));
+        let transitions = multiply_owned
+            .get("graph")
+            .and_then(|graph| graph.get("transitions"))
+            .and_then(Value::as_array)
+            .expect("fixture pair transitions");
+        let error = validate_directional_break_even_cardinality(&multiply_owned, transitions)
+            .expect_err("multiply owned break-even transition must fail closed");
+        assert!(error.to_string().contains("must belong to exactly one"));
     }
 
     #[test]
