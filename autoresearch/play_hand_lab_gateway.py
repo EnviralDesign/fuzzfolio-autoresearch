@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections import deque
-from dataclasses import dataclass, field
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -17,14 +14,24 @@ import socket
 import statistics
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
-import requests
 import httpx
+import requests
 from websockets.asyncio.client import connect as websocket_connect
 
+from .completion_uploads import (
+    COMPLETION_UPLOAD_SCHEMA_VERSION,
+    CompletionUploadError,
+    CompletionUploadIdentity,
+    CompletionUploadStore,
+)
 from .ephemeral_worker_sessions import (
     AuthPrincipal,
     EphemeralSessionError,
@@ -53,6 +60,10 @@ DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS = 180.0
 DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS = 30.0
 DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS = 45.0
 DEFAULT_MAX_RESULT_BACKLOG_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_COMPLETION_UPLOAD_BYTES = 190 * 1024 * 1024
+DEFAULT_MAX_COMPLETION_UPLOAD_SPOOL_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_COMPLETION_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+DEFAULT_COMPLETION_UPLOAD_TTL_SECONDS = 1800.0
 _REMOTE_LAKE_MUTATION_ERROR_TYPE = "RemoteLakeMutationInProgress"
 _REMOTE_LAKE_MUTATION_ERROR_MESSAGE = (
     "Remote market data lake is mutating; retry after the advertised delay"
@@ -538,6 +549,11 @@ class LabGatewayConfig:
     lake_timeout_retry_after_seconds: float = DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS
     lake_recovery_initial_dispatch_limit: int = 1
     lake_recovery_max_dispatch_limit: int = 64
+    completion_upload_root: str | None = None
+    max_completion_upload_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_BYTES
+    max_completion_upload_spool_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_SPOOL_BYTES
+    max_completion_upload_chunk_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_CHUNK_BYTES
+    completion_upload_ttl_seconds: float = DEFAULT_COMPLETION_UPLOAD_TTL_SECONDS
 
 
 @dataclass(slots=True)
@@ -613,6 +629,13 @@ class PlayHandLabGateway:
         self._lake_recovery_dispatch_limit: int | None = None
         self._lake_recovery_successes_at_limit = 0
         self._lake_recovery_lease_ids: set[str] = set()
+        self._completion_uploads = CompletionUploadStore(
+            root=self.config.completion_upload_root,
+            max_upload_bytes=self.config.max_completion_upload_bytes,
+            max_total_bytes=self.config.max_completion_upload_spool_bytes,
+            max_chunk_bytes=self.config.max_completion_upload_chunk_bytes,
+            ttl_seconds=self.config.completion_upload_ttl_seconds,
+        )
         self._metrics: dict[str, int] = {
             "tasks_enqueued": 0,
             "duplicate_task_enqueues": 0,
@@ -649,6 +672,11 @@ class PlayHandLabGateway:
             "workers_pruned": 0,
             "workers_unregistered": 0,
             "terminal_tasks_pruned": 0,
+            "completion_uploads_started": 0,
+            "completion_uploads_resumed": 0,
+            "completion_upload_chunks_accepted": 0,
+            "completion_upload_chunks_duplicate": 0,
+            "completion_uploads_finalized": 0,
         }
 
     def enqueue(self, task: LabTask) -> bool:
@@ -1035,6 +1063,163 @@ class PlayHandLabGateway:
                 self._advance_lake_recovery_ramp_locked()
             return {"status": "accepted", "completion": _completion_receipt(completion)}
 
+    def begin_completion_upload(
+        self,
+        worker_id: str,
+        lease_id: str,
+        *,
+        schema_version: str,
+        status: str,
+        size_bytes: int,
+        sha256: str,
+        chunk_size_bytes: int,
+        chunk_count: int,
+    ) -> dict[str, Any]:
+        if str(schema_version) != COMPLETION_UPLOAD_SCHEMA_VERSION:
+            raise CompletionUploadError("unsupported_completion_upload_schema")
+        now = _now()
+        with self._lock:
+            self._maintain_lifecycle_locked(now)
+            completed = self._completed_by_lease.get(lease_id)
+            if completed is not None:
+                if str(completed.get("worker_id") or "") != worker_id:
+                    raise CompletionUploadError("completion_upload_owner_mismatch", http_status=403)
+                return {"status": "duplicate", "completion": dict(completed)}
+            self._require_completion_upload_lease_locked(worker_id, lease_id, now=now)
+            response = self._completion_uploads.begin(
+                CompletionUploadIdentity(
+                    lease_id=lease_id,
+                    worker_id=worker_id,
+                    status=str(status or "success"),
+                    size_bytes=int(size_bytes),
+                    sha256=str(sha256),
+                    chunk_size_bytes=int(chunk_size_bytes),
+                    chunk_count=int(chunk_count),
+                ),
+                now=now,
+            )
+            metric = (
+                "completion_uploads_started"
+                if response.get("status") == "created"
+                else "completion_uploads_resumed"
+            )
+            self._metrics[metric] += 1
+            return response
+
+    def write_completion_upload_chunk(
+        self,
+        worker_id: str,
+        lease_id: str,
+        upload_id: str,
+        *,
+        index: int,
+        payload: bytes,
+        sha256: str,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._lock:
+            self._maintain_lifecycle_locked(now)
+            completed = self._completed_by_lease.get(lease_id)
+            if completed is not None:
+                if str(completed.get("worker_id") or "") != worker_id:
+                    raise CompletionUploadError("completion_upload_owner_mismatch", http_status=403)
+                return {"status": "duplicate", "completion": dict(completed)}
+            self._require_completion_upload_lease_locked(worker_id, lease_id, now=now)
+        response = self._completion_uploads.write_chunk(
+            upload_id=upload_id,
+            lease_id=lease_id,
+            worker_id=worker_id,
+            index=int(index),
+            payload=payload,
+            sha256=sha256,
+            now=now,
+        )
+        with self._lock:
+            metric = (
+                "completion_upload_chunks_duplicate"
+                if response.get("status") == "duplicate"
+                else "completion_upload_chunks_accepted"
+            )
+            self._metrics[metric] += 1
+        return response
+
+    def finalize_completion_upload(
+        self,
+        worker_id: str,
+        lease_id: str,
+        upload_id: str,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._lock:
+            self._maintain_lifecycle_locked(now)
+            completed = self._completed_by_lease.get(lease_id)
+            if completed is not None:
+                if str(completed.get("worker_id") or "") != worker_id:
+                    raise CompletionUploadError("completion_upload_owner_mismatch", http_status=403)
+                return {"status": "duplicate", "completion": dict(completed)}
+            self._require_completion_upload_lease_locked(worker_id, lease_id, now=now)
+        upload = self._completion_uploads.prepare_finalize(
+            upload_id=upload_id,
+            lease_id=lease_id,
+            worker_id=worker_id,
+            now=now,
+        )
+        try:
+            actual_size = upload.path.stat().st_size
+            if actual_size != upload.identity.size_bytes:
+                raise CompletionUploadError("completion_upload_size_mismatch", http_status=409)
+            digest = hashlib.sha256()
+            with upload.path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            if digest.hexdigest() != upload.identity.sha256:
+                raise CompletionUploadError("completion_upload_sha256_mismatch", http_status=409)
+            with upload.path.open("r", encoding="utf-8") as handle:
+                envelope = json.load(handle)
+            if not isinstance(envelope, dict) or set(envelope) != {
+                "schema_version",
+                "worker_id",
+                "status",
+                "result",
+            }:
+                raise CompletionUploadError("invalid_completion_upload_envelope")
+            if str(envelope.get("schema_version") or "") != COMPLETION_UPLOAD_SCHEMA_VERSION:
+                raise CompletionUploadError("unsupported_completion_upload_schema")
+            if str(envelope.get("worker_id") or "") != worker_id:
+                raise CompletionUploadError("completion_upload_owner_mismatch", http_status=403)
+            if str(envelope.get("status") or "") != upload.identity.status:
+                raise CompletionUploadError("completion_upload_status_mismatch", http_status=409)
+            result_payload = envelope.get("result")
+            if not isinstance(result_payload, dict):
+                raise CompletionUploadError("completion_upload_result_object_required")
+            result = self.complete(
+                worker_id,
+                lease_id,
+                status=upload.identity.status,
+                result=result_payload,
+            )
+            with self._lock:
+                if result.get("status") in {"accepted", "duplicate"}:
+                    self._metrics["completion_uploads_finalized"] += 1
+            return result
+        finally:
+            self._completion_uploads.finish(upload_id)
+
+    def _require_completion_upload_lease_locked(
+        self,
+        worker_id: str,
+        lease_id: str,
+        *,
+        now: float,
+    ) -> LabLease:
+        lease = self._leases.get(lease_id)
+        if lease is None or lease.worker_id != worker_id:
+            raise CompletionUploadError("completion_upload_lease_lost", http_status=404)
+        if lease.expires_at <= now:
+            self._expire_lease_locked(lease, now)
+            raise CompletionUploadError("completion_upload_lease_lost", http_status=404)
+        return lease
+
     def fail(
         self,
         worker_id: str,
@@ -1310,6 +1495,7 @@ class PlayHandLabGateway:
                 "lake_recovery_dispatch_limit": self._lake_recovery_dispatch_limit,
                 "lake_recovery_active_leases": len(self._lake_recovery_lease_ids),
                 "lake_recovery_successes_at_limit": self._lake_recovery_successes_at_limit,
+                "completion_uploads": self._completion_uploads.snapshot(),
                 "metrics": dict(self._metrics),
             }
             if include_workers:
@@ -1325,6 +1511,7 @@ class PlayHandLabGateway:
 
     def _remove_lease_locked(self, lease: LabLease) -> None:
         self._leases.pop(lease.lease_id, None)
+        self._completion_uploads.abort_lease(lease.lease_id)
         self._lake_recovery_lease_ids.discard(lease.lease_id)
         if lease.lease_id == self._lake_probe_lease_id:
             self._lake_probe_lease_id = None
@@ -1504,6 +1691,7 @@ class PlayHandLabGateway:
 
     def _maintain_lifecycle_locked(self, now: float) -> None:
         self._requeue_expired_leases_locked(now)
+        self._completion_uploads.cleanup_stale(now=now)
         prune_after = self._worker_prune_after_seconds()
         for worker_id, worker in list(self._workers.items()):
             heartbeat_age = now - worker.heartbeat_at
@@ -2021,6 +2209,37 @@ class LabGatewayAsgiApp:
             return
 
         try:
+            parts = [part for part in path.split("/") if part]
+            if (
+                method == "PUT"
+                and len(parts) == 6
+                and parts[0] == "leases"
+                and parts[2] == "completion-upload"
+                and parts[4] == "chunks"
+            ):
+                raw_content_length = str(headers.get("content-length") or "")
+                if raw_content_length:
+                    try:
+                        announced_length = int(raw_content_length)
+                    except ValueError as exc:
+                        raise CompletionUploadError("invalid_content_length") from exc
+                    if announced_length > self.gateway.config.max_completion_upload_chunk_bytes:
+                        raise CompletionUploadError("completion_chunk_size_out_of_bounds", http_status=413)
+                body = await self._read_body(
+                    receive,
+                    max_bytes=self.gateway.config.max_completion_upload_chunk_bytes,
+                )
+                result = self.gateway.write_completion_upload_chunk(
+                    str(headers.get("x-fuzzfolio-worker-id") or ""),
+                    parts[1],
+                    parts[3],
+                    index=int(parts[5]),
+                    payload=body,
+                    sha256=str(headers.get("x-fuzzfolio-chunk-sha256") or ""),
+                )
+                await self._send_json(send, result)
+                return
+
             status_match = _ephemeral_session_route(path, action="status")
             if method == "GET" and status_match is not None:
                 session = self.gateway.ephemeral_sessions.get_session(status_match)
@@ -2130,7 +2349,6 @@ class LabGatewayAsgiApp:
                 )
                 return
 
-            parts = [part for part in path.split("/") if part]
             if method == "POST" and len(parts) == 3 and parts[0] == "leases":
                 lease_id = parts[1]
                 action = parts[2]
@@ -2159,6 +2377,19 @@ class LabGatewayAsgiApp:
                     )
                     status = 404 if result.get("status") == "lease_lost" else 200
                     await self._send_json(send, result, status=status)
+                    return
+                if action == "completion-upload":
+                    result = self.gateway.begin_completion_upload(
+                        worker_id,
+                        lease_id,
+                        schema_version=str(payload.get("schema_version") or ""),
+                        status=str(payload.get("status") or "success"),
+                        size_bytes=int(payload.get("size_bytes") or 0),
+                        sha256=str(payload.get("sha256") or ""),
+                        chunk_size_bytes=int(payload.get("chunk_size_bytes") or 0),
+                        chunk_count=int(payload.get("chunk_count") or 0),
+                    )
+                    await self._send_json(send, result)
                     return
                 if action == "fail":
                     result = self.gateway.fail(
@@ -2202,7 +2433,26 @@ class LabGatewayAsgiApp:
                     await self._send_json(send, result, status=status)
                     return
 
+            if (
+                method == "POST"
+                and len(parts) == 5
+                and parts[0] == "leases"
+                and parts[2] == "completion-upload"
+                and parts[4] == "finalize"
+            ):
+                result = await asyncio.to_thread(
+                    self.gateway.finalize_completion_upload,
+                    str(payload.get("worker_id") or ""),
+                    parts[1],
+                    parts[3],
+                )
+                status = 404 if result.get("status") == "lease_lost" else 200
+                await self._send_json(send, result, status=status)
+                return
+
             await self._send_json(send, {"error": "not_found"}, status=404)
+        except CompletionUploadError as exc:
+            await self._send_json(send, {"error": exc.code}, status=exc.http_status)
         except EphemeralSessionError as exc:
             await self._send_json(send, {"error": exc.code}, status=int(exc.http_status))
         except json.JSONDecodeError:
@@ -2470,6 +2720,21 @@ class LabGatewayAsgiApp:
             raise ValueError("json_object_required")
         return parsed
 
+    async def _read_body(self, receive: Any, *, max_bytes: int) -> bytes:
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                continue
+            chunk = message.get("body") or b""
+            if chunk:
+                if len(body) + len(chunk) > max(int(max_bytes), 1):
+                    raise CompletionUploadError("completion_chunk_size_out_of_bounds", http_status=413)
+                body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+        return bytes(body)
+
     async def _send_json(
         self,
         send: Any,
@@ -2578,6 +2843,11 @@ def serve_lab_gateway(
     port: int,
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    completion_upload_root: str | None = None,
+    max_completion_upload_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_BYTES,
+    max_completion_upload_spool_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_SPOOL_BYTES,
+    max_completion_upload_chunk_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_CHUNK_BYTES,
+    completion_upload_ttl_seconds: float = DEFAULT_COMPLETION_UPLOAD_TTL_SECONDS,
     lease_ttl_seconds: float = 600.0,
     max_recent_completions: int = 20_000,
     max_result_backlog: int = 100_000,
@@ -2606,6 +2876,11 @@ def serve_lab_gateway(
             worker_prune_after_seconds=max(float(worker_prune_after_seconds), stale_after),
             lake_mutation_retry_after_seconds=max(float(lake_mutation_retry_after_seconds), 0.0),
             lake_timeout_retry_after_seconds=max(float(lake_timeout_retry_after_seconds), 0.0),
+            completion_upload_root=completion_upload_root,
+            max_completion_upload_bytes=max(int(max_completion_upload_bytes), 1),
+            max_completion_upload_spool_bytes=max(int(max_completion_upload_spool_bytes), 1),
+            max_completion_upload_chunk_bytes=max(int(max_completion_upload_chunk_bytes), 1),
+            completion_upload_ttl_seconds=max(float(completion_upload_ttl_seconds), 1.0),
         )
     )
     effective_max_body_bytes = max(int(max_body_bytes), 1024)
@@ -2653,6 +2928,11 @@ def cmd_play_hand_lab_gateway(
     port: int,
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    completion_upload_root: str | None = None,
+    max_completion_upload_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_BYTES,
+    max_completion_upload_spool_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_SPOOL_BYTES,
+    max_completion_upload_chunk_bytes: int = DEFAULT_MAX_COMPLETION_UPLOAD_CHUNK_BYTES,
+    completion_upload_ttl_seconds: float = DEFAULT_COMPLETION_UPLOAD_TTL_SECONDS,
     lease_ttl_seconds: float = 600.0,
     max_recent_completions: int = 20_000,
     max_result_backlog: int = 100_000,
@@ -2677,6 +2957,11 @@ def cmd_play_hand_lab_gateway(
         port=port,
         token=token,
         max_body_bytes=max_body_bytes,
+        completion_upload_root=completion_upload_root,
+        max_completion_upload_bytes=max_completion_upload_bytes,
+        max_completion_upload_spool_bytes=max_completion_upload_spool_bytes,
+        max_completion_upload_chunk_bytes=max_completion_upload_chunk_bytes,
+        completion_upload_ttl_seconds=completion_upload_ttl_seconds,
         lease_ttl_seconds=lease_ttl_seconds,
         max_recent_completions=max_recent_completions,
         max_result_backlog=max_result_backlog,

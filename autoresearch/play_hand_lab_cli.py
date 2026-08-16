@@ -16,9 +16,9 @@ from .play_hand_lab import (
     DEFAULT_LAB_GATEWAY_URL,
     DEFAULT_LAB_MAX_DRAIN_SECONDS,
     DEFAULT_LAB_MAX_RESULTS_PER_CYCLE,
-    DEFAULT_LAB_SCRUTINY_MONTHS,
     DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS,
     DEFAULT_LAB_SCREEN_ANCHOR_MODE,
+    DEFAULT_LAB_SCRUTINY_MONTHS,
     DEFAULT_LAB_TERMINAL_LANE_RETENTION,
     DEFAULT_LAB_VALIDATION_MIN_SCORE,
     DEFAULT_LAB_VALIDATION_MONTHS,
@@ -26,19 +26,22 @@ from .play_hand_lab import (
     cmd_play_hand_lab,
 )
 from .play_hand_lab_gateway import (
-    DEFAULT_MAX_RESULT_BACKLOG_BYTES,
-    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_COMPLETION_UPLOAD_TTL_SECONDS,
     DEFAULT_LAB_WS_PING_INTERVAL_SECONDS,
     DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS,
     DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS,
     DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS,
+    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_COMPLETION_UPLOAD_BYTES,
+    DEFAULT_MAX_COMPLETION_UPLOAD_CHUNK_BYTES,
+    DEFAULT_MAX_COMPLETION_UPLOAD_SPOOL_BYTES,
+    DEFAULT_MAX_RESULT_BACKLOG_BYTES,
     DEFAULT_RESULT_BACKPRESSURE_BYTES,
     cmd_play_hand_lab_gateway,
     cmd_play_hand_lab_http_sim,
     cmd_play_hand_lab_sim,
     cmd_play_hand_lab_ws_sim,
 )
-
 
 PLAY_HAND_LAB_COMMANDS = {
     "play-hand-lab",
@@ -554,6 +557,35 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Maximum HTTP/WebSocket request body size in MiB. Default: 64.",
     )
     play_hand_lab_gateway.add_argument(
+        "--completion-upload-root",
+        default=None,
+        help="Directory for bounded oversized completion spools. Default: system temp.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--max-completion-upload-mb",
+        type=float,
+        default=DEFAULT_MAX_COMPLETION_UPLOAD_BYTES / (1024 * 1024),
+        help="Maximum logical canonical JSON size for one chunked completion. Default: 190.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--max-completion-upload-spool-mb",
+        type=float,
+        default=DEFAULT_MAX_COMPLETION_UPLOAD_SPOOL_BYTES / (1024 * 1024),
+        help="Maximum reserved size across active chunked completion uploads. Default: 2048.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--max-completion-upload-chunk-mb",
+        type=float,
+        default=DEFAULT_MAX_COMPLETION_UPLOAD_CHUNK_BYTES / (1024 * 1024),
+        help="Maximum raw body size for one completion upload chunk. Default: 8.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--completion-upload-ttl-seconds",
+        type=float,
+        default=DEFAULT_COMPLETION_UPLOAD_TTL_SECONDS,
+        help="Idle lifetime for abandoned completion spools. Default: 1800.",
+    )
+    play_hand_lab_gateway.add_argument(
         "--lease-ttl-seconds",
         type=float,
         default=600.0,
@@ -830,6 +862,17 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
             port=int(args.port),
             token=args.token,
             max_body_bytes=max(int(float(args.max_body_mb) * 1024 * 1024), 1024),
+            completion_upload_root=args.completion_upload_root,
+            max_completion_upload_bytes=max(
+                int(float(args.max_completion_upload_mb) * 1024 * 1024), 1
+            ),
+            max_completion_upload_spool_bytes=max(
+                int(float(args.max_completion_upload_spool_mb) * 1024 * 1024), 1
+            ),
+            max_completion_upload_chunk_bytes=max(
+                int(float(args.max_completion_upload_chunk_mb) * 1024 * 1024), 1
+            ),
+            completion_upload_ttl_seconds=max(float(args.completion_upload_ttl_seconds), 1.0),
             lease_ttl_seconds=args.lease_ttl_seconds,
             max_recent_completions=args.max_recent_completions,
             max_result_backlog=args.max_result_backlog,

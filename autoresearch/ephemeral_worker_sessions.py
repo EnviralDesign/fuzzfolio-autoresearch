@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import hmac
 import re
 import secrets
 import threading
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 
@@ -355,7 +355,24 @@ def ephemeral_http_operation_allowed(method: str, path: str) -> bool:
         method_u == "POST"
         and len(parts) == 3
         and parts[0] == "leases"
-        and parts[2] in {"heartbeat", "complete", "fail"}
+        and parts[2] in {"heartbeat", "complete", "completion-upload", "fail"}
+    ):
+        return True
+    if (
+        method_u == "PUT"
+        and len(parts) == 6
+        and parts[0] == "leases"
+        and parts[2] == "completion-upload"
+        and parts[4] == "chunks"
+        and parts[5].isdigit()
+    ):
+        return True
+    if (
+        method_u == "POST"
+        and len(parts) == 5
+        and parts[0] == "leases"
+        and parts[2] == "completion-upload"
+        and parts[4] == "finalize"
     ):
         return True
     if (
