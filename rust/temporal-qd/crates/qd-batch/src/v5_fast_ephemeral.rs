@@ -44,8 +44,20 @@ const EVALUATION_POPULATION_PATH: &str = "evaluation-population.json";
 const IDENTITY_LEDGER_PATH: &str = "identity-ledger.json";
 pub(crate) const PARENT_MATERIAL_PATH: &str = "parent-material.jsonl";
 pub(crate) const PARENT_MATERIAL_ROW_SCHEMA: &str =
-    "temporal_qd_v5_fast_ephemeral_parent_material_v1";
+    "temporal_qd_v5_fast_ephemeral_parent_material_v2";
 pub(crate) const MAX_PARENT_MATERIAL_ROW_BYTES: usize = 8 * 1024 * 1024;
+
+/// One private parent handoff for the next fast-ephemeral generation.
+///
+/// `reference` binds the immutable compact accepted record.  The public
+/// archive candidate instead binds its historical proposal-attempt identity
+/// through `proposal_entry_sha256`; both are required so later parent recovery
+/// cannot conflate the two identities.
+#[derive(Clone, Debug)]
+pub(crate) struct ParentMaterialEntry {
+    pub(crate) reference: ParentReference,
+    pub(crate) proposal_entry_sha256: String,
+}
 
 struct ParentMaterialWriter {
     writer: BufWriter<fs::File>,
@@ -64,7 +76,7 @@ impl ParentMaterialWriter {
         })
     }
 
-    fn append(&mut self, reference: &ParentReference) -> Result<()> {
+    fn append(&mut self, reference: &ParentReference, proposal_entry_sha256: &str) -> Result<()> {
         reference
             .validate()
             .context("validate fast-ephemeral parent reference")?;
@@ -76,6 +88,14 @@ impl ParentMaterialWriter {
             .insert(reference.candidate_id.clone())
         {
             bail!("fast-ephemeral parent material repeats a candidate");
+        }
+        if proposal_entry_sha256.len() != 71
+            || !proposal_entry_sha256.starts_with("sha256:")
+            || !proposal_entry_sha256.as_bytes()[7..]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("fast-ephemeral parent material proposal entry identity is invalid");
         }
         let semantic = Value::Object(Map::from_iter([
             (
@@ -89,6 +109,10 @@ impl ParentMaterialWriter {
             (
                 "pairIdentitySha256".to_owned(),
                 Value::String(reference.pair_identity_sha256.clone()),
+            ),
+            (
+                "proposalEntrySha256".to_owned(),
+                Value::String(proposal_entry_sha256.to_owned()),
             ),
             ("pairPayload".to_owned(), reference.pair_payload.clone()),
         ]));
@@ -127,14 +151,24 @@ impl ParentMaterialWriter {
 }
 
 impl V5G0ParentReferenceSink for ParentMaterialWriter {
-    fn write_parent_reference(&mut self, reference: &ParentReference) -> io::Result<()> {
-        self.append(reference).map_err(io::Error::other)
+    fn write_parent_reference(
+        &mut self,
+        reference: &ParentReference,
+        proposal_entry_sha256: &str,
+    ) -> io::Result<()> {
+        self.append(reference, proposal_entry_sha256)
+            .map_err(io::Error::other)
     }
 }
 
 impl V5EvolvedParentReferenceSink for ParentMaterialWriter {
-    fn write_parent_reference(&mut self, reference: &ParentReference) -> io::Result<()> {
-        self.append(reference).map_err(io::Error::other)
+    fn write_parent_reference(
+        &mut self,
+        reference: &ParentReference,
+        proposal_entry_sha256: &str,
+    ) -> io::Result<()> {
+        self.append(reference, proposal_entry_sha256)
+            .map_err(io::Error::other)
     }
 }
 
@@ -652,8 +686,16 @@ mod tests {
         fs::create_dir(&root).expect("create test root");
         let path = root.join(PARENT_MATERIAL_PATH);
         let mut writer = ParentMaterialWriter::create(&path).expect("create parent writer");
-        writer.append(&reference("candidate-a")).expect("write row");
-        assert!(writer.append(&reference("candidate-a")).is_err());
+        let proposal_entry_sha256 = canonical_sha256(&Value::String("candidate-a".to_owned()))
+            .expect("identify proposal entry");
+        writer
+            .append(&reference("candidate-a"), &proposal_entry_sha256)
+            .expect("write row");
+        assert!(
+            writer
+                .append(&reference("candidate-a"), &proposal_entry_sha256)
+                .is_err()
+        );
         let (rows, bytes) = writer.finish().expect("finish parent writer");
         assert_eq!(rows, 1);
 
@@ -662,6 +704,15 @@ mod tests {
         assert_eq!(raw.last(), Some(&b'\n'));
         assert!(!raw.contains(&b'\r'));
         let value: Value = serde_json::from_slice(&raw).expect("parse parent row");
+        assert_eq!(
+            value.get("schemaVersion").and_then(Value::as_str),
+            Some(PARENT_MATERIAL_ROW_SCHEMA)
+        );
+        assert_eq!(
+            value.get("proposalEntrySha256").and_then(Value::as_str),
+            Some(proposal_entry_sha256.as_str()),
+            "the proposal-attempt identity is independently bound from compact parent payload"
+        );
         assert_eq!(canonical_json_line(&value).expect("canonical row"), raw);
         let supplied = value
             .get("rowSha256")
@@ -784,8 +835,8 @@ pub(crate) fn execute_evolved(
     let publication_prepare_elapsed = publication_started.elapsed();
     let mut memory = MemoryFragments::default();
     let mut parent_writer = ParentMaterialWriter::create(&output_root.join(PARENT_MATERIAL_PATH))?;
-    for reference in prior_parent_references.values() {
-        parent_writer.append(reference)?;
+    for entry in prior_parent_references.values() {
+        parent_writer.append(&entry.reference, &entry.proposal_entry_sha256)?;
     }
     // This traversal is the mandatory independent compiler replay for the
     // fast-ephemeral transaction. It must succeed before either the invocation

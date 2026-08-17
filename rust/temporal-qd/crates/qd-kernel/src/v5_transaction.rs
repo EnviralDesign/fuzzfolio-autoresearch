@@ -4365,6 +4365,7 @@ mod tests {
             fn write_parent_reference(
                 &mut self,
                 reference: &ParentReference,
+                _proposal_entry_sha256: &str,
             ) -> std::io::Result<()> {
                 self.0.push(reference.clone());
                 Ok(())

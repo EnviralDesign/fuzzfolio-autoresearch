@@ -3363,7 +3363,7 @@ fn native_v5_archive_candidate_ids(archive: &Value) -> Result<BTreeSet<String>> 
 fn native_v5_fast_ephemeral_parent_references(
     manifest: &V5ProposalManifest,
     archive: &V5EvolvedInputDocument,
-) -> Result<BTreeMap<String, ParentReference>> {
+) -> Result<BTreeMap<String, v5_fast_ephemeral::ParentMaterialEntry>> {
     if manifest.generation_index < 2 {
         bail!("fast-ephemeral parent recovery requires generation two or later");
     }
@@ -3460,6 +3460,7 @@ fn native_v5_fast_ephemeral_parent_references(
             "schemaVersion",
             "candidateId",
             "pairIdentitySha256",
+            "proposalEntrySha256",
             "pairPayload",
             "rowSha256",
         ];
@@ -3496,6 +3497,20 @@ fn native_v5_fast_ephemeral_parent_references(
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("fast-ephemeral parent material lacks pair identity"))?
             .to_owned();
+        let proposal_entry_sha256 = fields
+            .get("proposalEntrySha256")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() == 71
+                    && value.starts_with("sha256:")
+                    && value.as_bytes()[7..]
+                        .iter()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                anyhow!("fast-ephemeral parent material proposal entry identity is invalid")
+            })?
+            .to_owned();
         let pair_payload = fields
             .get("pairPayload")
             .cloned()
@@ -3505,9 +3520,6 @@ fn native_v5_fast_ephemeral_parent_references(
             .ok_or_else(|| anyhow!("fast-ephemeral parent payload lacks accepted record"))?;
         let record = V5CompactAcceptedRecord::from_value(record_value)
             .context("validate fast-ephemeral parent compact record")?;
-        let record_sha256 = record
-            .record_sha256()
-            .context("identify fast-ephemeral parent compact record")?;
         if record.candidate_id != candidate_id
             || record.pair_identity_sha256 != pair_identity_sha256
             || archive_candidate
@@ -3529,7 +3541,7 @@ fn native_v5_fast_ephemeral_parent_references(
             || archive_candidate
                 .get("proposalEntrySha256")
                 .and_then(Value::as_str)
-                != Some(record_sha256.as_str())
+                != Some(proposal_entry_sha256.as_str())
         {
             bail!("fast-ephemeral archive candidate drifts from its parent material");
         }
@@ -3541,7 +3553,13 @@ fn native_v5_fast_ephemeral_parent_references(
         };
         verify_v5_evolved_parent_reference(&authority, &reference)
             .context("recompile fast-ephemeral archive parent material")?;
-        references.insert(candidate_id.to_owned(), reference);
+        references.insert(
+            candidate_id.to_owned(),
+            v5_fast_ephemeral::ParentMaterialEntry {
+                reference,
+                proposal_entry_sha256,
+            },
+        );
     }
     if references.len() != archive_candidates.len()
         || archive_candidates
@@ -3775,6 +3793,7 @@ fn v5_evolved_transaction_request_with_parent_references(
     RuntimeParentSelector,
     temporal_qd_kernel::proposal::CandidateIdentityLedger,
     BTreeMap<String, ParentReference>,
+    BTreeMap<String, v5_fast_ephemeral::ParentMaterialEntry>,
 )> {
     if manifest.generation_kind != "evolved" || manifest.generation_index < 2 {
         bail!("native v5 typed later-generation transaction requires an evolved generation >= 2");
@@ -3799,12 +3818,19 @@ fn v5_evolved_transaction_request_with_parent_references(
     // authenticated archive.  This is especially important for a G0 frontier
     // whose cumulative economics are all direction-ineligible: it is a valid
     // all-immigrant G1 authority, not a corrupt archive.
-    let parent_references = if fast_ephemeral {
-        native_v5_fast_ephemeral_parent_references(manifest, &parent_archive)
+    let (parent_references, prior_parent_material) = if fast_ephemeral {
+        let entries = native_v5_fast_ephemeral_parent_references(manifest, &parent_archive)?;
+        let references = entries
+            .iter()
+            .map(|(candidate_id, entry)| (candidate_id.clone(), entry.reference.clone()))
+            .collect();
+        Ok((references, entries))
     } else if manifest.generation_index == 2 {
         native_v5_g0_parent_references(manifest, &parent_archive)
+            .map(|references| (references, BTreeMap::new()))
     } else {
         native_v5_evolved_parent_references(manifest, &parent_archive)
+            .map(|references| (references, BTreeMap::new()))
     }
     .context("open typed native v5 evolved parent material")?;
     let parents = RuntimeParentSelector::from_native_v5_archive(
@@ -3870,7 +3896,13 @@ fn v5_evolved_transaction_request_with_parent_references(
         identity_ledger_state_sha256: canonical_sha256(&ledger.compact_state())
             .context("identify native v5 evolved identity ledger state")?,
     };
-    Ok((request, parents, ledger, parent_references))
+    Ok((
+        request,
+        parents,
+        ledger,
+        parent_references,
+        prior_parent_material,
+    ))
 }
 
 fn v5_evolved_transaction_request(
@@ -3880,7 +3912,7 @@ fn v5_evolved_transaction_request(
     RuntimeParentSelector,
     temporal_qd_kernel::proposal::CandidateIdentityLedger,
 )> {
-    let (request, parents, ledger, _) =
+    let (request, parents, ledger, _, _) =
         v5_evolved_transaction_request_with_parent_references(manifest, false)?;
     Ok((request, parents, ledger))
 }
@@ -3891,9 +3923,11 @@ fn v5_fast_ephemeral_evolved_transaction_request(
     V5EvolvedTransactionRequest,
     RuntimeParentSelector,
     temporal_qd_kernel::proposal::CandidateIdentityLedger,
-    BTreeMap<String, ParentReference>,
+    BTreeMap<String, v5_fast_ephemeral::ParentMaterialEntry>,
 )> {
-    v5_evolved_transaction_request_with_parent_references(manifest, true)
+    let (request, parents, ledger, _parent_references, parent_material) =
+        v5_evolved_transaction_request_with_parent_references(manifest, true)?;
+    Ok((request, parents, ledger, parent_material))
 }
 
 /// Rebuild only the cap-bearing control request needed by the evolved public

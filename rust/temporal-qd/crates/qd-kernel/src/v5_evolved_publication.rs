@@ -47,13 +47,24 @@ use crate::{
 /// Fast-ephemeral publication persists these while the verified material is
 /// already live; durable publication uses the no-op implementation below.
 pub trait V5EvolvedParentReferenceSink {
-    fn write_parent_reference(&mut self, reference: &ParentReference) -> std::io::Result<()>;
+    /// Preserve the historical proposal-attempt identity separately from the
+    /// compact accepted-record object carried by `reference`.  The public
+    /// evaluation/archive candidate binds the former as `proposalEntrySha256`.
+    fn write_parent_reference(
+        &mut self,
+        reference: &ParentReference,
+        proposal_entry_sha256: &str,
+    ) -> std::io::Result<()>;
 }
 
 struct NoopV5EvolvedParentReferenceSink;
 
 impl V5EvolvedParentReferenceSink for NoopV5EvolvedParentReferenceSink {
-    fn write_parent_reference(&mut self, _reference: &ParentReference) -> std::io::Result<()> {
+    fn write_parent_reference(
+        &mut self,
+        _reference: &ParentReference,
+        _proposal_entry_sha256: &str,
+    ) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -2685,7 +2696,8 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                         self.serialization_wall += started.elapsed();
                     }
                     let sink_started = self.collect_telemetry.then(Instant::now);
-                    self.parent_sink.write_parent_reference(&parent_reference)?;
+                    self.parent_sink
+                        .write_parent_reference(&parent_reference, attempt_entry_sha256)?;
                     if let Some(started) = sink_started {
                         self.sink_wait_wall += started.elapsed();
                     }
@@ -4126,11 +4138,16 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct ParentCollector(Vec<ParentReference>);
+    struct ParentCollector(Vec<(ParentReference, String)>);
 
     impl V5EvolvedParentReferenceSink for ParentCollector {
-        fn write_parent_reference(&mut self, reference: &ParentReference) -> std::io::Result<()> {
-            self.0.push(reference.clone());
+        fn write_parent_reference(
+            &mut self,
+            reference: &ParentReference,
+            proposal_entry_sha256: &str,
+        ) -> std::io::Result<()> {
+            self.0
+                .push((reference.clone(), proposal_entry_sha256.to_owned()));
             Ok(())
         }
     }
@@ -4744,19 +4761,23 @@ mod tests {
         parent_material: Vec<u8>,
     }
 
-    fn canonical_parent_material(references: &[ParentReference]) -> Vec<u8> {
+    fn canonical_parent_material(references: &[(ParentReference, String)]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for reference in references {
+        for (reference, proposal_entry_sha256) in references {
             assert!(reference.selection_audit.is_none());
             let semantic = object([
                 (
                     "schemaVersion",
-                    Value::String("temporal_qd_v5_fast_ephemeral_parent_material_v1".to_owned()),
+                    Value::String("temporal_qd_v5_fast_ephemeral_parent_material_v2".to_owned()),
                 ),
                 ("candidateId", Value::String(reference.candidate_id.clone())),
                 (
                     "pairIdentitySha256",
                     Value::String(reference.pair_identity_sha256.clone()),
+                ),
+                (
+                    "proposalEntrySha256",
+                    Value::String(proposal_entry_sha256.clone()),
                 ),
                 ("pairPayload", reference.pair_payload.clone()),
             ]);
@@ -5017,9 +5038,20 @@ mod tests {
             let authority =
                 V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
                     .expect("parse evolved parent authority");
-            for parent in &parents.0 {
+            for (parent, proposal_entry_sha256) in &parents.0 {
                 crate::v5::verify_v5_evolved_parent_reference(&authority, parent)
                     .expect("recompile streamed evolved parent");
+                assert_ne!(
+                    proposal_entry_sha256,
+                    &parent
+                        .pair_payload
+                        .get("acceptedRecord")
+                        .expect("accepted record")
+                        .get("recordSha256")
+                        .and_then(Value::as_str)
+                        .expect("accepted record identity"),
+                    "evolved archive entries deliberately retain proposal-attempt identity, not record identity"
+                );
             }
             assert_eq!(
                 materialization_test_observer::ACCEPTED_SINK_VISITS

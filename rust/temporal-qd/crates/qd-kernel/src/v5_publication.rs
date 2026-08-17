@@ -35,13 +35,23 @@ use crate::{
 /// the fast path writes one compact JSONL stream alongside its evaluation
 /// population without reconstructing selected candidates twice.
 pub trait V5G0ParentReferenceSink {
-    fn write_parent_reference(&mut self, reference: &ParentReference) -> std::io::Result<()>;
+    /// Preserve the entry identity exposed by the selected evaluation/archive
+    /// candidate alongside its compact parent material.
+    fn write_parent_reference(
+        &mut self,
+        reference: &ParentReference,
+        proposal_entry_sha256: &str,
+    ) -> std::io::Result<()>;
 }
 
 struct NoopV5G0ParentReferenceSink;
 
 impl V5G0ParentReferenceSink for NoopV5G0ParentReferenceSink {
-    fn write_parent_reference(&mut self, _reference: &ParentReference) -> std::io::Result<()> {
+    fn write_parent_reference(
+        &mut self,
+        _reference: &ParentReference,
+        _proposal_entry_sha256: &str,
+    ) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -1565,11 +1575,18 @@ impl<'a> V5G0PublicationStream<'a> {
             FragmentAccumulator::new(V5G0PublicationFragmentKind::GenerationJournalBindings);
 
         let mut append = |materialization: &V5SelectedG0Materialization| -> Result<()> {
-            parent_sink.write_parent_reference(&materialization.parent_reference)?;
-            population.append(sink, &materialization.rich_evaluation_candidate)?;
             let row = &materialization.publication_precomputed_row;
             let evaluation_candidate =
                 required(row, "evaluationCandidate", "v5 selected publication row")?;
+            let proposal_entry_sha256 = evaluation_candidate
+                .get("proposalEntrySha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    contract("v5 selected evaluation candidate lacks proposal entry SHA-256")
+                })?;
+            parent_sink
+                .write_parent_reference(&materialization.parent_reference, proposal_entry_sha256)?;
+            population.append(sink, &materialization.rich_evaluation_candidate)?;
             evaluation.append(sink, evaluation_candidate)?;
             let funnel_entry = required(row, "funnelEntry", "v5 selected publication row")?;
             funnel.append(sink, funnel_entry)?;
