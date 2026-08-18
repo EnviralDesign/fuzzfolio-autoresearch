@@ -432,6 +432,83 @@ def _bidirectional_pair_policy(payload: Mapping[str, Any]) -> dict[str, Any] | N
     return result
 
 
+def _require_native_compact_parent_candidate(candidate: Mapping[str, Any]) -> None:
+    """Admit a native rotating-generation compact parent without an embedded genome.
+
+    Native v5 archives keep proposal-entry and source-profile identities on the
+    member and restore pair payloads through the native parent-reference sidecar
+    during Rust construction. Python parent open is only used to freeze
+    panel-confidence quotas, so it must not demand the redundant FrozenPair.
+    """
+
+    _sha(
+        candidate.get("proposalEntrySha256"),
+        name="native QD archive proposal entry SHA-256",
+    )
+    _sha(candidate.get("programSha256"), name="native QD archive program SHA-256")
+    _sha(
+        candidate.get("sourceProfileSha256"),
+        name="native QD archive sourceProfile SHA-256",
+    )
+    profile = candidate.get("sourceProfile")
+    if (
+        not isinstance(profile, Mapping)
+        or profile.get("version") != "v3"
+        or profile.get("directionMode") != "both"
+    ):
+        raise TemporalDiscoveryContractError(
+            "native QD archive source profile is not the frozen v3/both pair"
+        )
+    graph = profile.get("graph")
+    if not isinstance(graph, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native QD archive source profile lacks graph"
+        )
+    arbitration = graph.get("entryArbitration")
+    if not isinstance(arbitration, Mapping):
+        raise TemporalDiscoveryContractError(
+            "native QD archive lacks entry arbitration"
+        )
+    modules = arbitration.get("modules")
+    if not isinstance(modules, list):
+        raise TemporalDiscoveryContractError(
+            "native QD archive entry modules must be an array"
+        )
+    seen: dict[str, str] = {}
+    for module in modules:
+        if not isinstance(module, Mapping):
+            raise TemporalDiscoveryContractError(
+                "native QD archive entry module is invalid"
+            )
+        side = module.get("direction")
+        if side not in {"long", "short"}:
+            raise TemporalDiscoveryContractError(
+                "native QD archive entry module direction is invalid"
+            )
+        if side in seen:
+            raise TemporalDiscoveryContractError(
+                f"native QD archive repeats {side} entry module"
+            )
+        seen[side] = _sha(
+            module.get("sourceProfileSnapshotSha256"),
+            name="native QD archive source profile snapshot",
+        )
+    for side in ("long", "short"):
+        if side not in seen:
+            raise TemporalDiscoveryContractError(
+                f"native QD archive lacks {side} entry module"
+            )
+
+
+def _admit_bidirectional_archive_candidate(
+    candidate: Mapping[str, Any], policy: Mapping[str, Any]
+) -> None:
+    if isinstance(candidate.get("bidirectionalGenome"), Mapping):
+        _require_bidirectional_candidate(candidate, policy)
+        return
+    _require_native_compact_parent_candidate(candidate)
+
+
 def _require_bidirectional_candidate(candidate: Mapping[str, Any], policy: Mapping[str, Any]) -> FrozenPair:
     """Admit only fully materialized, immutable v3/both economic candidates."""
     raw = candidate.get("bidirectionalGenome")
@@ -1127,6 +1204,79 @@ def _direction_selection_for_aggregate(aggregate: Mapping[str, Any]) -> dict[str
     return selection
 
 
+_DIRECTION_PROJECTION_KEYS = (
+    "directionSelection",
+    "directionBehaviorLane",
+    "directionBreedingLane",
+)
+
+
+def _direction_breeding_context_eligible(member: Mapping[str, Any]) -> bool:
+    """Whether a directional member may occupy a bound breeding lane.
+
+    Ordinary Python quality members still require nonnegative worst-window
+    economics. Native rotating archives also keep finite-data quality-lane
+    occupants whose current-panel worst window is negative when they carry
+    authenticated cumulative robust-breeder evidence; parent admission must
+    treat those the same as ``rotating_frontier`` robust breeders.
+    """
+
+    if _quality_member(member):
+        return True
+    return (
+        member.get("archiveLane") in {"quality", "rotating_frontier"}
+        and member.get("robustBreederEligible") is True
+        and isinstance(member.get("cumulativeEvidence"), Mapping)
+    )
+
+
+def _expected_direction_breeding_lane(
+    member: Mapping[str, Any], expected: Mapping[str, Any]
+) -> str | None:
+    return (
+        expected["lane"]
+        if expected["selectionEligible"] is True
+        and _direction_breeding_context_eligible(member)
+        else None
+    )
+
+
+def _hydrate_omitted_direction_projection(member: dict[str, Any]) -> None:
+    """Attach the frozen direction projection when a native archive omitted it.
+
+    Native rotating-generation archives keep the authoritative aggregate
+    realized behavior and omit the redundant Python projection. Parent
+    scheduling still reads ``directionSelection`` / breeding-lane fields, so
+    admission hydrates them in memory without rewriting the frozen artifact.
+    """
+
+    if any(key in member for key in _DIRECTION_PROJECTION_KEYS):
+        return
+    aggregate = member.get("aggregate")
+    if not isinstance(aggregate, Mapping):
+        return
+    expected = _direction_selection_for_aggregate(aggregate)
+    member["directionSelection"] = expected
+    member["directionBehaviorLane"] = expected["lane"]
+    member["directionBreedingLane"] = _expected_direction_breeding_lane(
+        member, expected
+    )
+
+
+def _hydrate_directional_parent_projections(archive: dict[str, Any]) -> None:
+    if _archive_policy_kind(archive) != "directional":
+        return
+    for cell in archive.get("cells") or []:
+        if not isinstance(cell, dict):
+            continue
+        members = cell.get("members")
+        if not isinstance(members, list):
+            continue
+        for member in members:
+            if isinstance(member, dict):
+                _hydrate_omitted_direction_projection(member)
+
+
 def _direction_breeding_lane(member: Mapping[str, Any]) -> str | None:
     """Return a v5 member's explicitly admitted breeding lane, if any."""
 
@@ -1142,14 +1292,7 @@ def _direction_breeding_lane(member: Mapping[str, Any]) -> str | None:
             LANE_SHORT_SPECIALIST,
         }
         and member.get("directionBreedingLane") == lane
-        and (
-            _quality_member(member)
-            or (
-                member.get("archiveLane") == "rotating_frontier"
-                and member.get("robustBreederEligible") is True
-                and isinstance(member.get("cumulativeEvidence"), Mapping)
-            )
-        )
+        and _direction_breeding_context_eligible(member)
     ):
         return str(lane)
     return None
@@ -2679,12 +2822,35 @@ def validate_qd_archive_geometry(archive: Mapping[str, Any]) -> None:
                 )
             if policy_kind == "directional":
                 aggregate = member.get("aggregate")
-                embedded = member.get("directionSelection")
-                if not isinstance(aggregate, Mapping) or not isinstance(embedded, Mapping):
+                if not isinstance(aggregate, Mapping):
                     raise TemporalDiscoveryContractError(
                         "direction-aware QD member lacks bound realized behavior selection"
                     )
                 expected = _direction_selection_for_aggregate(aggregate)
+                expected_breeding_lane = _expected_direction_breeding_lane(
+                    member, expected
+                )
+                has_selection = "directionSelection" in member
+                has_behavior_lane = "directionBehaviorLane" in member
+                has_breeding_lane = "directionBreedingLane" in member
+                if not has_selection and not has_behavior_lane and not has_breeding_lane:
+                    # Native rotating-generation archives omit the redundant
+                    # Python projection. Derive eligibility from authenticated
+                    # aggregate realized behavior instead of rejecting an
+                    # otherwise valid committed archive. A partially
+                    # materialized projection remains invalid below. Rust
+                    # parent admission does not reject this shape; ineligible
+                    # occupants simply do not become breeders after hydrate.
+                    continue
+                if not (has_selection and has_behavior_lane and has_breeding_lane):
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware QD member lacks bound realized behavior selection"
+                    )
+                embedded = member.get("directionSelection")
+                if not isinstance(embedded, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "direction-aware QD member lacks bound realized behavior selection"
+                    )
                 if embedded != expected:
                     raise TemporalDiscoveryContractError(
                         "direction-aware QD member selection identity mismatch"
@@ -2693,19 +2859,6 @@ def validate_qd_archive_geometry(archive: Mapping[str, Any]) -> None:
                     raise TemporalDiscoveryContractError(
                         "direction-aware QD member behavior lane mismatch"
                     )
-                expected_breeding_lane = (
-                    expected["lane"]
-                    if expected["selectionEligible"] is True
-                    and (
-                        _quality_member(member)
-                        or (
-                            member.get("archiveLane") == "rotating_frontier"
-                            and member.get("robustBreederEligible") is True
-                            and isinstance(member.get("cumulativeEvidence"), Mapping)
-                        )
-                    )
-                    else None
-                )
                 if member.get("directionBreedingLane") != expected_breeding_lane:
                     raise TemporalDiscoveryContractError(
                         "direction-aware QD member breeding lane mismatch"
@@ -2727,6 +2880,7 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
     ):
         raise TemporalDiscoveryContractError("unknown QD archive schema")
     validate_qd_archive_geometry(archive)
+    _hydrate_directional_parent_projections(archive)
     bidirectional_policy = _bidirectional_pair_policy(archive)
     if bidirectional_policy is not None:
         for cell in archive.get("cells") or []:
@@ -2735,7 +2889,7 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
             for member in cell.get("members") or []:
                 if not isinstance(member, Mapping) or not isinstance(member.get("candidate"), Mapping):
                     raise TemporalDiscoveryContractError("QD bidirectional archive member lacks candidate")
-                _require_bidirectional_candidate(member["candidate"], bidirectional_policy)
+                _admit_bidirectional_archive_candidate(member["candidate"], bidirectional_policy)
     return archive, archive_sha
 
 

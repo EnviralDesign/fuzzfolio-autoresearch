@@ -36,6 +36,7 @@ from .temporal_qd_pair_factory import (
 from .temporal_qd_pair_generation import (
     _rotating_parent_schedule,
     build_pair_generation_config,
+    select_breeding_confidence,
 )
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
@@ -61,6 +62,7 @@ from .temporal_qd_evolution import (
     qd_canonical_evidence_identity,
 )
 from .temporal_qd_funnel_adapter import build_qd_generation_funnel
+from .temporal_qd_generation_quality_audit import observe_generation_quality_audit
 from .temporal_qd_native import (
     G0_FINALIZATION_RUNTIME_RUST,
     PAIR_GENERATION_RUNTIME_DEFAULT,
@@ -1507,6 +1509,41 @@ def _native_v5_proposal_archive_descriptor(
     return dict(descriptor)
 
 
+def _load_bound_parent_archive_for_breeding_confidence(
+    descriptor: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Open the authenticated parent-archive descriptor for panel-confidence freeze.
+
+    This reuses the sealed absolute path and file identity already bound for
+    native construction.  It never accepts an unsigned alternate JSON path.
+    """
+
+    sealed = _native_v5_proposal_archive_descriptor(
+        descriptor, name="native v5 evolved parent archive"
+    )
+    path = Path(sealed["absolutePath"])
+    if not path.is_file():
+        raise TemporalDiscoveryContractError(
+            "native v5 evolved parent archive path is missing"
+        )
+    raw = path.read_bytes()
+    if len(raw) != int(sealed["byteLength"]):
+        raise TemporalDiscoveryContractError(
+            "native v5 evolved parent archive byte length drifted"
+        )
+    file_sha = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if file_sha != sealed["fileSha256"]:
+        raise TemporalDiscoveryContractError(
+            "native v5 evolved parent archive file identity drifted"
+        )
+    archive, archive_sha = _load_archive(path)
+    if archive_sha != sealed["semanticSha256"]:
+        raise TemporalDiscoveryContractError(
+            "native v5 evolved parent archive semantic identity drifted"
+        )
+    return archive
+
+
 def _native_v5_prefinalizer_archive_binding(
     value: Mapping[str, Any], *, name: str
 ) -> dict[str, Any]:
@@ -1645,6 +1682,15 @@ def _run_native_v5_generation(
         raise TemporalDiscoveryContractError(
             "native v5 source authority lacks immutable immigrant construction policy"
         )
+    breeding_confidence = None
+    if not is_g0:
+        breeding_archive = _load_bound_parent_archive_for_breeding_confidence(
+            parent_archive_descriptor
+        )
+        breeding_confidence = select_breeding_confidence(
+            parent_archive=breeding_archive,
+            target_unique_candidates=construction_width,
+        )
     generation_config = build_pair_generation_config(
         generation_index=generation_index,
         target_unique_candidates=construction_width,
@@ -1655,12 +1701,15 @@ def _run_native_v5_generation(
         # Parent parsing and selection belongs to Rust for v5.  The frozen
         # schedule is control-plane material only; the parent archive itself
         # is bound as an opaque, receipt-validated native input below.
+        # Python opens the same bound descriptor only to freeze panel-confidence
+        # offspring/immigrant quotas into the hashed generation config.
         parent_archive=None,
         immigrant_construction_policy=immigrant_policy,
         global_identity_ledger_enabled=(
             generation_kind == V5_PROPOSAL_GENERATION_EVOLVED
         ),
         parent_schedule=generation_parent_schedule,
+        breeding_confidence=breeding_confidence,
     )
     proposal_root = _native_v5_proposal_root(root, generation_index)
     try:
@@ -12091,6 +12140,12 @@ def run_qd_supervisor(
                 parent_schedule = generation_record.get("parentSchedule")
                 immigrant_cursor = int(state["nextImmigrantContinuationOrdinal"])
                 completed_by_index[generation_index] = generation_record
+                observe_generation_quality_audit(
+                    root,
+                    generation_index,
+                    finalization=native_completion.get("finalization"),
+                    generation_record=generation_record,
+                )
                 _event(
                     "generation_completed",
                     generationIndex=generation_index,

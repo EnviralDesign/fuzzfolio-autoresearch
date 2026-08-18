@@ -191,6 +191,103 @@ fn frozen_qd_version(fields: &Map<String, Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn validate_breeding_confidence_freeze(
+    config_fields: &Map<String, Value>,
+    target: u64,
+    desired_offspring: u64,
+    desired_immigrants: u64,
+    immigrant_numerator: u64,
+    immigrant_denominator: u64,
+    has_supported_parents: bool,
+) -> Result<()> {
+    let policy = config_fields
+        .get("breedingConfidencePolicy")
+        .and_then(Value::as_object)
+        .ok_or_else(|| contract("pair config breeding confidence policy is invalid"))?;
+    let receipt = config_fields
+        .get("breedingConfidenceReceipt")
+        .and_then(Value::as_object)
+        .ok_or_else(|| contract("pair config breeding confidence receipt is invalid"))?;
+    if policy.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_qd_breeding_confidence_policy_v1")
+        || receipt.get("schemaVersion").and_then(Value::as_str)
+            != Some("temporal_qd_v5_breeding_confidence_receipt_v1")
+    {
+        return Err(contract(
+            "pair config breeding confidence freeze schema is incompatible",
+        ));
+    }
+    let min_panels = receipt
+        .get("minimumQualifiedPanelCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| contract("pair config breeding confidence receipt is invalid"))?;
+    let max_panels = receipt
+        .get("maximumQualifiedPanelCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| contract("pair config breeding confidence receipt is invalid"))?;
+    let eligible = receipt
+        .get("breedingEligibleParentCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| contract("pair config breeding confidence receipt is invalid"))?;
+    if max_panels < min_panels {
+        return Err(contract(
+            "pair config breeding confidence receipt panel counts are invalid",
+        ));
+    }
+    let (offspring_numerator, offspring_denominator, expected_immigrant_numerator) =
+        match (eligible, min_panels) {
+            (0, 0) => (0_u64, 1_u64, 1_u64),
+            (_, 1) => (1, 5, 4),
+            (_, 2) => (1, 2, 1),
+            (_, panels) if panels >= 3 => (4, 5, 1),
+            _ => {
+                return Err(contract(
+                    "pair config breeding confidence receipt panel tier is invalid",
+                ));
+            }
+        };
+    if immigrant_numerator != expected_immigrant_numerator
+        || immigrant_denominator != offspring_denominator
+    {
+        return Err(contract(
+            "pair config reproduction allocation immigrant rational drifted from breeding confidence",
+        ));
+    }
+    let (expected_offspring, expected_immigrants) =
+        crate::schedule::breeding_confidence_quota_counts(
+            target,
+            offspring_numerator,
+            offspring_denominator,
+        );
+    if desired_offspring != expected_offspring
+        || desired_immigrants != expected_immigrants
+        || receipt
+            .get("desiredOffspringCandidateCount")
+            .and_then(Value::as_u64)
+            != Some(desired_offspring)
+        || receipt
+            .get("desiredImmigrantCandidateCount")
+            .and_then(Value::as_u64)
+            != Some(desired_immigrants)
+    {
+        return Err(contract(
+            "pair config breeding confidence receipt disagrees with reproduction allocation",
+        ));
+    }
+    if has_supported_parents {
+        if eligible == 0 || min_panels == 0 || offspring_numerator == 0 {
+            return Err(contract(
+                "pair config breeding confidence freeze disagrees with parent schedule",
+            ));
+        }
+    } else if eligible != 0 || min_panels != 0 || desired_offspring != 0 {
+        return Err(contract(
+            "pair config breeding confidence freeze disagrees with parent schedule",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerateGenerationRequest {
     pub output_root: PathBuf,
@@ -267,48 +364,47 @@ impl GenerateGenerationRequest {
         let has_supported_parents = self
             .parent_schedule
             .is_some_and(|schedule| schedule.breeder_parent_count > 0);
-        let expected_immigrants = crate::schedule::accepted_quota_immigrant_count(
-            self.target_unique_candidates,
-            has_supported_parents,
-        );
-        let desired_offspring = self.target_unique_candidates - expected_immigrants;
         let accepted_terms = allocation.get("schemaVersion").and_then(Value::as_str)
             == Some(REPRODUCTION_ALLOCATION_SCHEMA_ACCEPTED);
-        if (!accepted_terms
+        let target_key = if accepted_terms {
+            "targetAcceptedCandidates"
+        } else {
+            "targetEvaluatedCandidates"
+        };
+        let immigrant_key = if accepted_terms {
+            "desiredAcceptedImmigrantCount"
+        } else {
+            "desiredEvaluatedImmigrantCount"
+        };
+        let offspring_key = if accepted_terms {
+            "desiredAcceptedOffspringCount"
+        } else {
+            "desiredEvaluatedOffspringCount"
+        };
+        let desired_immigrants = allocation
+            .get(immigrant_key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| contract("pair config reproduction allocation is invalid"))?;
+        let desired_offspring = allocation
+            .get(offspring_key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| contract("pair config reproduction allocation is invalid"))?;
+        let immigrant_numerator = allocation
+            .get("minimumImmigrantNumerator")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| contract("pair config reproduction allocation is invalid"))?;
+        let immigrant_denominator = allocation
+            .get("minimumImmigrantDenominator")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| contract("pair config reproduction allocation is invalid"))?;
+        let common_valid = (!accepted_terms
             && allocation.get("schemaVersion").and_then(Value::as_str)
                 != Some(REPRODUCTION_ALLOCATION_SCHEMA))
-            || allocation
-                .get(if accepted_terms {
-                    "targetAcceptedCandidates"
-                } else {
-                    "targetEvaluatedCandidates"
-                })
-                .and_then(Value::as_u64)
+            || allocation.get(target_key).and_then(Value::as_u64)
                 != Some(self.target_unique_candidates)
-            || allocation
-                .get(if accepted_terms {
-                    "desiredAcceptedImmigrantCount"
-                } else {
-                    "desiredEvaluatedImmigrantCount"
-                })
-                .and_then(Value::as_u64)
-                != Some(expected_immigrants)
-            || allocation
-                .get(if accepted_terms {
-                    "desiredAcceptedOffspringCount"
-                } else {
-                    "desiredEvaluatedOffspringCount"
-                })
-                .and_then(Value::as_u64)
-                != Some(desired_offspring)
-            || allocation
-                .get("minimumImmigrantNumerator")
-                .and_then(Value::as_u64)
-                != Some(1)
-            || allocation
-                .get("minimumImmigrantDenominator")
-                .and_then(Value::as_u64)
-                != Some(5)
+            || desired_offspring + desired_immigrants != self.target_unique_candidates
+            || immigrant_denominator == 0
+            || immigrant_numerator > immigrant_denominator
             || allocation.get("parentSampling").and_then(Value::as_str)
                 != Some("with_replacement_supported_parents_v1")
             || allocation
@@ -316,13 +412,39 @@ impl GenerateGenerationRequest {
                 .and_then(Value::as_str)
                 != Some("immigrant_only_authority_bound_v1")
             || allocation.get("allocationMethod").and_then(Value::as_str)
-                != Some("accepted_quota_prefix_balance_v1")
-        {
+                != Some("accepted_quota_prefix_balance_v1");
+        if common_valid {
             return Err(contract("pair config reproduction allocation is invalid"));
+        }
+        let has_breeding_confidence = config_fields.contains_key("breedingConfidencePolicy")
+            || config_fields.contains_key("breedingConfidenceReceipt");
+        if has_breeding_confidence {
+            validate_breeding_confidence_freeze(
+                config_fields,
+                self.target_unique_candidates,
+                desired_offspring,
+                desired_immigrants,
+                immigrant_numerator,
+                immigrant_denominator,
+                has_supported_parents,
+            )?;
+        } else {
+            let expected_immigrants = crate::schedule::accepted_quota_immigrant_count(
+                self.target_unique_candidates,
+                has_supported_parents,
+            );
+            let expected_offspring = self.target_unique_candidates - expected_immigrants;
+            if desired_immigrants != expected_immigrants
+                || desired_offspring != expected_offspring
+                || immigrant_numerator != 1
+                || immigrant_denominator != 5
+            {
+                return Err(contract("pair config reproduction allocation is invalid"));
+            }
         }
         Ok(ReproductionPolicy::FrozenAcceptedQuota {
             desired_offspring,
-            desired_immigrants: expected_immigrants,
+            desired_immigrants,
         })
     }
 
@@ -349,6 +471,38 @@ impl GenerateGenerationRequest {
                 desired_offspring,
                 desired_immigrants,
             } => {
+                let has_breeding_confidence = fields.contains_key("breedingConfidencePolicy")
+                    || fields.contains_key("breedingConfidenceReceipt");
+                if has_breeding_confidence {
+                    if has_parents {
+                        let receipt = fields
+                            .get("breedingConfidenceReceipt")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                contract("pair config breeding confidence receipt is invalid")
+                            })?;
+                        let eligible = receipt
+                            .get("breedingEligibleParentCount")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let min_panels = receipt
+                            .get("minimumQualifiedPanelCount")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        if eligible == 0 || min_panels == 0 {
+                            return Err(contract(
+                                "frozen reproduction allocation disagrees with the supplied parent selector",
+                            ));
+                        }
+                    } else if desired_offspring != 0
+                        || desired_immigrants != self.target_unique_candidates
+                    {
+                        return Err(contract(
+                            "frozen reproduction allocation disagrees with the supplied parent selector",
+                        ));
+                    }
+                    return Ok((desired_offspring, desired_immigrants));
+                }
                 let expected_immigrants = crate::schedule::accepted_quota_immigrant_count(
                     self.target_unique_candidates,
                     has_parents,

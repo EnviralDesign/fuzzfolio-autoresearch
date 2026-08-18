@@ -250,7 +250,12 @@ def test_legacy_parent_archive_keeps_exact_four_to_one_origin_schedule() -> None
     assert [index for index, immigrant in enumerate(origins) if immigrant] == [4, 9]
 
 
-def test_sparse_rotating_archive_keeps_the_frozen_80_20_evaluated_quota() -> None:
+def test_sparse_rotating_archive_keeps_the_legacy_no_policy_80_20_evaluated_quota() -> None:
+    """Legacy path without breedingConfidencePolicy retains the 1/5 immigrant floor.
+
+    Production v5 one-panel parents now freeze 20% offspring / 80% immigrants via
+    breeding confidence; these helpers exercise the pre-policy allocation only.
+    """
     archive = _rotating_schedule_archive(parent_count=25, breeder_width=128)
     schedule = pair_generation._rotating_parent_schedule(archive)
     allocation = pair_generation._frozen_reproduction_allocation(
@@ -260,7 +265,7 @@ def test_sparse_rotating_archive_keeps_the_frozen_80_20_evaluated_quota() -> Non
     assert allocation["desiredEvaluatedImmigrantCount"] == 26
 
 
-def test_normal_rotating_archive_keeps_the_same_quota_and_parent_reservoir_policy() -> None:
+def test_normal_rotating_archive_keeps_the_same_legacy_no_policy_quota_and_parent_reservoir_policy() -> None:
     archive = _rotating_schedule_archive(parent_count=128, breeder_width=128)
     schedule = pair_generation._rotating_parent_schedule(archive)
     allocation = pair_generation._frozen_reproduction_allocation(
@@ -268,6 +273,48 @@ def test_normal_rotating_archive_keeps_the_same_quota_and_parent_reservoir_polic
     )
     assert allocation["desiredEvaluatedOffspringCount"] == 102
     assert allocation["parentSampling"] == "with_replacement_supported_parents_v1"
+
+
+def test_v5_one_panel_breeding_confidence_inverts_legacy_80_20_at_128() -> None:
+    confidence = pair_generation.select_breeding_confidence(
+        parent_archive={
+            "generationIndex": 3,
+            "cells": [
+                {
+                    "cellId": "cell-0",
+                    "members": [
+                        {
+                            "archiveLane": "quality",
+                            "robustBreederEligible": True,
+                            "cumulativeEvidenceArchiveSha256": "sha256:" + "a" * 64,
+                            "cumulativeEvidence": {"requiredPanelIds": ["panel-1"]},
+                        }
+                    ],
+                }
+            ],
+            "rotatingEvidenceTransaction": {
+                "cumulativeArchiveSha256": "sha256:" + "a" * 64,
+            },
+        },
+        target_unique_candidates=128,
+    )
+    allocation = pair_generation._frozen_reproduction_allocation(
+        parent_schedule=_rotating_schedule_archive(
+            parent_count=1, breeder_width=1
+        )["rotatingEvidenceTransaction"]["parentSchedule"],
+        target_unique_candidates=128,
+        accepted_terminology=True,
+        desired_offspring_count=confidence["desiredOffspringCandidateCount"],
+        desired_immigrant_count=confidence["desiredImmigrantCandidateCount"],
+        minimum_immigrant_numerator=confidence["immigrantNumerator"],
+        minimum_immigrant_denominator=confidence["immigrantDenominator"],
+    )
+    # Legacy no-policy floor at 128 was 102/26 (80% offspring). One-panel
+    # breeding confidence freezes the inverted 20% offspring schedule.
+    assert allocation["desiredAcceptedOffspringCount"] == 26
+    assert allocation["desiredAcceptedImmigrantCount"] == 102
+    assert allocation["minimumImmigrantNumerator"] == 4
+    assert allocation["minimumImmigrantDenominator"] == 5
 
 
 def test_allocation_retries_the_same_origin_until_accepted_then_balances_exactly() -> None:

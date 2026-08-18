@@ -3785,6 +3785,69 @@ fn native_v5_evolved_parent_references(
 /// intentionally restored from the public compact G0 ledger; G3+ restores
 /// only the dedicated evolved ledger facade.  Batch never falls back to a
 /// generic JSON ledger or a previous generation's private schedule receipt.
+fn v5_evolved_frozen_accepted_quotas(
+    generation_config: &Value,
+    target_accepted: u64,
+) -> Result<(u64, u64)> {
+    let allocation = generation_config
+        .get("reproductionAllocation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            anyhow!("native v5 evolved generation config lacks reproductionAllocation")
+        })?;
+    let accepted_terms = allocation.get("schemaVersion").and_then(Value::as_str)
+        == Some("temporal_qd_reproduction_allocation_v2");
+    let (offspring_key, immigrant_key, target_key) = if accepted_terms {
+        (
+            "desiredAcceptedOffspringCount",
+            "desiredAcceptedImmigrantCount",
+            "targetAcceptedCandidates",
+        )
+    } else {
+        (
+            "desiredEvaluatedOffspringCount",
+            "desiredEvaluatedImmigrantCount",
+            "targetEvaluatedCandidates",
+        )
+    };
+    let offspring = allocation
+        .get(offspring_key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            anyhow!("native v5 evolved reproduction allocation lacks offspring count")
+        })?;
+    let immigrants = allocation
+        .get(immigrant_key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            anyhow!("native v5 evolved reproduction allocation lacks immigrant count")
+        })?;
+    if allocation.get(target_key).and_then(Value::as_u64) != Some(target_accepted)
+        || offspring.checked_add(immigrants) != Some(target_accepted)
+    {
+        bail!("native v5 evolved reproduction allocation disagrees with targetAccepted");
+    }
+    if let Some(receipt) = generation_config
+        .get("breedingConfidenceReceipt")
+        .and_then(Value::as_object)
+    {
+        if receipt
+            .get("desiredOffspringCandidateCount")
+            .and_then(Value::as_u64)
+            != Some(offspring)
+            || receipt
+                .get("desiredImmigrantCandidateCount")
+                .and_then(Value::as_u64)
+                != Some(immigrants)
+        {
+            bail!(
+                "native v5 evolved breeding confidence receipt disagrees with reproduction allocation"
+            );
+        }
+    }
+    Ok((offspring, immigrants))
+}
+
 fn v5_evolved_transaction_request_with_parent_references(
     manifest: &V5ProposalManifest,
     fast_ephemeral: bool,
@@ -3878,6 +3941,8 @@ fn v5_evolved_transaction_request_with_parent_references(
             .restore_candidate_identity_ledger()
             .context("restore typed native v5 G3+ candidate identity ledger")?
     };
+    let frozen_quotas =
+        v5_evolved_frozen_accepted_quotas(&manifest.generation_config, manifest.requested_count)?;
     let request = V5EvolvedTransactionRequest {
         shared_authority: manifest.frozen_authority.clone(),
         generation_config_sha256: manifest.generation_config_sha256.clone(),
@@ -3888,6 +3953,8 @@ fn v5_evolved_transaction_request_with_parent_references(
         max_attempts: manifest.max_proposal_attempts,
         evaluation_width: manifest.evaluation_population_size,
         thread_cap: manifest.thread_cap,
+        desired_accepted_offspring: frozen_quotas.0,
+        desired_accepted_immigrants: frozen_quotas.1,
         parent_schedule,
         parent_selector_state_sha256: canonical_sha256(&parents.compact_state())
             .context("identify native v5 evolved parent selector state")?,
@@ -3976,6 +4043,8 @@ fn v5_evolved_adoption_request(
         configured_parent_schedule,
         schedule.parent_schedule_sha256.as_deref(),
     )?;
+    let frozen_quotas =
+        v5_evolved_frozen_accepted_quotas(&manifest.generation_config, manifest.requested_count)?;
     let request = V5EvolvedTransactionRequest {
         shared_authority: manifest.frozen_authority.clone(),
         generation_config_sha256: manifest.generation_config_sha256.clone(),
@@ -3988,6 +4057,8 @@ fn v5_evolved_adoption_request(
         // This is invocation telemetry only and remains absent from every
         // core semantic root.  It is still validated by the typed core.
         thread_cap: manifest.thread_cap,
+        desired_accepted_offspring: frozen_quotas.0,
+        desired_accepted_immigrants: frozen_quotas.1,
         parent_schedule,
         parent_selector_state_sha256: canonical_sha256(&schedule.initial_parent_selector_state)
             .context("identify sealed native v5 evolved initial parent-selector state")?,

@@ -20,6 +20,7 @@ from autoresearch.temporal_qd_rotating_evidence import (
     panel_for_generation,
     missing_backfill_panel_ids,
     reduce_provisional_diverse_survivors,
+    reduce_provisional_gate_aligned_survivors,
     required_panel_ids,
     validate_rotating_evidence_contract,
 )
@@ -187,6 +188,64 @@ def test_current_panel_fairness_and_completion_order_invariance():
     assert reduce_provisional_diverse_survivors(rows, limit=3) == reduce_provisional_diverse_survivors(reversed(rows), limit=3)
     with pytest.raises(TemporalDiscoveryContractError, match="conservative"):
         reduce_provisional_diverse_survivors([{**rows[0], "costView": "none"}], limit=1)
+
+
+def test_gate_aligned_provisional_prefers_screen_class_and_keeps_incumbents():
+    contract = _contract()
+    assert contract["provisionalReduction"] == {
+        "maxCandidates": 128,
+        "maxCandidatesAppliesTo": "new_proposals_only_v1",
+        "retainedParentRequalification": "mandatory_outside_new_proposal_cap_v1",
+        "selection": "current_panel_gate_aligned_round_robin_v2",
+        "economicEvidence": "current_panel_conservative_cost_only",
+    }
+    validate_rotating_evidence_contract(contract)
+    rows = [
+        {
+            "candidateId": "flash",
+            "cellId": "aaa_unsupported",
+            "costView": "research_conservative",
+            "currentPanelRank": 99.0,
+            "screenClass": 0,
+            "positiveEconomicConditionCount": 1,
+            "directionEligible": False,
+            "activeWindowFraction": 0.5,
+            "averageClosedTradesPerCandidateMonth": 1.0,
+            "cohortRole": "new_proposal",
+        },
+        {
+            "candidateId": "ready",
+            "cellId": "zzz_quality",
+            "costView": "research_conservative",
+            "currentPanelRank": 3.0,
+            "screenClass": 4,
+            "positiveEconomicConditionCount": 2,
+            "directionEligible": True,
+            "activeWindowFraction": 1.0,
+            "averageClosedTradesPerCandidateMonth": 5.0,
+            "cohortRole": "new_proposal",
+        },
+        {
+            "candidateId": "inc_b",
+            "cellId": "inc",
+            "costView": "research_conservative",
+            "currentPanelRank": -1.0,
+            "screenClass": 0,
+            "cohortRole": "retained_parent_evaluation",
+        },
+        {
+            "candidateId": "inc_a",
+            "cellId": "inc",
+            "costView": "research_conservative",
+            "currentPanelRank": -2.0,
+            "screenClass": 0,
+            "cohortRole": "retained_parent_evaluation",
+        },
+    ]
+    selected = reduce_provisional_gate_aligned_survivors(
+        rows, limit=1, retained_parent_ids=["inc_a", "inc_b"]
+    )
+    assert [row["candidateId"] for row in selected] == ["inc_a", "inc_b", "ready"]
 
 
 def test_panel_cycle_dedup_and_replace_archive_rejects_stale_coverage():

@@ -248,7 +248,13 @@ def build_rotating_evidence_contract(config: Mapping[str, Any]) -> dict[str, Any
         "panels": panels,
         "absoluteGenerationMapping": {"schemaVersion": "temporal_qd_absolute_panel_phase_v1", "firstGenerationIndex": 1, "cycleLength": 4, "mapping": "one_based_modulo_cycle"},
         "cumulativeCoveragePolicy": {"schemaVersion": "temporal_qd_cumulative_coverage_v1", "deduplicateRepeatedPanelIds": True, "backfillOnlyMissingPriorPanels": True, "currentPanelUnionNewCandidatesAndRetainedParents": True, "rawTaskResultsRemainAuthorityBound": True},
-        "provisionalReduction": {"maxCandidates": width, "selection": "current_panel_diverse_round_robin_v1", "economicEvidence": "current_panel_conservative_cost_only"},
+        "provisionalReduction": {
+            "maxCandidates": width,
+            "maxCandidatesAppliesTo": "new_proposals_only_v1",
+            "retainedParentRequalification": "mandatory_outside_new_proposal_cap_v1",
+            "selection": "current_panel_gate_aligned_round_robin_v2",
+            "economicEvidence": "current_panel_conservative_cost_only",
+        },
         "robustSelection": {
             "breederWidth": breeder_width,
             "policy": robust_policy,
@@ -604,11 +610,48 @@ def _validate_candidate_panel_bundle(
     return row
 
 
-def reduce_provisional_diverse_survivors(rows: Iterable[Mapping[str, Any]], *, limit: int) -> list[dict[str, Any]]:
-    """Deterministic current-panel round robin.  Rows must already use costed metrics."""
+def _provisional_screen_key(row: Mapping[str, Any]) -> tuple:
+    """Private gate-aligned ordering key; never part of candidate identity."""
+    screen_class = row.get("screenClass")
+    if isinstance(screen_class, bool) or not isinstance(screen_class, int):
+        # Sparse legacy rows without a projection fail closed into UNSUPPORTED.
+        screen_class = 0
+    positive = row.get("positiveEconomicConditionCount", 0)
+    if isinstance(positive, bool) or not isinstance(positive, int):
+        positive = 0
+    direction_eligible = bool(row.get("directionEligible", False))
+    active = float(row.get("activeWindowFraction", 0.0) or 0.0)
+    trades = float(row.get("averageClosedTradesPerCandidateMonth", 0.0) or 0.0)
+    rank = float(row["currentPanelRank"])
+    return (
+        -int(screen_class),
+        -int(positive),
+        0 if direction_eligible else 1,
+        -active,
+        -trades,
+        -rank,
+        str(row["candidateId"]),
+    )
+
+
+def reduce_provisional_gate_aligned_survivors(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    limit: int,
+    retained_parent_ids: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Gate-aligned current-panel round robin with mandatory retained parents.
+
+    ``limit`` caps newcomers only. Retained parents listed in
+    ``retained_parent_ids`` are concatenated first (candidateId ascending) and
+    never consume the newcomer budget. A row with ``cohortRole == "new_proposal"``
+    supersedes a matching retained-parent id.
+    """
     if not isinstance(limit, int) or limit < 1:
         raise TemporalDiscoveryContractError("provisional survivor limit must be positive")
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    retained = {str(item) for item in (retained_parent_ids or ())}
+    incumbents: list[dict[str, Any]] = []
+    newcomers: list[dict[str, Any]] = []
     for raw in rows:
         row = _clone(raw, name="current panel candidate")
         if not isinstance(row.get("candidateId"), str) or not isinstance(row.get("cellId"), str):
@@ -618,18 +661,45 @@ def reduce_provisional_diverse_survivors(rows: Iterable[Mapping[str, Any]], *, l
         rank = row.get("currentPanelRank")
         if isinstance(rank, bool) or not isinstance(rank, (int, float)):
             raise TemporalDiscoveryContractError("current panel candidate rank is invalid")
-        groups[row["cellId"]].append(row)
+        candidate_id = str(row["candidateId"])
+        role = row.get("cohortRole")
+        if role == "new_proposal" or candidate_id not in retained:
+            newcomers.append(row)
+        else:
+            incumbents.append(row)
+    incumbents.sort(key=lambda row: str(row["candidateId"]))
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in newcomers:
+        groups[str(row["cellId"])].append(row)
     for values in groups.values():
-        values.sort(key=lambda row: (-float(row["currentPanelRank"]), str(row["candidateId"])))
-    selected: list[dict[str, Any]] = []
-    while len(selected) < limit:
+        values.sort(key=_provisional_screen_key)
+    # Freeze cell order from each cell's best candidate before removals.
+    cell_order = sorted(
+        groups,
+        key=lambda cell: (_provisional_screen_key(groups[cell][0]), cell),
+    )
+    selected_newcomers: list[dict[str, Any]] = []
+    while len(selected_newcomers) < limit:
         added = False
-        for cell in sorted(groups):
-            if groups[cell] and len(selected) < limit:
-                selected.append(groups[cell].pop(0)); added = True
+        for cell in cell_order:
+            if groups[cell] and len(selected_newcomers) < limit:
+                selected_newcomers.append(groups[cell].pop(0))
+                added = True
         if not added:
             break
-    return selected
+    return [*incumbents, *selected_newcomers]
+
+
+def reduce_provisional_diverse_survivors(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    limit: int,
+    retained_parent_ids: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministic gate-aligned provisional reduction (v2 policy)."""
+    return reduce_provisional_gate_aligned_survivors(
+        rows, limit=limit, retained_parent_ids=retained_parent_ids
+    )
 
 
 def build_current_panel_evaluation_cohort(
@@ -1207,6 +1277,6 @@ __all__ = [
     "CANDIDATE_PANEL_BUNDLE_SCHEMA", "CUMULATIVE_ARCHIVE_SCHEMA", "GENERATION_EVIDENCE_CHECKPOINT_SCHEMA", "OUTER_TAIL_START",
     "build_rotating_evidence_contract", "validate_rotating_evidence_contract", "panel_for_generation",
     "required_panel_ids", "template_for_generation", "build_candidate_window_evidence",
-    "validate_generation_template", "validate_panel_template", "panel_scoped_evaluation_identity", "build_candidate_panel_bundle", "reduce_provisional_diverse_survivors",
+    "validate_generation_template", "validate_panel_template", "panel_scoped_evaluation_identity", "build_candidate_panel_bundle", "reduce_provisional_diverse_survivors", "reduce_provisional_gate_aligned_survivors",
     "build_current_panel_evaluation_cohort", "robust_breeder_policy", "classify_robust_breeders", "cumulative_candidate_row", "missing_backfill_panel_ids", "build_generation_evidence_checkpoint", "build_cumulative_breeder_archive",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -298,3 +299,95 @@ def test_v5_rotating_frontier_uses_cumulative_direction_behavior(tmp_path) -> No
     assert member["directionBreedingLane"] is None
     with pytest.raises(TemporalDiscoveryContractError, match="no quality-eligible"):
         qd._reproduction_cells(harmful_archive)
+
+
+def _directional_archive(members: list[dict], *, omit_projection: bool = False) -> dict:
+    cells = qd.select_qd_archive(deepcopy(members), cell_capacity=4, direction_aware=True)
+    if omit_projection:
+        for cell in cells:
+            for member in cell["members"]:
+                for key in ("directionSelection", "directionBehaviorLane", "directionBreedingLane"):
+                    member.pop(key, None)
+    archive = {
+        "schemaVersion": qd.QD_ARCHIVE_SCHEMA,
+        "qdVersion": qd.QD_VERSION,
+        "policyName": qd.DIRECTIONAL_QD_POLICY_NAME,
+        "policySha256": qd.DIRECTIONAL_QD_POLICY_SHA256,
+        "frozenPolicy": deepcopy(qd.DIRECTIONAL_QD_POLICY),
+        "cells": cells,
+    }
+    archive["archiveSha256"] = canonical_sha256(
+        {key: value for key, value in archive.items() if key != "archiveSha256"}
+    )
+    return archive
+
+
+def test_native_archive_omits_direction_projection_and_parent_load_derives_it(tmp_path) -> None:
+    archive = _directional_archive(
+        [_member("balanced", _behavior(long_net=1.0, short_net=1.0))],
+        omit_projection=True,
+    )
+    member = archive["cells"][0]["members"][0]
+    assert "directionSelection" not in member
+    assert "directionBehaviorLane" not in member
+    assert "directionBreedingLane" not in member
+    qd.validate_qd_archive_geometry(archive)
+
+    path = tmp_path / "native-parent.json"
+    path.write_text(json.dumps(archive), encoding="utf-8")
+    loaded, archive_sha = qd._load_archive(path)
+    assert archive_sha == archive["archiveSha256"]
+    hydrated = loaded["cells"][0]["members"][0]
+    assert hydrated["directionBehaviorLane"] == LANE_BALANCED_BIDIRECTIONAL
+    assert hydrated["directionBreedingLane"] == LANE_BALANCED_BIDIRECTIONAL
+    assert qd._direction_breeding_lane(hydrated) == LANE_BALANCED_BIDIRECTIONAL
+    assert "directionSelection" not in member
+
+
+def test_partial_native_direction_projection_is_still_rejected() -> None:
+    archive = _directional_archive(
+        [_member("balanced", _behavior(long_net=1.0, short_net=1.0))],
+        omit_projection=True,
+    )
+    archive["cells"][0]["members"][0]["directionBehaviorLane"] = LANE_BALANCED_BIDIRECTIONAL
+    archive["archiveSha256"] = canonical_sha256(
+        {key: value for key, value in archive.items() if key != "archiveSha256"}
+    )
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="lacks bound realized behavior selection",
+    ):
+        qd.validate_qd_archive_geometry(archive)
+
+
+_V32_NATIVE_G1_ARCHIVE = Path(
+    "runs/temporal-qd-v5-fast-ephemeral-4000x1024x5-20260817-v32"
+    "/run/broad-4000x1024x5/generations/generation-0001/native-finalization/archive.json"
+)
+
+
+@pytest.mark.skipif(
+    not _V32_NATIVE_G1_ARCHIVE.is_file(),
+    reason="v32 native G1 archive is not present",
+)
+def test_v32_native_g1_archive_loads_as_g2_parent() -> None:
+    on_disk = json.loads(_V32_NATIVE_G1_ARCHIVE.read_text(encoding="utf-8"))
+    loaded, archive_sha = qd._load_archive(_V32_NATIVE_G1_ARCHIVE)
+    assert archive_sha == on_disk["archiveSha256"]
+    assert loaded["cells"]
+    for cell in loaded["cells"]:
+        for member in cell["members"]:
+            assert isinstance(member.get("directionSelection"), dict)
+            assert member.get("directionBehaviorLane")
+            assert "directionBreedingLane" in member
+            if member.get("archiveLane") == "quality":
+                assert qd._direction_breeding_lane(member) is not None
+    cells = qd._reproduction_cells(loaded)
+    assert cells
+    assert sum(len(cell["members"]) for cell in cells) == 3
+    from autoresearch.temporal_qd_pair_generation import select_breeding_confidence
+
+    confidence = select_breeding_confidence(
+        parent_archive=loaded, target_unique_candidates=1024
+    )
+    assert confidence["receipt"]["breedingEligibleParentCount"] == 3

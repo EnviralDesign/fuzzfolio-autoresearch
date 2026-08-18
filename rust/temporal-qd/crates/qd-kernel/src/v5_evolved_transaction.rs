@@ -29,7 +29,7 @@ use crate::{
         AcceptedProposal, IdentityLedger, LedgerProposal, ParentSelector, PlannedProposal,
         ProposalError, ProposalPlanner, ProposalSchedule, ProposalState,
     },
-    schedule::{RotatingParentSchedule, accepted_quota_immigrant_count},
+    schedule::RotatingParentSchedule,
     v5::{
         V5AttemptJournal, V5AttemptLineageRefs, V5AttemptOutcomeAudit, V5AttemptParentReference,
         V5CompactAcceptedRecord, V5Error, V5EvolvedAcceptedBuildInput,
@@ -1321,6 +1321,10 @@ pub struct V5EvolvedTransactionRequest {
     /// Control-plane only.  It is bounded to 1..=8 and deliberately omitted
     /// from the result's semantic identity.
     pub thread_cap: u64,
+    /// Frozen accepted-population offspring quota from reproductionAllocation.
+    pub desired_accepted_offspring: u64,
+    /// Frozen accepted-population immigrant quota from reproductionAllocation.
+    pub desired_accepted_immigrants: u64,
     pub parent_schedule: Option<RotatingParentSchedule>,
     pub parent_selector_state_sha256: String,
     pub identity_ledger_identity_sha256: String,
@@ -1361,6 +1365,15 @@ impl V5EvolvedTransactionRequest {
         if self.target_accepted == 0 {
             return Err(contract(
                 "native v5 evolved transaction targetAccepted must be positive",
+            ));
+        }
+        if self
+            .desired_accepted_offspring
+            .checked_add(self.desired_accepted_immigrants)
+            != Some(self.target_accepted)
+        {
+            return Err(contract(
+                "native v5 evolved transaction desired accepted quotas must sum to targetAccepted",
             ));
         }
         if self.max_attempts < self.target_accepted {
@@ -6229,11 +6242,13 @@ where
         }
         (false, None) => None,
     };
-    let desired_immigrants = accepted_quota_immigrant_count(request.target_accepted, has_parents);
-    let desired_offspring = request
-        .target_accepted
-        .checked_sub(desired_immigrants)
-        .ok_or_else(|| contract("v5 evolved accepted quota underflowed"))?;
+    let desired_immigrants = request.desired_accepted_immigrants;
+    let desired_offspring = request.desired_accepted_offspring;
+    if desired_offspring.checked_add(desired_immigrants) != Some(request.target_accepted) {
+        return Err(contract(
+            "v5 evolved accepted quota disagrees with targetAccepted",
+        ));
+    }
     let schedule = ProposalSchedule {
         config_sha256: request.generation_config_sha256.clone(),
         generation_index: request.generation_index,
@@ -6753,6 +6768,7 @@ mod scheduler_tests {
     use crate::{
         factory::ParentReference,
         proposal::{CandidateIdentityLedger, ExplicitParentRing, ParentSelector},
+        schedule::{accepted_quota_immigrant_count, breeding_confidence_quota_counts},
         v5::{
             build_v5_g0_accepted_material, parent_reference_from_v5_compact_record,
             v5_proposal_seed,
@@ -7134,6 +7150,7 @@ mod scheduler_tests {
         selector: &TestParentSelector,
         ledger: &CandidateIdentityLedger,
     ) -> V5EvolvedTransactionRequest {
+        let desired_immigrants = accepted_quota_immigrant_count(2, true);
         V5EvolvedTransactionRequest {
             shared_authority: shared_authority_fixture(),
             generation_config_sha256: sha(object([(
@@ -7155,6 +7172,8 @@ mod scheduler_tests {
             max_attempts: 7,
             evaluation_width: 1,
             thread_cap,
+            desired_accepted_offspring: 2 - desired_immigrants,
+            desired_accepted_immigrants: desired_immigrants,
             parent_schedule: Some(
                 RotatingParentSchedule::from_counts(2, 2).expect("test parent schedule"),
             ),
@@ -7162,6 +7181,35 @@ mod scheduler_tests {
             identity_ledger_identity_sha256: sha(ledger.identity().clone()),
             identity_ledger_state_sha256: sha(ledger.compact_state()),
         }
+    }
+
+    #[test]
+    fn evolved_transaction_consumes_frozen_one_panel_quota_not_legacy_four_fifths() {
+        let (offspring, immigrants) = breeding_confidence_quota_counts(1024, 1, 5);
+        assert_eq!((offspring, immigrants), (205, 819));
+        let legacy_immigrants = accepted_quota_immigrant_count(1024, true);
+        assert_eq!(legacy_immigrants, 205);
+        assert_ne!(
+            immigrants, legacy_immigrants,
+            "one-panel breeding confidence must invert the legacy 80/20 floor"
+        );
+        let parents = ExplicitParentRing::new(Vec::new()).expect("empty parent ring");
+        let ledger = ledger();
+        let mut request = direct_native_request(sha(object([(
+            "schemaVersion",
+            Value::String("temporal_qd_v5_evolved_breeding_confidence_quota_v1".to_owned()),
+        )])));
+        request.target_accepted = 1024;
+        request.max_attempts = 1024;
+        request.evaluation_width = 1;
+        request.desired_accepted_offspring = offspring;
+        request.desired_accepted_immigrants = immigrants;
+        request.parent_selector_state_sha256 = sha(parents.compact_state());
+        request.identity_ledger_identity_sha256 = sha(ledger.identity().clone());
+        request.identity_ledger_state_sha256 = sha(ledger.compact_state());
+        request
+            .validate_shape()
+            .expect("frozen one-panel quotas must validate");
     }
 
     fn ledger() -> CandidateIdentityLedger {
@@ -7293,6 +7341,8 @@ mod scheduler_tests {
             max_attempts: 1,
             evaluation_width: 1,
             thread_cap: 1,
+            desired_accepted_offspring: 0,
+            desired_accepted_immigrants: 1,
             parent_schedule: None,
             parent_selector_state_sha256: sha(object([(
                 "schemaVersion",
@@ -8102,6 +8152,8 @@ mod scheduler_tests {
     ) {
         let (mut request, parents, base_ledger) = real_immigrant_fixture(thread_cap);
         request.target_accepted = 2;
+        request.desired_accepted_offspring = 0;
+        request.desired_accepted_immigrants = 2;
         request.max_attempts = 6;
         let authority =
             V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
@@ -8173,6 +8225,8 @@ mod scheduler_tests {
         for thread_cap in [1_u64, 2, 8] {
             let (mut request, mut parents, mut ledger) = real_immigrant_fixture(thread_cap);
             request.target_accepted = 2;
+            request.desired_accepted_offspring = 0;
+            request.desired_accepted_immigrants = 2;
             request.max_attempts = 8;
             let engine = NativeV5EvolvedConstructionEngine::fast_ephemeral();
             let (result, telemetry) = execute_with_constructor_and_telemetry(

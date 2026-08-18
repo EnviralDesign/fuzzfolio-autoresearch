@@ -973,7 +973,19 @@ fn prepare(
             &proposal_member_ids,
             &retained_parent_member_ids,
         )?;
-        let provisional = make_provisional(base.generation, &current, &cohort, &[], 0)?;
+        let provisional = make_provisional(
+            base.generation,
+            &current,
+            &cohort,
+            &[],
+            &BTreeMap::new(),
+            &proposal_member_ids,
+            &retained_parent_member_ids,
+            &robust_selection_policy(&base.rotating)?,
+            &direction_selection_policy(&base.archive_policy)?,
+            current_panel_covered_months(&base.rotating, &current)?,
+            0,
+        )?;
         let (pending_task, pending_descriptor) = task(
             0,
             "retained_parent_current_panel",
@@ -1029,11 +1041,20 @@ fn prepare(
         .ok()
         .and_then(|x| unsigned(x, "maxCandidates").ok())
         .unwrap_or(members.len() as u64) as usize;
+    let robust_policy = robust_selection_policy(&base.rotating)?;
+    let direction_policy = direction_selection_policy(&base.archive_policy)?;
+    let covered_months = current_panel_covered_months(&base.rotating, &current)?;
     let provisional = make_provisional(
         base.generation,
         &current,
         &cohort,
         &members.values().cloned().collect::<Vec<_>>(),
+        &member_records,
+        &proposal_member_ids,
+        &retained_parent_member_ids,
+        &robust_policy,
+        &direction_policy,
+        covered_months,
         max,
     )?;
     let selected = array(&provisional, "candidates")?
@@ -1114,6 +1135,7 @@ fn prepare(
                         &receipts,
                     )?,
                     previous.as_ref(),
+                    &panel_missing,
                 )?,
             )?;
             tasks.push(task);
@@ -1237,53 +1259,474 @@ fn make_cohort(
     add(&mut v, "cohortSha256")?;
     Ok(v)
 }
-fn make_provisional(g: u64, p: &str, c: &Value, rows: &[Value], limit: usize) -> Result<Value> {
-    let mut counts = BTreeMap::<String, usize>::new();
-    let mut groups = BTreeMap::<String, Vec<&Value>>::new();
+fn robust_selection_policy(rotating: &Value) -> Result<Value> {
+    let selection = member(rotating, "robustSelection")?;
+    let policy = member(selection, "policy")?;
+    number_f64(policy, "minimumActiveWindowFraction")?;
+    number_f64(policy, "minimumAverageClosedTradesPerCandidateMonth")?;
+    Ok(policy.clone())
+}
+
+fn direction_selection_policy(archive_policy: &Value) -> Result<Value> {
+    let frozen = member(archive_policy, "frozenPolicy")?;
+    let direction = member(frozen, "directionSelection")?;
+    let policy = member(direction, "selectionPolicy")?;
+    unsigned(policy, "minimum_closed_trades_per_side")?;
+    unsigned(policy, "minimum_active_windows_per_side")?;
+    number_f64(policy, "minimum_acceptable_side_net_r")?;
+    number_f64(policy, "harmful_opposite_net_r")?;
+    Ok(policy.clone())
+}
+
+fn current_panel_covered_months(rotating: &Value, panel_id: &str) -> Result<f64> {
+    for panel in array(rotating, "panels")? {
+        if text(panel, "panelId")? == panel_id {
+            let months = number_f64(panel, "totalMonths")?;
+            ensure!(
+                months.is_finite() && months > 0.0,
+                "current panel totalMonths must be a positive finite value"
+            );
+            return Ok(months);
+        }
+    }
+    Err(anyhow!("current panel is absent from rotating evidence"))
+}
+
+#[derive(Clone, Debug)]
+struct ProvisionalScreen {
+    screen_class: u8,
+    positive_economic_condition_count: u8,
+    direction_eligible: bool,
+    active_window_fraction: f64,
+    average_closed_trades_per_candidate_month: f64,
+    current_panel_rank: f64,
+    candidate_id: String,
+}
+
+fn screen_ordering(left: &ProvisionalScreen, right: &ProvisionalScreen) -> std::cmp::Ordering {
+    right
+        .screen_class
+        .cmp(&left.screen_class)
+        .then_with(|| {
+            right
+                .positive_economic_condition_count
+                .cmp(&left.positive_economic_condition_count)
+        })
+        .then_with(|| right.direction_eligible.cmp(&left.direction_eligible))
+        .then_with(|| {
+            right
+                .active_window_fraction
+                .total_cmp(&left.active_window_fraction)
+        })
+        .then_with(|| {
+            right
+                .average_closed_trades_per_candidate_month
+                .total_cmp(&left.average_closed_trades_per_candidate_month)
+        })
+        .then_with(|| right.current_panel_rank.total_cmp(&left.current_panel_rank))
+        .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+}
+
+fn number_f64(v: &Value, k: &str) -> Result<f64> {
+    let n = member(v, k)?
+        .as_f64()
+        .ok_or_else(|| anyhow!("{k} must be numeric"))?;
+    ensure!(n.is_finite(), "{k} must be finite");
+    Ok(n)
+}
+
+fn optional_number_f64(v: &Value, k: &str) -> Result<Option<f64>> {
+    match v.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let n = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{k} must be numeric"))?;
+            ensure!(n.is_finite(), "{k} must be finite");
+            Ok(Some(n))
+        }
+    }
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectionCategory {
+    Eligible,
+    NoNonnegativeSide,
+    MildNegativeOpposite,
+    HarmfulOpposite,
+}
+
+impl DirectionCategory {
+    #[allow(dead_code)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::NoNonnegativeSide => "no_nonnegative_side",
+            Self::MildNegativeOpposite => "mild_negative_opposite",
+            Self::HarmfulOpposite => "harmful_opposite",
+        }
+    }
+}
+
+/// Copied from qd-generation-finalizer::direction_selection_eligible (no crate dep).
+fn direction_selection_assessment(
+    behavior: Option<&Value>,
+    policy: &Value,
+) -> Result<(bool, DirectionCategory)> {
+    let Some(behavior) = behavior else {
+        return Ok((false, DirectionCategory::NoNonnegativeSide));
+    };
+    if text(behavior, "schemaVersion").ok() != Some("temporal_realized_behavior_v1") {
+        return Ok((false, DirectionCategory::NoNonnegativeSide));
+    }
+    let window_count = match unsigned(behavior, "windowCount") {
+        Ok(count) if count > 0 => count,
+        _ => return Ok((false, DirectionCategory::NoNonnegativeSide)),
+    };
+    let minimum_active_windows = unsigned(policy, "minimum_active_windows_per_side")?;
+    if window_count < minimum_active_windows {
+        return Ok((false, DirectionCategory::NoNonnegativeSide));
+    }
+    let minimum_closed_trades = unsigned(policy, "minimum_closed_trades_per_side")?;
+    let minimum_acceptable_net = number_f64(policy, "minimum_acceptable_side_net_r")?;
+    let harmful_net = number_f64(policy, "harmful_opposite_net_r")?;
+    ensure!(
+        harmful_net < minimum_acceptable_net,
+        "direction harmful-side threshold is invalid"
+    );
+    let side = |name: &str| -> Result<(bool, bool, bool)> {
+        let sides = match member(behavior, "sides") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        let row = match member(sides, name) {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        let closed = match unsigned(row, "closedTrades") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        let active_windows = match unsigned(row, "activeWindowCount") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        if active_windows > window_count {
+            return Ok((false, false, false));
+        }
+        let active_fraction = match number_f64(row, "activeWindowFraction") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        if (active_fraction - active_windows as f64 / window_count as f64).abs() > 1e-12 {
+            return Ok((false, false, false));
+        }
+        let gross = match number_f64(row, "grossR") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        let net = match number_f64(row, "netR") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        let cost = match number_f64(row, "costR") {
+            Ok(value) => value,
+            Err(_) => return Ok((false, false, false)),
+        };
+        if (gross - net - cost).abs() > 1e-9 {
+            return Ok((false, false, false));
+        }
+        let terminal = unsigned(row, "terminalDirectionCount").unwrap_or(0);
+        if row.get("active").and_then(Value::as_bool) != Some(closed > 0 || terminal > 0) {
+            return Ok((false, false, false));
+        }
+        let supported = closed >= minimum_closed_trades && active_windows >= minimum_active_windows;
+        Ok((
+            supported,
+            supported && net >= minimum_acceptable_net,
+            supported && net <= harmful_net,
+        ))
+    };
+    let (long_supported, long_acceptable, long_harmful) = side("long")?;
+    let (short_supported, short_acceptable, short_harmful) = side("short")?;
+    if (long_acceptable && short_harmful) || (short_acceptable && long_harmful) {
+        return Ok((false, DirectionCategory::HarmfulOpposite));
+    }
+    let eligible = long_acceptable && (short_acceptable || !short_supported)
+        || (short_acceptable && !long_supported);
+    if eligible {
+        return Ok((true, DirectionCategory::Eligible));
+    }
+    if (long_supported && !long_acceptable) || (short_supported && !short_acceptable) {
+        return Ok((false, DirectionCategory::MildNegativeOpposite));
+    }
+    Ok((false, DirectionCategory::NoNonnegativeSide))
+}
+
+fn window_closed_trades(window: &Value) -> Result<f64> {
+    if let Some(value) = optional_number_f64(window, "closedTrades")? {
+        return Ok(value);
+    }
+    if let Some(value) = optional_number_f64(window, "trades")? {
+        return Ok(value);
+    }
+    Ok(0.0)
+}
+
+fn window_conservative_net(window: &Value) -> Result<f64> {
+    if let Some(value) = optional_number_f64(window, "conservativeNetR")? {
+        return Ok(value);
+    }
+    if let Some(value) = optional_number_f64(window, "netR")? {
+        return Ok(value);
+    }
+    Ok(0.0)
+}
+
+fn provisional_screen_for_member(
+    row: &Value,
+    raw_member: Option<&Value>,
+    robust_policy: &Value,
+    direction_policy: &Value,
+    covered_months: f64,
+) -> Result<ProvisionalScreen> {
+    let candidate_id = text(row, "candidateId")?.to_owned();
+    let current_panel_rank = row
+        .get("currentPanelRank")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow!("provisional candidate lacks finite currentPanelRank"))?;
+    let min_active = number_f64(robust_policy, "minimumActiveWindowFraction")?;
+    let min_trades = number_f64(robust_policy, "minimumAverageClosedTradesPerCandidateMonth")?;
+    let mut nets = Vec::new();
+    let mut active = 0usize;
+    let mut trades = 0.0;
+    let mut realized = None;
+    if let Some(raw) = raw_member {
+        if let Some(aggregate) = raw.get("aggregate") {
+            if let Some(windows) = aggregate.get("windowRecords").and_then(Value::as_array) {
+                for window in windows {
+                    let closed = window_closed_trades(window)?;
+                    let net = window_conservative_net(window)?;
+                    nets.push(net);
+                    trades += closed;
+                    if closed > 0.0 {
+                        active += 1;
+                    }
+                }
+            }
+            realized = aggregate.get("realizedBehavior");
+        }
+    }
+    let window_count = nets.len();
+    let active_window_fraction = if window_count == 0 {
+        0.0
+    } else {
+        active as f64 / window_count as f64
+    };
+    let average_closed_trades_per_candidate_month = if covered_months > 0.0 {
+        trades / covered_months
+    } else {
+        0.0
+    };
+    let support_pass = active_window_fraction >= min_active
+        && average_closed_trades_per_candidate_month >= min_trades;
+    let sum_net = nets.iter().sum::<f64>();
+    let median_net = if nets.is_empty() {
+        0.0
+    } else {
+        median_f64(&nets)
+    };
+    let cumulative_net_positive = sum_net > 0.0;
+    let median_window_net_positive = median_net > 0.0;
+    let positive_economic_condition_count =
+        u8::from(cumulative_net_positive) + u8::from(median_window_net_positive);
+    let (direction_eligible, _direction_category) =
+        direction_selection_assessment(realized, direction_policy)?;
+    let screen_class = if !support_pass {
+        0
+    } else if direction_eligible && cumulative_net_positive && median_window_net_positive {
+        4
+    } else if direction_eligible {
+        3
+    } else if positive_economic_condition_count >= 1 {
+        2
+    } else {
+        1
+    };
+    Ok(ProvisionalScreen {
+        screen_class,
+        positive_economic_condition_count,
+        direction_eligible,
+        active_window_fraction,
+        average_closed_trades_per_candidate_month,
+        current_panel_rank,
+        candidate_id,
+    })
+}
+
+fn make_provisional(
+    g: u64,
+    p: &str,
+    c: &Value,
+    rows: &[Value],
+    member_records: &BTreeMap<String, Value>,
+    proposal_ids: &BTreeSet<String>,
+    retained_ids: &BTreeSet<String>,
+    robust_policy: &Value,
+    direction_policy: &Value,
+    covered_months: f64,
+    newcomer_limit: usize,
+) -> Result<Value> {
+    let mut cell_population = BTreeMap::<String, usize>::new();
+    let mut incumbents = Vec::new();
+    let mut newcomers = Vec::new();
     for row in rows {
+        let id = text(row, "candidateId")?.to_owned();
         let cell = text(row, "cellId")?.to_owned();
-        *counts.entry(cell.clone()).or_default() += 1;
-        groups.entry(cell).or_default().push(row);
+        *cell_population.entry(cell).or_default() += 1;
+        // Proposal receipts supersede matching retained-parent receipts.
+        if proposal_ids.contains(&id) {
+            newcomers.push(row);
+        } else if retained_ids.contains(&id) {
+            ensure!(
+                row.get("currentPanelRank")
+                    .and_then(Value::as_f64)
+                    .is_some()
+                    && row.get("cellId").and_then(Value::as_str).is_some(),
+                "retained parent {id} lacks consistent current-panel evaluation fields"
+            );
+            ensure!(
+                member_records.contains_key(&id),
+                "retained parent {id} lacks an authenticated current-panel member record"
+            );
+            incumbents.push(row);
+        } else {
+            return Err(anyhow!(
+                "provisional candidate {id} lacks an admitted campaign role"
+            ));
+        }
+    }
+    for id in retained_ids {
+        if proposal_ids.contains(id) {
+            continue;
+        }
+        ensure!(
+            rows.iter()
+                .any(|row| text(row, "candidateId").ok() == Some(id.as_str())),
+            "retained parent {id} is admitted without a current-panel evaluation row"
+        );
+    }
+
+    incumbents.sort_by(|left, right| {
+        text(left, "candidateId")
+            .unwrap_or("")
+            .cmp(text(right, "candidateId").unwrap_or(""))
+    });
+
+    let mut newcomer_screens = newcomers
+        .into_iter()
+        .map(|row| {
+            let id = text(row, "candidateId")?.to_owned();
+            let screen = provisional_screen_for_member(
+                row,
+                member_records.get(&id),
+                robust_policy,
+                direction_policy,
+                covered_months,
+            )?;
+            Ok((screen, row))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut groups: BTreeMap<String, Vec<(ProvisionalScreen, &Value)>> = BTreeMap::new();
+    for (screen, row) in newcomer_screens.drain(..) {
+        let cell = text(row, "cellId")?.to_owned();
+        groups.entry(cell).or_default().push((screen, row));
     }
     for values in groups.values_mut() {
-        values.sort_by(|left, right| {
-            right["currentPanelRank"]
-                .as_f64()
-                .unwrap_or(f64::NEG_INFINITY)
-                .total_cmp(
-                    &left["currentPanelRank"]
-                        .as_f64()
-                        .unwrap_or(f64::NEG_INFINITY),
-                )
-                .then_with(|| {
-                    text(left, "candidateId")
-                        .unwrap()
-                        .cmp(text(right, "candidateId").unwrap())
-                })
-        });
+        values.sort_by(|(left, _), (right, _)| screen_ordering(left, right));
     }
-    let mut selected = Vec::new();
-    loop {
-        let mut added = false;
-        for group in groups.values_mut() {
-            if selected.len() == limit {
+
+    // Freeze cell order once from each cell's best candidate before removals.
+    let mut cell_order = groups
+        .iter()
+        .map(|(cell, values)| {
+            let best = &values[0].0;
+            (best.clone(), cell.clone())
+        })
+        .collect::<Vec<_>>();
+    cell_order.sort_by(|(left, left_cell), (right, right_cell)| {
+        screen_ordering(left, right).then_with(|| left_cell.cmp(right_cell))
+    });
+    let cell_order = cell_order
+        .into_iter()
+        .map(|(_, cell)| cell)
+        .collect::<Vec<_>>();
+
+    let mut selected_newcomers = Vec::new();
+    if newcomer_limit > 0 {
+        loop {
+            let mut added = false;
+            for cell in &cell_order {
+                if selected_newcomers.len() == newcomer_limit {
+                    break;
+                }
+                if let Some(group) = groups.get_mut(cell) {
+                    if !group.is_empty() {
+                        selected_newcomers.push(group.remove(0).1);
+                        added = true;
+                    }
+                }
+            }
+            if !added || selected_newcomers.len() == newcomer_limit {
                 break;
             }
-            if !group.is_empty() {
-                selected.push(group.remove(0));
-                added = true;
-            }
-        }
-        if !added || selected.len() == limit {
-            break;
         }
     }
+
+    let selected_new_proposal_count = selected_newcomers.len() as u64;
+    let mandatory_retained_parent_count = incumbents.len() as u64;
     let mut cs = Vec::new();
-    for r in selected {
+    for r in incumbents.into_iter().chain(selected_newcomers.into_iter()) {
         let cell = text(r, "cellId")?;
-        cs.push(json!({"candidateId":text(r,"candidateId")?,"candidateIdentitySha256":hash_of(r,"candidateIdentitySha256")?,"programSha256":hash_of(r,"programSha256")?,"profileSnapshotSha256":hash_of(r,"profileSnapshotSha256")?,"cellId":cell,"costView":"research_conservative","currentPanelRank":r["currentPanelRank"],"novelty":1.0 / *counts.get(cell).expect("selection cell count") as f64}));
+        cs.push(json!({
+            "candidateId": text(r, "candidateId")?,
+            "candidateIdentitySha256": hash_of(r, "candidateIdentitySha256")?,
+            "programSha256": hash_of(r, "programSha256")?,
+            "profileSnapshotSha256": hash_of(r, "profileSnapshotSha256")?,
+            "cellId": cell,
+            "costView": "research_conservative",
+            "currentPanelRank": r["currentPanelRank"],
+            "novelty": 1.0 / *cell_population.get(cell).expect("selection cell count") as f64
+        }));
     }
-    let mut v = json!({"schemaVersion":"temporal_qd_provisional_survivors_v1","generationIndex":g,"panelId":p,"cohortSha256":hash_of(c,"cohortSha256")?,"candidateCount":cs.len(),"candidates":cs});
+    let total = cs.len() as u64;
+    let mut v = json!({
+        "schemaVersion": "temporal_qd_provisional_survivors_v1",
+        "generationIndex": g,
+        "panelId": p,
+        "cohortSha256": hash_of(c, "cohortSha256")?,
+        "candidateCount": total,
+        "selectedNewProposalCount": selected_new_proposal_count,
+        "mandatoryRetainedParentCount": mandatory_retained_parent_count,
+        "totalCumulativeQualificationCount": total,
+        "candidates": cs
+    });
     add(&mut v, "provisionalSha256")?;
     Ok(v)
 }
@@ -1338,6 +1781,7 @@ fn prior_panel_backfill_source_authority(
     provisional: &Value,
     ledger: &Value,
     previous: Option<&Value>,
+    selected_rows: &[Value],
 ) -> Result<Value> {
     let proof = array(ledger, "campaigns")?
         .iter()
@@ -1345,12 +1789,35 @@ fn prior_panel_backfill_source_authority(
             Ok(json!({"campaignRole":text(campaign,"campaignRole")?,"panelId":text(campaign,"panelId")?,"semanticReceiptSha256":hash_of(campaign,"semanticReceiptSha256")?,"receiptSha256":hash_of(campaign,"receiptSha256")?}))
         })
         .collect::<Result<Vec<_>>>()?;
-    let selected_candidate_proof = array(provisional, "candidates")?
+    // Campaign freeze requires one selected-candidate proof per backfill row.
+    // Provisional survivors can include retained parents already covered on the
+    // missing panel (and therefore omitted from this task); prove only the
+    // rows actually scheduled, while still binding the full provisional set
+    // through provisionalSha256.
+    let provisional_ids = array(provisional, "candidates")?
+        .iter()
+        .map(|row| text(row, "candidateId").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut seen_ids = BTreeSet::new();
+    let selected_candidate_proof = selected_rows
         .iter()
         .map(|row| {
-            Ok(json!({"candidateId":text(row,"candidateId")?,"candidateIdentitySha256":hash_of(row,"candidateIdentitySha256")?,"programSha256":hash_of(row,"programSha256")?,"profileSnapshotSha256":hash_of(row,"profileSnapshotSha256")?}))
+            let id = text(row, "candidateId")?.to_owned();
+            ensure!(
+                provisional_ids.contains(&id),
+                "prior-panel backfill candidate is absent from provisional survivors"
+            );
+            ensure!(
+                seen_ids.insert(id.clone()),
+                "prior-panel backfill selected-candidate proof has duplicate candidate ID"
+            );
+            Ok(json!({"candidateId":id,"candidateIdentitySha256":hash_of(row,"candidateIdentitySha256")?,"programSha256":hash_of(row,"programSha256")?,"profileSnapshotSha256":hash_of(row,"profileSnapshotSha256")?}))
         })
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        selected_candidate_proof.len() == selected_rows.len(),
+        "v2 selected-candidate proof cardinality drifted"
+    );
     Ok(
         json!({"schemaVersion":"temporal_qd_v5_prior_panel_backfill_source_authority_v1","cohortSha256":hash_of(cohort,"cohortSha256")?,"provisionalSha256":hash_of(provisional,"provisionalSha256")?,"admittedCampaignLedgerSha256":hash_of(ledger,"admittedCampaignLedgerSha256")?,"priorResultSha256":previous.map(|value|hash_of(value,"resultSha256").map(str::to_owned)).transpose()?,"priorReceiptProof":proof,"selectedCandidateProof":selected_candidate_proof}),
     )
@@ -2984,5 +3451,425 @@ mod tests {
         let mut forged = backfill;
         forged["currentPanelRank"] = json!(-7.0);
         assert!(validate_backfill_candidate_projection(&selected, &forged).is_err());
+    }
+
+    fn hash_tag(tag: &str) -> String {
+        format!("sha256:{:0<64}", tag)
+    }
+
+    fn test_robust_policy() -> Value {
+        json!({
+            "minimumAverageClosedTradesPerCandidateMonth": 4.0,
+            "minimumActiveWindowFraction": 0.75,
+        })
+    }
+
+    fn test_direction_policy() -> Value {
+        json!({
+            "schemaVersion": "temporal_direction_selection_policy_v1",
+            "minimum_closed_trades_per_side": 1,
+            "minimum_active_windows_per_side": 1,
+            "minimum_acceptable_side_net_r": 0.0,
+            "harmful_opposite_net_r": -0.25,
+        })
+    }
+
+    fn zero_side() -> Value {
+        json!({
+            "closedTrades": 0, "wins": 0, "losses": 0, "flatTrades": 0,
+            "grossR": 0.0, "netR": 0.0, "costR": 0.0,
+            "holdingBars": 0, "holdingHours": 0.0, "activeWindowCount": 0,
+            "closeReasonCounts": {}, "actionCounts": {}, "transitionCounts": {},
+            "terminalStatusCounts": {}, "terminalDirectionCount": 0,
+            "conflictAbstentions": 0, "tradeSequence": [], "active": false,
+            "activeWindowFraction": 0.0, "exposureProxy": 0.0,
+            "averageHoldingBars": 0.0, "closeReasonDistribution": {},
+            "actionDistribution": {}, "transitionDistribution": {}
+        })
+    }
+
+    fn eligible_behavior(window_count: u64) -> Value {
+        let mut long = zero_side();
+        long["closedTrades"] = json!(4);
+        long["wins"] = json!(4);
+        long["grossR"] = json!(2.0);
+        long["netR"] = json!(1.5);
+        long["costR"] = json!(0.5);
+        long["activeWindowCount"] = json!(window_count);
+        long["active"] = json!(true);
+        long["activeWindowFraction"] = json!(1.0);
+        json!({
+            "schemaVersion": "temporal_realized_behavior_v1",
+            "windowCount": window_count,
+            "sides": {"long": long, "short": zero_side()},
+        })
+    }
+
+    fn selection_row(id: &str, cell: &str, rank: f64) -> Value {
+        json!({
+            "candidateId": id,
+            "candidateIdentitySha256": hash_tag(&format!("id-{id}")),
+            "programSha256": hash_tag(&format!("program-{id}")),
+            "profileSnapshotSha256": hash_tag(&format!("profile-{id}")),
+            "cellId": cell,
+            "currentPanelRank": rank,
+        })
+    }
+
+    fn member_record(
+        id: &str,
+        cell: &str,
+        rank: f64,
+        windows: Vec<(f64, f64)>,
+        behavior: Option<Value>,
+    ) -> Value {
+        let window_records: Vec<Value> = windows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (net, trades))| {
+                json!({
+                    "windowId": format!("w{index}"),
+                    "conservativeNetR": net,
+                    "closedTrades": trades,
+                })
+            })
+            .collect();
+        let mut aggregate = json!({
+            "totalConservativeNetR": rank,
+            "windowRecords": window_records,
+        });
+        if let Some(behavior) = behavior {
+            aggregate
+                .as_object_mut()
+                .unwrap()
+                .insert("realizedBehavior".into(), behavior);
+        }
+        json!({
+            "schemaVersion": "temporal_qd_evaluated_member_v1",
+            "candidate": selection_row(id, cell, rank),
+            "descriptor": {"cellId": cell},
+            "aggregate": aggregate,
+        })
+    }
+
+    fn empty_cohort() -> Value {
+        let mut cohort = json!({
+            "schemaVersion": "temporal_qd_current_panel_evaluation_cohort_v1",
+            "rotatingEvidenceSha256": HASH,
+            "generationIndex": 1,
+            "panelId": "p1",
+            "candidates": [],
+            "newProposalCandidateIds": [],
+            "retainedParentEvaluationCandidateIds": [],
+            "parentReevaluationIsProposal": false,
+        });
+        add(&mut cohort, "cohortSha256").unwrap();
+        cohort
+    }
+
+    fn run_provisional(
+        rows: &[Value],
+        records: &BTreeMap<String, Value>,
+        proposal_ids: &BTreeSet<String>,
+        retained_ids: &BTreeSet<String>,
+        limit: usize,
+    ) -> Value {
+        make_provisional(
+            1,
+            "p1",
+            &empty_cohort(),
+            rows,
+            records,
+            proposal_ids,
+            retained_ids,
+            &test_robust_policy(),
+            &test_direction_policy(),
+            1.0,
+            limit,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gate_aligned_supported_beats_flashy_unsupported_same_cell() {
+        // A: high net, misses 4 trades/month support. B: lower positive net, passes gates.
+        let a = selection_row("A", "cell", 100.0);
+        let b = selection_row("B", "cell", 5.0);
+        let mut records = BTreeMap::new();
+        records.insert(
+            "A".into(),
+            member_record(
+                "A",
+                "cell",
+                100.0,
+                vec![(100.0, 1.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        records.insert(
+            "B".into(),
+            member_record(
+                "B",
+                "cell",
+                5.0,
+                vec![(5.0, 4.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        let proposal = BTreeSet::from(["A".into(), "B".into()]);
+        let provisional = run_provisional(&[a, b], &records, &proposal, &BTreeSet::new(), 1);
+        assert_eq!(provisional["candidates"][0]["candidateId"], "B");
+        assert_eq!(provisional["selectedNewProposalCount"], 1);
+    }
+
+    #[test]
+    fn gate_aligned_v30_counterexample_ids_prefer_supported_quality() {
+        let flashy = "qd_a8338e2e3bc4113cc307208723df";
+        let quality = "qd_efe3530537751e6db7609f7b239f";
+        let a = selection_row(flashy, "shared", 50.0);
+        let b = selection_row(quality, "shared", 8.0);
+        let mut records = BTreeMap::new();
+        records.insert(
+            flashy.into(),
+            member_record(
+                flashy,
+                "shared",
+                50.0,
+                vec![(50.0, 1.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        records.insert(
+            quality.into(),
+            member_record(
+                quality,
+                "shared",
+                8.0,
+                vec![(8.0, 5.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        let proposal = BTreeSet::from([flashy.into(), quality.into()]);
+        let provisional = run_provisional(&[a, b], &records, &proposal, &BTreeSet::new(), 1);
+        assert_eq!(provisional["candidates"][0]["candidateId"], quality);
+    }
+
+    #[test]
+    fn mandatory_incumbents_survive_outside_newcomer_cap() {
+        let mut rows = Vec::new();
+        let mut records = BTreeMap::new();
+        let mut proposal = BTreeSet::new();
+        for index in 0..130 {
+            let id = format!("n{index:03}");
+            rows.push(selection_row(
+                &id,
+                &format!("c{index:03}"),
+                10.0 + index as f64,
+            ));
+            records.insert(
+                id.clone(),
+                member_record(
+                    &id,
+                    &format!("c{index:03}"),
+                    10.0 + index as f64,
+                    vec![(10.0 + index as f64, 5.0)],
+                    Some(eligible_behavior(1)),
+                ),
+            );
+            proposal.insert(id);
+        }
+        for id in ["inc_a", "inc_b"] {
+            rows.push(selection_row(id, "inc_cell", 1.0));
+            records.insert(
+                id.into(),
+                member_record(
+                    id,
+                    "inc_cell",
+                    1.0,
+                    vec![(1.0, 5.0)],
+                    Some(eligible_behavior(1)),
+                ),
+            );
+        }
+        let retained = BTreeSet::from(["inc_a".into(), "inc_b".into()]);
+        let provisional = run_provisional(&rows, &records, &proposal, &retained, 128);
+        let ids: Vec<_> = provisional["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["candidateId"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(ids.contains(&"inc_a".to_owned()));
+        assert!(ids.contains(&"inc_b".to_owned()));
+        assert_eq!(provisional["mandatoryRetainedParentCount"], 2);
+        assert!(provisional["selectedNewProposalCount"].as_u64().unwrap() <= 128);
+        assert_eq!(
+            provisional["totalCumulativeQualificationCount"],
+            provisional["selectedNewProposalCount"].as_u64().unwrap() + 2
+        );
+        assert_eq!(ids[0], "inc_a");
+        assert_eq!(ids[1], "inc_b");
+    }
+
+    #[test]
+    fn missing_retained_parent_current_panel_evaluation_fails_closed() {
+        let newcomer = selection_row("new", "cell", 9.0);
+        let mut records = BTreeMap::new();
+        records.insert(
+            "new".into(),
+            member_record(
+                "new",
+                "cell",
+                9.0,
+                vec![(9.0, 5.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        let proposal = BTreeSet::from(["new".into()]);
+        let retained = BTreeSet::from(["missing_parent".into()]);
+        let error = make_provisional(
+            1,
+            "p1",
+            &empty_cohort(),
+            &[newcomer],
+            &records,
+            &proposal,
+            &retained,
+            &test_robust_policy(),
+            &test_direction_policy(),
+            1.0,
+            128,
+        )
+        .expect_err("missing retained-parent evaluation must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("admitted without a current-panel evaluation row")
+        );
+    }
+
+    #[test]
+    fn incumbent_with_current_evidence_is_in_finalizer_bound_set() {
+        // Requalification-not-protection: incumbent is selected for the
+        // finalizer-bound provisional cohort. Finalizer classify remains
+        // authoritative for archive survival (see generation-finalizer tests).
+        let newcomer = selection_row("new", "cell", 9.0);
+        let incumbent = selection_row("parent", "cell", -2.0);
+        let mut records = BTreeMap::new();
+        records.insert(
+            "new".into(),
+            member_record(
+                "new",
+                "cell",
+                9.0,
+                vec![(9.0, 5.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        records.insert(
+            "parent".into(),
+            member_record(
+                "parent",
+                "cell",
+                -2.0,
+                vec![(-2.0, 5.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        let provisional = run_provisional(
+            &[newcomer, incumbent],
+            &records,
+            &BTreeSet::from(["new".into()]),
+            &BTreeSet::from(["parent".into()]),
+            128,
+        );
+        let ids: Vec<_> = provisional["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["candidateId"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"parent"));
+        assert_eq!(provisional["mandatoryRetainedParentCount"], 1);
+    }
+
+    #[test]
+    fn cell_order_uses_best_screen_not_lexical_cell_id() {
+        let unsupported = selection_row("flash", "aaa_unsupported", 99.0);
+        let quality = selection_row("ready", "zzz_quality", 3.0);
+        let mut records = BTreeMap::new();
+        records.insert(
+            "flash".into(),
+            member_record(
+                "flash",
+                "aaa_unsupported",
+                99.0,
+                vec![(99.0, 1.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        records.insert(
+            "ready".into(),
+            member_record(
+                "ready",
+                "zzz_quality",
+                3.0,
+                vec![(3.0, 5.0)],
+                Some(eligible_behavior(1)),
+            ),
+        );
+        // Many filler cells so cap forces a choice among first-pass cells.
+        let mut rows = vec![unsupported, quality];
+        let mut proposal = BTreeSet::from(["flash".into(), "ready".into()]);
+        for index in 0..130 {
+            let id = format!("pad{index:03}");
+            let cell = format!("mmm_pad_{index:03}");
+            rows.push(selection_row(&id, &cell, 1.0));
+            records.insert(
+                id.clone(),
+                member_record(&id, &cell, 1.0, vec![(0.1, 1.0)], None),
+            );
+            proposal.insert(id);
+        }
+        let provisional = run_provisional(&rows, &records, &proposal, &BTreeSet::new(), 128);
+        let first = provisional["candidates"][0]["candidateId"]
+            .as_str()
+            .unwrap();
+        assert_eq!(first, "ready");
+        let selected: Vec<_> = provisional["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["candidateId"].as_str().unwrap())
+            .collect();
+        assert!(selected.contains(&"ready"));
+        let ready_pos = selected.iter().position(|id| *id == "ready").unwrap();
+        if let Some(flash_pos) = selected.iter().position(|id| *id == "flash") {
+            assert!(ready_pos < flash_pos);
+        }
+    }
+
+    #[test]
+    fn provisional_selection_is_input_order_deterministic() {
+        let ids = ["z", "m", "a", "q", "b"];
+        let mut base_rows = Vec::new();
+        let mut records = BTreeMap::new();
+        let mut proposal = BTreeSet::new();
+        for id in ids {
+            base_rows.push(selection_row(id, id, 2.0));
+            records.insert(
+                id.into(),
+                member_record(id, id, 2.0, vec![(2.0, 5.0)], Some(eligible_behavior(1))),
+            );
+            proposal.insert(id.to_owned());
+        }
+        let first = run_provisional(&base_rows, &records, &proposal, &BTreeSet::new(), 3);
+        for _ in 0..8 {
+            let mut shuffled = base_rows.clone();
+            shuffled.reverse();
+            let again = run_provisional(&shuffled, &records, &proposal, &BTreeSet::new(), 3);
+            assert_eq!(first["provisionalSha256"], again["provisionalSha256"]);
+            assert_eq!(first["candidates"], again["candidates"]);
+        }
     }
 }

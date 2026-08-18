@@ -92,6 +92,201 @@ ROTATING_PARENT_SCHEDULE_SCHEMA_LEGACY = "temporal_qd_rotating_parent_schedule_v
 ROTATING_PARENT_SCHEDULE_SCHEMA = "temporal_qd_rotating_parent_schedule_v2"
 REPRODUCTION_ALLOCATION_SCHEMA = "temporal_qd_reproduction_allocation_v1"
 REPRODUCTION_ALLOCATION_SCHEMA_ACCEPTED = "temporal_qd_reproduction_allocation_v2"
+BREEDING_CONFIDENCE_POLICY_SCHEMA = "temporal_qd_breeding_confidence_policy_v1"
+BREEDING_CONFIDENCE_RECEIPT_SCHEMA = "temporal_qd_v5_breeding_confidence_receipt_v1"
+BREEDING_CONFIDENCE_PANEL_COUNT_SOURCE = (
+    "minimum_distinct_required_panel_ids_across_breeding_eligible_parent_archive_members"
+)
+BREEDING_CONFIDENCE_ROUNDING = "existing_generation_target_rounding_v1"
+
+# Frozen hashed policy body. Quota math uses integer rationals, never binary floats.
+BREEDING_CONFIDENCE_POLICY_V1: dict[str, Any] = {
+    "schemaVersion": BREEDING_CONFIDENCE_POLICY_SCHEMA,
+    "panelCountSource": BREEDING_CONFIDENCE_PANEL_COUNT_SOURCE,
+    "emptyArchiveOffspringProposalFraction": 0.0,
+    "tiers": [
+        {
+            "minimumQualifiedPanelCount": 1,
+            "maximumQualifiedPanelCount": 1,
+            "offspringProposalFraction": 0.20,
+        },
+        {
+            "minimumQualifiedPanelCount": 2,
+            "maximumQualifiedPanelCount": 2,
+            "offspringProposalFraction": 0.50,
+        },
+        {
+            "minimumQualifiedPanelCount": 3,
+            "offspringProposalFraction": 0.80,
+        },
+    ],
+    "rounding": BREEDING_CONFIDENCE_ROUNDING,
+}
+
+# Offspring rationals by minimum qualified panel count: empty→0/1, 1→1/5, 2→1/2, 3+→4/5.
+_BREEDING_OFFSPRING_RATIONALS: dict[int, tuple[int, int]] = {
+    0: (0, 1),
+    1: (1, 5),
+    2: (1, 2),
+    3: (4, 5),
+}
+_BREEDING_REASON_CODES: dict[int, str] = {
+    0: "empty_archive_immigrants_only",
+    1: "one_panel_parent_exploration_only",
+    2: "two_panel_parent_balanced_exploration",
+    3: "three_plus_panel_parent_exploitation",
+}
+
+
+def breeding_confidence_quota_counts(
+    target: int, *, offspring_numerator: int, offspring_denominator: int
+) -> tuple[int, int]:
+    """Integer round-half-up offspring; remainder immigrants. Always sums to target."""
+
+    if target < 1:
+        raise TemporalDiscoveryContractError("breeding confidence target is invalid")
+    if (
+        offspring_denominator < 1
+        or offspring_numerator < 0
+        or offspring_numerator > offspring_denominator
+    ):
+        raise TemporalDiscoveryContractError(
+            "breeding confidence offspring rational is invalid"
+        )
+    offspring = (
+        target * offspring_numerator + offspring_denominator // 2
+    ) // offspring_denominator
+    return offspring, target - offspring
+
+
+def _member_required_panel_ids(member: Mapping[str, Any]) -> list[str]:
+    cumulative = member.get("cumulativeEvidence")
+    raw = None
+    if isinstance(cumulative, Mapping) and cumulative.get("requiredPanelIds") is not None:
+        raw = cumulative.get("requiredPanelIds")
+    elif member.get("requiredPanelIds") is not None:
+        raw = member.get("requiredPanelIds")
+    if not isinstance(raw, list) or not raw:
+        raise TemporalDiscoveryContractError(
+            "breeding-eligible parent lacks required panel evidence"
+        )
+    panels: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise TemporalDiscoveryContractError(
+                "breeding-eligible parent panel evidence is malformed"
+            )
+        if item not in seen:
+            seen.add(item)
+            panels.append(item)
+    if not panels:
+        raise TemporalDiscoveryContractError(
+            "breeding-eligible parent lacks required panel evidence"
+        )
+    return panels
+
+
+def _breeding_eligible_archive_members(
+    parent_archive: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Mirror production v5 `_reproduction_cells` eligibility for panel budgeting."""
+
+    if parent_archive is None:
+        return []
+    rotating = isinstance(parent_archive.get("rotatingEvidenceTransaction"), Mapping)
+    rotating_sha = None
+    if rotating:
+        rotating_sha = parent_archive["rotatingEvidenceTransaction"].get(
+            "cumulativeArchiveSha256"
+        )
+    eligible: list[dict[str, Any]] = []
+    for cell in parent_archive.get("cells") or []:
+        if not isinstance(cell, Mapping):
+            continue
+        for member in cell.get("members") or []:
+            if not isinstance(member, Mapping):
+                continue
+            if member.get("robustBreederEligible") is not True:
+                continue
+            lane = member.get("archiveLane")
+            if lane not in {"quality", "rotating_frontier"}:
+                continue
+            if rotating and member.get("cumulativeEvidenceArchiveSha256") != rotating_sha:
+                continue
+            eligible.append(dict(member))
+    return eligible
+
+
+def select_breeding_confidence(
+    *,
+    parent_archive: Mapping[str, Any] | None,
+    target_unique_candidates: int,
+    source_archive_generation_index: int | None = None,
+    policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze offspring/immigrant quotas from minimum qualified panel confidence."""
+
+    selected_policy = _clone(policy or BREEDING_CONFIDENCE_POLICY_V1)
+    if selected_policy.get("schemaVersion") != BREEDING_CONFIDENCE_POLICY_SCHEMA:
+        raise TemporalDiscoveryContractError(
+            "breeding confidence policy schema is incompatible"
+        )
+    members = _breeding_eligible_archive_members(parent_archive)
+    panel_counts: list[int] = []
+    for member in members:
+        panel_counts.append(len(_member_required_panel_ids(member)))
+    breeding_eligible_parent_count = len(panel_counts)
+    if breeding_eligible_parent_count == 0:
+        minimum_panels = 0
+        maximum_panels = 0
+        tier_key = 0
+    else:
+        minimum_panels = min(panel_counts)
+        maximum_panels = max(panel_counts)
+        tier_key = 3 if minimum_panels >= 3 else minimum_panels
+    offspring_numerator, offspring_denominator = _BREEDING_OFFSPRING_RATIONALS[tier_key]
+    immigrant_numerator = offspring_denominator - offspring_numerator
+    immigrant_denominator = offspring_denominator
+    offspring, immigrants = breeding_confidence_quota_counts(
+        int(target_unique_candidates),
+        offspring_numerator=offspring_numerator,
+        offspring_denominator=offspring_denominator,
+    )
+    fraction_map = {0: 0.0, 1: 0.20, 2: 0.50, 3: 0.80}
+    offspring_fraction = fraction_map[tier_key]
+    immigrant_fraction = {
+        0: 1.0,
+        1: 0.80,
+        2: 0.50,
+        3: 0.20,
+    }[tier_key]
+    if source_archive_generation_index is None and isinstance(parent_archive, Mapping):
+        raw_index = parent_archive.get("generationIndex")
+        if isinstance(raw_index, int) and not isinstance(raw_index, bool):
+            source_archive_generation_index = raw_index
+    receipt = {
+        "schemaVersion": BREEDING_CONFIDENCE_RECEIPT_SCHEMA,
+        "sourceArchiveGenerationIndex": source_archive_generation_index,
+        "breedingEligibleParentCount": breeding_eligible_parent_count,
+        "minimumQualifiedPanelCount": minimum_panels,
+        "maximumQualifiedPanelCount": maximum_panels,
+        "effectiveOffspringProposalFraction": offspring_fraction,
+        "effectiveImmigrantProposalFraction": immigrant_fraction,
+        "desiredOffspringCandidateCount": offspring,
+        "desiredImmigrantCandidateCount": immigrants,
+        "reason": _BREEDING_REASON_CODES[tier_key],
+    }
+    return {
+        "policy": selected_policy,
+        "receipt": receipt,
+        "desiredOffspringCandidateCount": offspring,
+        "desiredImmigrantCandidateCount": immigrants,
+        "offspringNumerator": offspring_numerator,
+        "offspringDenominator": offspring_denominator,
+        "immigrantNumerator": immigrant_numerator,
+        "immigrantDenominator": immigrant_denominator,
+    }
 
 
 def _validate_rotating_parent_schedule(
@@ -187,11 +382,17 @@ def _frozen_reproduction_allocation(
     *, parent_schedule: Mapping[str, Any] | None, target_unique_candidates: int,
     has_supported_parents: bool | None = None,
     accepted_terminology: bool = False,
+    desired_offspring_count: int | None = None,
+    desired_immigrant_count: int | None = None,
+    minimum_immigrant_numerator: int | None = None,
+    minimum_immigrant_denominator: int | None = None,
 ) -> dict[str, Any]:
     """Freeze desired worker-handoff origin counts, never parent-cap attempts.
 
     A sparse but valid parent reservoir is sampled with replacement.  It does
     not silently redefine the experiment as an immigrant-heavy generation.
+    When breeding-confidence counts are supplied they become the sealed quota;
+    otherwise the legacy accepted 1/5 immigrant floor is retained.
     """
     if target_unique_candidates < 1:
         raise TemporalDiscoveryContractError("reproduction allocation target is invalid")
@@ -200,12 +401,55 @@ def _frozen_reproduction_allocation(
         if has_supported_parents is not None
         else parent_schedule is not None and int(parent_schedule["breederParentCount"]) > 0
     )
-    immigrants = (
-        target_unique_candidates
-        if not supported
-        else (target_unique_candidates + 4) // 5
-    )
-    offspring = target_unique_candidates - immigrants
+    if desired_offspring_count is not None or desired_immigrant_count is not None:
+        if desired_offspring_count is None or desired_immigrant_count is None:
+            raise TemporalDiscoveryContractError(
+                "reproduction allocation desired origin counts must be supplied together"
+            )
+        if (
+            isinstance(desired_offspring_count, bool)
+            or isinstance(desired_immigrant_count, bool)
+            or desired_offspring_count < 0
+            or desired_immigrant_count < 0
+            or desired_offspring_count + desired_immigrant_count
+            != target_unique_candidates
+        ):
+            raise TemporalDiscoveryContractError(
+                "reproduction allocation desired origin counts are invalid"
+            )
+        offspring = int(desired_offspring_count)
+        immigrants = int(desired_immigrant_count)
+        immigrant_numerator = (
+            1 if minimum_immigrant_numerator is None else int(minimum_immigrant_numerator)
+        )
+        immigrant_denominator = (
+            5
+            if minimum_immigrant_denominator is None
+            else int(minimum_immigrant_denominator)
+        )
+    else:
+        immigrants = (
+            target_unique_candidates
+            if not supported
+            else (target_unique_candidates + 4) // 5
+        )
+        offspring = target_unique_candidates - immigrants
+        immigrant_numerator = (
+            1 if minimum_immigrant_numerator is None else int(minimum_immigrant_numerator)
+        )
+        immigrant_denominator = (
+            5
+            if minimum_immigrant_denominator is None
+            else int(minimum_immigrant_denominator)
+        )
+    if (
+        immigrant_denominator < 1
+        or immigrant_numerator < 0
+        or immigrant_numerator > immigrant_denominator
+    ):
+        raise TemporalDiscoveryContractError(
+            "reproduction allocation immigrant rational is invalid"
+        )
     allocation = {
         "schemaVersion": (
             REPRODUCTION_ALLOCATION_SCHEMA_ACCEPTED
@@ -223,8 +467,8 @@ def _frozen_reproduction_allocation(
                 "desiredEvaluatedImmigrantCount": immigrants,
             }
         ),
-        "minimumImmigrantNumerator": 1,
-        "minimumImmigrantDenominator": 5,
+        "minimumImmigrantNumerator": immigrant_numerator,
+        "minimumImmigrantDenominator": immigrant_denominator,
         "parentSampling": "with_replacement_supported_parents_v1",
         "unsupportedParentPolicy": "immigrant_only_authority_bound_v1",
         "allocationMethod": "accepted_quota_prefix_balance_v1",
@@ -854,6 +1098,7 @@ def build_pair_generation_config(
     global_identity_ledger_enabled: bool,
     parent_schedule: Mapping[str, Any] | None = None,
     has_supported_parents: bool | None = None,
+    breeding_confidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze the sole pair-generation config consumed by Python and Rust."""
 
@@ -877,15 +1122,82 @@ def build_pair_generation_config(
     resolved_parent_schedule = (
         supplied_schedule if parent_schedule is not None else archive_schedule
     )
+    accepted_terminology = (
+        isinstance(run_config.get("archivePolicyAuthority"), Mapping)
+        and run_config["archivePolicyAuthority"].get("qdVersion")
+        == "temporal_qd_evolution_v5"
+    )
+    confidence = None
+    if breeding_confidence is not None:
+        confidence = _clone(breeding_confidence)
+        for field in (
+            "policy",
+            "receipt",
+            "desiredOffspringCandidateCount",
+            "desiredImmigrantCandidateCount",
+            "immigrantNumerator",
+            "immigrantDenominator",
+        ):
+            if field not in confidence:
+                raise TemporalDiscoveryContractError(
+                    f"breeding confidence freeze lacks {field}"
+                )
+    elif accepted_terminology:
+        supported = (
+            bool(has_supported_parents)
+            if has_supported_parents is not None
+            else resolved_parent_schedule is not None
+            and int(resolved_parent_schedule["breederParentCount"]) > 0
+        )
+        # Native v5 G0 / empty-quality always seals the empty-archive receipt.
+        # Evolved callers with parents must pass an explicit freeze computed from
+        # the bound parent archive; do not invent panel confidence here.
+        if not supported:
+            confidence = select_breeding_confidence(
+                parent_archive=parent_archive,
+                target_unique_candidates=int(target_unique_candidates),
+            )
     reproduction_allocation = _frozen_reproduction_allocation(
         parent_schedule=resolved_parent_schedule,
         target_unique_candidates=int(target_unique_candidates),
         has_supported_parents=has_supported_parents,
-        accepted_terminology=(
-            isinstance(run_config.get("archivePolicyAuthority"), Mapping)
-            and run_config["archivePolicyAuthority"].get("qdVersion") == "temporal_qd_evolution_v5"
+        accepted_terminology=accepted_terminology,
+        **(
+            {
+                "desired_offspring_count": int(
+                    confidence["desiredOffspringCandidateCount"]
+                ),
+                "desired_immigrant_count": int(
+                    confidence["desiredImmigrantCandidateCount"]
+                ),
+                "minimum_immigrant_numerator": int(confidence["immigrantNumerator"]),
+                "minimum_immigrant_denominator": int(confidence["immigrantDenominator"]),
+            }
+            if confidence is not None
+            else {}
         ),
     )
+    if confidence is not None:
+        receipt = confidence["receipt"]
+        offspring_field = (
+            "desiredAcceptedOffspringCount"
+            if accepted_terminology
+            else "desiredEvaluatedOffspringCount"
+        )
+        immigrant_field = (
+            "desiredAcceptedImmigrantCount"
+            if accepted_terminology
+            else "desiredEvaluatedImmigrantCount"
+        )
+        if (
+            int(receipt["desiredOffspringCandidateCount"])
+            != int(reproduction_allocation[offspring_field])
+            or int(receipt["desiredImmigrantCandidateCount"])
+            != int(reproduction_allocation[immigrant_field])
+        ):
+            raise TemporalDiscoveryContractError(
+                "breeding confidence receipt disagrees with reproduction allocation"
+            )
     config = {
         "schemaVersion": PAIR_GENERATION_SCHEMA,
         "generationIndex": int(generation_index),
@@ -896,6 +1208,14 @@ def build_pair_generation_config(
         "operatorImplementation": _clone(operator_implementation_identity),
         "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
         "reproductionAllocation": reproduction_allocation,
+        **(
+            {
+                "breedingConfidencePolicy": _clone(confidence["policy"]),
+                "breedingConfidenceReceipt": _clone(confidence["receipt"]),
+            }
+            if confidence is not None
+            else {}
+        ),
         **(
             {"parentSchedule": resolved_parent_schedule}
             if resolved_parent_schedule is not None

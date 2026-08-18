@@ -2294,6 +2294,49 @@ def _validate_v5_full_generation_config(
     if target != config.get("targetUniqueCandidates") or offspring + immigrants != target:
         raise TemporalQDV5NativeError("v5 reproduction allocation dimensions drifted")
 
+    policy = config.get("breedingConfidencePolicy")
+    receipt = config.get("breedingConfidenceReceipt")
+    if policy is None and receipt is None:
+        # Legacy fixtures without the hashed breeding-confidence freeze remain
+        # admissible only when they still carry the historical 1/5 floor.
+        if (
+            allocation.get("minimumImmigrantNumerator") != 1
+            or allocation.get("minimumImmigrantDenominator") != 5
+        ):
+            raise TemporalQDV5NativeError(
+                "v5 reproduction allocation immigrant rational drifted"
+            )
+    else:
+        if not isinstance(policy, Mapping) or not isinstance(receipt, Mapping):
+            raise TemporalQDV5NativeError(
+                "v5 generation config breeding confidence freeze is incomplete"
+            )
+        if policy.get("schemaVersion") != "temporal_qd_breeding_confidence_policy_v1":
+            raise TemporalQDV5NativeError(
+                "v5 breeding confidence policy schema is incompatible"
+            )
+        if receipt.get("schemaVersion") != "temporal_qd_v5_breeding_confidence_receipt_v1":
+            raise TemporalQDV5NativeError(
+                "v5 breeding confidence receipt schema is incompatible"
+            )
+        if (
+            int(receipt.get("desiredOffspringCandidateCount") or -1) != offspring
+            or int(receipt.get("desiredImmigrantCandidateCount") or -1) != immigrants
+        ):
+            raise TemporalQDV5NativeError(
+                "v5 breeding confidence receipt disagrees with reproduction allocation"
+            )
+        if (
+            int(allocation.get("minimumImmigrantNumerator") or -1)
+            < 0
+            or int(allocation.get("minimumImmigrantDenominator") or 0) < 1
+            or int(allocation["minimumImmigrantNumerator"])
+            > int(allocation["minimumImmigrantDenominator"])
+        ):
+            raise TemporalQDV5NativeError(
+                "v5 reproduction allocation immigrant rational drifted"
+            )
+
     expected_bindings = build_v5_generation_bindings(
         generation_run_config=run_config,
         pair_source_authority=pair_source_authority,

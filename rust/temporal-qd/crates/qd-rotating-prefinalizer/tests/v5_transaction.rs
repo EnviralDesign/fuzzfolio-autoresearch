@@ -123,11 +123,57 @@ fn funnel_pair(
 fn candidate(id: &str) -> Value {
     json!({"candidateId":id,"candidateIdentitySha256":sha(&format!("id-{id}")),"programSha256":sha(&format!("program-{id}")),"profileSnapshotSha256":sha(&format!("profile-{id}")),"cellId":"cell","currentPanelRank":1.0})
 }
-fn rotating_sha() -> String {
-    let windows = json!([{"windowId":"w","analysisWindowStart":"2024-01-01T00:00:00Z","analysisWindowEnd":"2024-02-01T00:00:00Z"}]);
-    let mut rotating = json!({"schemaVersion":"temporal_qd_rotating_evidence_v1","panels":[{"panelId":"p1","windows":windows},{"panelId":"p2","windows":windows}],"absoluteGenerationMapping":{"cycleLength":2},"provisionalReduction":{"maxCandidates":4},"robustSelection":{"breederWidth":1}});
+fn robust_policy_fixture() -> Value {
+    let mut policy = json!({
+        "schemaVersion": "temporal_qd_robust_breeder_policy_v1",
+        "minimumAverageClosedTradesPerCandidateMonth": 4.0,
+        "minimumActiveWindowFraction": 0.75,
+        "qualityRequiresPositiveCumulativeConservativeNetR": true,
+        "qualityRequiresPositiveMedianWindowConservativeNetR": true,
+        "frontierMaximumFraction": 0.2,
+        "worstWindowConservativeNetRIsHardGate": false,
+        "drawdownIsHardGate": false,
+        "objectiveDimensions": ["worstWindowConservativeNetR", "drawdown", "costDrag", "novelty"],
+    });
+    add(&mut policy, "policySha256");
+    policy
+}
+
+fn direction_policy_fixture() -> Value {
+    json!({
+        "schemaVersion": "temporal_direction_selection_policy_v1",
+        "minimum_closed_trades_per_side": 1,
+        "minimum_active_windows_per_side": 1,
+        "minimum_acceptable_side_net_r": 0.0,
+        "harmful_opposite_net_r": -0.25,
+    })
+}
+
+fn rotating_fixture() -> Value {
+    let windows = json!([{
+        "windowId": "w",
+        "analysisWindowStart": "2024-01-01T00:00:00Z",
+        "analysisWindowEnd": "2024-02-01T00:00:00Z"
+    }]);
+    let mut rotating = json!({
+        "schemaVersion": "temporal_qd_rotating_evidence_v1",
+        "panels": [
+            {"panelId": "p1", "windows": windows, "totalMonths": 1.0},
+            {"panelId": "p2", "windows": windows, "totalMonths": 1.0}
+        ],
+        "absoluteGenerationMapping": {"cycleLength": 2},
+        "provisionalReduction": {"maxCandidates": 4},
+        "robustSelection": {
+            "breederWidth": 1,
+            "policy": robust_policy_fixture(),
+        },
+    });
     add(&mut rotating, "rotatingEvidenceSha256");
-    rotating["rotatingEvidenceSha256"]
+    rotating
+}
+
+fn rotating_sha() -> String {
+    rotating_fixture()["rotatingEvidenceSha256"]
         .as_str()
         .unwrap()
         .to_owned()
@@ -223,10 +269,15 @@ fn base(root: &Path, proposal: &Value, parent: &Value) -> Value {
     let finalizer_root = root.join("immutable-generation-finalizer");
     fs::create_dir_all(&finalizer_root).unwrap();
     let finalizer_root = fs::canonicalize(finalizer_root).unwrap();
-    let windows = json!([{"windowId":"w","analysisWindowStart":"2024-01-01T00:00:00Z","analysisWindowEnd":"2024-02-01T00:00:00Z"}]);
-    let mut rotating = json!({"schemaVersion":"temporal_qd_rotating_evidence_v1","panels":[{"panelId":"p1","windows":windows},{"panelId":"p2","windows":windows}],"absoluteGenerationMapping":{"cycleLength":2},"provisionalReduction":{"maxCandidates":4},"robustSelection":{"breederWidth":1}});
-    add(&mut rotating, "rotatingEvidenceSha256");
-    let policy_frozen = json!({"archive":{"defaultCellCapacity":1}});
+    let rotating = rotating_fixture();
+    let direction_policy = direction_policy_fixture();
+    let policy_frozen = json!({
+        "archive": {"defaultCellCapacity": 1},
+        "directionSelection": {
+            "selectionPolicy": direction_policy,
+            "selectionPolicySha256": canonical_sha256(&direction_policy).unwrap(),
+        },
+    });
     let mut policy = json!({"schemaVersion":"temporal_qd_archive_policy_binding_v1","policyName":"x","policySha256":sha("policy"),"frozenPolicy":policy_frozen});
     add(&mut policy, "policyBindingSha256");
     let completed = json!([]);
@@ -499,6 +550,17 @@ fn v5_retained_parent_resume_backfill_ready_and_tamper_gates() {
     let r1 = execute_manifest(&d1.join("manifest.json")).unwrap()["result"].clone();
     assert_eq!(r1["status"], "awaiting_prior_panel_backfill");
     assert_eq!(r1["cohort"]["newProposalCandidateIds"], json!(["a"]));
+    // Retained parent `p` is a provisional survivor, but already has p1
+    // coverage, so the backfill task and its freeze proof must name only `a`.
+    let backfill_task = &r1["taskPlan"]["tasks"][0];
+    assert_eq!(backfill_task["campaignRole"], "prior_panel_backfill");
+    assert_eq!(backfill_task["candidateCount"], 1);
+    let backfill_proofs = backfill_task["sourceAuthority"]["selectedCandidateProof"]
+        .as_array()
+        .unwrap();
+    assert_eq!(backfill_proofs.len(), 1);
+    assert_eq!(backfill_proofs[0]["candidateId"], "a");
+    consume_task_cohort(&d1, &r1, &["a"]);
     assert_eq!(
         r1["cohort"]["retainedParentEvaluationCandidateIds"],
         json!(["p"])

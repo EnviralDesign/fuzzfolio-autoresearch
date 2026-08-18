@@ -136,6 +136,8 @@ fn public_native_immigrant_transaction_is_all_attempt_durable() {
         max_attempts: 1,
         evaluation_width: 1,
         thread_cap: 1,
+        desired_accepted_offspring: 0,
+        desired_accepted_immigrants: 1,
         parent_schedule: None,
         parent_selector_state_sha256: sha(parents.compact_state()),
         identity_ledger_identity_sha256: sha(ledger.identity().clone()),

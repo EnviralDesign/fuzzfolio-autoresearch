@@ -4631,6 +4631,8 @@ mod tests {
             max_attempts,
             evaluation_width: target_accepted,
             thread_cap,
+            desired_accepted_offspring: 0,
+            desired_accepted_immigrants: target_accepted,
             parent_schedule: None,
             parent_selector_state_sha256: sha(parents.compact_state()),
             identity_ledger_identity_sha256: sha(ledger.identity().clone()),
@@ -4720,6 +4722,7 @@ mod tests {
             Vec::<String>::new(),
         )
         .expect("construct structural candidate ledger");
+        let desired_immigrants = accepted_quota_immigrant_count(target_accepted, true);
         let request = V5EvolvedTransactionRequest {
             shared_authority,
             generation_config_sha256,
@@ -4738,6 +4741,8 @@ mod tests {
             max_attempts,
             evaluation_width: target_accepted,
             thread_cap,
+            desired_accepted_offspring: target_accepted - desired_immigrants,
+            desired_accepted_immigrants: desired_immigrants,
             parent_schedule: Some(
                 RotatingParentSchedule::from_counts(2, 2)
                     .expect("construct structural parent schedule"),

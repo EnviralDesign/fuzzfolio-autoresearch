@@ -267,6 +267,21 @@ def audit_temporal_qd_g5(
         warnings.append("archive turnover exceeded 90% without new-cell gain")
 
     ladder: dict[str, Any] | None = None
+    run_quality_audit: dict[str, Any] | None = None
+    run_quality_path = root / "quality-audit" / "run-quality-audit.json"
+    if run_quality_path.is_file():
+        loaded = _read(run_quality_path, name="run quality audit")
+        supplied = loaded.get("auditSha256")
+        body = dict(loaded)
+        body.pop("auditSha256", None)
+        if isinstance(supplied, str) and canonical_sha256(body) == supplied:
+            run_quality_audit = {
+                "schemaVersion": loaded.get("schemaVersion"),
+                "auditSha256": supplied,
+                "generationCount": loaded.get("generationCount"),
+                "generationSummaries": loaded.get("generationSummaries"),
+                "crossGenerationTrends": loaded.get("crossGenerationTrends"),
+            }
     decision = DECISION_STOP if hard_failures else DECISION_HOLD
     reasons = list(hard_failures)
     if not hard_failures and ladder_summary_path is not None:
@@ -350,6 +365,7 @@ def audit_temporal_qd_g5(
         "decision": decision,
         "decisionReasons": reasons,
         "ladderSummary": ladder,
+        "runQualityAudit": run_quality_audit,
     }
     result["auditSha256"] = canonical_sha256(result)
     return result

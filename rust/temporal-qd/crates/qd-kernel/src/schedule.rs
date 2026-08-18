@@ -218,6 +218,20 @@ pub const fn accepted_quota_immigrant_count(
         }
 }
 
+/// Integer round-half-up offspring quota used by breeding-confidence freeze.
+/// Immigrants receive the remainder so the pair always sums to `target`.
+pub const fn breeding_confidence_quota_counts(
+    target_unique_candidates: u64,
+    offspring_numerator: u64,
+    offspring_denominator: u64,
+) -> (u64, u64) {
+    let offspring = ((target_unique_candidates as u128) * (offspring_numerator as u128)
+        + (offspring_denominator as u128) / 2)
+        / (offspring_denominator as u128);
+    let offspring = offspring as u64;
+    (offspring, target_unique_candidates - offspring)
+}
+
 /// Mirrors `_scheduled_immigrant`.  An archive-free run always starts from
 /// immigrants; without an opt-in rotating schedule, one in five slots is an
 /// immigrant (`ordinal % 5 == 4`).
