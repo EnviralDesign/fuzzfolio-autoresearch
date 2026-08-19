@@ -30,6 +30,9 @@ AUDIT_SCHEMA = "temporal_qd_generation_quality_audit_v1"
 RUN_AUDIT_SCHEMA = "temporal_qd_run_quality_audit_v1"
 NEAR_MISS_CAP = 32
 COUNTERFACTUAL_CAPS = (128, 192, 256)
+# Observational artifacts (cumulative archives, prefinalizer results) are not
+# compact control documents. Keep the 1 MiB control-plane cap unchanged.
+_OBSERVATIONAL_DOCUMENT_LIMIT_BYTES = 512 * 1024 * 1024
 
 _LOG = logging.getLogger(__name__)
 
@@ -97,9 +100,19 @@ def _read_jsonl(path: Path, *, name: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _read_observational_object(path: Path | str, *, name: str) -> dict[str, Any]:
+    """Read a large canonical JSON artifact without the 1 MiB control-document cap."""
+
+    return _read_canonical_object(
+        path,
+        name=name,
+        maximum_bytes=_OBSERVATIONAL_DOCUMENT_LIMIT_BYTES,
+    )
+
+
 def _optional_json(path: Path, *, name: str) -> dict[str, Any] | None:
     try:
-        return _read_canonical_object(path, name=name)
+        return _read_observational_object(path, name=name)
     except Exception:
         return None
 
@@ -149,8 +162,8 @@ def _discover_latest_prefinalizer_round(generation_root: Path) -> Path | None:
         if not result_path.is_file() or not receipt_path.is_file():
             continue
         try:
-            result = _read_canonical_object(result_path, name="prefinalizer result")
-            receipt = _read_canonical_object(
+            result = _read_observational_object(result_path, name="prefinalizer result")
+            receipt = _read_observational_object(
                 receipt_path, name="prefinalizer execution receipt"
             )
         except Exception:
@@ -365,20 +378,47 @@ def _screen_class(flags: Mapping[str, bool]) -> int:
     return 0
 
 
+def _mapping_or_none(value: Any) -> Mapping[str, Any] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _first_nonempty_str(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _lineage_parent_identity(entries: Any) -> str | None:
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        operation = str(entry.get("operation") or "")
+        if "mutation" in operation or "crossover" in operation:
+            identity = entry.get("parentCandidateIdentitySha256")
+            if isinstance(identity, str) and identity:
+                return identity
+    return None
+
+
 def _parse_parent_material(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     parsed: list[dict[str, Any]] = []
     for row in rows:
         pair_payload = row.get("pairPayload")
-        proposal_delta = (
-            pair_payload.get("proposalDelta")
-            if isinstance(pair_payload, Mapping)
-            else None
+        pair_payload = pair_payload if isinstance(pair_payload, Mapping) else {}
+        accepted = _mapping_or_none(pair_payload.get("acceptedRecord")) or {}
+        proposal_delta = _mapping_or_none(pair_payload.get("proposalDelta")) or {}
+        construction_audit = _mapping_or_none(accepted.get("constructionAudit")) or {}
+        evolved_audit = _mapping_or_none(construction_audit.get("evolvedAudit")) or {}
+        descriptor = _mapping_or_none(accepted.get("descriptorProjection")) or {}
+        descriptor_vector = _mapping_or_none(descriptor.get("descriptorVector")) or {}
+        origin_kind = _first_nonempty_str(
+            proposal_delta.get("originKind"),
+            accepted.get("originKind"),
         )
-        origin_kind = None
-        scheduled_kind = None
-        if isinstance(proposal_delta, Mapping):
-            origin_kind = proposal_delta.get("originKind")
-            scheduled_kind = proposal_delta.get("scheduledKind")
+        scheduled_kind = _first_nonempty_str(proposal_delta.get("scheduledKind"))
         parent = row.get("parent") if isinstance(row.get("parent"), Mapping) else {}
         mate = row.get("mate") if isinstance(row.get("mate"), Mapping) else {}
         operators: list[str] = []
@@ -396,23 +436,76 @@ def _parse_parent_material(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                 operator_id = audit.get("operatorId")
                 if isinstance(operator_id, str) and operator_id:
                     operators.append(operator_id)
+        construction_kind = _first_nonempty_str(
+            evolved_audit.get("kind"),
+            construction_audit.get("kind"),
+        )
+        parent_identity = _first_nonempty_str(
+            parent.get("candidateIdentitySha256"),
+            evolved_audit.get("parentCandidateIdentitySha256"),
+            _lineage_parent_identity(pair_payload.get("sideTargetedLineage")),
+            _lineage_parent_identity(
+                (_mapping_or_none(accepted.get("lineage")) or {}).get("orderedSideLineage")
+            ),
+        )
         parsed.append(
             {
-                "candidateId": row.get("candidateId"),
+                "candidateId": row.get("candidateId") or accepted.get("candidateId"),
+                "candidateIdentitySha256": _first_nonempty_str(
+                    row.get("candidateIdentitySha256"),
+                    accepted.get("candidateIdentitySha256"),
+                ),
                 "originKind": origin_kind,
                 "scheduledKind": scheduled_kind,
                 "parentCandidateId": parent.get("candidateId"),
-                "parentCandidateIdentitySha256": parent.get("candidateIdentitySha256"),
+                "parentCandidateIdentitySha256": parent_identity,
                 "mateCandidateId": mate.get("candidateId"),
+                "constructionKind": construction_kind,
                 "mutationDepth": row.get("mutationDepth"),
                 "operatorIds": operators,
                 "operatorSequence": " > ".join(operators) if operators else "",
+                "managementModes": {
+                    key: descriptor_vector.get(key)
+                    for key in (
+                        "long.graphManagementTrailingModes",
+                        "short.graphManagementTrailingModes",
+                        "long.holdKindBucket",
+                        "short.holdKindBucket",
+                    )
+                    if key in descriptor_vector
+                },
                 "terminalDisposition": row.get("terminalDisposition"),
                 "terminalReasonCode": row.get("terminalReasonCode"),
-                "proposalOrdinal": row.get("proposalOrdinal"),
+                "proposalOrdinal": row.get("proposalOrdinal")
+                or proposal_delta.get("proposalOrdinal")
+                or accepted.get("proposalOrdinal"),
             }
         )
     return parsed
+
+
+def _identity_map_from_parent_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for row in rows:
+        candidate_id = row.get("candidateId")
+        identity = row.get("candidateIdentitySha256")
+        if isinstance(candidate_id, str) and candidate_id and isinstance(identity, str) and identity:
+            mapping[identity] = candidate_id
+    return mapping
+
+
+def _resolve_parent_candidate_ids(
+    parsed: Sequence[dict[str, Any]],
+    identity_map: Mapping[str, str],
+) -> None:
+    for row in parsed:
+        if row.get("parentCandidateId"):
+            continue
+        identity = row.get("parentCandidateIdentitySha256")
+        if isinstance(identity, str) and identity in identity_map:
+            row["parentCandidateId"] = identity_map[identity]
 
 
 def _index_evaluated(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -469,16 +562,46 @@ def _cumulative_member_index(
     return indexed
 
 
+def _attempt_parent_id(row: Mapping[str, Any]) -> str | None:
+    parent_id = row.get("parentCandidateId")
+    if isinstance(parent_id, str) and parent_id:
+        return parent_id
+    refs = row.get("lineageRefs")
+    if isinstance(refs, Mapping):
+        parent = refs.get("parent")
+        if isinstance(parent, Mapping):
+            candidate_id = parent.get("candidateId")
+            if isinstance(candidate_id, str) and candidate_id:
+                return candidate_id
+    parent = row.get("parent")
+    if isinstance(parent, Mapping):
+        candidate_id = parent.get("candidateId")
+        if isinstance(candidate_id, str) and candidate_id:
+            return candidate_id
+    return None
+
+
+def _attempt_operator_id(row: Mapping[str, Any]) -> str | None:
+    operator = row.get("operatorId")
+    if isinstance(operator, str) and operator:
+        return operator
+    return None
+
+
 def _attempt_telemetry(
     generation_root: Path, generation_index: int
 ) -> tuple[bool, dict[str, Any]]:
     prefinalizer = generation_root / "prefinalizer"
+    proposal_attempts = generation_root / "proposal" / "proposal-attempts.jsonl"
+    proposal_receipt = generation_root / "proposal" / "proposal-attempts-receipt.json"
     evolved_attempts = prefinalizer / "proposal-attempts" / "proposal-attempts.jsonl"
     evolved_receipt = prefinalizer / "proposal-attempts" / "proposal-attempts-receipt.json"
     g0_attempts = prefinalizer / "g0-selected-proposal-attempts.jsonl"
     g0_receipt = prefinalizer / "g0-selected-attempts-receipt.json"
     attempts_path: Path | None = None
-    if evolved_attempts.is_file() and evolved_receipt.is_file():
+    if proposal_attempts.is_file() and proposal_receipt.is_file():
+        attempts_path = proposal_attempts
+    elif evolved_attempts.is_file() and evolved_receipt.is_file():
         attempts_path = evolved_attempts
     elif generation_index == 1 and g0_attempts.is_file() and g0_receipt.is_file():
         attempts_path = g0_attempts
@@ -489,22 +612,34 @@ def _attempt_telemetry(
     reasons: dict[str, int] = defaultdict(int)
     by_operator: dict[str, int] = defaultdict(int)
     by_depth: dict[str, int] = defaultdict(int)
+    by_parent: dict[str, int] = defaultdict(int)
+    by_reason_code: dict[str, int] = defaultdict(int)
+    by_origin: dict[str, int] = defaultdict(int)
     for row in rows:
         disposition = str(row.get("disposition") or "unknown")
         reasons[disposition] += 1
         if disposition in {"accepted", "materialized", "selected"}:
             accepted += 1
-        elif disposition in {"no_op_proposal", "operation_rejected"}:
+        elif disposition in {"no_op", "no_op_proposal", "operation_rejected"}:
             no_op += 1
         else:
             rejected += 1
-        operator = row.get("operatorId")
-        if isinstance(operator, str) and operator:
+        operator = _attempt_operator_id(row)
+        if operator is not None:
             by_operator[operator] += 1
         depth = row.get("mutationDepth")
         if depth is not None:
             by_depth[str(depth)] += 1
-    return True, {
+        parent_id = _attempt_parent_id(row)
+        if parent_id is not None:
+            by_parent[parent_id] += 1
+        reason_code = row.get("reasonCode") or row.get("terminalReasonCode")
+        if isinstance(reason_code, str) and reason_code:
+            by_reason_code[reason_code] += 1
+        origin = row.get("originKind")
+        if isinstance(origin, str) and origin:
+            by_origin[origin] += 1
+    stats = {
         "attemptCount": len(rows),
         "acceptedAttemptCount": accepted,
         "rejectedAttemptCount": rejected,
@@ -512,7 +647,11 @@ def _attempt_telemetry(
         "attemptReasons": dict(sorted(reasons.items())),
         "attemptsByOperator": dict(sorted(by_operator.items())),
         "attemptsByMutationDepth": dict(sorted(by_depth.items())),
+        "attemptsByParent": dict(sorted(by_parent.items())),
+        "attemptsByReasonCode": dict(sorted(by_reason_code.items())),
+        "attemptsByOriginKind": dict(sorted(by_origin.items())),
     }
+    return True, stats
 
 
 def _quantiles(values: Sequence[float]) -> dict[str, float | None] | None:
@@ -650,6 +789,7 @@ def _aggregate_gate_counts(
         for key in keys:
             if flags.get(key):
                 counts[key] += 1
+    counts["finiteSupportEligibleCount"] = counts["combinedSupportPass"]
     return counts
 
 
@@ -666,6 +806,66 @@ def _origin_kind(row: Mapping[str, Any]) -> str:
     if parent_id is None:
         return "immigrant"
     return "offspring"
+
+
+def _construction_kind_label(row: Mapping[str, Any]) -> str:
+    kind = row.get("constructionKind")
+    if isinstance(kind, str) and kind:
+        return kind
+    origin = _origin_kind(row)
+    if origin == "immigrant":
+        return "immigrant"
+    return "unresolved"
+
+
+def _parent_relative_summary(deltas: Sequence[float]) -> dict[str, Any]:
+    if not deltas:
+        return {
+            "comparisonCount": 0,
+            "meanParentRelativeConservativeNetR": None,
+            "medianParentRelativeConservativeNetR": None,
+            "offspringBeatParentCount": 0,
+            "offspringBeatParentRate": None,
+        }
+    beat = sum(1 for delta in deltas if delta > 0)
+    return {
+        "comparisonCount": len(deltas),
+        "meanParentRelativeConservativeNetR": sum(deltas) / len(deltas),
+        "medianParentRelativeConservativeNetR": float(statistics.median(deltas)),
+        "offspringBeatParentCount": beat,
+        "offspringBeatParentRate": beat / len(deltas),
+    }
+
+
+def _parent_relative_deltas(
+    parent_rows: Sequence[Mapping[str, Any]],
+    *,
+    kind: str,
+    evaluated: Mapping[str, Mapping[str, Any]],
+    parent_lookup: Mapping[str, Mapping[str, Any]],
+    robust_policy: Mapping[str, Any],
+    direction_policy: Any,
+) -> list[float]:
+    deltas: list[float] = []
+    for row in parent_rows:
+        if _construction_kind_label(row) != kind:
+            continue
+        child_id = row.get("candidateId")
+        parent_id = row.get("parentCandidateId")
+        if not isinstance(child_id, str) or not isinstance(parent_id, str):
+            continue
+        child = evaluated.get(child_id)
+        parent = parent_lookup.get(parent_id)
+        if child is None or parent is None:
+            continue
+        child_net = _gate_flags(
+            child, robust_policy=robust_policy, direction_policy=direction_policy
+        )["_metrics"]["cumulativeConservativeNetR"]
+        parent_net = _gate_flags(
+            parent, robust_policy=robust_policy, direction_policy=direction_policy
+        )["_metrics"]["cumulativeConservativeNetR"]
+        deltas.append(float(child_net) - float(parent_net))
+    return deltas
 
 
 def _yield_row(
@@ -726,6 +926,7 @@ def _yield_row(
         "uniqueBehaviorIdentityCount": len(behavior_identities),
         "zeroTradeCandidateCount": zero_trade,
         "supportPassCount": support_pass,
+        "finiteSupportEligibleCount": support_pass,
         "supportPassRate": (support_pass / evaluated_count) if evaluated_count else 0.0,
         "directionPassCount": direction_pass,
         "directionPassRate": (direction_pass / evaluated_count) if evaluated_count else 0.0,
@@ -741,6 +942,78 @@ def _yield_row(
         "provisionalSelectedCount": len(evaluated_ids & provisional_ids),
         "cumulativePresentCount": len(evaluated_ids & cumulative_ids),
     }
+
+
+def _construction_kind_yield(
+    parent_rows: Sequence[Mapping[str, Any]],
+    *,
+    evaluated: dict[str, dict[str, Any]],
+    previous_evaluated: Mapping[str, Mapping[str, Any]],
+    provisional_ids: set[str],
+    cumulative_ids: set[str],
+    quality_ids: set[str],
+    frontier_ids: set[str],
+    archive_ids: set[str],
+    archive_members: Mapping[str, Mapping[str, Any]],
+    robust_policy: Mapping[str, Any],
+    direction_policy: Any,
+) -> list[dict[str, Any]]:
+    by_kind: dict[str, list[str]] = defaultdict(list)
+    for row in parent_rows:
+        candidate_id = row.get("candidateId")
+        if isinstance(candidate_id, str) and candidate_id:
+            by_kind[_construction_kind_label(row)].append(candidate_id)
+    previous_lookup = {
+        candidate_id: row
+        for candidate_id, row in previous_evaluated.items()
+        if candidate_id not in evaluated
+    }
+    rows: list[dict[str, Any]] = []
+    for kind in sorted(by_kind):
+        ids = set(by_kind[kind])
+        archive_cells = {
+            str(archive_members[cid].get("cellId"))
+            for cid in ids
+            if cid in archive_members and archive_members[cid].get("cellId") is not None
+        }
+        row = _yield_row(
+            origin=kind,
+            constructed=len(ids),
+            evaluated_ids=ids & set(evaluated),
+            evaluated=evaluated,
+            provisional_ids=provisional_ids,
+            cumulative_ids=cumulative_ids,
+            quality_ids=quality_ids,
+            frontier_ids=frontier_ids,
+            archive_ids=archive_ids,
+            archive_cells=archive_cells,
+            robust_policy=robust_policy,
+            direction_policy=direction_policy,
+        )
+        row.pop("originKind", None)
+        row["constructionKind"] = kind
+        row["samePanelParentRelative"] = _parent_relative_summary(
+            _parent_relative_deltas(
+                parent_rows,
+                kind=kind,
+                evaluated=evaluated,
+                parent_lookup=evaluated,
+                robust_policy=robust_policy,
+                direction_policy=direction_policy,
+            )
+        )
+        row["previousGenerationParentRelative"] = _parent_relative_summary(
+            _parent_relative_deltas(
+                parent_rows,
+                kind=kind,
+                evaluated=evaluated,
+                parent_lookup=previous_lookup,
+                robust_policy=robust_policy,
+                direction_policy=direction_policy,
+            )
+        )
+        rows.append(row)
+    return rows
 
 
 def _cumulative_qualification(
@@ -849,6 +1122,8 @@ def _cumulative_qualification(
     return {
         "enteringCohortSize": len(entering_ids),
         **pass_counts,
+        "finiteSupportEligibleCount": pass_counts["supportPass"],
+        "currentPanelQualityLikeCount": pass_counts["rawQualityEligible"],
         **{key: terminal.get(key, 0) for key in (
             "failedActiveWindowFraction",
             "failedTradesPerMonth",
@@ -875,7 +1150,7 @@ def _stable_binding(path: Path, *, name: str, run_root: Path) -> dict[str, Any]:
         raw = "".join(canonical_json(row) + "\n" for row in rows).encode("utf-8")
     else:
         try:
-            document = _read_canonical_object(checked, name=name)
+            document = _read_observational_object(checked, name=name)
             raw = (canonical_json(document) + "\n").encode("utf-8")
         except Exception:
             raw = checked.read_bytes()
@@ -983,8 +1258,15 @@ def audit_temporal_qd_generation_quality(
     if generation_index > 1:
         previous_archive = _generation_root(root, generation_index - 1) / "native-finalization" / "archive.json"
         paths["previousParentArchive"] = previous_archive if previous_archive.is_file() else None
+        previous_parent_material = (
+            _generation_root(root, generation_index - 1) / "proposal" / "parent-material.jsonl"
+        )
+        paths["previousParentMaterial"] = (
+            previous_parent_material if previous_parent_material.is_file() else None
+        )
     else:
         paths["previousParentArchive"] = None
+        paths["previousParentMaterial"] = None
 
     parent_rows = _parse_parent_material(
         _read_jsonl(parent_material_path, name="parent material")
@@ -993,12 +1275,12 @@ def audit_temporal_qd_generation_quality(
     evaluated = _index_evaluated(evaluated_rows)
 
     cumulative = (
-        _read_canonical_object(paths["cumulativeArchive"], name="cumulative archive")
+        _read_observational_object(paths["cumulativeArchive"], name="cumulative archive")
         if paths.get("cumulativeArchive") is not None
         else None
     )
     archive = (
-        _read_canonical_object(paths["parentArchive"], name="parent archive")
+        _read_observational_object(paths["parentArchive"], name="parent archive")
         if paths.get("parentArchive") is not None
         else None
     )
@@ -1010,6 +1292,40 @@ def audit_temporal_qd_generation_quality(
     robust_policy, direction_policy = _load_threshold_policies(archive)
     archive_members = _archive_member_index(archive)
     cumulative_members = _cumulative_member_index(cumulative)
+    identity_map = _identity_map_from_parent_rows(parent_rows)
+    if paths.get("previousParentMaterial") is not None:
+        previous_parents = _parse_parent_material(
+            _read_jsonl(paths["previousParentMaterial"], name="previous parent material")
+        )
+        identity_map.update(_identity_map_from_parent_rows(previous_parents))
+    previous_evaluated: dict[str, dict[str, Any]] = {}
+    if generation_index > 1:
+        previous_evaluated_path = (
+            _generation_root(root, generation_index - 1)
+            / "campaign"
+            / "proposal-current-panel"
+            / "campaign-output"
+            / "evaluated-members.jsonl"
+        )
+        if previous_evaluated_path.is_file():
+            previous_evaluated = _index_evaluated(
+                _read_jsonl(
+                    previous_evaluated_path, name="previous evaluated members"
+                )
+            )
+        else:
+            limitations.append(
+                "previous generation evaluated members unavailable for parent-relative comparison"
+            )
+    for candidate_id, row in evaluated.items():
+        identity = _member_field(row, "candidateIdentitySha256")
+        if isinstance(identity, str) and identity:
+            identity_map.setdefault(identity, candidate_id)
+    for candidate_id, member in archive_members.items():
+        identity = _member_field(member, "candidateIdentitySha256")
+        if isinstance(identity, str) and identity:
+            identity_map.setdefault(identity, candidate_id)
+    _resolve_parent_candidate_ids(parent_rows, identity_map)
     quality_ids = {
         str(value)
         for value in (cumulative.get("qualityCandidateIds") or [])
@@ -1132,6 +1448,20 @@ def audit_temporal_qd_generation_quality(
             )
         )
 
+    construction_kind_yield = _construction_kind_yield(
+        parent_rows,
+        evaluated=evaluated,
+        previous_evaluated=previous_evaluated,
+        provisional_ids=provisional_ids,
+        cumulative_ids=set(cumulative_members),
+        quality_ids=quality_ids,
+        frontier_ids=frontier_ids,
+        archive_ids=set(archive_members),
+        archive_members=archive_members,
+        robust_policy=robust_policy,
+        direction_policy=direction_policy,
+    )
+
     parent_yield: list[dict[str, Any]] = []
     children_by_parent: dict[str, list[str]] = defaultdict(list)
     for row in parent_rows:
@@ -1181,12 +1511,16 @@ def audit_temporal_qd_generation_quality(
 
     operator_counts: dict[str, int] = defaultdict(int)
     sequence_counts: dict[str, int] = defaultdict(int)
+    construction_kind_counts: dict[str, int] = defaultdict(int)
     for row in parent_rows:
         for operator_id in row.get("operatorIds") or []:
             operator_counts[str(operator_id)] += 1
         sequence = row.get("operatorSequence")
         if isinstance(sequence, str) and sequence:
             sequence_counts[sequence] += 1
+        construction_kind = row.get("constructionKind")
+        if isinstance(construction_kind, str) and construction_kind:
+            construction_kind_counts[construction_kind] += 1
     operator_yield = [
         {"operatorId": operator_id, "occurrenceCount": operator_counts[operator_id]}
         for operator_id in sorted(operator_counts)
@@ -1199,6 +1533,13 @@ def audit_temporal_qd_generation_quality(
         }
         for sequence in sorted(sequence_counts)
         if " > " in sequence
+    )
+    operator_yield.extend(
+        {
+            "constructionKind": kind,
+            "occurrenceCount": construction_kind_counts[kind],
+        }
+        for kind in sorted(construction_kind_counts)
     )
 
     behavior_clusters: dict[str, int] = defaultdict(int)
@@ -1338,6 +1679,7 @@ def audit_temporal_qd_generation_quality(
         "cumulativeQualification": cumulative_qualification,
         "archive": archive_summary,
         "originYield": origin_yield,
+        "constructionKindYield": construction_kind_yield,
         "parentYield": parent_yield,
         "operatorYield": operator_yield,
         "behaviorDiversity": {
@@ -1385,6 +1727,13 @@ def _build_run_quality_audit(run_root: Path, generation_index: int) -> dict[str,
                 "archiveRetained": audit.get("cumulativeQualification", {}).get(
                     "archiveRetained"
                 ),
+                "finiteSupportEligibleCount": audit.get("cumulativeQualification", {}).get(
+                    "finiteSupportEligibleCount"
+                ),
+                "currentPanelQualityLikeCount": audit.get(
+                    "cumulativeQualification", {}
+                ).get("currentPanelQualityLikeCount"),
+                "constructionKindYield": audit.get("constructionKindYield"),
             }
         )
     trends: dict[str, Any] = {}
@@ -1429,6 +1778,11 @@ def observe_generation_quality_audit(
             generation_record=generation_record,
         )
         _write_canonical(success_path, audit)
+        if error_path.is_file():
+            try:
+                error_path.unlink()
+            except OSError:
+                pass
         if generation_index == 5:
             run_audit = _build_run_quality_audit(Path(run_root).resolve(), generation_index)
             run_audit_dir = Path(run_root).resolve() / "quality-audit"
@@ -1483,9 +1837,39 @@ def observe_generation_quality_audit(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--generation-index", type=int, required=True)
+    parser.add_argument("--generation-index", type=int)
+    parser.add_argument(
+        "--through-generation",
+        type=int,
+        help="observe every generation from --generation-index (default 1) through this index",
+    )
+    parser.add_argument(
+        "--observe",
+        action="store_true",
+        help="write quality-audit artifacts instead of printing the full audit",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
+    if args.through_generation is not None:
+        if not args.observe:
+            parser.error("--through-generation requires --observe")
+        start = 1 if args.generation_index is None else args.generation_index
+        indexes = list(range(start, args.through_generation + 1))
+    elif args.generation_index is not None:
+        indexes = [args.generation_index]
+    else:
+        parser.error("--generation-index is required")
+
+    if args.observe:
+        failed = False
+        for index in indexes:
+            result = observe_generation_quality_audit(args.run_root, index)
+            encoded = canonical_json(result) + "\n"
+            print(encoded, end="")
+            if result.get("status") != "ok":
+                failed = True
+        return 1 if failed else 0
+
     result = audit_temporal_qd_generation_quality(
         args.run_root, args.generation_index
     )

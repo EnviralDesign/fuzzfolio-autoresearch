@@ -18,6 +18,7 @@ use temporal_qd_contract::{
     canonical_sha256,
 };
 use temporal_qd_kernel::factory::ParentReference;
+use temporal_qd_kernel::v5::{V5ProposalAttemptRecord, V5_PROPOSAL_ATTEMPT_SCHEMA};
 use temporal_qd_kernel::v5_evolved_publication::{
     V5EvolvedParentReferenceSink, V5EvolvedPublicationFragmentKind,
     V5EvolvedPublicationFragmentSink, V5EvolvedPublicationFragmentSource,
@@ -46,6 +47,10 @@ pub(crate) const PARENT_MATERIAL_PATH: &str = "parent-material.jsonl";
 pub(crate) const PARENT_MATERIAL_ROW_SCHEMA: &str =
     "temporal_qd_v5_fast_ephemeral_parent_material_v2";
 pub(crate) const MAX_PARENT_MATERIAL_ROW_BYTES: usize = 8 * 1024 * 1024;
+const PROPOSAL_ATTEMPTS_PATH: &str = "proposal-attempts.jsonl";
+const PROPOSAL_ATTEMPTS_RECEIPT_PATH: &str = "proposal-attempts-receipt.json";
+const PROPOSAL_ATTEMPTS_RECEIPT_SCHEMA: &str =
+    "temporal_qd_v5_fast_ephemeral_attempt_stream_receipt_v1";
 
 /// One private parent handoff for the next fast-ephemeral generation.
 ///
@@ -358,6 +363,67 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+fn write_proposal_attempt_stream(
+    output_root: &Path,
+    attempts: &[V5ProposalAttemptRecord],
+) -> Result<()> {
+    let attempts_path = output_root.join(PROPOSAL_ATTEMPTS_PATH);
+    let mut writer = create_new_writer(&attempts_path, "fast-ephemeral proposal attempts")?;
+    let mut encoded = Vec::new();
+    let mut seen_ordinals = BTreeSet::new();
+    for attempt in attempts {
+        if !seen_ordinals.insert(attempt.proposal_ordinal) {
+            bail!("fast-ephemeral proposal attempt stream repeats an ordinal");
+        }
+        let value = attempt
+            .to_value()
+            .map_err(|error| anyhow!("encode fast-ephemeral proposal attempt: {error}"))?;
+        let row = canonical_json_line(&value).context("encode fast-ephemeral proposal attempt row")?;
+        encoded.extend_from_slice(&row);
+        writer
+            .write_all(&row)
+            .context("write fast-ephemeral proposal attempt row")?;
+    }
+    writer
+        .flush()
+        .context("flush fast-ephemeral proposal attempt stream")?;
+    drop(writer);
+    let file_sha256 = sha256_bytes(&encoded);
+    let mut receipt_fields = Map::from_iter([
+        (
+            "schemaVersion".to_owned(),
+            Value::String(PROPOSAL_ATTEMPTS_RECEIPT_SCHEMA.to_owned()),
+        ),
+        (
+            "relativePath".to_owned(),
+            Value::String(PROPOSAL_ATTEMPTS_PATH.to_owned()),
+        ),
+        (
+            "rowSchema".to_owned(),
+            Value::String(V5_PROPOSAL_ATTEMPT_SCHEMA.to_owned()),
+        ),
+        (
+            "recordCount".to_owned(),
+            Value::from(attempts.len() as u64),
+        ),
+        ("fileSha256".to_owned(), Value::String(file_sha256)),
+        ("sizeBytes".to_owned(), Value::from(encoded.len() as u64)),
+    ]);
+    let receipt_sha256 = canonical_sha256(&Value::Object(receipt_fields.clone()))
+        .context("identify fast-ephemeral proposal attempt receipt")?;
+    receipt_fields.insert(
+        "receiptSha256".to_owned(),
+        Value::String(receipt_sha256),
+    );
+    write_new(
+        &output_root.join(PROPOSAL_ATTEMPTS_RECEIPT_PATH),
+        &canonical_json_line(&Value::Object(receipt_fields))
+            .context("encode fast-ephemeral proposal attempt receipt")?,
+        "fast-ephemeral proposal attempt receipt",
+    )?;
+    Ok(())
+}
+
 fn duration_ms(duration: Duration) -> Result<u64> {
     u64::try_from(duration.as_millis()).context("convert fast-ephemeral duration")
 }
@@ -379,6 +445,8 @@ pub(crate) fn execute_g0(
         EVALUATION_POPULATION_PATH,
         IDENTITY_LEDGER_PATH,
         PARENT_MATERIAL_PATH,
+        PROPOSAL_ATTEMPTS_PATH,
+        PROPOSAL_ATTEMPTS_RECEIPT_PATH,
         "v5-native",
         "internal",
     ] {
@@ -506,6 +574,7 @@ pub(crate) fn execute_g0(
         &ledger_bytes,
         "fast-ephemeral identity ledger",
     )?;
+    write_proposal_attempt_stream(output_root, &transaction.attempts)?;
     let publication_elapsed = publication_started.elapsed();
 
     let artifacts = Value::Object(Map::from_iter([
@@ -726,6 +795,109 @@ mod tests {
         );
         fs::remove_dir_all(root).expect("remove test root");
     }
+
+    fn immigrant_attempt(ordinal: u64, disposition: &str, reason: &str, effect: &str) -> V5ProposalAttemptRecord {
+        use temporal_qd_kernel::v5::{V5AttemptLineageRefs, V5AttemptOutcomeAudit, v5_proposal_seed};
+
+        let config = canonical_sha256(&Value::String("fast-ephemeral-attempt-config".to_owned()))
+            .expect("config SHA");
+        let authority = canonical_sha256(&Value::String("fast-ephemeral-attempt-authority".to_owned()))
+            .expect("authority SHA");
+        let lineage_refs = V5AttemptLineageRefs {
+            parent: None,
+            mate: None,
+            parent_selection_receipt_sha256: None,
+            operator_plan_sha256: None,
+            operator_application_sha256: None,
+            operator_trace_sha256: None,
+            step_index: None,
+        };
+        let proposal_seed = v5_proposal_seed(&config, ordinal).expect("proposal seed");
+        let delta = if disposition == "accepted" {
+            Some(canonical_sha256(&Value::String("delta".to_owned())).expect("delta SHA"))
+        } else {
+            None
+        };
+        let accepted = if disposition == "accepted" {
+            Some(canonical_sha256(&Value::String("accepted".to_owned())).expect("accepted SHA"))
+        } else {
+            None
+        };
+        let stage = if disposition == "accepted" {
+            "accepted"
+        } else {
+            "pre_plan"
+        };
+        let audit = V5AttemptOutcomeAudit {
+            generation_index: 1,
+            proposal_ordinal: ordinal,
+            generation_config_sha256: config.clone(),
+            shared_authority_sha256: authority.clone(),
+            proposal_seed: proposal_seed.clone(),
+            origin_kind: "random_immigrant".to_owned(),
+            disposition: disposition.to_owned(),
+            reason_code: reason.to_owned(),
+            stage: stage.to_owned(),
+            proposal_delta_sha256: delta.clone(),
+            lineage_refs_sha256: canonical_sha256(&lineage_refs.to_value().expect("refs"))
+                .expect("lineage SHA"),
+            identity_ledger_effect: effect.to_owned(),
+            accepted_record_sha256: accepted.clone(),
+        };
+        V5ProposalAttemptRecord {
+            generation_index: 1,
+            proposal_ordinal: ordinal,
+            generation_config_sha256: config,
+            shared_authority_sha256: authority,
+            proposal_seed,
+            origin_kind: "random_immigrant".to_owned(),
+            proposal_delta_sha256: delta,
+            disposition: disposition.to_owned(),
+            reason_code: reason.to_owned(),
+            lineage_refs,
+            identity_ledger_effect: effect.to_owned(),
+            outcome_audit_sha256: audit.audit_sha256().expect("outcome audit SHA"),
+            accepted_record_sha256: accepted,
+        }
+    }
+
+    #[test]
+    fn proposal_attempt_stream_is_canonical_jsonl_with_receipt() {
+        let root = test_root("attempt-writer");
+        fs::create_dir(&root).expect("create test root");
+        let rejected = immigrant_attempt(0, "rejected", "pre_plan_rejected", "not_applicable");
+        let accepted = immigrant_attempt(1, "accepted", "accepted", "inserted");
+        write_proposal_attempt_stream(&root, &[rejected, accepted]).expect("write attempts");
+        let raw = fs::read(root.join(PROPOSAL_ATTEMPTS_PATH)).expect("read attempts");
+        assert_eq!(raw.last(), Some(&b'\n'));
+        assert!(!raw.contains(&b'\r'));
+        let rows: Vec<Value> = raw
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("parse attempt row"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("schemaVersion").and_then(Value::as_str),
+            Some(V5_PROPOSAL_ATTEMPT_SCHEMA)
+        );
+        assert_eq!(
+            rows[0].get("disposition").and_then(Value::as_str),
+            Some("rejected")
+        );
+        let receipt_raw = fs::read(root.join(PROPOSAL_ATTEMPTS_RECEIPT_PATH)).expect("read receipt");
+        let receipt: Value = serde_json::from_slice(&receipt_raw).expect("parse receipt");
+        assert_eq!(
+            receipt.get("schemaVersion").and_then(Value::as_str),
+            Some(PROPOSAL_ATTEMPTS_RECEIPT_SCHEMA)
+        );
+        assert_eq!(receipt.get("recordCount").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            receipt.get("fileSha256").and_then(Value::as_str),
+            Some(sha256_bytes(&raw).as_str())
+        );
+        fs::remove_dir_all(root).expect("remove test root");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -744,6 +916,8 @@ pub(crate) fn execute_evolved(
         EVALUATION_POPULATION_PATH,
         IDENTITY_LEDGER_PATH,
         PARENT_MATERIAL_PATH,
+        PROPOSAL_ATTEMPTS_PATH,
+        PROPOSAL_ATTEMPTS_RECEIPT_PATH,
         "v5-native",
         "internal",
     ] {
@@ -893,6 +1067,7 @@ pub(crate) fn execute_evolved(
         .flush()
         .context("flush fast-ephemeral evolved identity ledger")?;
     drop(ledger_writer);
+    write_proposal_attempt_stream(output_root, &transaction.attempts)?;
     let publication_assembly_elapsed = publication_assembly_started.elapsed();
     let publication_elapsed = publication_started.elapsed();
 

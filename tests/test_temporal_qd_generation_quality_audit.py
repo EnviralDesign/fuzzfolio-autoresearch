@@ -10,6 +10,7 @@ from autoresearch.temporal_qd_generation_quality_audit import (
     AUDIT_SCHEMA,
     audit_temporal_qd_generation_quality,
     observe_generation_quality_audit,
+    _parse_parent_material,
 )
 
 
@@ -526,3 +527,230 @@ def test_observe_writes_success_file(tmp_path: Path) -> None:
         / "generation-quality-audit.json"
     )
     assert success_path.is_file()
+
+
+def test_oversized_prefinalizer_result_is_discovered(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path)
+    path = (
+        run_root
+        / "generations"
+        / "generation-0001"
+        / "prefinalizer"
+        / "round-0001"
+        / "result.json"
+    )
+    result = json.loads(path.read_text(encoding="utf-8"))
+    result.pop("resultSha256", None)
+    result["observationalPadding"] = "x" * (1_048_576 + 64)
+    result["resultSha256"] = canonical_sha256(
+        {key: value for key, value in result.items() if key != "resultSha256"}
+    )
+    _write(path, result)
+    assert path.stat().st_size > 1_048_576
+    audit = audit_temporal_qd_generation_quality(run_root, 1)
+    assert "latest ready prefinalizer round unavailable" not in audit["limitations"]
+    assert audit["provisionalSelection"]["provisionalCandidateCount"] == 3
+
+
+def test_oversized_cumulative_archive_still_audits(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path)
+    path = (
+        run_root
+        / "generations"
+        / "generation-0001"
+        / "native-finalization"
+        / "evidence"
+        / "cumulative-archive.json"
+    )
+    cumulative = json.loads(path.read_text(encoding="utf-8"))
+    cumulative.pop("archiveSha256", None)
+    cumulative["observationalPadding"] = "x" * (1_048_576 + 64)
+    cumulative["archiveSha256"] = canonical_sha256(
+        {key: value for key, value in cumulative.items() if key != "archiveSha256"}
+    )
+    _write(path, cumulative)
+    assert path.stat().st_size > 1_048_576
+    audit = audit_temporal_qd_generation_quality(run_root, 1)
+    assert audit["schemaVersion"] == AUDIT_SCHEMA
+    assert audit["cumulativeQualification"]["archiveRetained"] == 2
+
+
+def test_finite_support_alias_is_not_quality(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path)
+    audit = audit_temporal_qd_generation_quality(run_root, 1)
+    all_eval = audit["evaluation"]["allEvaluated"]
+    assert all_eval["finiteSupportEligibleCount"] == all_eval["combinedSupportPass"]
+    cumulative = audit["cumulativeQualification"]
+    assert cumulative["finiteSupportEligibleCount"] == cumulative["supportPass"]
+    assert cumulative["currentPanelQualityLikeCount"] == cumulative["rawQualityEligible"]
+    offspring = next(row for row in audit["originYield"] if row["originKind"] == "offspring")
+    assert offspring["finiteSupportEligibleCount"] == offspring["supportPassCount"]
+    assert "currentPanelQualityLikeCount" in offspring
+
+
+def test_fast_ephemeral_attempt_sidecar_telemetry(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path, include_attempts=False)
+    generation_root = run_root / "generations" / "generation-0001"
+    attempts = [
+        {
+            "proposalOrdinal": 1,
+            "disposition": "accepted",
+            "originKind": "structural_offspring",
+            "reasonCode": "accepted",
+            "lineageRefs": {"parent": {"candidateId": "parent-a"}},
+        },
+        {
+            "proposalOrdinal": 2,
+            "disposition": "rejected",
+            "originKind": "structural_offspring",
+            "reasonCode": "pre_plan_rejected",
+            "lineageRefs": {"parent": {"candidateId": "parent-a"}},
+        },
+        {
+            "proposalOrdinal": 3,
+            "disposition": "no_op",
+            "originKind": "structural_offspring",
+            "reasonCode": "no_eligible_operation",
+            "lineageRefs": {"parent": {"candidateId": "parent-a"}},
+        },
+    ]
+    _write_jsonl(generation_root / "proposal" / "proposal-attempts.jsonl", attempts)
+    receipt = {
+        "schemaVersion": "temporal_qd_v5_fast_ephemeral_attempt_stream_receipt_v1",
+        "recordCount": len(attempts),
+    }
+    receipt["receiptSha256"] = canonical_sha256(receipt)
+    _write(generation_root / "proposal" / "proposal-attempts-receipt.json", receipt)
+    audit = audit_temporal_qd_generation_quality(run_root, 1)
+    assert audit["construction"]["attemptTelemetryAvailable"] is True
+    assert audit["construction"]["attemptCount"] == 3
+    assert audit["construction"]["acceptedAttemptCount"] == 1
+    assert audit["construction"]["rejectedAttemptCount"] == 1
+    assert audit["construction"]["noOpAttemptCount"] == 1
+    assert audit["construction"]["attemptsByParent"]["parent-a"] == 3
+    assert audit["construction"]["attemptsByOriginKind"]["structural_offspring"] == 3
+
+
+def test_nested_parent_material_resolves_parent_sha_and_construction_kind(
+    tmp_path: Path,
+) -> None:
+    parent_identity = canonical_sha256({"candidateId": "parent-a"})
+    child_identity = canonical_sha256({"candidateId": "child-a"})
+    parsed = _parse_parent_material(
+        [
+            {
+                "candidateId": "child-a",
+                "pairPayload": {
+                    "acceptedRecord": {
+                        "candidateId": "child-a",
+                        "candidateIdentitySha256": child_identity,
+                        "originKind": "qd_structural_offspring",
+                        "constructionAudit": {
+                            "kind": "mutation_trace",
+                            "evolvedAudit": {
+                                "kind": "mutation_trace",
+                                "parentCandidateIdentitySha256": parent_identity,
+                            },
+                        },
+                    },
+                    "proposalDelta": {
+                        "originKind": "qd_structural_offspring",
+                        "scheduledKind": "qd_structural_offspring",
+                    },
+                },
+            }
+        ]
+    )
+    assert parsed[0]["parentCandidateId"] is None
+    assert parsed[0]["parentCandidateIdentitySha256"] == parent_identity
+    assert parsed[0]["constructionKind"] == "mutation_trace"
+
+    run_root = _build_fixture(tmp_path)
+    _write_jsonl(
+        run_root / "generations" / "generation-0001" / "proposal" / "parent-material.jsonl",
+        [
+            {
+                "candidateId": "child-a",
+                "candidateIdentitySha256": child_identity,
+                "pairPayload": {
+                    "acceptedRecord": {
+                        "candidateId": "child-a",
+                        "candidateIdentitySha256": child_identity,
+                        "originKind": "qd_structural_offspring",
+                        "constructionAudit": {
+                            "kind": "mutation_trace",
+                            "evolvedAudit": {
+                                "kind": "mutation_trace",
+                                "parentCandidateIdentitySha256": parent_identity,
+                            },
+                        },
+                    },
+                    "proposalDelta": {
+                        "originKind": "qd_structural_offspring",
+                        "scheduledKind": "qd_structural_offspring",
+                    },
+                },
+            },
+            {
+                "candidateId": "immigrant-a",
+                "pairPayload": {
+                    "proposalDelta": {
+                        "originKind": "qd_random_immigrant",
+                        "scheduledKind": "qd_random_immigrant",
+                    }
+                },
+            },
+        ],
+    )
+    audit = audit_temporal_qd_generation_quality(run_root, 1)
+    parent_row = next(
+        row for row in audit["parentYield"] if row["parentCandidateId"] == "parent-a"
+    )
+    assert parent_row["offspringConstructedCount"] == 1
+    mutation = next(
+        row
+        for row in audit["constructionKindYield"]
+        if row["constructionKind"] == "mutation_trace"
+    )
+    assert mutation["constructedCandidateCount"] == 1
+    assert mutation["samePanelParentRelative"]["comparisonCount"] == 1
+    assert mutation["samePanelParentRelative"]["meanParentRelativeConservativeNetR"] == pytest.approx(
+        3.2
+    )
+
+
+def test_previous_generation_parent_relative_uses_prior_evals(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path, generation_index=1, include_parent_eval=True)
+    _build_fixture(tmp_path, generation_index=2, include_parent_eval=False)
+    audit = audit_temporal_qd_generation_quality(run_root, 2)
+    offspring = next(
+        row for row in audit["constructionKindYield"] if row["constructionKind"] != "immigrant"
+    )
+    assert offspring["samePanelParentRelative"]["comparisonCount"] == 0
+    assert offspring["previousGenerationParentRelative"]["comparisonCount"] == 1
+    assert offspring["previousGenerationParentRelative"][
+        "meanParentRelativeConservativeNetR"
+    ] == pytest.approx(3.2)
+
+
+def test_observe_unlinks_stale_audit_error(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path)
+    error_path = (
+        run_root
+        / "generations"
+        / "generation-0001"
+        / "quality-audit"
+        / "audit-error.json"
+    )
+    _write(error_path, {"schemaVersion": AUDIT_SCHEMA, "message": "stale"})
+    result = observe_generation_quality_audit(run_root, 1)
+    assert result["status"] == "ok"
+    assert not error_path.is_file()
+    assert (
+        run_root
+        / "generations"
+        / "generation-0001"
+        / "quality-audit"
+        / "generation-quality-audit.json"
+    ).is_file()
+

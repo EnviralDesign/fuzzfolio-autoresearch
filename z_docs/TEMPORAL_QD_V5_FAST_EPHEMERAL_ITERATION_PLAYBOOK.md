@@ -250,12 +250,14 @@ Do not mix recent halt classes:
 - v34: backfill freeze proof cardinality (proofs for parents already covered).
 - v35: 0-offspring immigrants-only receipt treated as missing (`or -1`).
 - v36: G1–G5 completed. Empty G3+ archives were a quality signal, not a halt.
-      Per-generation `quality-audit/audit-error.json` with
-      `cumulative archive exceeds the control-document limit` was written
-      on G1–G5 and is **not** a tripwire. The audit is best-effort after
-      finalization; it refuses to ingest the large cumulative archive as a
-      control document. Do not halt for that stderr line. A real halt is a
-      `supervisor_tripwire` event or `state.tripwire` payload.
+      Historical v36/v37 wrote per-generation `quality-audit/audit-error.json`
+      with `cumulative archive exceeds the control-document limit`. That was a
+      1 MiB control-document cap on an observational archive, not a tripwire.
+      Current quality-audit loads those archives with a 512 MiB observational
+      limit and leaves the control-plane 1 MiB cap unchanged. Re-audit a
+      finished run with
+      `scripts/temporal_qd_generation_quality_audit.py --observe --through-generation 5`.
+      A real halt is a `supervisor_tripwire` event or `state.tripwire` payload.
 - v37: G1–G5 completed after the playbook notes. Same archive shape as v36.
       G5 is not done when the first 4,096-task panel finishes. It still needs
       seal, any rotating-merge backfill, prefinalizer, and archive, same as
@@ -562,10 +564,13 @@ dispatch is this campaign.
   as `duplicate_task_enqueues` stays 0 and proofs match scheduled rows.
 - A 4,096-task evaluation round with two 64-effective-core boxes (~122
   workers) is typically 30–40 minutes.
-- After G1 finalization, `quality-audit/audit-error.json` with
-  `TemporalQDV5ControlPlaneError: cumulative archive exceeds the
-  control-document limit` is the known v36/v37 diagnostic. The supervisor
-  continues. Treat it as a missing quality-audit artifact, not a halt.
+- After G1 finalization, a missing or stale `quality-audit/audit-error.json`
+  from historical v36/v37 (`cumulative archive exceeds the control-document
+  limit`) is not a halt. Current code should write
+  `quality-audit/generation-quality-audit.json` instead. Fast-ephemeral
+  construction now also writes `proposal/proposal-attempts.jsonl` plus
+  `proposal/proposal-attempts-receipt.json`; historical v37 trees lack that
+  sidecar, so `attemptTelemetryAvailable` stays false there.
 
 At successful G5, `state.json` may show `status=completed` with
 `currentGenerationIndex=6` and **no** `generation-0006` directory. That is
