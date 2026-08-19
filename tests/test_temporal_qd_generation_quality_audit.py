@@ -12,6 +12,11 @@ from autoresearch.temporal_qd_generation_quality_audit import (
     observe_generation_quality_audit,
     _parse_parent_material,
 )
+from autoresearch.temporal_qd_operator_family_report import (
+    REPORT_SCHEMA,
+    build_operator_family_report,
+    render_pro_agent_handoff,
+)
 
 
 def _write(path: Path, value: object) -> None:
@@ -377,6 +382,10 @@ def test_multi_step_operator_extraction(tmp_path: Path) -> None:
         if row.get("operatorSequence")
     ]
     assert "evolvable_resource_v1 > evolvable_hold_policy_v1" in sequences
+    hold = next(
+        row for row in audit["operatorFamilyYield"] if row["operatorFamily"] == "hold"
+    )
+    assert hold["constructedCandidateCount"] == 1
 
 
 def test_immigrant_rows_have_null_parents(tmp_path: Path) -> None:
@@ -636,6 +645,19 @@ def test_nested_parent_material_resolves_parent_sha_and_construction_kind(
 ) -> None:
     parent_identity = canonical_sha256({"candidateId": "parent-a"})
     child_identity = canonical_sha256({"candidateId": "child-a"})
+    nested_delta = {
+        "originKind": "qd_structural_offspring",
+        "scheduledKind": "qd_structural_offspring",
+        "mutationDepth": 1,
+        "terminalOperatorPlan": {"operatorId": "evolvable_hold_policy_v1"},
+        "steps": [
+            {
+                "application": {
+                    "applicationAudit": {"operatorId": "evolvable_hold_policy_v1"}
+                }
+            }
+        ],
+    }
     parsed = _parse_parent_material(
         [
             {
@@ -653,10 +675,7 @@ def test_nested_parent_material_resolves_parent_sha_and_construction_kind(
                             },
                         },
                     },
-                    "proposalDelta": {
-                        "originKind": "qd_structural_offspring",
-                        "scheduledKind": "qd_structural_offspring",
-                    },
+                    "proposalDelta": nested_delta,
                 },
             }
         ]
@@ -664,6 +683,28 @@ def test_nested_parent_material_resolves_parent_sha_and_construction_kind(
     assert parsed[0]["parentCandidateId"] is None
     assert parsed[0]["parentCandidateIdentitySha256"] == parent_identity
     assert parsed[0]["constructionKind"] == "mutation_trace"
+    assert parsed[0]["operatorIds"] == ["evolvable_hold_policy_v1"]
+    assert parsed[0]["operatorFamily"] == "hold"
+    assert parsed[0]["mutationDepth"] == 1
+    crossover = _parse_parent_material(
+        [
+            {
+                "candidateId": "child-x",
+                "pairPayload": {
+                    "acceptedRecord": {
+                        "constructionAudit": {"kind": "crossover_trace"}
+                    },
+                    "proposalDelta": {
+                        "originKind": "qd_structural_offspring",
+                        "terminalOperatorPlan": {
+                            "schemaVersion": "evolvable_module_motif_crossover_v1"
+                        },
+                    },
+                },
+            }
+        ]
+    )
+    assert crossover[0]["operatorFamily"] == "crossover"
 
     run_root = _build_fixture(tmp_path)
     _write_jsonl(
@@ -685,10 +726,7 @@ def test_nested_parent_material_resolves_parent_sha_and_construction_kind(
                             },
                         },
                     },
-                    "proposalDelta": {
-                        "originKind": "qd_structural_offspring",
-                        "scheduledKind": "qd_structural_offspring",
-                    },
+                    "proposalDelta": nested_delta,
                 },
             },
             {
@@ -717,6 +755,13 @@ def test_nested_parent_material_resolves_parent_sha_and_construction_kind(
     assert mutation["samePanelParentRelative"]["meanParentRelativeConservativeNetR"] == pytest.approx(
         3.2
     )
+    hold = next(
+        row for row in audit["operatorFamilyYield"] if row["operatorFamily"] == "hold"
+    )
+    assert hold["constructedCandidateCount"] == 1
+    assert hold["samePanelParentRelative"]["comparisonCount"] == 1
+    assert "actionMix" in hold
+    assert "currentPanelNetPositiveCount" in hold
 
 
 def test_previous_generation_parent_relative_uses_prior_evals(tmp_path: Path) -> None:
@@ -753,4 +798,19 @@ def test_observe_unlinks_stale_audit_error(tmp_path: Path) -> None:
         / "quality-audit"
         / "generation-quality-audit.json"
     ).is_file()
+
+
+def test_operator_family_report_reads_written_audits(tmp_path: Path) -> None:
+    run_root = _build_fixture(tmp_path)
+    result = observe_generation_quality_audit(run_root, 1)
+    assert result["status"] == "ok"
+    report = build_operator_family_report(run_root, through_generation=1)
+    assert report["schemaVersion"] == REPORT_SCHEMA
+    assert report["generationCount"] == 1
+    families = report["generations"][0]["operatorFamilyYield"]
+    assert any(row["operatorFamily"] == "hold" for row in families)
+    markdown = render_pro_agent_handoff(report)
+    assert "operator-family heritability handoff" in markdown
+    assert "hold" in markdown
+
 

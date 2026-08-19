@@ -403,6 +403,154 @@ def _lineage_parent_identity(entries: Any) -> str | None:
     return None
 
 
+_OPERATOR_FAMILY_BY_ID = {
+    "evolvable_hold_policy_v1": "hold",
+    "evolvable_initial_protection_v1": "initial_protection",
+    "evolvable_resource_v1": "resource",
+    "evolvable_temporal_v1": "temporal",
+    "evolvable_topology_v1": "topology",
+    "evolvable_same_side_crossover_v1": "crossover",
+}
+_ENTRY_ACTION_KINDS = frozenset({"enter_next_open"})
+_EXIT_ACTION_KINDS = frozenset({"exit_next_open", "protective_close"})
+_MANAGEMENT_ACTION_KINDS = frozenset(
+    {
+        "tighten_stop_next_open",
+        "move_stop_to_break_even_next_open",
+        "activate_trailing_stop_next_open",
+    }
+)
+
+
+def _operator_id_from_step(step: Mapping[str, Any]) -> str | None:
+    application = step.get("application")
+    application = application if isinstance(application, Mapping) else {}
+    audit = application.get("applicationAudit")
+    audit = audit if isinstance(audit, Mapping) else {}
+    plan = application.get("plan")
+    plan = plan if isinstance(plan, Mapping) else {}
+    return _first_nonempty_str(
+        audit.get("operatorId"),
+        plan.get("operatorId"),
+        application.get("operatorId"),
+        step.get("operatorId"),
+    )
+
+
+def _operators_from_steps(steps: Any) -> list[str]:
+    operators: list[str] = []
+    if not isinstance(steps, list):
+        return operators
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        operator_id = _operator_id_from_step(step)
+        if operator_id is not None:
+            operators.append(operator_id)
+    return operators
+
+
+def _collect_operator_ids(row: Mapping[str, Any], proposal_delta: Mapping[str, Any]) -> list[str]:
+    operators = _operators_from_steps(row.get("steps"))
+    if operators:
+        return operators
+    operators = _operators_from_steps(proposal_delta.get("steps"))
+    if operators:
+        return operators
+    trace = _mapping_or_none(proposal_delta.get("terminalOperatorTrace")) or {}
+    operators = _operators_from_steps(trace.get("steps"))
+    if operators:
+        return operators
+    plan = _mapping_or_none(proposal_delta.get("terminalOperatorPlan")) or {}
+    operator_id = plan.get("operatorId")
+    if isinstance(operator_id, str) and operator_id:
+        return [operator_id]
+    return []
+
+
+def _operator_family_from_ids(operator_ids: Sequence[str]) -> str | None:
+    if not operator_ids:
+        return None
+    return _OPERATOR_FAMILY_BY_ID.get(str(operator_ids[-1]), str(operator_ids[-1]))
+
+
+def _operator_family_from_row(
+    operator_ids: Sequence[str], construction_kind: str | None
+) -> str | None:
+    family = _operator_family_from_ids(operator_ids)
+    if family is not None:
+        return family
+    if construction_kind == "crossover_trace":
+        return "crossover"
+    return None
+
+
+def _side_action_counts(row: Mapping[str, Any]) -> dict[str, int]:
+    aggregate = row.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, Mapping) else row
+    behavior = aggregate.get("realizedBehavior")
+    behavior = behavior if isinstance(behavior, Mapping) else {}
+    sides = behavior.get("sides")
+    sides = sides if isinstance(sides, Mapping) else {}
+    counts: dict[str, int] = defaultdict(int)
+    for side in sides.values():
+        if not isinstance(side, Mapping):
+            continue
+        action_counts = side.get("actionCounts")
+        if not isinstance(action_counts, Mapping):
+            continue
+        for kind, value in action_counts.items():
+            if isinstance(kind, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
+                counts[kind] += int(value)
+    return dict(counts)
+
+
+def _action_mix(row: Mapping[str, Any]) -> dict[str, Any]:
+    counts = _side_action_counts(row)
+    total = sum(counts.values())
+    management = sum(counts.get(kind, 0) for kind in _MANAGEMENT_ACTION_KINDS)
+    entry = sum(counts.get(kind, 0) for kind in _ENTRY_ACTION_KINDS)
+    exit_count = sum(counts.get(kind, 0) for kind in _EXIT_ACTION_KINDS)
+    aggregate = row.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, Mapping) else {}
+    trades = aggregate.get("totalTrades")
+    cost = aggregate.get("costDragR")
+    if cost is None:
+        cost = aggregate.get("totalRawClosedCostDragR")
+    return {
+        "actionCount": total,
+        "entryActionCount": entry,
+        "exitActionCount": exit_count,
+        "managementActionCount": management,
+        "managementActionShare": (management / total) if total else None,
+        "totalTrades": int(trades) if isinstance(trades, (int, float)) and not isinstance(trades, bool) else 0,
+        "costDragR": float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+    }
+
+
+def _action_mix_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    shares: list[float] = []
+    trades: list[float] = []
+    costs: list[float] = []
+    net_positive = 0
+    for row in rows:
+        mix = _action_mix(row)
+        share = mix.get("managementActionShare")
+        if isinstance(share, float):
+            shares.append(share)
+        trades.append(float(mix.get("totalTrades") or 0))
+        cost = mix.get("costDragR")
+        if isinstance(cost, float):
+            costs.append(cost)
+    return {
+        "evaluatedWithActionsCount": len(shares),
+        "meanManagementActionShare": (sum(shares) / len(shares)) if shares else None,
+        "medianManagementActionShare": float(statistics.median(shares)) if shares else None,
+        "meanTotalTrades": (sum(trades) / len(trades)) if trades else None,
+        "meanCostDragR": (sum(costs) / len(costs)) if costs else None,
+    }
+
+
 def _parse_parent_material(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     parsed: list[dict[str, Any]] = []
     for row in rows:
@@ -421,21 +569,7 @@ def _parse_parent_material(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, 
         scheduled_kind = _first_nonempty_str(proposal_delta.get("scheduledKind"))
         parent = row.get("parent") if isinstance(row.get("parent"), Mapping) else {}
         mate = row.get("mate") if isinstance(row.get("mate"), Mapping) else {}
-        operators: list[str] = []
-        steps = row.get("steps")
-        if isinstance(steps, list):
-            for step in steps:
-                if not isinstance(step, Mapping):
-                    continue
-                application = step.get("application")
-                if not isinstance(application, Mapping):
-                    continue
-                audit = application.get("applicationAudit")
-                if not isinstance(audit, Mapping):
-                    continue
-                operator_id = audit.get("operatorId")
-                if isinstance(operator_id, str) and operator_id:
-                    operators.append(operator_id)
+        operators = _collect_operator_ids(row, proposal_delta)
         construction_kind = _first_nonempty_str(
             evolved_audit.get("kind"),
             construction_audit.get("kind"),
@@ -448,6 +582,9 @@ def _parse_parent_material(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                 (_mapping_or_none(accepted.get("lineage")) or {}).get("orderedSideLineage")
             ),
         )
+        mutation_depth = row.get("mutationDepth")
+        if mutation_depth is None:
+            mutation_depth = proposal_delta.get("mutationDepth")
         parsed.append(
             {
                 "candidateId": row.get("candidateId") or accepted.get("candidateId"),
@@ -461,7 +598,8 @@ def _parse_parent_material(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                 "parentCandidateIdentitySha256": parent_identity,
                 "mateCandidateId": mate.get("candidateId"),
                 "constructionKind": construction_kind,
-                "mutationDepth": row.get("mutationDepth"),
+                "operatorFamily": _operator_family_from_row(operators, construction_kind),
+                "mutationDepth": mutation_depth,
                 "operatorIds": operators,
                 "operatorSequence": " > ".join(operators) if operators else "",
                 "managementModes": {
@@ -818,6 +956,16 @@ def _construction_kind_label(row: Mapping[str, Any]) -> str:
     return "unresolved"
 
 
+def _operator_family_label(row: Mapping[str, Any]) -> str:
+    family = row.get("operatorFamily")
+    if isinstance(family, str) and family:
+        return family
+    origin = _origin_kind(row)
+    if origin == "immigrant":
+        return "immigrant"
+    return "unresolved"
+
+
 def _parent_relative_summary(deltas: Sequence[float]) -> dict[str, Any]:
     if not deltas:
         return {
@@ -841,6 +989,7 @@ def _parent_relative_deltas(
     parent_rows: Sequence[Mapping[str, Any]],
     *,
     kind: str,
+    label_fn,
     evaluated: Mapping[str, Mapping[str, Any]],
     parent_lookup: Mapping[str, Mapping[str, Any]],
     robust_policy: Mapping[str, Any],
@@ -848,7 +997,7 @@ def _parent_relative_deltas(
 ) -> list[float]:
     deltas: list[float] = []
     for row in parent_rows:
-        if _construction_kind_label(row) != kind:
+        if label_fn(row) != kind:
             continue
         child_id = row.get("candidateId")
         parent_id = row.get("parentCandidateId")
@@ -944,9 +1093,11 @@ def _yield_row(
     }
 
 
-def _construction_kind_yield(
+def _grouped_yield(
     parent_rows: Sequence[Mapping[str, Any]],
     *,
+    label_fn,
+    label_field: str,
     evaluated: dict[str, dict[str, Any]],
     previous_evaluated: Mapping[str, Mapping[str, Any]],
     provisional_ids: set[str],
@@ -962,7 +1113,7 @@ def _construction_kind_yield(
     for row in parent_rows:
         candidate_id = row.get("candidateId")
         if isinstance(candidate_id, str) and candidate_id:
-            by_kind[_construction_kind_label(row)].append(candidate_id)
+            by_kind[label_fn(row)].append(candidate_id)
     previous_lookup = {
         candidate_id: row
         for candidate_id, row in previous_evaluated.items()
@@ -971,6 +1122,7 @@ def _construction_kind_yield(
     rows: list[dict[str, Any]] = []
     for kind in sorted(by_kind):
         ids = set(by_kind[kind])
+        evaluated_ids = ids & set(evaluated)
         archive_cells = {
             str(archive_members[cid].get("cellId"))
             for cid in ids
@@ -979,7 +1131,7 @@ def _construction_kind_yield(
         row = _yield_row(
             origin=kind,
             constructed=len(ids),
-            evaluated_ids=ids & set(evaluated),
+            evaluated_ids=evaluated_ids,
             evaluated=evaluated,
             provisional_ids=provisional_ids,
             cumulative_ids=cumulative_ids,
@@ -991,11 +1143,12 @@ def _construction_kind_yield(
             direction_policy=direction_policy,
         )
         row.pop("originKind", None)
-        row["constructionKind"] = kind
+        row[label_field] = kind
         row["samePanelParentRelative"] = _parent_relative_summary(
             _parent_relative_deltas(
                 parent_rows,
                 kind=kind,
+                label_fn=label_fn,
                 evaluated=evaluated,
                 parent_lookup=evaluated,
                 robust_policy=robust_policy,
@@ -1006,14 +1159,92 @@ def _construction_kind_yield(
             _parent_relative_deltas(
                 parent_rows,
                 kind=kind,
+                label_fn=label_fn,
                 evaluated=evaluated,
                 parent_lookup=previous_lookup,
                 robust_policy=robust_policy,
                 direction_policy=direction_policy,
             )
         )
+        evaluated_rows = [evaluated[cid] for cid in sorted(evaluated_ids)]
+        row["actionMix"] = _action_mix_summary(evaluated_rows)
+        net_positive = sum(
+            1
+            for cid in evaluated_ids
+            if _gate_flags(
+                evaluated[cid],
+                robust_policy=robust_policy,
+                direction_policy=direction_policy,
+            ).get("cumulativeNetPositive")
+        )
+        row["currentPanelNetPositiveCount"] = net_positive
+        row["currentPanelNetPositiveRate"] = (
+            net_positive / len(evaluated_ids) if evaluated_ids else 0.0
+        )
         rows.append(row)
     return rows
+
+
+def _construction_kind_yield(
+    parent_rows: Sequence[Mapping[str, Any]],
+    *,
+    evaluated: dict[str, dict[str, Any]],
+    previous_evaluated: Mapping[str, Mapping[str, Any]],
+    provisional_ids: set[str],
+    cumulative_ids: set[str],
+    quality_ids: set[str],
+    frontier_ids: set[str],
+    archive_ids: set[str],
+    archive_members: Mapping[str, Mapping[str, Any]],
+    robust_policy: Mapping[str, Any],
+    direction_policy: Any,
+) -> list[dict[str, Any]]:
+    return _grouped_yield(
+        parent_rows,
+        label_fn=_construction_kind_label,
+        label_field="constructionKind",
+        evaluated=evaluated,
+        previous_evaluated=previous_evaluated,
+        provisional_ids=provisional_ids,
+        cumulative_ids=cumulative_ids,
+        quality_ids=quality_ids,
+        frontier_ids=frontier_ids,
+        archive_ids=archive_ids,
+        archive_members=archive_members,
+        robust_policy=robust_policy,
+        direction_policy=direction_policy,
+    )
+
+
+def _operator_family_yield(
+    parent_rows: Sequence[Mapping[str, Any]],
+    *,
+    evaluated: dict[str, dict[str, Any]],
+    previous_evaluated: Mapping[str, Mapping[str, Any]],
+    provisional_ids: set[str],
+    cumulative_ids: set[str],
+    quality_ids: set[str],
+    frontier_ids: set[str],
+    archive_ids: set[str],
+    archive_members: Mapping[str, Mapping[str, Any]],
+    robust_policy: Mapping[str, Any],
+    direction_policy: Any,
+) -> list[dict[str, Any]]:
+    return _grouped_yield(
+        parent_rows,
+        label_fn=_operator_family_label,
+        label_field="operatorFamily",
+        evaluated=evaluated,
+        previous_evaluated=previous_evaluated,
+        provisional_ids=provisional_ids,
+        cumulative_ids=cumulative_ids,
+        quality_ids=quality_ids,
+        frontier_ids=frontier_ids,
+        archive_ids=archive_ids,
+        archive_members=archive_members,
+        robust_policy=robust_policy,
+        direction_policy=direction_policy,
+    )
 
 
 def _cumulative_qualification(
@@ -1461,6 +1692,19 @@ def audit_temporal_qd_generation_quality(
         robust_policy=robust_policy,
         direction_policy=direction_policy,
     )
+    operator_family_yield = _operator_family_yield(
+        parent_rows,
+        evaluated=evaluated,
+        previous_evaluated=previous_evaluated,
+        provisional_ids=provisional_ids,
+        cumulative_ids=set(cumulative_members),
+        quality_ids=quality_ids,
+        frontier_ids=frontier_ids,
+        archive_ids=set(archive_members),
+        archive_members=archive_members,
+        robust_policy=robust_policy,
+        direction_policy=direction_policy,
+    )
 
     parent_yield: list[dict[str, Any]] = []
     children_by_parent: dict[str, list[str]] = defaultdict(list)
@@ -1680,6 +1924,7 @@ def audit_temporal_qd_generation_quality(
         "archive": archive_summary,
         "originYield": origin_yield,
         "constructionKindYield": construction_kind_yield,
+        "operatorFamilyYield": operator_family_yield,
         "parentYield": parent_yield,
         "operatorYield": operator_yield,
         "behaviorDiversity": {
@@ -1734,6 +1979,7 @@ def _build_run_quality_audit(run_root: Path, generation_index: int) -> dict[str,
                     "cumulativeQualification", {}
                 ).get("currentPanelQualityLikeCount"),
                 "constructionKindYield": audit.get("constructionKindYield"),
+                "operatorFamilyYield": audit.get("operatorFamilyYield"),
             }
         )
     trends: dict[str, Any] = {}
