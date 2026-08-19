@@ -2320,8 +2320,16 @@ def _validate_v5_full_generation_config(
                 "v5 breeding confidence receipt schema is incompatible"
             )
         if (
-            int(receipt.get("desiredOffspringCandidateCount") or -1) != offspring
-            or int(receipt.get("desiredImmigrantCandidateCount") or -1) != immigrants
+            _nonnegative(
+                receipt.get("desiredOffspringCandidateCount"),
+                name="v5 breeding confidence receipt desiredOffspringCandidateCount",
+            )
+            != offspring
+            or _nonnegative(
+                receipt.get("desiredImmigrantCandidateCount"),
+                name="v5 breeding confidence receipt desiredImmigrantCandidateCount",
+            )
+            != immigrants
         ):
             raise TemporalQDV5NativeError(
                 "v5 breeding confidence receipt disagrees with reproduction allocation"

@@ -129,6 +129,14 @@ An empty or tiny survivor archive is a **quality signal**, not automatically a
 runtime failure. Record it for post-run analysis. Do not weaken selection gates
 mid-run to force survivor counts upward.
 
+A later generation that starts from that empty archive is **immigrants-only**.
+The frozen breeding-confidence receipt then names **0 offspring** and a full
+immigrant quota (reason `empty_archive_immigrants_only`). That 0 is a real
+count. Do not treat it as missing, default it, or trip because Python
+`value or -1` is falsy. G1 G0 configs may omit the hashed receipt entirely;
+the first evolved 0-offspring freeze is typically G4 after G3 archived nobody.
+v35 halted there. v36 passed the same freeze and finished G5.
+
 ## Preflight: establish a new immutable launch
 
 Perform these checks before the supervisor is started and before any Vast
@@ -235,6 +243,24 @@ newly enqueued. If the Lab Gateway still holds the previous version's
 and the supervisor tripwires. v33 halted this way after a correct new run
 root was pointed at a leftover v32 gateway.
 
+Do not mix recent halt classes:
+
+- v32: parent-admission / direction-aware member lacked bound realized behavior.
+- v33: leftover gateway `recent_terminal_task_ids` caused Fresh duplicate enqueue.
+- v34: backfill freeze proof cardinality (proofs for parents already covered).
+- v35: 0-offspring immigrants-only receipt treated as missing (`or -1`).
+- v36: G1–G5 completed. Empty G3+ archives were a quality signal, not a halt.
+      Per-generation `quality-audit/audit-error.json` with
+      `cumulative archive exceeds the control-document limit` was written
+      on G1–G5 and is **not** a tripwire. The audit is best-effort after
+      finalization; it refuses to ingest the large cumulative archive as a
+      control document. Do not halt for that stderr line. A real halt is a
+      `supervisor_tripwire` event or `state.tripwire` payload.
+- v37: G1–G5 completed after the playbook notes. Same archive shape as v36.
+      G5 is not done when the first 4,096-task panel finishes. It still needs
+      seal, any rotating-merge backfill, prefinalizer, and archive, same as
+      G2–G4. Stop only after `status=completed`.
+
 A new ephemeral version is therefore a full clean slate, not a new folder on
 an old control plane. The required sequence, using live Procman IDs:
 
@@ -257,8 +283,31 @@ an old control plane. The required sequence, using live Procman IDs:
 7. Start the new supervisor. Confirm its first artifacts land under the new
    run root.
 
-Python `urllib` is the reliable client for Procman JSON on this host;
-`Invoke-RestMethod` can flatten process lists.
+Python `urllib` is the reliable client for Procman JSON and the Lab Gateway
+snapshot on this host. `Invoke-RestMethod` can flatten process lists. Never
+print `FUZZFOLIO_LAB_GATEWAY_TOKEN`, lake tokens, or Vast `extra_env`. Parse
+`vastai show instances-v1 --raw` locally and emit only id, label, state,
+effective cores, and price.
+
+### Host tooling on this Windows workstation
+
+Use the repository venv, not a PATH `python`:
+
+```powershell
+C:\repos\fuzzfolio-autoresearch\.venv\Scripts\python.exe
+```
+
+Bare `python` on this host is a Microsoft Store alias and fails with exit
+`9009` (`Python was not found`). Each versioned run root also carries
+`_status_probe.py`, `_gw_queue.py`, and `_vast_create.py`. Call those with
+the venv interpreter from the autoresearch repo. Supervisor stdout lives in
+Procman `GET /processes/<id>/logs`, not a `runRoot/supervisor/` folder.
+
+During a native campaign, `state.json` often lags. `workerTasksCompleted`,
+`uniqueCandidatesEvaluated`, and `lastProgress` may stay empty until a
+generation boundary, and `updatedAt` may freeze through
+`gateway_dispatch` `completion_wait`. Trust `native_v5_progress` events and
+the authenticated gateway snapshot for live work counts.
 
 ```powershell
 $processes = Invoke-RestMethod http://127.0.0.1:47831/processes
@@ -385,7 +434,8 @@ tab, a remembered instance ID, or an old run script to infer fleet state.
 
    Treat an empty instance list as zero paid capacity. Reconcile any existing
    instances by their verified IDs, labels, state, and cost before creating
-   another one.
+   another one. The raw payload includes `extra_env` with worker and lake
+   tokens. Never print it. Filter to non-secret fields before logging.
 
 2. Before renting, derive the worker image, bootstrap/on-start material,
    contract, storage, network settings, and run label from the **current frozen
@@ -423,7 +473,7 @@ tab, a remembered instance ID, or an old run script to infer fleet state.
 
    ```powershell
    vastai show instances-v1 --raw
-   vastai destroy instance <verified-instance-id> --yes
+   vastai destroy instance <verified-instance-id> -y --raw
    vastai show instances-v1 --raw
    ```
 
@@ -435,8 +485,9 @@ tab, a remembered instance ID, or an old run script to infer fleet state.
 ### Scale-down rules
 
 - Destroy paid instances when the replay queue is exhausted or no useful work
-  is expected for roughly 30 minutes. Do not leave them running while building,
-  diagnosing, waiting for a code change, or deciding what to do next.
+  is expected for roughly 30 minutes **and the campaign is not in a known-good
+  native phase whose next step is dispatch**. Do not leave them running while
+  building, diagnosing, waiting for a code change, or deciding what to do next.
 - Destroy them immediately when the run halts, fails, reaches successful G5,
   or needs a new launch.
 - Verify destruction with a separate read-only `vastai show instances-v1
@@ -460,7 +511,7 @@ capacity and treating an unfinished run as a completed experiment.
 | Backtests queued; existing workers healthy and backlogged | Verify completions before scaling | Add a second 32/48/64-effective-core instance if still at one | Continue at tight cadence |
 | Backtests queued; lake/gateway/retries abnormal | Halt new work and capture evidence | Destroy all paid capacity | Diagnose; do not scale around the fault |
 | Healthy known-good bulk replay | Poll at normal cadence | Hold only useful capacity | Scale down as demand drops |
-| Known-good long native phase with no replay queue | Observe stage telemetry | Destroy if idle period will be material | Resume scaling only at real dispatch |
+| Known-good long native phase with no replay queue | Observe stage telemetry | Keep if the next dispatch is this campaign's evaluation or the following generation; destroy only for a halt, G5, or a real debug gap | Resume scaling only at real dispatch |
 | Generation boundary or new code path | Tight observation | Keep only capacity that has imminent work | Verify full transition |
 | G5 terminal finalization succeeds | Stop supervisor and capture report | Destroy all paid capacity | Audit; do not start G6 |
 | Any novel invariant/contract/transport failure | Halt, preserve evidence, classify | Destroy all paid capacity | Full clean-slate next version: new root plus restarted gateway |
@@ -491,6 +542,36 @@ At each meaningful stage boundary, emit or collect a concise timing summary for
 construction, freeze, dispatch/backtest, sealing/reduction, finalization, and
 the generation transition.
 
+### Known-good native dead zones
+
+These are not stalls. Keep observing stage telemetry; keep Vast if the next
+dispatch is this campaign.
+
+- G1 construction of 4,000 accepted immigrants is typically ~2 minutes.
+- Evolved construction of 1,024 accepted candidates is slower and can take
+  7–35 minutes as the accept rate drops. G3 in v36 needed ~3,400 attempts.
+- `ephemeral_publication` after G1 is short (~30–40s). After G2+ it writes
+  `parent-material.jsonl` and can take 7–15 minutes with a 1–3 GB native
+  process. A 0-byte file that later grows is normal.
+- First-round `campaign_seal` of a ~2.6 GB `results.pack` commonly takes
+  6–8 minutes at ~1.2–1.5 GB working set. Later 512-task backfill seals are
+  shorter.
+- After the first 4,096-task panel round, G2+ often freeze additional
+  coverage: a small round (tens of tasks) then one or more 512-task rounds.
+  That is rotating-merge backfill, not a duplicate-enqueue failure, as long
+  as `duplicate_task_enqueues` stays 0 and proofs match scheduled rows.
+- A 4,096-task evaluation round with two 64-effective-core boxes (~122
+  workers) is typically 30–40 minutes.
+- After G1 finalization, `quality-audit/audit-error.json` with
+  `TemporalQDV5ControlPlaneError: cumulative archive exceeds the
+  control-document limit` is the known v36/v37 diagnostic. The supervisor
+  continues. Treat it as a missing quality-audit artifact, not a halt.
+
+At successful G5, `state.json` may show `status=completed` with
+`currentGenerationIndex=6` and **no** `generation-0006` directory. That is
+the supervisor's next-index after finishing generation 5. It is not G6.
+Stop. Do not start another generation.
+
 Use this compact report form so a new operator can take over without interpreting
 free-form prose:
 
@@ -510,6 +591,9 @@ Reason: <one evidence-backed sentence>
 At successful G5 finalization:
 
 1. Verify the G5 archive/finalization evidence and terminal stage summary.
+   `status=completed` plus a G5 quality-audit directory is enough. A
+   `currentGenerationIndex` of 6 without a `generation-0006` tree is still G5
+   complete.
 2. Stop the supervisor; do not allow an implicit G6 or continuation.
 3. Destroy all Vast instances and verify the fleet is zero.
 4. Preserve the run root and capture the compact timing, quality, rejection,
@@ -642,3 +726,5 @@ logs, or whole worker result payloads into Git.
       version (new root, restarted gateway, zero Vast), never resumed.
 - [ ] A compact handoff or terminal record identifies the evidence-backed next
       decision.
+- [ ] Zero-offspring immigrants-only is a valid evolved freeze; do not halt
+      merely because G3+ archived nobody.

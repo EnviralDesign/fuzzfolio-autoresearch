@@ -12,7 +12,10 @@ import pytest
 
 from autoresearch import temporal_qd_native as native
 from autoresearch import temporal_qd_v5_native as v5
-from autoresearch.temporal_qd_pair_generation import build_pair_generation_config
+from autoresearch.temporal_qd_pair_generation import (
+    build_pair_generation_config,
+    select_breeding_confidence,
+)
 from autoresearch.result_codec import canonical_json_bytes, sha256
 
 
@@ -832,6 +835,65 @@ def test_manifest_requires_the_existing_full_v2_generation_config(tmp_path: Path
             evaluation_population_size=1,
             thread_cap=1,
         )
+
+
+def test_empty_archive_zero_offspring_receipt_validates_v5_generation_config() -> None:
+    """G4 immigrants-only must treat a 0-offspring receipt as a real freeze.
+
+    Python ``value or -1`` treats a valid 0 as missing and was the v35 G4 halt.
+    """
+
+    inputs = _authority_inputs()
+    source = inputs["pairSourceAuthority"]
+    assert isinstance(source, dict)
+    bindings = v5.build_v5_generation_bindings(
+        generation_run_config={
+            "runId": "v5-native-bridge-fixture",
+            "pairRunConfigSha256": source["pairRunConfigSha256"],
+        },
+        pair_source_authority=source,
+        evolvable_module_authority=inputs["evolvableModuleAuthority"],
+    )
+    confidence = select_breeding_confidence(
+        parent_archive=None,
+        target_unique_candidates=1024,
+    )
+    assert confidence["desiredOffspringCandidateCount"] == 0
+    assert confidence["desiredImmigrantCandidateCount"] == 1024
+    config = build_pair_generation_config(
+        generation_index=4,
+        target_unique_candidates=1024,
+        max_proposal_attempts=2048,
+        run_config=bindings["runConfig"],
+        pair_policy=inputs["bidirectionalPairPolicy"],
+        operator_implementation_identity=bindings["operatorImplementation"],
+        parent_archive=None,
+        immigrant_construction_policy=source["immigrantConstructionPolicy"],
+        global_identity_ledger_enabled=True,
+        breeding_confidence=confidence,
+    )
+    validated = v5._validate_v5_full_generation_config(
+        generation_config=config,
+        pair_source_authority=source,
+        evolvable_module_authority=inputs["evolvableModuleAuthority"],
+        bidirectional_pair_policy=inputs["bidirectionalPairPolicy"],
+    )
+    receipt = validated["breedingConfidenceReceipt"]
+    allocation = validated["reproductionAllocation"]
+    offspring_field = (
+        "desiredAcceptedOffspringCount"
+        if allocation["schemaVersion"] == "temporal_qd_reproduction_allocation_v2"
+        else "desiredEvaluatedOffspringCount"
+    )
+    immigrant_field = (
+        "desiredAcceptedImmigrantCount"
+        if allocation["schemaVersion"] == "temporal_qd_reproduction_allocation_v2"
+        else "desiredEvaluatedImmigrantCount"
+    )
+    assert receipt["desiredOffspringCandidateCount"] == 0
+    assert receipt["reason"] == "empty_archive_immigrants_only"
+    assert allocation[offspring_field] == 0
+    assert allocation[immigrant_field] == 1024
 
 
 def test_generation_construction_adapter_is_an_exact_receipt_inventory_projection(
