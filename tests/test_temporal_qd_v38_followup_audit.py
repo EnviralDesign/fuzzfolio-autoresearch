@@ -11,7 +11,9 @@ from autoresearch.temporal_qd_pair_generation import PAIR_GENERATION_SCHEMA
 from autoresearch.temporal_qd_topology_coadaptation import (
     ARMS,
     COADAPTATION_SCHEMA,
+    FIRST_EXPERIMENT_JUSTIFICATION,
     attach_topology_coadaptation_matrix,
+    build_topology_coadaptation_matrix,
     topology_coadaptation_from_config,
     validate_topology_coadaptation_matrix,
 )
@@ -169,21 +171,29 @@ def test_resource_report_counts_unrecovered_rejects() -> None:
 
 
 def _coadaptation_contract() -> dict[str, object]:
-    return {
-        "schemaVersion": COADAPTATION_SCHEMA,
-        "mode": "frozen_parent_topology_then_local_resource_settling_v1",
-        "includeCrossover": False,
-        "cloneControl": "re_evaluate_parent_on_frozen_panel",
-        "productionArchiveWrite": False,
-        "mutationDepth": 1,
-        "arms": list(ARMS),
-        "parents": [{"candidateId": "parent_a", "role": "archive"}],
-        "settling": {"maxResourceSteps": 4, "families": ["resource"]},
-        "morphologyNursery": {
-            "schemaVersion": "temporal_qd_morphology_nursery_archive_v1",
-            "productionBreedingRights": False,
-        },
-    }
+    return build_topology_coadaptation_matrix(
+        parents=[{"candidateId": "parent_a", "role": "archive"}],
+        rotating_evidence_sha256="sha256:" + ("ab" * 32),
+        topology_plans=[
+            {
+                "planId": "insert_setup",
+                "operation": "insert_setup",
+                "operatorSchema": "evolvable_module_topology_operator_v1",
+                "schemaVersion": "evolvable_module_topology_plan_v1",
+                "arguments": {"edgeId": "start_setup", "guard": {"kind": "always"}, "kind": "context"},
+                "v38ExampleOperatorPlanSha256": "sha256:" + ("11" * 32),
+            },
+            {
+                "planId": "insert_exit_region",
+                "operation": "insert_exit_region",
+                "operatorSchema": "evolvable_module_topology_operator_v1",
+                "schemaVersion": "evolvable_module_topology_plan_v1",
+                "arguments": {"guard": {"kind": "always"}, "kind": "region", "priority": 1},
+                "v38ExampleOperatorPlanSha256": "sha256:" + ("22" * 32),
+            },
+        ],
+        first_experiment_justification=FIRST_EXPERIMENT_JUSTIFICATION,
+    )
 
 
 def test_coadaptation_overlay_is_inert_when_absent() -> None:
@@ -192,15 +202,22 @@ def test_coadaptation_overlay_is_inert_when_absent() -> None:
 
 
 def test_coadaptation_rejects_production_archive_writes_and_wrong_arms() -> None:
+    contract = _coadaptation_contract()
     with pytest.raises(TemporalDiscoveryContractError, match="production archive"):
-        validate_topology_coadaptation_matrix({**_coadaptation_contract(), "productionArchiveWrite": True})
-    with pytest.raises(TemporalDiscoveryContractError, match="arms"):
-        validate_topology_coadaptation_matrix({**_coadaptation_contract(), "arms": list(ARMS)[:3]})
+        validate_topology_coadaptation_matrix({**contract, "productionArchiveWrite": True})
+    with pytest.raises(TemporalDiscoveryContractError, match="unexpected schema|arms"):
+        validate_topology_coadaptation_matrix({**contract, "arms": list(ARMS)[:3]})
 
 
-def test_coadaptation_attach_does_not_touch_production_matrix_field() -> None:
+def test_coadaptation_attach_reseals_config_and_does_not_touch_production_matrix_field() -> None:
+    from autoresearch.evidence_plan import canonical_sha256
+
     base = {"schemaVersion": PAIR_GENERATION_SCHEMA, "configSha256": "x"}
     attached = attach_topology_coadaptation_matrix(base, _coadaptation_contract())
     assert "operatorFamilyMatrix" not in attached
+    assert attached["topologyCoadaptationMatrix"]["schemaVersion"] == COADAPTATION_SCHEMA
     assert attached["topologyCoadaptationMatrix"]["arms"] == list(ARMS)
     assert base.get("topologyCoadaptationMatrix") is None
+    assert attached["configSha256"] != "x"
+    unsigned = {key: value for key, value in attached.items() if key != "configSha256"}
+    assert attached["configSha256"] == canonical_sha256(unsigned)
