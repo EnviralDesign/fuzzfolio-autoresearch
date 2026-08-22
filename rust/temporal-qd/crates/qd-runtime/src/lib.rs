@@ -5027,6 +5027,7 @@ impl<D: DashboardPort> NativePairAuthority for RuntimePairAuthority<D> {
                 proposal_seed,
                 parent,
                 mutation_depth,
+                ..
             } => {
                 let pair = FrozenPair::from_payload(&parent.pair_payload).map_err(|error| {
                     temporal_qd_kernel::factory::FactoryError::Authority(format!(

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "temporal_qd_symmetric_protection_diagnostic_v1",
+  "diagnosticOnly": true,
+  "notAProductionGate": true,
+  "notAUniversalRequirement": true,
+  "nativeSemanticsOnly": true,
+  "noSecondExecutionEngine": true,
+  "probes": {
+    "fullSystemSymmetricProtection": {
+      "retainNativeStrategyAndStopDefinition": true,
+      "target": {"kind": "reward_multiple", "multiple": 1.0, "whereSemanticallyValid": true},
+      "allowRealStateMachineExitsReentryAndManagement": true,
+      "compareToExactParentClone": true
+    },
+    "fixedEntryCounterfactual": {
+      "reuseParentEntryTapeIfRetained": true,
+      "applySymmetricProtectionCounterfactually": true,
+      "label": "diagnostic_only_because_altered_exits_change_future_entry_availability",
+      "currentlyFeasibleFromRetainedArtifacts": false,
+      "missingWorkerArtifact": {
+        "name": "temporal_qd_entry_opportunity_tape_v1",
+        "need": [
+          "per-bar or per-clock entry-intent/opportunity mask for each side",
+          "the parent stop/target locators used at each fill",
+          "cost model identical to conservative replay"
+        ],
+        "whyCurrentTradeSequenceIsInsufficient": "evaluated-members tradeSequence retains fills, not skipped opportunities, so counterfactual exits cannot reconstruct the entries that would have existed under a different hold"
+      }
+    }
+  },
+  "costBreakEven": {
+    "atOneToOne": "win_rate_must_exceed_0.5_plus_half_round_trip_cost_in_R",
+    "detectExtremeRrSkew": "candidate looks good only when reward_multiple is large and collapses under 1.0 target"
+  }
+}

@@ -19,6 +19,8 @@ pub mod grammar;
 pub mod identity;
 pub mod indicator;
 pub mod journal;
+pub mod operator_family_matrix;
+pub mod topology_coadaptation_matrix;
 pub mod proposal;
 pub mod protection;
 pub mod publication;

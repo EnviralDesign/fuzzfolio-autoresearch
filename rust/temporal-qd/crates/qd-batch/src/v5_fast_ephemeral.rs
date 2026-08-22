@@ -33,7 +33,7 @@ use temporal_qd_kernel::v5_publication::{
 };
 use temporal_qd_kernel::v5_transaction::execute_v5_g0_transaction_with_progress;
 
-use crate::v5_proposal_contract::V5ProposalManifest;
+use crate::v5_proposal_contract::{V5ProposalManifest, evolved_construction_is_publishable};
 
 const EXECUTION_MODE: &str = "fast-ephemeral-v1";
 const STATUS_SCHEMA: &str = "temporal_qd_v5_fast_ephemeral_status_v1";
@@ -974,12 +974,13 @@ pub(crate) fn execute_evolved(
     )
     .context("execute fast-ephemeral native v5 evolved transaction")?;
     let construction_elapsed = construction_started.elapsed();
-    if !transaction.target_reached
-        || transaction.accepted_records.len() as u64 != manifest.requested_count
-        || transaction.attempts.len() as u64 > manifest.max_proposal_attempts
-    {
-        bail!("fast-ephemeral native v5 evolved construction did not reach its exact dimensions");
-    }
+    evolved_construction_is_publishable(
+        manifest,
+        transaction.target_reached,
+        transaction.accepted_records.len() as u64,
+        transaction.attempts.len() as u64,
+    )
+    .context("fast-ephemeral native v5 evolved construction did not reach a publishable slot grid")?;
 
     progress_handle.begin_phase(
         "ephemeral_publication",
@@ -1003,7 +1004,7 @@ pub(crate) fn execute_evolved(
         .context("derive fast-ephemeral evolved publication plan")?;
     let stream = prepare_v5_evolved_publication_stream(&request, &transaction, &publication_plan)
         .context("prepare fast-ephemeral evolved publication stream")?;
-    if stream.accepted_count() as u64 != manifest.requested_count {
+    if stream.accepted_count() as u64 != transaction.accepted_records.len() as u64 {
         bail!("fast-ephemeral evolved accepted width drifted");
     }
     let publication_prepare_elapsed = publication_started.elapsed();
@@ -1027,8 +1028,7 @@ pub(crate) fn execute_evolved(
     let (parent_row_count, parent_byte_count) = parent_writer.finish()?;
     let publication_replay_elapsed = publication_replay_started.elapsed();
     if parent_row_count
-        != manifest
-            .requested_count
+        != (transaction.accepted_records.len() as u64)
             .checked_add(prior_parent_references.len() as u64)
             .ok_or_else(|| anyhow!("fast-ephemeral evolved parent count overflow"))?
     {

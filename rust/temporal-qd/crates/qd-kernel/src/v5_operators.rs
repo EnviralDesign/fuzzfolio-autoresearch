@@ -10261,6 +10261,24 @@ fn evolved_choice_kind(choice: &V5LegacyOperatorChoice) -> Result<String> {
     )
 }
 
+fn experiment_operator_family(choice: &V5LegacyOperatorChoice) -> Result<&'static str> {
+    let from_native = object_get(&choice.native_plan, "operatorId").and_then(Value::as_str);
+    let from_legacy = object_get(&choice.legacy_choice, "plan")
+        .and_then(|plan| object_get(plan, "operatorId"))
+        .and_then(Value::as_str)
+        .or_else(|| object_get(&choice.legacy_choice, "operatorId").and_then(Value::as_str));
+    match from_native.or(from_legacy) {
+        Some(V5_HOLD_OPERATOR_ID) => Ok("hold"),
+        Some(V5_RESOURCE_OPERATOR_ID) => Ok("resource"),
+        Some(V5_TEMPORAL_OPERATOR_ID) => Ok("temporal"),
+        Some(V5_TOPOLOGY_OPERATOR_ID) => Ok("topology"),
+        Some(V5_INITIAL_PROTECTION_OPERATOR_ID) => Ok("initial_protection"),
+        _ => Err(invalid(
+            "legacy choice lacks an experiment operator family",
+        )),
+    }
+}
+
 fn evolved_choice_mutation_class(choice: &V5LegacyOperatorChoice) -> Result<String> {
     let plan = required(
         &choice.legacy_choice,
@@ -10324,6 +10342,7 @@ fn select_admitted_evolved_operator_choice(
     authority: &V5OperatorAuthority,
     profile: &V5CompiledProfileView,
     admission: &dyn V5EvolvedChildAdmission,
+    forced_experiment_family: Option<&str>,
 ) -> Result<V5AdmittedEvolvedOperatorSelection> {
     let parent_identity_sha256 = sha256_identifier(
         &Value::String(parent_identity_sha256.to_owned()),
@@ -10340,21 +10359,45 @@ fn select_admitted_evolved_operator_choice(
             "evolved operator selection has no applicable legacy choices",
         ));
     }
-    let mut grouped = BTreeMap::<String, Vec<V5LegacyOperatorChoice>>::new();
-    for choice in choices {
-        let kind = evolved_choice_kind(&choice)?;
-        grouped.entry(kind).or_default().push(choice);
-    }
-    let families = grouped.keys().cloned().collect::<Vec<_>>();
-    let family_seed = sha(&object([
-        ("seed", Value::String(proposal_seed.to_owned())),
-        ("parent", Value::String(parent_identity_sha256.clone())),
-        ("draw", Value::String("family".to_owned())),
-    ]))?;
-    let family = families[unbiased_choice(&family_seed, families.len())?].clone();
-    let candidates = grouped
-        .get(&family)
-        .ok_or_else(|| invalid("selected evolved operator family disappeared"))?;
+    let (family, candidates) = if let Some(forced_family) = forced_experiment_family {
+        if !matches!(
+            forced_family,
+            "hold" | "resource" | "topology" | "temporal" | "initial_protection"
+        ) {
+            return Err(invalid(
+                "evolved operator selection forced family is not a matrix family",
+            ));
+        }
+        let mut candidates = Vec::new();
+        for choice in choices {
+            if experiment_operator_family(&choice)? == forced_family {
+                candidates.push(choice);
+            }
+        }
+        if candidates.is_empty() {
+            return Err(invalid(
+                "evolved operator selection has no applicable choices for the forced family",
+            ));
+        }
+        (forced_family.to_owned(), candidates)
+    } else {
+        let mut grouped = BTreeMap::<String, Vec<V5LegacyOperatorChoice>>::new();
+        for choice in choices {
+            let kind = evolved_choice_kind(&choice)?;
+            grouped.entry(kind).or_default().push(choice);
+        }
+        let families = grouped.keys().cloned().collect::<Vec<_>>();
+        let family_seed = sha(&object([
+            ("seed", Value::String(proposal_seed.to_owned())),
+            ("parent", Value::String(parent_identity_sha256.clone())),
+            ("draw", Value::String("family".to_owned())),
+        ]))?;
+        let family = families[unbiased_choice(&family_seed, families.len())?].clone();
+        let candidates = grouped
+            .remove(&family)
+            .ok_or_else(|| invalid("selected evolved operator family disappeared"))?;
+        (family, candidates)
+    };
 
     let (choice, selected_class) = if family != "initial_protection" {
         let plan_seed = sha(&object([
@@ -10371,7 +10414,7 @@ fn select_admitted_evolved_operator_choice(
         let weights = protection_class_weights(authority.initial_protection_policy())?;
         let mut by_class = BTreeMap::<String, Vec<V5LegacyOperatorChoice>>::new();
         for candidate in candidates {
-            let class = evolved_choice_mutation_class(candidate)?;
+            let class = evolved_choice_mutation_class(&candidate)?;
             if !weights.contains_key(&class) {
                 return Err(invalid(
                     "legacy initial-protection choice has an unsealed mutation class",
@@ -10488,6 +10531,7 @@ pub(crate) fn select_evolved_operator_choice_with_admission(
         authority,
         profile,
         admission,
+        None,
     )?
     .selection)
 }
@@ -10518,6 +10562,7 @@ pub(crate) fn select_admitted_evolved_operator_choice_from_state(
     state: &V5EvolvedSideState,
     authority: &V5OperatorAuthority,
     admission: &dyn V5EvolvedChildAdmission,
+    forced_experiment_family: Option<&str>,
 ) -> Result<V5AdmittedEvolvedOperatorSelection> {
     state.validate_for_authority(authority)?;
     select_admitted_evolved_operator_choice(
@@ -10527,6 +10572,7 @@ pub(crate) fn select_admitted_evolved_operator_choice_from_state(
         authority,
         &state.compiled_profile,
         admission,
+        forced_experiment_family,
     )
 }
 

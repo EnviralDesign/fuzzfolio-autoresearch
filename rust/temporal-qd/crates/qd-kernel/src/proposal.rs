@@ -15,6 +15,7 @@ use temporal_qd_contract::{
 use crate::{
     factory::{FactoryError, NativeProposal, ParentReference, ProposalIntent},
     identity::{Side, immigrant_side_seed, proposal_seed, proposal_side},
+    operator_family_matrix::OperatorFamilyMatrixContract,
     schedule::{
         RotatingParentSchedule, is_crossover_slot, mutation_depth_for_seed,
         scheduled_immigrant_for_accepted_quota,
@@ -166,6 +167,8 @@ pub struct ProposalSchedule {
     pub parent_schedule: Option<RotatingParentSchedule>,
     pub desired_evaluated_offspring: u64,
     pub desired_evaluated_immigrants: u64,
+    pub operator_family_matrix: Option<OperatorFamilyMatrixContract>,
+    pub matrix_parents: BTreeMap<String, ParentReference>,
 }
 
 impl ProposalSchedule {
@@ -590,6 +593,9 @@ pub struct ProposalPlanner<'parents> {
 impl ProposalPlanner<'_> {
     pub fn plan_next(&mut self, state: &mut ProposalState) -> Result<PlannedProposal> {
         self.schedule.validate()?;
+        if self.schedule.operator_family_matrix.is_some() {
+            return self.plan_matrix_next(state);
+        }
         let ordinal = state.next_proposal_ordinal;
         let seed = proposal_seed(&self.schedule.config_sha256, ordinal);
         let accepted_immigrants = *state
@@ -646,6 +652,7 @@ impl ProposalPlanner<'_> {
                 proposal_seed: seed,
                 parent,
                 mutation_depth,
+                forced_operator_family: None,
             }
         };
         intent.validate()?;
@@ -667,6 +674,55 @@ impl ProposalPlanner<'_> {
             .ok_or_else(|| contract("structural parent selection ordinal overflowed"))?;
         parent.validate()?;
         Ok(parent)
+    }
+
+    fn plan_matrix_next(&self, state: &mut ProposalState) -> Result<PlannedProposal> {
+        let matrix = self
+            .schedule
+            .operator_family_matrix
+            .as_ref()
+            .ok_or_else(|| contract("operator-family matrix planner lost its contract"))?;
+        let ordinal = state.next_proposal_ordinal;
+        let slot = matrix
+            .slot_at(ordinal)
+            .map_err(|error| contract(error.to_string()))?
+            .ok_or_else(|| {
+                contract("operator-family matrix has no remaining construction slots")
+            })?;
+        let parent = self
+            .schedule
+            .matrix_parents
+            .get(&slot.parent_candidate_id)
+            .cloned()
+            .ok_or_else(|| {
+                contract(format!(
+                    "operator-family matrix parent {} is not bound",
+                    slot.parent_candidate_id
+                ))
+            })?;
+        parent
+            .validate()
+            .map_err(|error| contract(error.to_string()))?;
+        // Matrix parents are bound by ordinal, not drawn from the rotating
+        // selector. Replay still credits one structural-offspring receipt per
+        // committed attempt, so the compact counter must advance here without
+        // mutating selector state.
+        state.structural_parent_selections = state
+            .structural_parent_selections
+            .checked_add(1)
+            .ok_or_else(|| contract("structural parent selection ordinal overflowed"))?;
+        let seed = proposal_seed(&self.schedule.config_sha256, ordinal);
+        let intent = ProposalIntent::StructuralMutation {
+            proposal_seed: seed,
+            parent,
+            mutation_depth: 1,
+            forced_operator_family: Some(slot.operator_family),
+        };
+        intent.validate().map_err(ProposalError::from)?;
+        Ok(PlannedProposal {
+            proposal_ordinal: ordinal,
+            intent,
+        })
     }
 }
 

@@ -16,6 +16,7 @@ use temporal_qd_contract::{
     CONTRACT_VERSION, Map, Value, canonical_json_line, canonical_sha256,
     canonical_sha256_without_object_field,
 };
+use temporal_qd_kernel::operator_family_matrix::OperatorFamilyMatrixContract;
 use temporal_qd_kernel::v5::V5_SHARED_AUTHORITY_SCHEMA;
 
 pub const V5_PROPOSAL_MANIFEST_SCHEMA: &str =
@@ -290,6 +291,8 @@ pub struct V5ProposalReceiptBuildInput {
 #[derive(Clone, Debug)]
 pub struct V5EvolvedProposalReceiptBuildInput {
     pub attempt_count: u64,
+    pub accepted_record_count: u64,
+    pub evaluation_population_size: u64,
     pub transaction_sha256: String,
     pub parent_archive_input_binding_sha256: String,
     pub identity_ledger_input_binding_sha256: String,
@@ -365,6 +368,76 @@ fn count(value: &Value, label: &str) -> Result<u64> {
 
 fn count_field(map: &Map<String, Value>, key: &str, label: &str) -> Result<u64> {
     count(field(map, key, label)?, &format!("{label} {key}"))
+}
+
+fn operator_family_matrix_from_manifest(
+    manifest: &V5ProposalManifest,
+) -> Result<Option<OperatorFamilyMatrixContract>> {
+    OperatorFamilyMatrixContract::from_generation_config(&manifest.generation_config)
+        .map_err(|error| anyhow!(error.to_string()))
+}
+
+pub fn evolved_construction_is_publishable(
+    manifest: &V5ProposalManifest,
+    target_reached: bool,
+    accepted_count: u64,
+    attempt_count: u64,
+) -> Result<()> {
+    match operator_family_matrix_from_manifest(manifest)? {
+        None => {
+            if !target_reached
+                || accepted_count != manifest.requested_count
+                || attempt_count > manifest.max_proposal_attempts
+            {
+                bail!("native v5 evolved construction did not reach its exact dimensions");
+            }
+        }
+        Some(matrix) => {
+            matrix
+                .require_exhausted_slot_grid(
+                    attempt_count,
+                    accepted_count,
+                    manifest.requested_count,
+                    manifest.max_proposal_attempts,
+                )
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn evolved_fill_matches_manifest(
+    manifest: &V5ProposalManifest,
+    accepted_record_count: Option<u64>,
+    attempt_count: Option<u64>,
+    evaluation_population_size: Option<u64>,
+) -> bool {
+    let (Some(accepted), Some(attempts), Some(eval_size)) = (
+        accepted_record_count,
+        attempt_count,
+        evaluation_population_size,
+    ) else {
+        return false;
+    };
+    match operator_family_matrix_from_manifest(manifest) {
+        Ok(None) => {
+            accepted == manifest.requested_count
+                && eval_size == manifest.evaluation_population_size
+                && attempts >= manifest.requested_count
+                && attempts <= manifest.max_proposal_attempts
+        }
+        Ok(Some(matrix)) => matrix
+            .require_exhausted_slot_grid(
+                attempts,
+                accepted,
+                manifest.requested_count,
+                manifest.max_proposal_attempts,
+            )
+            .is_ok()
+            && eval_size == accepted
+            && eval_size <= manifest.evaluation_population_size,
+        Err(_) => false,
+    }
 }
 
 fn count_map(value: &Value, label: &str) -> Result<(Map<String, Value>, u64)> {
@@ -768,7 +841,7 @@ pub fn build_v5_evolved_proposal_receipt_and_result(
         ),
         (
             "acceptedRecordCount".to_owned(),
-            Value::from(manifest.requested_count),
+            Value::from(input.accepted_record_count),
         ),
         ("attemptCount".to_owned(), Value::from(input.attempt_count)),
         (
@@ -801,7 +874,7 @@ pub fn build_v5_evolved_proposal_receipt_and_result(
         ),
         (
             "evaluationPopulationSize".to_owned(),
-            Value::from(manifest.evaluation_population_size),
+            Value::from(input.evaluation_population_size),
         ),
         (
             "identityLedgerSha256".to_owned(),
@@ -2173,18 +2246,12 @@ pub fn validate_v5_evolved_proposal_result(
             != Some(manifest.generation_config_sha256.as_str())
         || fields.get("generationIndex").and_then(Value::as_u64) != Some(manifest.generation_index)
         || fields.get("requestedCount").and_then(Value::as_u64) != Some(manifest.requested_count)
-        || fields.get("acceptedRecordCount").and_then(Value::as_u64)
-            != Some(manifest.requested_count)
-        || fields
-            .get("attemptCount")
-            .and_then(Value::as_u64)
-            .is_none_or(|count| {
-                count < manifest.requested_count || count > manifest.max_proposal_attempts
-            })
-        || fields
-            .get("evaluationPopulationSize")
-            .and_then(Value::as_u64)
-            != Some(manifest.evaluation_population_size)
+        || !evolved_fill_matches_manifest(
+            manifest,
+            fields.get("acceptedRecordCount").and_then(Value::as_u64),
+            fields.get("attemptCount").and_then(Value::as_u64),
+            fields.get("evaluationPopulationSize").and_then(Value::as_u64),
+        )
         || fields
             .get("parentArchiveInputBindingSha256")
             .and_then(Value::as_str)
@@ -2352,18 +2419,12 @@ fn validate_v5_evolved_proposal_receipt(
             != Some(manifest.generation_config_sha256.as_str())
         || fields.get("generationIndex").and_then(Value::as_u64) != Some(manifest.generation_index)
         || fields.get("requestedCount").and_then(Value::as_u64) != Some(manifest.requested_count)
-        || fields.get("acceptedRecordCount").and_then(Value::as_u64)
-            != Some(manifest.requested_count)
-        || fields
-            .get("attemptCount")
-            .and_then(Value::as_u64)
-            .is_none_or(|count| {
-                count < manifest.requested_count || count > manifest.max_proposal_attempts
-            })
-        || fields
-            .get("evaluationPopulationSize")
-            .and_then(Value::as_u64)
-            != Some(manifest.evaluation_population_size)
+        || !evolved_fill_matches_manifest(
+            manifest,
+            fields.get("acceptedRecordCount").and_then(Value::as_u64),
+            fields.get("attemptCount").and_then(Value::as_u64),
+            fields.get("evaluationPopulationSize").and_then(Value::as_u64),
+        )
         || fields.get("threadCap").and_then(Value::as_u64) != Some(manifest.thread_cap)
         || fields
             .get("parentArchiveInputBindingSha256")
@@ -2395,6 +2456,12 @@ fn validate_v5_evolved_proposal_receipt(
             bail!("native v5 evolved proposal receipt {key} differs from result");
         }
         sha_field(fields, key, "native v5 evolved proposal receipt")?;
+    }
+    if fields.get("acceptedRecordCount") != result.get("acceptedRecordCount")
+        || fields.get("evaluationPopulationSize") != result.get("evaluationPopulationSize")
+        || fields.get("attemptCount") != result.get("attemptCount")
+    {
+        bail!("native v5 evolved proposal receipt fill differs from result");
     }
     let mut semantic_roots = result.clone();
     semantic_roots.insert(

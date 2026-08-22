@@ -38,6 +38,15 @@ from .temporal_qd_pair_generation import (
     build_pair_generation_config,
     select_breeding_confidence,
 )
+from .temporal_qd_operator_family_matrix import (
+    attach_operator_family_matrix,
+    construction_slot_count,
+    evolved_fill_matches_manifest,
+    freeze_spec_source_pin,
+    matrix_source_identity_ledger_descriptor,
+    unique_evaluations_meet_plan,
+    validate_operator_family_matrix,
+)
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
     QD_IDENTITY_LEDGER_SCHEMA,
@@ -285,6 +294,28 @@ NATIVE_V5_IDENTITY_LEDGER_TRANSACTION_SCHEMA = (
 )
 NATIVE_V5_STATE_APPLICATION_PENDING_KEY = "nativeV5StateApplicationPending"
 NATIVE_V5_COMMITTED_IDENTITY_LEDGER_KEY = "nativeV5CommittedIdentityLedger"
+
+
+def _operator_family_matrix_from_supervisor_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    matrix = config.get("operatorFamilyMatrix")
+    if matrix is None:
+        return None
+    return validate_operator_family_matrix(matrix)
+
+
+def _unique_evaluations_meet_plan(config: Mapping[str, Any], unique_count: object) -> bool:
+    target = config.get("generationPlan", {}).get("targetUniqueEvaluations")
+    if not isinstance(unique_count, int) or isinstance(unique_count, bool):
+        return False
+    if not isinstance(target, int) or isinstance(target, bool):
+        return False
+    return unique_evaluations_meet_plan(
+        matrix=config.get("operatorFamilyMatrix"),
+        unique_count=unique_count,
+        target_unique_evaluations=target,
+    )
 
 
 def _v5_evolvable_authority(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -1648,8 +1679,13 @@ def _run_native_v5_generation(
     qd_engine_version = _native_v5_qd_engine_version(
         config=config, evolvable_authority=evolvable
     )
+    matrix = _operator_family_matrix_from_supervisor_config(config)
     g0 = config.get("g0Bootstrap")
     is_g0 = isinstance(g0, Mapping) and generation_index == 1
+    if matrix is not None and is_g0:
+        raise TemporalDiscoveryContractError(
+            "operator-family matrix cannot run on the G0 immigrant construction path"
+        )
     if is_g0:
         generation_kind = V5_PROPOSAL_GENERATION_G0
         construction_width = int(g0["initialConstructionPoolSize"])
@@ -1658,10 +1694,19 @@ def _run_native_v5_generation(
         if identity_ledger_input is not None:
             raise TemporalDiscoveryContractError("native v5 G0 cannot bind an identity ledger")
         generation_parent_schedule = None
+        max_proposal_attempts = int(config["frozenSearchPolicy"]["maxProposalAttempts"])
     else:
         generation_kind = V5_PROPOSAL_GENERATION_EVOLVED
-        construction_width = int(config["frozenSearchPolicy"]["targetUniqueCandidates"])
-        evaluation_width = construction_width
+        if matrix is not None:
+            construction_width = construction_slot_count(matrix)
+            evaluation_width = construction_width
+            max_proposal_attempts = construction_width
+            generation_parent_schedule = None
+        else:
+            construction_width = int(config["frozenSearchPolicy"]["targetUniqueCandidates"])
+            evaluation_width = construction_width
+            max_proposal_attempts = int(config["frozenSearchPolicy"]["maxProposalAttempts"])
+            generation_parent_schedule = parent_schedule
         if not isinstance(identity_ledger_input, Mapping):
             raise TemporalDiscoveryContractError(
                 "native v5 evolved generation lacks its frozen identity ledger"
@@ -1676,14 +1721,13 @@ def _run_native_v5_generation(
             )
         except TemporalQDV5NativeError as exc:
             raise TemporalDiscoveryContractError(str(exc)) from exc
-        generation_parent_schedule = parent_schedule
     immigrant_policy = source.get("immigrantConstructionPolicy")
     if not isinstance(immigrant_policy, Mapping):
         raise TemporalDiscoveryContractError(
             "native v5 source authority lacks immutable immigrant construction policy"
         )
     breeding_confidence = None
-    if not is_g0:
+    if not is_g0 and matrix is None:
         breeding_archive = _load_bound_parent_archive_for_breeding_confidence(
             parent_archive_descriptor
         )
@@ -1694,7 +1738,7 @@ def _run_native_v5_generation(
     generation_config = build_pair_generation_config(
         generation_index=generation_index,
         target_unique_candidates=construction_width,
-        max_proposal_attempts=int(config["frozenSearchPolicy"]["maxProposalAttempts"]),
+        max_proposal_attempts=max_proposal_attempts,
         run_config=bindings["runConfig"],
         pair_policy=runtime["bidirectionalPairPolicy"],
         operator_implementation_identity=bindings["operatorImplementation"],
@@ -1711,6 +1755,10 @@ def _run_native_v5_generation(
         parent_schedule=generation_parent_schedule,
         breeding_confidence=breeding_confidence,
     )
+    if matrix is not None:
+        generation_config = attach_operator_family_matrix(
+            generation_config, config["operatorFamilyMatrix"]
+        )
     proposal_root = _native_v5_proposal_root(root, generation_index)
     try:
         adapter = run_native_v5_generation_construction(
@@ -1740,7 +1788,22 @@ def _run_native_v5_generation(
         generation_kind=generation_kind,
         generation_config_sha256=generation_config["configSha256"],
     )
-    if (
+    if matrix is not None:
+        if not evolved_fill_matches_manifest(
+            generation_config=generation_config,
+            requested_count=evaluation_width,
+            max_attempts=evaluation_width,
+            declared_evaluation_population_size=evaluation_width,
+            accepted_count=checked_adapter["acceptedCandidateCount"],
+            attempt_count=checked_adapter["attemptCount"],
+            evaluation_population_size=checked_adapter[
+                "selectedEvaluationCandidateCount"
+            ],
+        ):
+            raise TemporalDiscoveryContractError(
+                "native v5 operator-family matrix construction did not exhaust its slot grid"
+            )
+    elif (
         checked_adapter["selectedEvaluationCandidateCount"] != evaluation_width
         or checked_adapter["acceptedCandidateCount"] < evaluation_width
         or (is_g0 and checked_adapter["acceptedCandidateCount"] != construction_width)
@@ -4878,6 +4941,7 @@ def _reconcile_native_v5_identity_ledger(
     state: dict[str, Any],
     state_path: Path,
     completed_by_index: Mapping[int, Mapping[str, Any]],
+    config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Recover the opaque current-v5 ledger authority without reopening it.
 
@@ -4901,7 +4965,17 @@ def _reconcile_native_v5_identity_ledger(
             raise TemporalDiscoveryContractError(
                 "current native v5 has an unbound committed identity-ledger descriptor"
             )
-        return None
+        source = (
+            config.get("operatorFamilyMatrixSourceIdentityLedger")
+            if isinstance(config, Mapping)
+            else None
+        )
+        if source is None:
+            return None
+        return _native_v5_identity_ledger_descriptor(
+            source,
+            name="operator-family matrix source identity ledger",
+        )
     if not isinstance(raw_descriptor, Mapping):
         raise TemporalDiscoveryContractError(
             "current native v5 lacks its committed identity-ledger descriptor"
@@ -9587,6 +9661,7 @@ def _frozen_config(
     evolvable_module_authority_config: Mapping[str, Any] | None = None,
     initial_archive_transport_descriptor: Mapping[str, Any] | None = None,
     native_v5_execution_mode: str = V5_EXECUTION_MODE_DURABLE,
+    operator_family_matrix: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -9606,6 +9681,41 @@ def _frozen_config(
     }:
         raise TemporalDiscoveryContractError("native v5 execution mode is invalid")
     normalized_parameters = _normalize_parameters(parameters)
+    frozen_matrix: dict[str, Any] | None = None
+    matrix_source_identity_ledger: dict[str, Any] | None = None
+    if operator_family_matrix is not None:
+        source_root, source_generation = freeze_spec_source_pin(operator_family_matrix)
+        canonical_matrix = validate_operator_family_matrix(operator_family_matrix)
+        slot_count = construction_slot_count(canonical_matrix)
+        if continuation_from is not None:
+            raise TemporalDiscoveryContractError(
+                "operator-family matrix cannot continue or resume a prior campaign"
+            )
+        if broad_admission:
+            raise TemporalDiscoveryContractError(
+                "operator-family matrix cannot use frozen 5x1024 broad admission"
+            )
+        if native_v5_execution_mode != V5_EXECUTION_MODE_FAST_EPHEMERAL:
+            raise TemporalDiscoveryContractError(
+                "operator-family matrix requires fast-ephemeral-v1 parent-material reconstruction"
+            )
+        if rotating_evidence_config is None:
+            raise TemporalDiscoveryContractError(
+                "operator-family matrix requires rotating evidence so clones share the frozen panel"
+            )
+        if generation_count != 1 or first_generation_index != source_generation + 1:
+            raise TemporalDiscoveryContractError(
+                "operator-family matrix must run exactly one generation after the freeze-spec source"
+            )
+        normalized_parameters = dict(normalized_parameters)
+        normalized_parameters["targetUniqueCandidates"] = slot_count
+        normalized_parameters["maxProposalAttempts"] = slot_count
+        frozen_matrix = dict(canonical_matrix)
+        frozen_matrix["sourceRunRoot"] = str(source_root)
+        frozen_matrix["sourceGenerationIndex"] = int(source_generation)
+        matrix_source_identity_ledger = matrix_source_identity_ledger_descriptor(
+            frozen_matrix
+        )
     evaluation_target = generation_count * int(
         normalized_parameters["targetUniqueCandidates"]
     )
@@ -10132,6 +10242,14 @@ def _frozen_config(
         **({"evidenceLadder": evidence_ladder} if evidence_ladder is not None else {}),
         **({"rotatingEvidence": rotating_evidence} if rotating_evidence is not None else {}),
         **({"evidenceLadderExecution": ladder_execution} if ladder_execution is not None else {}),
+        **(
+            {
+                "operatorFamilyMatrix": frozen_matrix,
+                "operatorFamilyMatrixSourceIdentityLedger": matrix_source_identity_ledger,
+            }
+            if frozen_matrix is not None and matrix_source_identity_ledger is not None
+            else {}
+        ),
         "generationPlan": generation_plan,
         **({"g0Bootstrap": g0_bootstrap} if g0_bootstrap is not None else {}),
         **(
@@ -11329,6 +11447,7 @@ def run_qd_supervisor(
     stop_before_evaluation_generation: int | None = None,
     evolvable_module_authority_config: Mapping[str, Any] | None = None,
     native_v5_execution_mode: str = V5_EXECUTION_MODE_DURABLE,
+    operator_family_matrix: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     tail_result_mode = _normalize_tail_result_mode(tail_result_mode)
     native_finalization_validation = _normalize_native_finalization_validation(
@@ -11482,6 +11601,7 @@ def run_qd_supervisor(
             evolvable_module_authority_config=evolvable_module_authority_config,
             initial_archive_transport_descriptor=initial_archive_transport_descriptor,
             native_v5_execution_mode=native_v5_execution_mode,
+            operator_family_matrix=operator_family_matrix,
         )
     if (
         tail_result_mode == TAIL_RESULT_MODE_INDEXED
@@ -11638,6 +11758,7 @@ def run_qd_supervisor(
             state=state,
             state_path=state_path,
             completed_by_index=completed_by_index,
+            config=config,
             )
         )
     elif native_pair_ledger_transaction:
@@ -11660,8 +11781,8 @@ def run_qd_supervisor(
             raise TemporalDiscoveryContractError(
                 "completed QD supervisor state lacks a complete artifact ledger"
             )
-        if int(state.get("uniqueCandidatesEvaluated") or 0) != int(
-            config["generationPlan"]["targetUniqueEvaluations"]
+        if not _unique_evaluations_meet_plan(
+            config, int(state.get("uniqueCandidatesEvaluated") or 0)
         ):
             raise TemporalDiscoveryContractError(
                 "completed QD supervisor state misses its frozen evaluation target"
@@ -12796,8 +12917,8 @@ def run_qd_supervisor(
                     "runRoot": str(root.resolve()),
                 }
 
-        if int(state["uniqueCandidatesEvaluated"]) != int(
-            config["generationPlan"]["targetUniqueEvaluations"]
+        if not _unique_evaluations_meet_plan(
+            config, int(state["uniqueCandidatesEvaluated"])
         ):
             raise TemporalDiscoveryContractError(
                 "completed supervisor run does not meet its frozen evaluation target"
@@ -13170,10 +13291,31 @@ def main() -> None:
             "direct disposable outputs and refuses resume"
         ),
     )
+    parser.add_argument(
+        "--operator-family-matrix",
+        type=Path,
+        help=(
+            "frozen temporal_qd_operator_family_matrix_v1 freeze-spec; runs one "
+            "fast-ephemeral generation after the source generation with balanced "
+            "one-change slots and no immigrants"
+        ),
+    )
     args = parser.parse_args()
     if args.bidirectional_pair_config is None and any(value is None for value in (args.source_preparation, args.base_generator_root, args.confirmed_entry_admission_root, args.validator_command_file)):
         parser.error("legacy mode requires --source-preparation, --base-generator-root, --confirmed-entry-admission-root, and --validator-command-file")
     parameters = _read(args.parameters, name="QD supervisor parameters")
+    operator_family_matrix = (
+        _read(args.operator_family_matrix, name="operator-family matrix freeze-spec")
+        if args.operator_family_matrix is not None
+        else None
+    )
+    if operator_family_matrix is not None:
+        if args.continue_from is not None:
+            parser.error("--operator-family-matrix cannot be combined with --continue-from")
+        if args.broad_admission:
+            parser.error("--operator-family-matrix cannot be combined with --broad-admission")
+        if args.native_v5_execution_mode != V5_EXECUTION_MODE_FAST_EPHEMERAL:
+            parser.error("--operator-family-matrix requires --native-v5-execution-mode fast-ephemeral-v1")
     if args.continue_from is not None:
         if args.native_v5_execution_mode == V5_EXECUTION_MODE_FAST_EPHEMERAL:
             parser.error("fast-ephemeral-v1 does not support continuation or resume")
@@ -13318,6 +13460,7 @@ def main() -> None:
             else None
         ),
         native_v5_execution_mode=args.native_v5_execution_mode,
+        operator_family_matrix=operator_family_matrix,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

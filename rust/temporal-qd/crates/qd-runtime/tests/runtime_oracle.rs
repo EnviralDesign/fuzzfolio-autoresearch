@@ -454,6 +454,7 @@ fn runtime_replays_real_python_oracle_transcript_in_exact_order() {
                     .into(),
                 parent: root.clone(),
                 mutation_depth: 2,
+                forced_operator_family: None,
             },
             &context,
         )
@@ -469,6 +470,7 @@ fn runtime_replays_real_python_oracle_transcript_in_exact_order() {
                     .into(),
                 parent: root,
                 mutation_depth: 3,
+                forced_operator_family: None,
             },
             &context,
         )

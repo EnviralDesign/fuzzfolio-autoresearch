@@ -2296,7 +2296,34 @@ def _validate_v5_full_generation_config(
 
     policy = config.get("breedingConfidencePolicy")
     receipt = config.get("breedingConfidenceReceipt")
-    if policy is None and receipt is None:
+    matrix = config.get("operatorFamilyMatrix")
+    if matrix is not None:
+        from .temporal_qd_operator_family_matrix import (
+            construction_slot_count,
+            validate_operator_family_matrix,
+        )
+
+        contract = validate_operator_family_matrix(matrix)
+        if policy is not None or receipt is not None:
+            raise TemporalQDV5NativeError(
+                "operator-family matrix overlay must not carry breeding confidence"
+            )
+        if config.get("parentSchedule") is not None:
+            raise TemporalQDV5NativeError(
+                "operator-family matrix overlay must not carry a rotating parent schedule"
+            )
+        if (
+            immigrants != 0
+            or offspring != target
+            or allocation.get("minimumImmigrantNumerator") != 0
+            or allocation.get("minimumImmigrantDenominator") != 1
+            or config.get("targetUniqueCandidates") != construction_slot_count(contract)
+            or config.get("maxProposalAttempts") != construction_slot_count(contract)
+        ):
+            raise TemporalQDV5NativeError(
+                "operator-family matrix overlay must seal a zero-immigrant slot quota"
+            )
+    elif policy is None and receipt is None:
         # Legacy fixtures without the hashed breeding-confidence freeze remain
         # admissible only when they still carry the historical 1/5 floor.
         if (
@@ -2726,6 +2753,40 @@ def _validate_fast_ephemeral_artifact(
     return artifact
 
 
+def _v5_result_fill_matches_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    accepted_count: object,
+    attempt_count: object,
+    evaluation_population_size: object,
+) -> bool:
+    from .temporal_qd_operator_family_matrix import evolved_fill_matches_manifest
+
+    if (
+        not isinstance(accepted_count, int)
+        or isinstance(accepted_count, bool)
+        or not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or not isinstance(evaluation_population_size, int)
+        or isinstance(evaluation_population_size, bool)
+        or accepted_count < 0
+        or attempt_count < accepted_count
+    ):
+        return False
+    generation_config = manifest.get("generationConfig")
+    if not isinstance(generation_config, Mapping):
+        return False
+    return evolved_fill_matches_manifest(
+        generation_config=generation_config,
+        requested_count=manifest["requestedCount"],
+        max_attempts=manifest["maxProposalAttempts"],
+        declared_evaluation_population_size=manifest["evaluationPopulationSize"],
+        accepted_count=accepted_count,
+        attempt_count=attempt_count,
+        evaluation_population_size=evaluation_population_size,
+    )
+
+
 def validate_v5_fast_ephemeral_result(
     value: object, *, manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -2759,13 +2820,12 @@ def validate_v5_fast_ephemeral_result(
         or result.get("manifestSha256") != checked_manifest["manifestSha256"]
         or result.get("generationConfigSha256")
         != checked_manifest["generationConfigSha256"]
-        or result.get("acceptedCandidateCount") != checked_manifest["requestedCount"]
-        or result.get("selectedEvaluationCandidateCount")
-        != checked_manifest["evaluationPopulationSize"]
-        or not isinstance(result.get("attemptCount"), int)
-        or isinstance(result.get("attemptCount"), bool)
-        or result["attemptCount"] < result["acceptedCandidateCount"]
-        or result["attemptCount"] > checked_manifest["maxProposalAttempts"]
+        or not _v5_result_fill_matches_manifest(
+            checked_manifest,
+            accepted_count=result.get("acceptedCandidateCount"),
+            attempt_count=result.get("attemptCount"),
+            evaluation_population_size=result.get("selectedEvaluationCandidateCount"),
+        )
     ):
         raise TemporalQDV5NativeError(
             "v5 fast-ephemeral result is incompatible with its manifest"
@@ -3022,14 +3082,16 @@ def _validate_v5_evolved_receipt(
         or receipt.get("generationConfigSha256") != manifest["generationConfigSha256"]
         or receipt.get("generationIndex") != manifest["generationIndex"]
         or receipt.get("requestedCount") != manifest["requestedCount"]
-        or receipt.get("acceptedRecordCount") != manifest["requestedCount"]
-        or not isinstance(receipt.get("attemptCount"), int)
-        or isinstance(receipt.get("attemptCount"), bool)
-        or receipt["attemptCount"] < manifest["requestedCount"]
-        or receipt["attemptCount"] > manifest["maxProposalAttempts"]
+        or not _v5_result_fill_matches_manifest(
+            manifest,
+            accepted_count=receipt.get("acceptedRecordCount"),
+            attempt_count=receipt.get("attemptCount"),
+            evaluation_population_size=receipt.get("evaluationPopulationSize"),
+        )
         or receipt.get("attemptCount") != result.get("attemptCount")
+        or receipt.get("acceptedRecordCount") != result.get("acceptedRecordCount")
         or receipt.get("evaluationPopulationSize")
-        != manifest["evaluationPopulationSize"]
+        != result.get("evaluationPopulationSize")
         or receipt.get("threadCap") != manifest["threadCap"]
         or receipt.get("parentArchiveInputBindingSha256")
         != parent_binding.get("bindingSha256")
@@ -3153,13 +3215,12 @@ def validate_v5_evolved_proposal_result(
         != checked_manifest["generationConfigSha256"]
         or result.get("generationIndex") != checked_manifest["generationIndex"]
         or result.get("requestedCount") != checked_manifest["requestedCount"]
-        or result.get("acceptedRecordCount") != checked_manifest["requestedCount"]
-        or not isinstance(result.get("attemptCount"), int)
-        or isinstance(result.get("attemptCount"), bool)
-        or result["attemptCount"] < checked_manifest["requestedCount"]
-        or result["attemptCount"] > checked_manifest["maxProposalAttempts"]
-        or result.get("evaluationPopulationSize")
-        != checked_manifest["evaluationPopulationSize"]
+        or not _v5_result_fill_matches_manifest(
+            checked_manifest,
+            accepted_count=result.get("acceptedRecordCount"),
+            attempt_count=result.get("attemptCount"),
+            evaluation_population_size=result.get("evaluationPopulationSize"),
+        )
         or result.get("parentArchiveInputBindingSha256")
         != parent_binding.get("bindingSha256")
         or result.get("identityLedgerInputBindingSha256")

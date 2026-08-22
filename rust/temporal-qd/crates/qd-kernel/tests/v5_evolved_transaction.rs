@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Read;
 
 use flate2::read::GzDecoder;
@@ -142,6 +143,8 @@ fn public_native_immigrant_transaction_is_all_attempt_durable() {
         parent_selector_state_sha256: sha(parents.compact_state()),
         identity_ledger_identity_sha256: sha(ledger.identity().clone()),
         identity_ledger_state_sha256: sha(ledger.compact_state()),
+        operator_family_matrix: None,
+        matrix_parents: BTreeMap::new(),
     };
     let result = execute_v5_evolved_transaction(request.clone(), &mut parents, &mut ledger)
         .expect("execute public sealed native immigrant transaction");

@@ -1201,7 +1201,7 @@ pub struct V5EvolvedPublicationFragment {
 
 impl V5EvolvedPublicationFragment {
     fn validate(&self, expected_kind: V5EvolvedPublicationFragmentKind) -> Result<()> {
-        if self.kind != expected_kind || self.row_count == 0 {
+        if self.kind != expected_kind {
             return Err(contract(
                 "v5 evolved publication fragment kind/count is invalid",
             ));
@@ -1312,9 +1312,9 @@ impl V5EvolvedPublicationFragments {
                 "v5 evolved publication fragment receipt count binding drifted",
             ));
         }
-        if accepted_candidate_count == 0 {
+        if proposal_attempt_count == 0 {
             return Err(contract(
-                "v5 evolved publication fragment accepted count must be positive",
+                "v5 evolved publication must retain the proposal-attempt transcript",
             ));
         }
         if proposal_attempt_count < accepted_candidate_count {
@@ -2253,6 +2253,73 @@ impl V5EvolvedPublicationReceiptObjectBinding {
     }
 }
 
+fn require_evolved_transaction_publishable(
+    request: &V5EvolvedTransactionRequest,
+    transaction: &V5EvolvedTransactionResult,
+    plan: &V5EvolvedPublicationPlan,
+) -> Result<()> {
+    let accepted = transaction.accepted_records.len() as u64;
+    let attempts = transaction.attempts.len() as u64;
+    if let Some(matrix) = &request.operator_family_matrix {
+        matrix
+            .require_exhausted_slot_grid(
+                attempts,
+                accepted,
+                request.target_accepted,
+                request.max_attempts,
+            )
+            .map_err(|error| contract(error.to_string()))?;
+        if plan.target_unique_candidates != request.target_accepted
+            || plan.evaluation_population_size != request.evaluation_width
+            || accepted > plan.target_unique_candidates
+        {
+            return Err(contract(
+                "v5 evolved publication plan width does not bind the operator-family matrix slot grid",
+            ));
+        }
+        return Ok(());
+    }
+    if !transaction.target_reached || accepted != transaction.target_accepted {
+        return Err(contract(
+            "cannot publish an incomplete v5 evolved transaction",
+        ));
+    }
+    if plan.target_unique_candidates != accepted || plan.evaluation_population_size != accepted {
+        return Err(contract(
+            "v5 evolved publication plan width does not bind completed accepted records",
+        ));
+    }
+    Ok(())
+}
+
+fn require_matrix_allocation_exhausted(accounting: &Value, slot_count: u64) -> Result<()> {
+    let origins = accounting
+        .get("origins")
+        .and_then(Value::as_object)
+        .ok_or_else(|| contract("v5 evolved allocation accounting lacks origins"))?;
+    let structural = origins
+        .get("structural_offspring")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            contract("v5 evolved allocation accounting lacks structural_offspring")
+        })?;
+    let immigrant = origins
+        .get("random_immigrant")
+        .and_then(Value::as_object)
+        .ok_or_else(|| contract("v5 evolved allocation accounting lacks random_immigrant"))?;
+    if structural.get("attempted").and_then(Value::as_u64) != Some(slot_count)
+        || structural.get("targetAccepted").and_then(Value::as_u64) != Some(slot_count)
+        || immigrant.get("attempted").and_then(Value::as_u64) != Some(0)
+        || immigrant.get("acceptedForEvaluation").and_then(Value::as_u64) != Some(0)
+        || immigrant.get("targetAccepted").and_then(Value::as_u64) != Some(0)
+    {
+        return Err(contract(
+            "operator-family matrix allocation must exhaust structural slots with zero immigrants",
+        ));
+    }
+    Ok(())
+}
+
 /// Prepared, write-neutral publication view over one complete later-generation
 /// compact transaction.  It holds only compact references and small envelopes;
 /// rich candidates exist only synchronously inside `materialize_accepted_fragments`.
@@ -2281,23 +2348,10 @@ pub fn prepare_v5_evolved_publication_stream<'a>(
     plan: &'a V5EvolvedPublicationPlan,
 ) -> Result<V5EvolvedPublicationStream<'a>> {
     transaction.verify_replay()?;
-    if !transaction.target_reached
-        || transaction.accepted_records.len() as u64 != transaction.target_accepted
-    {
-        return Err(contract(
-            "cannot publish an incomplete v5 evolved transaction",
-        ));
-    }
+    require_evolved_transaction_publishable(request, transaction, plan)?;
     let authority = V5SharedConstructionAuthority::from_shared_object(&request.shared_authority)
         .map_err(V5EvolvedTransactionError::from)?;
     plan.validate_against_transaction(request, &authority)?;
-    if plan.target_unique_candidates != transaction.accepted_records.len() as u64
-        || plan.evaluation_population_size != transaction.accepted_records.len() as u64
-    {
-        return Err(contract(
-            "v5 evolved publication plan width does not bind completed accepted records",
-        ));
-    }
 
     let mut origin_proposal_counts = BTreeMap::new();
     let mut origin_accepted_counts = BTreeMap::new();
@@ -2333,7 +2387,12 @@ pub fn prepare_v5_evolved_publication_stream<'a>(
         &rejected_by_origin,
     )
     .map_err(|error| contract(format!("v5 evolved allocation accounting failed: {error}")))?;
-    if reproduction_allocation_accounting
+    if request.operator_family_matrix.is_some() {
+        require_matrix_allocation_exhausted(
+            &reproduction_allocation_accounting,
+            request.target_accepted,
+        )?;
+    } else if reproduction_allocation_accounting
         .get("complete")
         .and_then(Value::as_bool)
         != Some(true)
@@ -2815,9 +2874,10 @@ impl<'a> V5EvolvedPublicationStream<'a> {
                 &mut replay_sink,
             )?)
         };
+        let expected_peak_rich_live = if self.accepted_count() == 0 { 0 } else { 1 };
         if replay_sink.next_attempt_ordinal != self.proposal_attempt_count() as u64
             || replay_sink.next_accepted != self.accepted_count()
-            || replay_sink.peak_rich_live != 1
+            || replay_sink.peak_rich_live != expected_peak_rich_live
         {
             return Err(contract(
                 "v5 evolved publication one-pass materialization count/live-state drifted",
@@ -4637,6 +4697,8 @@ mod tests {
             parent_selector_state_sha256: sha(parents.compact_state()),
             identity_ledger_identity_sha256: sha(ledger.identity().clone()),
             identity_ledger_state_sha256: sha(ledger.compact_state()),
+            operator_family_matrix: None,
+            matrix_parents: BTreeMap::new(),
         };
         (request, publication_inputs, parents, ledger)
     }
@@ -4750,6 +4812,8 @@ mod tests {
             parent_selector_state_sha256: sha(parents.compact_state()),
             identity_ledger_identity_sha256: sha(ledger.identity().clone()),
             identity_ledger_state_sha256: sha(ledger.compact_state()),
+            operator_family_matrix: None,
+            matrix_parents: BTreeMap::new(),
         };
         (request, publication_inputs, parents, ledger)
     }

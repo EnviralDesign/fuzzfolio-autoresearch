@@ -25,6 +25,7 @@ use temporal_qd_contract::{
 use crate::{
     factory::{ParentReference, ProposalIntent},
     identity::{Side, immigrant_side_seed},
+    operator_family_matrix::OperatorFamilyMatrixContract,
     proposal::{
         AcceptedProposal, IdentityLedger, LedgerProposal, ParentSelector, PlannedProposal,
         ProposalError, ProposalPlanner, ProposalSchedule, ProposalState,
@@ -1329,6 +1330,11 @@ pub struct V5EvolvedTransactionRequest {
     pub parent_selector_state_sha256: String,
     pub identity_ledger_identity_sha256: String,
     pub identity_ledger_state_sha256: String,
+    /// Present only for the operator-family matrix experiment.  Production
+    /// evolved generations must leave this empty so rotating 4/5 breeding is
+    /// unchanged.
+    pub operator_family_matrix: Option<OperatorFamilyMatrixContract>,
+    pub matrix_parents: BTreeMap<String, ParentReference>,
 }
 
 impl V5EvolvedTransactionRequest {
@@ -1389,6 +1395,52 @@ impl V5EvolvedTransactionRequest {
         if !(1..=8).contains(&self.thread_cap) {
             return Err(contract(
                 "native v5 evolved transaction threadCap must be in 1..=8",
+            ));
+        }
+        if let Some(matrix) = &self.operator_family_matrix {
+            if self.parent_schedule.is_some() {
+                return Err(contract(
+                    "operator-family matrix experiment must not carry a rotating parent schedule",
+                ));
+            }
+            if self.desired_accepted_immigrants != 0 {
+                return Err(contract(
+                    "operator-family matrix experiment must not schedule immigrants",
+                ));
+            }
+            let slots = matrix
+                .construction_slot_count()
+                .map_err(|error| contract(error.to_string()))?;
+            if self.target_accepted != slots
+                || self.desired_accepted_offspring != slots
+                || self.max_attempts != slots
+                || self.evaluation_width != slots
+            {
+                return Err(contract(
+                    "operator-family matrix must bind target, max attempts, and evaluation width to the slot grid",
+                ));
+            }
+            if self.matrix_parents.is_empty() {
+                // Replay/adoption reconstructs parents from snapshots and does
+                // not re-bind the planner map.
+            } else {
+                for parent in &matrix.parents {
+                    if !self.matrix_parents.contains_key(&parent.candidate_id) {
+                        return Err(contract(format!(
+                            "operator-family matrix parent {} is not bound",
+                            parent.candidate_id
+                        )));
+                    }
+                }
+                if self.matrix_parents.len() != matrix.parents.len() {
+                    return Err(contract(
+                        "operator-family matrix parent bindings do not match the sealed contract",
+                    ));
+                }
+            }
+        } else if !self.matrix_parents.is_empty() {
+            return Err(contract(
+                "matrix parent bindings require an operator-family matrix contract",
             ));
         }
         Ok(())
@@ -3279,6 +3331,7 @@ fn construct_sealed_mutation(
             ));
         }
     };
+    let forced_operator_family = planned.intent.forced_operator_family();
     let parent = load_parent_for_construction(parent_cache, authority, scheduled_parent)?;
     let receipt = parent_selection_receipt_for_planned(planned, &parent, None)?;
     let proposal_seed = planned.intent.proposal_seed();
@@ -3322,6 +3375,7 @@ fn construct_sealed_mutation(
             &current_state,
             &operator_authority,
             admission,
+            forced_operator_family,
         ) {
             Ok(selection) => selection,
             Err(error) => {
@@ -5227,6 +5281,7 @@ impl V5EvolvedTransactionResult {
                         replay_parent_cache,
                         &mut telemetry,
                         collect_telemetry,
+                        request,
                         attempt,
                         delta,
                         refs,
@@ -5533,6 +5588,7 @@ fn offline_planned_proposal_from_snapshot(
     replay_parent_cache: &V5VerifiedParentCache,
     telemetry: &mut V5EvolvedOfflineReplayTelemetry,
     collect_telemetry: bool,
+    request: &V5EvolvedTransactionRequest,
     attempt: &V5ProposalAttemptRecord,
     delta: &V5EvolvedProposalDelta,
     snapshot_refs: &V5EvolvedAttemptSnapshotRefs,
@@ -5592,6 +5648,11 @@ fn offline_planned_proposal_from_snapshot(
                 mutation_depth: delta.mutation_depth.ok_or_else(|| {
                     contract("v5 evolved offline mutation delta omits mutation depth")
                 })?,
+                forced_operator_family: request
+                    .operator_family_matrix
+                    .as_ref()
+                    .and_then(|matrix| matrix.slot_at(delta.proposal_ordinal).ok().flatten())
+                    .map(|slot| slot.operator_family),
             }
         }
         "same_side_crossover" => {
@@ -6055,15 +6116,18 @@ fn exact_planned_proposal(left: &PlannedProposal, right: &PlannedProposal) -> bo
                 proposal_seed: left_seed,
                 parent: left_parent,
                 mutation_depth: left_depth,
+                forced_operator_family: left_family,
             },
             ProposalIntent::StructuralMutation {
                 proposal_seed: right_seed,
                 parent: right_parent,
                 mutation_depth: right_depth,
+                forced_operator_family: right_family,
             },
         ) => {
             left_seed == right_seed
                 && left_depth == right_depth
+                && left_family == right_family
                 && exact_parent_reference(left_parent, right_parent)
         }
         (
@@ -6221,26 +6285,40 @@ where
         ));
     }
     let has_parents = parents.has_parents();
-    let parent_schedule = match (has_parents, request.parent_schedule) {
-        (true, Some(schedule)) => {
-            if schedule.breeder_parent_count != parents.eligible_parent_count() as u64 {
+    let parent_schedule = if request.operator_family_matrix.is_some() {
+        if request.matrix_parents.is_empty() {
+            return Err(contract(
+                "operator-family matrix experiment requires bound parents",
+            ));
+        }
+        if !has_parents {
+            return Err(contract(
+                "operator-family matrix experiment requires frozen parents",
+            ));
+        }
+        None
+    } else {
+        match (has_parents, request.parent_schedule) {
+            (true, Some(schedule)) => {
+                if schedule.breeder_parent_count != parents.eligible_parent_count() as u64 {
+                    return Err(contract(
+                        "v5 evolved parent schedule does not bind eligible parent count",
+                    ));
+                }
+                Some(schedule)
+            }
+            (true, None) => {
                 return Err(contract(
-                    "v5 evolved parent schedule does not bind eligible parent count",
+                    "v5 evolved transaction with parents requires rotating parent schedule",
                 ));
             }
-            Some(schedule)
+            (false, Some(_)) => {
+                return Err(contract(
+                    "v5 evolved transaction without parents must not carry a parent schedule",
+                ));
+            }
+            (false, None) => None,
         }
-        (true, None) => {
-            return Err(contract(
-                "v5 evolved transaction with parents requires rotating parent schedule",
-            ));
-        }
-        (false, Some(_)) => {
-            return Err(contract(
-                "v5 evolved transaction without parents must not carry a parent schedule",
-            ));
-        }
-        (false, None) => None,
     };
     let desired_immigrants = request.desired_accepted_immigrants;
     let desired_offspring = request.desired_accepted_offspring;
@@ -6255,6 +6333,8 @@ where
         parent_schedule,
         desired_evaluated_offspring: desired_offspring,
         desired_evaluated_immigrants: desired_immigrants,
+        operator_family_matrix: request.operator_family_matrix.clone(),
+        matrix_parents: request.matrix_parents.clone(),
     };
     let parent_schedule_sha256 = schedule
         .parent_schedule
@@ -7180,6 +7260,8 @@ mod scheduler_tests {
             parent_selector_state_sha256: sha(selector.compact_state()),
             identity_ledger_identity_sha256: sha(ledger.identity().clone()),
             identity_ledger_state_sha256: sha(ledger.compact_state()),
+            operator_family_matrix: None,
+            matrix_parents: BTreeMap::new(),
         }
     }
 
@@ -7269,6 +7351,7 @@ mod scheduler_tests {
                     .expect("derive aggregate-no-op proposal seed"),
                 parent: parent_reference,
                 mutation_depth: 2,
+                forced_operator_family: None,
             },
         };
         let receipt = parent_selection_receipt_for_planned(&planned, &parent, None)
@@ -7356,6 +7439,8 @@ mod scheduler_tests {
                 "schemaVersion",
                 Value::String("temporal_qd_v5_evolved_direct_native_ledger_state_v1".to_owned()),
             )])),
+            operator_family_matrix: None,
+            matrix_parents: BTreeMap::new(),
         }
     }
 
@@ -7396,6 +7481,7 @@ mod scheduler_tests {
                 proposal_seed,
                 parent,
                 mutation_depth: 1,
+                forced_operator_family: None,
             },
         };
         let scheduled_parent = match &planned.intent {
@@ -7699,6 +7785,8 @@ mod scheduler_tests {
             // fabricating a crossover proposal by hand.
             desired_evaluated_offspring: 1,
             desired_evaluated_immigrants: 0,
+            operator_family_matrix: None,
+            matrix_parents: BTreeMap::new(),
         };
         let mut planner = ProposalPlanner {
             schedule,

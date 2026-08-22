@@ -2787,6 +2787,8 @@ fn execute_with_ledger_prefetch_progress(
         parent_schedule: None,
         desired_evaluated_offspring: 0,
         desired_evaluated_immigrants: request.target_accepted,
+        operator_family_matrix: None,
+        matrix_parents: BTreeMap::new(),
     };
     schedule.validate()?;
     let mut parents = G0NoParents;

@@ -379,6 +379,7 @@ pub fn reconstruct_v5_evolved_transaction_from_durable_objects(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Read;
 
     use flate2::read::GzDecoder;
@@ -488,6 +489,8 @@ mod tests {
             parent_selector_state_sha256: sha(parents.compact_state()),
             identity_ledger_identity_sha256: sha(ledger.identity().clone()),
             identity_ledger_state_sha256: sha(ledger.compact_state()),
+            operator_family_matrix: None,
+            matrix_parents: BTreeMap::new(),
         };
         let result = execute_v5_evolved_transaction(request.clone(), &mut parents, &mut ledger)
             .expect("execute sealed evolved durable immigrant");

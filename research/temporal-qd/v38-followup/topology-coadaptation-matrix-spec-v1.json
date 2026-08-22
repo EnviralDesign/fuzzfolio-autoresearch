@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "temporal_qd_topology_coadaptation_matrix_v1",
+  "mode": "frozen_parent_topology_then_local_resource_settling_v1",
+  "includeCrossover": false,
+  "cloneControl": "re_evaluate_parent_on_frozen_panel",
+  "productionArchiveWrite": false,
+  "mutationDepth": 1,
+  "arms": [
+    "exact_parent_clone",
+    "topology_only_child",
+    "resource_parameter_only_control",
+    "topology_then_bounded_resource_settling"
+  ],
+  "oneExactTopologyPlanPerPairedSet": true,
+  "noMixedTopologyOperations": true,
+  "identicalFrozenDevelopmentPanel": true,
+  "independentPanelConfirmationRequired": true,
+  "preserveRawAndSettledIdentities": true,
+  "canonicalCompilerAndWorkerPathsOnly": true,
+  "settling": {
+    "families": ["resource"],
+    "maxResourceSteps": 4,
+    "deterministic": true,
+    "noLocalExecutorFork": true
+  },
+  "morphologyNursery": {
+    "schemaVersion": "temporal_qd_morphology_nursery_archive_v1",
+    "productionBreedingRights": false,
+    "minimumNativeValidity": true,
+    "minimumBehavioralLiveness": true,
+    "localCompetitionOnly": true,
+    "boundedLifetime": true,
+    "deterministicEviction": true,
+    "noRetentionToFillArchive": true
+  },
+  "successRule": {
+    "noveltyIsNotQuality": true,
+    "requireRepeatablePositiveParentRelativeTail": true,
+    "forbidSystematicallyWorseWorstWindow": true,
+    "requireIndependentPanelSurvival": true
+  },
+  "notAdmittedOnFrontGenerationPath": true
+}

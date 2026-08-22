@@ -103,6 +103,7 @@ pub enum ProposalIntent {
         proposal_seed: String,
         parent: ParentReference,
         mutation_depth: u8,
+        forced_operator_family: Option<String>,
     },
     SameSideCrossover {
         proposal_seed: String,
@@ -128,6 +129,16 @@ impl ProposalIntent {
             Self::StructuralMutation { .. } | Self::SameSideCrossover { .. } => {
                 "structural_offspring"
             }
+        }
+    }
+
+    pub fn forced_operator_family(&self) -> Option<&str> {
+        match self {
+            Self::StructuralMutation {
+                forced_operator_family,
+                ..
+            } => forced_operator_family.as_deref(),
+            _ => None,
         }
     }
 
@@ -158,6 +169,7 @@ impl ProposalIntent {
             Self::StructuralMutation {
                 parent,
                 mutation_depth,
+                forced_operator_family,
                 ..
             } => {
                 parent.validate()?;
@@ -165,6 +177,18 @@ impl ProposalIntent {
                     return Err(contract(
                         "structural mutation depth is outside the admitted 1..3 schedule",
                     ));
+                }
+                if let Some(family) = forced_operator_family {
+                    if *mutation_depth != 1 {
+                        return Err(contract(
+                            "forced operator family requires mutation depth 1",
+                        ));
+                    }
+                    if !crate::operator_family_matrix::is_matrix_family(family) {
+                        return Err(contract(
+                            "forced operator family is not a matrix family",
+                        ));
+                    }
                 }
             }
             Self::SameSideCrossover {
@@ -213,6 +237,7 @@ impl ProposalIntent {
             Self::StructuralMutation {
                 parent,
                 mutation_depth,
+                forced_operator_family,
                 ..
             } => {
                 fields.insert("mutationDepth".to_owned(), Value::from(*mutation_depth));
@@ -221,6 +246,12 @@ impl ProposalIntent {
                     "parentSelection".to_owned(),
                     parent.selection_audit.clone().unwrap_or(Value::Null),
                 );
+                if let Some(family) = forced_operator_family {
+                    fields.insert(
+                        "forcedOperatorFamily".to_owned(),
+                        Value::String(family.clone()),
+                    );
+                }
             }
             Self::SameSideCrossover {
                 side,

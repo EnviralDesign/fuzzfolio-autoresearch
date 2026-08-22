@@ -39,6 +39,7 @@ use temporal_qd_kernel::{
     },
     generation::{GenerateGenerationRequest, generate_generation},
     journal::FinalNewline,
+    operator_family_matrix::OperatorFamilyMatrixContract,
     proposal::{IdentityLedger, ParentSelector},
     publication::PublicationPolicy,
     schedule::RotatingParentSchedule,
@@ -97,7 +98,8 @@ use crate::v5_proposal_contract::{
     V5EvolvedProposalResult, V5ObjectStoreIdentity, V5OutputArtifactIdentity, V5ProposalManifest,
     V5ProposalReceiptBuildInput, V5ProposalResult, build_v5_evolved_proposal_receipt_and_result,
     build_v5_evolved_proposal_result_from_receipt, build_v5_proposal_receipt_and_result,
-    build_v5_proposal_result_from_receipt, parse_v5_proposal_manifest,
+    build_v5_proposal_result_from_receipt, evolved_construction_is_publishable,
+    parse_v5_proposal_manifest,
     validate_v5_evolved_proposal_adoption_evidence, validate_v5_evolved_proposal_result,
     validate_v5_proposal_adoption_evidence, validate_v5_proposal_result,
 };
@@ -3327,6 +3329,13 @@ fn native_v5_g0_parent_references(
     if references.is_empty() {
         bail!("native v5 G0 parent archive has no retained compact material");
     }
+    for candidate_id in v5_operator_family_matrix_parent_ids(&manifest.generation_config)? {
+        if !references.contains_key(&candidate_id) {
+            bail!(
+                "operator-family matrix parent {candidate_id} is not in the G0/G1 archive; extra matrix controls require evolved (G3+) parent reconstruction"
+            );
+        }
+    }
     Ok(references)
 }
 
@@ -3390,6 +3399,7 @@ fn native_v5_fast_ephemeral_parent_references(
     let authority = V5SharedConstructionAuthority::from_shared_object(&manifest.frozen_authority)
         .context("open sealed fast-ephemeral parent reconstruction authority")?;
 
+    let matrix_parent_ids = v5_operator_family_matrix_parent_ids(&manifest.generation_config)?;
     let mut archive_candidates = BTreeMap::<String, Value>::new();
     for cell in archive
         .value
@@ -3489,9 +3499,10 @@ fn native_v5_fast_ephemeral_parent_references(
             bail!("fast-ephemeral parent material row identity drifted");
         }
 
-        let Some(archive_candidate) = archive_candidates.get(candidate_id) else {
+        let archive_candidate = archive_candidates.get(candidate_id);
+        if archive_candidate.is_none() && !matrix_parent_ids.contains(candidate_id) {
             continue;
-        };
+        }
         let pair_identity_sha256 = fields
             .get("pairIdentitySha256")
             .and_then(Value::as_str)
@@ -3522,28 +3533,33 @@ fn native_v5_fast_ephemeral_parent_references(
             .context("validate fast-ephemeral parent compact record")?;
         if record.candidate_id != candidate_id
             || record.pair_identity_sha256 != pair_identity_sha256
-            || archive_candidate
+        {
+            bail!("fast-ephemeral parent material drifted from its compact record");
+        }
+        if let Some(archive_candidate) = archive_candidate {
+            if archive_candidate
                 .get("candidateIdentitySha256")
                 .and_then(Value::as_str)
                 != Some(record.candidate_identity_sha256.as_str())
-            || archive_candidate
-                .get("programSha256")
-                .and_then(Value::as_str)
-                != Some(record.compiled.program_sha256.as_str())
-            || archive_candidate
-                .get("sourceProfileSha256")
-                .and_then(Value::as_str)
-                != Some(record.compiled.raw_pair_sha256.as_str())
-            || archive_candidate
-                .get("profileSnapshotSha256")
-                .and_then(Value::as_str)
-                != Some(record.compiled.profile_snapshot_sha256.as_str())
-            || archive_candidate
-                .get("proposalEntrySha256")
-                .and_then(Value::as_str)
-                != Some(proposal_entry_sha256.as_str())
-        {
-            bail!("fast-ephemeral archive candidate drifts from its parent material");
+                || archive_candidate
+                    .get("programSha256")
+                    .and_then(Value::as_str)
+                    != Some(record.compiled.program_sha256.as_str())
+                || archive_candidate
+                    .get("sourceProfileSha256")
+                    .and_then(Value::as_str)
+                    != Some(record.compiled.raw_pair_sha256.as_str())
+                || archive_candidate
+                    .get("profileSnapshotSha256")
+                    .and_then(Value::as_str)
+                    != Some(record.compiled.profile_snapshot_sha256.as_str())
+                || archive_candidate
+                    .get("proposalEntrySha256")
+                    .and_then(Value::as_str)
+                    != Some(proposal_entry_sha256.as_str())
+            {
+                bail!("fast-ephemeral archive candidate drifts from its parent material");
+            }
         }
         let reference = ParentReference {
             pair_identity_sha256,
@@ -3561,12 +3577,18 @@ fn native_v5_fast_ephemeral_parent_references(
             },
         );
     }
-    if references.len() != archive_candidates.len()
-        || archive_candidates
-            .keys()
-            .any(|candidate_id| !references.contains_key(candidate_id))
+    if archive_candidates
+        .keys()
+        .any(|candidate_id| !references.contains_key(candidate_id))
     {
         bail!("fast-ephemeral parent material stream lacks an archive candidate");
+    }
+    for candidate_id in &matrix_parent_ids {
+        if !references.contains_key(candidate_id) {
+            bail!(
+                "fast-ephemeral parent material stream lacks operator-family matrix parent {candidate_id}"
+            );
+        }
     }
     Ok(references)
 }
@@ -3600,7 +3622,10 @@ fn native_v5_evolved_parent_references(
     if manifest.generation_index < 3 {
         bail!("native v5 evolved parent recovery requires generation three or later");
     }
-    let selected_candidate_ids = native_v5_archive_candidate_ids(&archive.value)?;
+    let mut selected_candidate_ids = native_v5_archive_candidate_ids(&archive.value)?;
+    selected_candidate_ids.extend(v5_operator_family_matrix_parent_ids(
+        &manifest.generation_config,
+    )?);
     if selected_candidate_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -3848,6 +3873,50 @@ fn v5_evolved_frozen_accepted_quotas(
     Ok((offspring, immigrants))
 }
 
+fn v5_operator_family_matrix_parent_ids(
+    generation_config: &Value,
+) -> Result<BTreeSet<String>> {
+    match generation_config.get("operatorFamilyMatrix") {
+        None | Some(Value::Null) => Ok(BTreeSet::new()),
+        Some(value) => {
+            let matrix = OperatorFamilyMatrixContract::from_value(value)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            Ok(matrix
+                .parents
+                .iter()
+                .map(|parent| parent.candidate_id.clone())
+                .collect())
+        }
+    }
+}
+
+fn v5_operator_family_matrix_bindings(
+    generation_config: &Value,
+    parent_references: &BTreeMap<String, ParentReference>,
+) -> Result<(
+    Option<OperatorFamilyMatrixContract>,
+    BTreeMap<String, ParentReference>,
+)> {
+    match generation_config.get("operatorFamilyMatrix") {
+        None | Some(Value::Null) => Ok((None, BTreeMap::new())),
+        Some(value) => {
+            let matrix = OperatorFamilyMatrixContract::from_value(value)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let mut bound = BTreeMap::new();
+            for parent in &matrix.parents {
+                let reference = parent_references.get(&parent.candidate_id).ok_or_else(|| {
+                    anyhow!(
+                        "operator-family matrix parent {} is missing from parent material",
+                        parent.candidate_id
+                    )
+                })?;
+                bound.insert(parent.candidate_id.clone(), reference.clone());
+            }
+            Ok((Some(matrix), bound))
+        }
+    }
+}
+
 fn v5_evolved_transaction_request_with_parent_references(
     manifest: &V5ProposalManifest,
     fast_ephemeral: bool,
@@ -3872,7 +3941,7 @@ fn v5_evolved_transaction_request_with_parent_references(
         bail!("sealed native v5 evolved parent archive semantic identity drifted from its binding");
     }
     let configured_parent_schedule =
-        v5_evolved_configured_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
+        v5_evolved_optional_configured_parent_schedule(&manifest.generation_config)?;
     // A rotating v2 schedule records the selected robust reservoir before the
     // direction-aware parent projection is applied.  Its frozen
     // `unsupportedParentPolicy` explicitly converts unsupported parent share
@@ -3903,10 +3972,17 @@ fn v5_evolved_transaction_request_with_parent_references(
         true,
     )
     .context("open typed native v5 evolved parent selector")?;
-    let parent_schedule = v5_evolved_effective_parent_schedule(
-        configured_parent_schedule,
-        parents.eligible_parent_count(),
+    let (operator_family_matrix, matrix_parents) = v5_operator_family_matrix_bindings(
+        &manifest.generation_config,
+        &parent_references,
     )?;
+    let parent_schedule = match configured_parent_schedule {
+        None => None,
+        Some(configured) => v5_evolved_effective_parent_schedule(
+            configured,
+            parents.eligible_parent_count(),
+        )?,
+    };
 
     let input_ledger =
         read_v5_evolved_input_document(manifest, "identityLedger", "identity ledger")?;
@@ -3962,6 +4038,8 @@ fn v5_evolved_transaction_request_with_parent_references(
             .context("identify native v5 evolved identity ledger authority")?,
         identity_ledger_state_sha256: canonical_sha256(&ledger.compact_state())
             .context("identify native v5 evolved identity ledger state")?,
+        operator_family_matrix,
+        matrix_parents,
     };
     Ok((
         request,
@@ -4038,13 +4116,31 @@ fn v5_evolved_adoption_request(
     }
     let schedule = &transaction.schedule_state_receipt;
     let configured_parent_schedule =
-        v5_evolved_configured_parent_schedule(manifest.generation_config.get("parentSchedule"))?;
-    let parent_schedule = v5_evolved_adopted_parent_schedule(
-        configured_parent_schedule,
-        schedule.parent_schedule_sha256.as_deref(),
-    )?;
+        v5_evolved_optional_configured_parent_schedule(&manifest.generation_config)?;
+    let parent_schedule = match configured_parent_schedule {
+        None => None,
+        Some(configured) => v5_evolved_adopted_parent_schedule(
+            configured,
+            schedule.parent_schedule_sha256.as_deref(),
+        )?,
+    };
     let frozen_quotas =
         v5_evolved_frozen_accepted_quotas(&manifest.generation_config, manifest.requested_count)?;
+    let operator_family_matrix = match manifest.generation_config.get("operatorFamilyMatrix") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            OperatorFamilyMatrixContract::from_value(value)
+                .map_err(|error| anyhow!(error.to_string()))?,
+        ),
+    };
+    let parent_schedule = if operator_family_matrix.is_some() {
+        if parent_schedule.is_some() {
+            bail!("operator-family matrix experiment must not carry a rotating parent schedule");
+        }
+        None
+    } else {
+        parent_schedule
+    };
     let request = V5EvolvedTransactionRequest {
         shared_authority: manifest.frozen_authority.clone(),
         generation_config_sha256: manifest.generation_config_sha256.clone(),
@@ -4066,6 +4162,8 @@ fn v5_evolved_adoption_request(
             .context("identify sealed native v5 evolved identity-ledger authority")?,
         identity_ledger_state_sha256: canonical_sha256(&schedule.initial_identity_ledger_state)
             .context("identify sealed native v5 evolved initial identity-ledger state")?,
+        operator_family_matrix,
+        matrix_parents: BTreeMap::new(),
     };
     Ok(request)
 }
@@ -5482,12 +5580,13 @@ fn execute_v5_evolved_fresh_transaction(
             .context("validate fresh sealed native v5 evolved transaction")?;
     }
     let construction_elapsed = construction_started.elapsed();
-    if !transaction.target_reached
-        || transaction.accepted_records.len() as u64 != manifest.requested_count
-        || transaction.attempts.len() as u64 > manifest.max_proposal_attempts
-    {
-        bail!("native v5 typed evolved transaction did not produce a complete publication bundle");
-    }
+    evolved_construction_is_publishable(
+        manifest,
+        transaction.target_reached,
+        transaction.accepted_records.len() as u64,
+        transaction.attempts.len() as u64,
+    )
+    .context("native v5 typed evolved transaction did not produce a complete publication bundle")?;
     let transaction_sha256 = transaction
         .transaction_sha256()
         .context("identify native v5 evolved transaction")?;
@@ -5553,14 +5652,14 @@ fn execute_v5_evolved_fresh_transaction(
         .context("derive sealed native v5 evolved publication plan")?;
     let stream = prepare_v5_evolved_publication_stream(&request, &transaction, &publication_plan)
         .context("prepare sealed native v5 evolved publication stream")?;
-    if stream.accepted_count() as u64 != manifest.requested_count {
+    if stream.accepted_count() as u64 != transaction.accepted_records.len() as u64 {
         let cleanup = cleanup_staged_v5_artifacts(&ops, &object_artifacts);
         if let Err(cleanup) = cleanup {
             return Err(anyhow!(
                 "native v5 evolved publication accepted count drifted; cleanup failed: {cleanup:#}"
             ));
         }
-        bail!("native v5 evolved publication accepted count drifts from the manifest");
+        bail!("native v5 evolved publication accepted count drifts from the compact transaction");
     }
 
     // Exactly one selected-material traversal enters the four file-backed
@@ -5840,6 +5939,8 @@ fn execute_v5_evolved_fresh_transaction(
             v5_evolved_construction_summary(&transaction, &public_artifacts, &object_artifacts)?;
         let receipt_input = V5EvolvedProposalReceiptBuildInput {
             attempt_count: transaction.attempts.len() as u64,
+            accepted_record_count: transaction.accepted_records.len() as u64,
+            evaluation_population_size: stream.accepted_count() as u64,
             transaction_sha256: transaction_sha256.clone(),
             parent_archive_input_binding_sha256: transaction
                 .parent_archive_input_binding_sha256
@@ -6710,6 +6811,23 @@ fn parse_parent_schedule(value: Option<&Value>) -> Result<Option<RotatingParentS
 fn v5_evolved_configured_parent_schedule(value: Option<&Value>) -> Result<RotatingParentSchedule> {
     parse_parent_schedule(value)?
         .ok_or_else(|| anyhow!("sealed native v5 evolved generation config lacks parentSchedule"))
+}
+
+fn v5_evolved_optional_configured_parent_schedule(
+    generation_config: &Value,
+) -> Result<Option<RotatingParentSchedule>> {
+    let matrix_present = !matches!(
+        generation_config.get("operatorFamilyMatrix"),
+        None | Some(Value::Null)
+    );
+    let schedule_value = generation_config.get("parentSchedule");
+    if matrix_present {
+        if schedule_value.is_some() && schedule_value != Some(&Value::Null) {
+            bail!("operator-family matrix experiment must not carry a rotating parent schedule");
+        }
+        return Ok(None);
+    }
+    Ok(Some(v5_evolved_configured_parent_schedule(schedule_value)?))
 }
 
 fn v5_evolved_effective_parent_schedule(

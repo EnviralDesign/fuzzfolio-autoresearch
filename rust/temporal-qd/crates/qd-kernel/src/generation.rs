@@ -4,7 +4,7 @@
 //! worker dispatch, replay, and archive reduction remain outside the native
 //! generation boundary.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf};
 
 use temporal_qd_contract::{ContractError, Map, Value, canonical_json_bytes, canonical_sha256};
 
@@ -356,6 +356,22 @@ impl GenerateGenerationRequest {
         if schema != Some(PAIR_GENERATION_SCHEMA) {
             return Err(contract(
                 "pair config schema is not admitted for native generation",
+            ));
+        }
+        if matches!(
+            config_fields.get("operatorFamilyMatrix"),
+            Some(value) if !value.is_null()
+        ) {
+            return Err(contract(
+                "operator-family matrix is not admitted on the front generation path",
+            ));
+        }
+        if matches!(
+            config_fields.get("topologyCoadaptationMatrix"),
+            Some(value) if !value.is_null()
+        ) {
+            return Err(contract(
+                "topology coadaptation matrix is not admitted on the front generation path",
             ));
         }
         let allocation = allocation
@@ -876,6 +892,8 @@ pub fn generate_generation(
         parent_schedule: request.parent_schedule,
         desired_evaluated_offspring,
         desired_evaluated_immigrants,
+        operator_family_matrix: None,
+        matrix_parents: BTreeMap::new(),
     };
     let mut factory =
         PairFactory::new(authority, request.expected_native_authority_sha256.clone())?;
