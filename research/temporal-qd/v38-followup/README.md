@@ -41,3 +41,22 @@ v1 files above are frozen. v2 corrects labels, metric identity, multi-panel summ
 Regenerate v2 with:
 
 `python -m autoresearch.temporal_qd_v38_followup_audit_v2 --output-dir research/temporal-qd/v38-followup`
+
+## v3
+
+v1 and v2 files above are frozen. v3 corrects event-insert mechanism labels, exact multi-panel economics, qd19 wording, phenotype breadth, the launch-grade resource slot manifest, and parent-bound topology-local co-adaptation.
+
+| File | Task |
+| --- | --- |
+| `v38-directional-event-insert-forensic-v3.json` / `.md` | A/B |
+| `v38-multipanel-suboperation-v3.json` / `.md` | C |
+| `resource-suboperation-launch-manifest-v1.json` / `.md` | D |
+| `topology-coadaptation-matrix-spec-v3.json` | E |
+| `topology-coadaptation-research-plan-v3.md` | E |
+| `v38-initial-protection-tail-forensic-v3.json` / `.md` | F |
+| `decision-memo-v3.md` | memo |
+| `README-v3.md` | index |
+
+Regenerate v3 with:
+
+`python -m autoresearch.temporal_qd_v38_followup_audit_v3 --output-dir research/temporal-qd/v38-followup`
