@@ -22,6 +22,7 @@ pub mod journal;
 pub mod operator_family_matrix;
 pub mod topology_coadaptation_matrix;
 pub mod topology_coadaptation_matrix_v3;
+pub mod topology_coadaptation_matrix_v4;
 pub mod proposal;
 pub mod protection;
 pub mod publication;

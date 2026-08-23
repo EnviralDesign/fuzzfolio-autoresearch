@@ -60,3 +60,23 @@ v1 and v2 files above are frozen. v3 corrects event-insert mechanism labels, exa
 Regenerate v3 with:
 
 `python -m autoresearch.temporal_qd_v38_followup_audit_v3 --output-dir research/temporal-qd/v38-followup`
+
+## v4
+
+v1, v2, and v3 files above are frozen. v4 adds the gross-versus-cost event partition, exact cumulative archive forensic, honest resource inventory, and complete 2x2 topology co-adaptation contract.
+
+| File | Task |
+| --- | --- |
+| `v38-directional-event-insert-forensic-v4.json` / `.md` | A |
+| `v38-multipanel-suboperation-v4.json` / `.md` | A |
+| `v38-cumulative-event-child-archive-forensic-v4.json` / `.md` | B |
+| `resource-suboperation-candidate-inventory-v1.json` / `.md` | C |
+| `resource-suboperation-balanced-design-proposal-v2.json` / `.md` | C |
+| `topology-coadaptation-matrix-spec-v4.json` / `.md` | D-G |
+| `topology-coadaptation-materialization-receipts-v4.json` | F |
+| `decision-memo-v4.md` | memo |
+| `README-v4.md` | index |
+
+Regenerate v4 with:
+
+`python -m autoresearch.temporal_qd_v38_followup_audit_v4 --output-dir research/temporal-qd/v38-followup`
