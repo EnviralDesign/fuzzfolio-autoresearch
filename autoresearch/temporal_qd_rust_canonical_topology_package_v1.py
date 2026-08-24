@@ -103,11 +103,22 @@ def _source_manifest(commit: str, *, allow_uncommitted: bool) -> dict[str, Any]:
             committed = _git("show", f"{commit}:{relative}", binary=True)
             assert isinstance(committed, bytes)
             commit_sha = "sha256:" + hashlib.sha256(committed).hexdigest()
+            commit_blob = str(_git("rev-parse", f"{commit}:{relative}"))
         except subprocess.CalledProcessError:
             commit_sha = None
-        if commit_sha != worktree_sha:
+            commit_blob = None
+        worktree_blob = str(_git("hash-object", "--path", relative, relative))
+        if commit_blob != worktree_blob:
             mismatches.append(relative)
-        file_rows.append({"path": relative, "sha256": worktree_sha, "commitBlobSha256": commit_sha})
+        file_rows.append(
+            {
+                "path": relative,
+                "sha256": commit_sha or worktree_sha,
+                "commitBlobSha256": commit_sha,
+                "worktreeRawSha256": worktree_sha,
+                "matchesCommitAfterGitFilters": commit_blob == worktree_blob,
+            }
+        )
     if mismatches and not allow_uncommitted:
         raise RuntimeError(f"authority source differs from {commit}: {mismatches}")
     return _seal(

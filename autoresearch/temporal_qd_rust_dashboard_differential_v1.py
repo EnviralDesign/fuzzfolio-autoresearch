@@ -55,6 +55,13 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def _git_paths_match(repo: Path, commit: str, paths: Iterable[str]) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo), "diff", "--quiet", commit, "--", *paths],
+        check=False,
+    ).returncode == 0
+
+
 def _seal(value: Mapping[str, Any], field: str = "reportSha256") -> dict[str, Any]:
     result = dict(value)
     result[field] = canonical_sha256(result)
@@ -294,8 +301,9 @@ def _divergence_summary(
     }
 
 
-def run(output_dir: Path) -> dict[str, Path]:
+def run(output_dir: Path, *, rust_source_commit: str | None = None) -> dict[str, Path]:
     config = _json(PAIR_RUN_CONFIG)
+    rust_source_commit = rust_source_commit or _git(ROOT, "rev-parse", "HEAD")
     dashboard_binding = config["nativeJsonlAuthority"]
     command = list(dashboard_binding["command"]) + ["--jsonl-server", "--jsonl-max-line-bytes", str(dashboard_binding["maxLineBytes"])]
     env = dict(os.environ)
@@ -306,8 +314,20 @@ def run(output_dir: Path) -> dict[str, Path]:
         "schemaVersion": "temporal_qd_cross_compiler_source_manifest_v1",
         "rust": {
             "repository": str(ROOT),
-            "gitCommit": _git(ROOT, "rev-parse", "HEAD"),
+            "gitCommit": rust_source_commit,
             "workingTreeDirty": bool(_git(ROOT, "status", "--porcelain")),
+            "authoritySourceFilesMatchGitCommit": _git_paths_match(
+                ROOT,
+                rust_source_commit,
+                [
+                    "rust/temporal-qd/Cargo.toml",
+                    "rust/temporal-qd/Cargo.lock",
+                    "rust/temporal-qd/crates/qd-kernel/src/v5.rs",
+                    "rust/temporal-qd/crates/qd-kernel/src/v5_operators.rs",
+                    "rust/temporal-qd/crates/qd-kernel/src/bin/temporal-qd-native-authority-jsonl.rs",
+                    "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs",
+                ],
+            ),
             "cargoLockSha256": _sha_file(ROOT / "rust/temporal-qd/Cargo.lock"),
             "kernelV5Sha256": _sha_file(ROOT / "rust/temporal-qd/crates/qd-kernel/src/v5.rs"),
             "jsonlSeamSha256": _sha_file(ROOT / "rust/temporal-qd/crates/qd-kernel/src/bin/temporal-qd-native-authority-jsonl.rs"),
@@ -487,8 +507,9 @@ def run(output_dir: Path) -> dict[str, Path]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=OUTPUT)
+    parser.add_argument("--rust-source-commit")
     args = parser.parse_args()
-    for name, path in run(args.output_dir).items():
+    for name, path in run(args.output_dir, rust_source_commit=args.rust_source_commit).items():
         print(f"{name}={path}")
 
 
