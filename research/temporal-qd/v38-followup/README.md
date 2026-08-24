@@ -101,3 +101,12 @@ v1-v4 files above are frozen. v5 repairs pair-level receipts, native-validation 
 Regenerate v5 with:
 
 `python -m autoresearch.temporal_qd_v38_followup_audit_v5 --output-dir research/temporal-qd/v38-followup`
+
+## v6
+
+v1-v5 files above are frozen. v6 is the last no-market contract pass: receiptId=slotId, fail-closed canonical pair compile, useful-innovation worst-window rule, frozen v38 policy pins, and experiment-specific confirmation authorities. No market compute was launched.
+
+Regenerate v6 with:
+
+`python -m autoresearch.temporal_qd_v38_followup_audit_v6 --output-dir research/temporal-qd/v38-followup`
+
