@@ -80,3 +80,24 @@ v1, v2, and v3 files above are frozen. v4 adds the gross-versus-cost event parti
 Regenerate v4 with:
 
 `python -m autoresearch.temporal_qd_v38_followup_audit_v4 --output-dir research/temporal-qd/v38-followup`
+
+## v5
+
+v1-v4 files above are frozen. v5 repairs pair-level receipts, native-validation labeling, receipt chaining, useful-innovation vs interaction, 4-window task math, five pair clones, frozen balanced plan IDs, exact archive gates, and a prepared confirmation-panel authority. No market compute was launched.
+
+| File | Task |
+| --- | --- |
+| `v38-directional-event-insert-forensic-v5.json` / `.md` | A |
+| `v38-multipanel-suboperation-v5.json` / `.md` | A |
+| `v38-cumulative-event-child-archive-forensic-v5.json` / `.md` | A/B |
+| `resource-suboperation-candidate-inventory-v2.json` / `.md` | F |
+| `resource-suboperation-balanced-design-proposal-v3.json` / `.md` | G |
+| `topology-coadaptation-matrix-spec-v5.json` / `.md` | B-E |
+| `topology-coadaptation-materialization-receipts-v5.json` | B/C |
+| `future-untouched-confirmation-panel-authority-v5.json` / `.md` | H |
+| `decision-memo-v5.md` | memo |
+| `README-v5.md` | index |
+
+Regenerate v5 with:
+
+`python -m autoresearch.temporal_qd_v38_followup_audit_v5 --output-dir research/temporal-qd/v38-followup`
