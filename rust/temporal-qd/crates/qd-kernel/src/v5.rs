@@ -3366,6 +3366,19 @@ pub struct V5NativeValidation {
     pub validation_report_sha256: String,
 }
 
+/// Return the exact language-neutral identity material hashed by native
+/// validation. Differential tooling uses this instead of attempting to
+/// reverse hashes or reimplementing normalization outside the kernel.
+pub fn native_profile_identity_material(profile: &Value) -> Result<Value> {
+    Ok(object([
+        (
+            "profileSnapshot",
+            normalized_profile_snapshot_payload(profile)?,
+        ),
+        ("program", normalized_program_payload(profile)?),
+    ]))
+}
+
 fn collect_native_capabilities(
     guard: &Value,
     required_capabilities: &mut BTreeSet<String>,
@@ -8768,6 +8781,661 @@ pub fn verify_v5_evolved_parent_reference(
     parent: &ParentReference,
 ) -> Result<()> {
     load_v5_evolved_parent(authority, parent).map(|_| ())
+}
+
+/// Reconstruct one retained compact parent into the exact native candidate
+/// material authored by this kernel. This is the versioned, read-only bridge
+/// for differential audits and new-protocol campaign freeze: callers receive
+/// compiler-owned profiles and identities, never a mutable shadow model.
+///
+/// The input is the retained `parent-material.jsonl` row. Historical record
+/// identities remain evidence and are verified byte-for-byte; the returned
+/// envelope is separately labeled and self-hashed as native authority v1.
+pub fn reconstruct_v5_native_candidate_envelope(
+    authority: &V5SharedConstructionAuthority,
+    parent_material_row: &Value,
+) -> Result<Value> {
+    let candidate_id = exact_text_value(
+        required(
+            parent_material_row,
+            "candidateId",
+            "v5 retained parent-material row",
+        )?,
+        "v5 retained parent candidate ID",
+    )?;
+    let pair_identity_sha256 = exact_sha256_value(
+        required(
+            parent_material_row,
+            "pairIdentitySha256",
+            "v5 retained parent-material row",
+        )?,
+        "v5 retained parent pair identity SHA-256",
+    )?;
+    let pair_payload = clone_value(required(
+        parent_material_row,
+        "pairPayload",
+        "v5 retained parent-material row",
+    )?)?;
+    let parent = ParentReference {
+        pair_identity_sha256: pair_identity_sha256.clone(),
+        candidate_id: candidate_id.clone(),
+        pair_payload,
+        selection_audit: None,
+    };
+    let material = load_v5_evolved_parent(authority, &parent)?;
+    let pair = material.sealed_pair.as_ref();
+    let record = &material.accepted_record;
+    if record.candidate_id != candidate_id || record.pair_identity_sha256 != pair_identity_sha256 {
+        return Err(invalid(
+            "v5 retained parent-material row disagrees with reconstructed compact record",
+        ));
+    }
+    let mut envelope = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_candidate_envelope_v1".to_owned()),
+        ),
+        (
+            "authorityVersion",
+            Value::String("temporal_qd_native_compiler_authority_v1".to_owned()),
+        ),
+        (
+            "historicalCompatibility",
+            object([
+                (
+                    "classification",
+                    Value::String("historical_v38_read_only".to_owned()),
+                ),
+                ("candidateId", Value::String(candidate_id)),
+                (
+                    "pairIdentitySha256",
+                    Value::String(pair_identity_sha256),
+                ),
+                ("acceptedRecord", record.to_value()?),
+                ("proposalDelta", clone_value(&material.proposal_delta)?),
+            ]),
+        ),
+        (
+            "sourceAuthority",
+            object([
+                (
+                    "sharedAuthoritySha256",
+                    Value::String(authority.shared_authority_sha256.clone()),
+                ),
+                (
+                    "pairCompilerAuthoritySha256",
+                    Value::String(authority.pair_compiler.sha256.clone()),
+                ),
+                (
+                    "pairPolicySha256",
+                    Value::String(authority.pair_policy_sha256.clone()),
+                ),
+                (
+                    "qdEngineVersion",
+                    Value::String(authority.qd_engine_version.clone()),
+                ),
+            ]),
+        ),
+        ("candidate", pair.canonical_payload(authority)?),
+        (
+            "candidateIdentitySha256",
+            Value::String(pair.candidate_identity_sha256.clone()),
+        ),
+        (
+            "executableSemanticSha256",
+            Value::String(pair.executable_semantic_sha256.clone()),
+        ),
+    ]);
+    let payload_sha256 = canonical_sha256(&envelope)?;
+    envelope
+        .as_object_mut()
+        .expect("native envelope is an object")
+        .insert("payloadSha256".to_owned(), Value::String(payload_sha256));
+    Ok(envelope)
+}
+
+fn validate_native_authority_v1_binding(
+    authority: &V5SharedConstructionAuthority,
+    binding: &Value,
+) -> Result<String> {
+    let fields = object_ref(binding, "native compiler authority v1")?;
+    if fields.get("schemaVersion").and_then(Value::as_str)
+        != Some("temporal_qd_native_compiler_authority_v1")
+        || fields.get("authorityVersion").and_then(Value::as_str) != Some("1")
+        || fields
+            .get("canonicalJsonContract")
+            .and_then(Value::as_str)
+            != Some("temporal_qd_contract::canonical_json_line")
+        || fields.get("validationSchemaVersion").and_then(Value::as_str)
+            != Some("temporal_search_candidate_validation_v1")
+    {
+        return Err(invalid("native compiler authority v1 contract drifted"));
+    }
+    for key in [
+        "rustSourceTreeSha256",
+        "cargoLockSha256",
+        "cargoWorkspaceSha256",
+        "authoritySha256",
+    ] {
+        let _ = sha256_text(
+            required(binding, key, "native compiler authority v1")?,
+            &format!("native compiler authority v1 {key}"),
+        )?;
+    }
+    let commit = text(
+        required(
+            binding,
+            "rustSourceCommit",
+            "native compiler authority v1",
+        )?,
+        "native compiler authority v1 source commit",
+    )?;
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid(
+            "native compiler authority v1 source commit is not lowercase Git SHA-1",
+        ));
+    }
+    for (key, expected) in [
+        ("historicalSharedAuthoritySha256", &authority.shared_authority_sha256),
+        ("pairRunConfigSha256", &authority.pair_run_config_sha256),
+        ("compilerPolicySha256", &authority.compiler_policy_sha256),
+        (
+            "nativeOperatorAuthoritySha256",
+            &authority.native_operator_authority_sha256,
+        ),
+        ("pairPolicySha256", &authority.pair_policy_sha256),
+    ] {
+        if fields.get(key).and_then(Value::as_str) != Some(expected.as_str()) {
+            return Err(invalid(format!(
+                "native compiler authority v1 {key} drifted"
+            )));
+        }
+    }
+    let stored = fields
+        .get("authoritySha256")
+        .and_then(Value::as_str)
+        .expect("checked authority SHA")
+        .to_owned();
+    let mut unsigned = fields.clone();
+    unsigned.remove("authoritySha256");
+    if canonical_sha256(&Value::Object(unsigned))? != stored {
+        return Err(invalid(
+            "native compiler authority v1 self identity drifted",
+        ));
+    }
+    Ok(stored)
+}
+
+fn native_v1_candidate_id(authority_sha: &str, block_id: &str, arm: &str) -> Result<String> {
+    let identity = canonical_sha256(&object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_candidate_key_v1".to_owned()),
+        ),
+        ("authoritySha256", Value::String(authority_sha.to_owned())),
+        ("blockId", Value::String(block_id.to_owned())),
+        ("arm", Value::String(arm.to_owned())),
+    ]))?;
+    Ok(format!("qd_native_v1_{}", &identity[7..35]))
+}
+
+fn native_v1_module_payload(
+    authority_sha: &str,
+    direction: &str,
+    program: &Value,
+    compiled: &V5CompiledEvolvableProfile,
+    lineage: &[Value],
+) -> Result<(Value, String)> {
+    let identity_material = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_module_identity_v1".to_owned()),
+        ),
+        ("authoritySha256", Value::String(authority_sha.to_owned())),
+        ("direction", Value::String(direction.to_owned())),
+        (
+            "genomeProgramSha256",
+            Value::String(compiled.genome_program_sha256.clone()),
+        ),
+        (
+            "rawProfileSha256",
+            Value::String(compiled.raw_profile_sha256.clone()),
+        ),
+        (
+            "profileSnapshotSha256",
+            Value::String(compiled.profile_snapshot_sha256.clone()),
+        ),
+        (
+            "programSha256",
+            Value::String(compiled.native_program_sha256.clone()),
+        ),
+        (
+            "validationReportSha256",
+            Value::String(compiled.native_validation_report_sha256.clone()),
+        ),
+        ("lineage", array(lineage.iter().cloned())),
+    ]);
+    let identity_sha256 = canonical_sha256(&identity_material)?;
+    Ok((
+        object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_native_module_envelope_v1".to_owned()),
+            ),
+            ("direction", Value::String(direction.to_owned())),
+            ("program", clone_value(program)?),
+            ("profile", clone_value(&compiled.profile)?),
+            (
+                "validationReport",
+                clone_value(&compiled.native_validation_report)?,
+            ),
+            ("identityMaterial", identity_material),
+            (
+                "moduleIdentitySha256",
+                Value::String(identity_sha256.clone()),
+            ),
+        ]),
+        identity_sha256,
+    ))
+}
+
+fn author_native_v1_candidate(
+    authority: &V5SharedConstructionAuthority,
+    native_authority: &Value,
+    authority_sha: &str,
+    parent_candidate_id: &str,
+    block_id: &str,
+    arm: &str,
+    long_program: &Value,
+    short_program: &Value,
+    long_lineage: &[Value],
+    short_lineage: &[Value],
+    candidate_lineage: &[Value],
+) -> Result<Value> {
+    let projection = authority.operator_authority_projection()?;
+    let candidate_id = native_v1_candidate_id(authority_sha, block_id, arm)?;
+    let long_candidate_id = format!("q_native_module_{}_long", &candidate_id[13..]);
+    let short_candidate_id = format!("q_native_module_{}_short", &candidate_id[13..]);
+    let long_compiled = compile_v5_module_profile(
+        long_program,
+        &projection,
+        "long",
+        &long_candidate_id,
+    )?;
+    let short_compiled = compile_v5_module_profile(
+        short_program,
+        &projection,
+        "short",
+        &short_candidate_id,
+    )?;
+    let (long_payload, long_identity) = native_v1_module_payload(
+        authority_sha,
+        "long",
+        long_program,
+        &long_compiled,
+        long_lineage,
+    )?;
+    let (short_payload, short_identity) = native_v1_module_payload(
+        authority_sha,
+        "short",
+        short_program,
+        &short_compiled,
+        short_lineage,
+    )?;
+    let pair_profile = compile_bidirectional_profile(
+        &long_compiled.profile,
+        &short_compiled.profile,
+        &candidate_id,
+        &ModuleSourceIdentities {
+            profile_snapshot_sha256: long_compiled.profile_snapshot_sha256.clone(),
+            program_sha256: long_compiled.native_program_sha256.clone(),
+        },
+        &ModuleSourceIdentities {
+            profile_snapshot_sha256: short_compiled.profile_snapshot_sha256.clone(),
+            program_sha256: short_compiled.native_program_sha256.clone(),
+        },
+    )?;
+    let pair_validation = validate_native_profile(&pair_profile, &candidate_id)?;
+    let pair_identity_material = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_pair_identity_v1".to_owned()),
+        ),
+        ("authoritySha256", Value::String(authority_sha.to_owned())),
+        ("longModuleIdentitySha256", Value::String(long_identity)),
+        ("shortModuleIdentitySha256", Value::String(short_identity)),
+        (
+            "rawProfileSha256",
+            Value::String(pair_validation.raw_profile_sha256.clone()),
+        ),
+        (
+            "profileSnapshotSha256",
+            Value::String(pair_validation.profile_snapshot_sha256.clone()),
+        ),
+        (
+            "programSha256",
+            Value::String(pair_validation.program_sha256.clone()),
+        ),
+        (
+            "validationReportSha256",
+            Value::String(pair_validation.validation_report_sha256.clone()),
+        ),
+        ("lineage", array(candidate_lineage.iter().cloned())),
+    ]);
+    let pair_identity_sha256 = canonical_sha256(&pair_identity_material)?;
+    let candidate_identity_material = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_candidate_identity_v1".to_owned()),
+        ),
+        ("authoritySha256", Value::String(authority_sha.to_owned())),
+        ("candidateId", Value::String(candidate_id.clone())),
+        (
+            "parentCandidateId",
+            Value::String(parent_candidate_id.to_owned()),
+        ),
+        ("blockId", Value::String(block_id.to_owned())),
+        ("arm", Value::String(arm.to_owned())),
+        (
+            "pairIdentitySha256",
+            Value::String(pair_identity_sha256.clone()),
+        ),
+    ]);
+    let candidate_identity_sha256 = canonical_sha256(&candidate_identity_material)?;
+    let mut envelope = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_candidate_envelope_v1".to_owned()),
+        ),
+        ("authority", clone_value(native_authority)?),
+        ("candidateId", Value::String(candidate_id)),
+        (
+            "candidateIdentitySha256",
+            Value::String(candidate_identity_sha256),
+        ),
+        (
+            "parentCandidateId",
+            Value::String(parent_candidate_id.to_owned()),
+        ),
+        ("blockId", Value::String(block_id.to_owned())),
+        ("arm", Value::String(arm.to_owned())),
+        ("longModule", long_payload),
+        ("shortModule", short_payload),
+        (
+            "compiledPair",
+            object([
+                ("profile", pair_profile),
+                ("validationReport", pair_validation.report),
+                ("identityMaterial", pair_identity_material),
+                (
+                    "pairIdentitySha256",
+                    Value::String(pair_identity_sha256),
+                ),
+            ]),
+        ),
+        ("lineage", array(candidate_lineage.iter().cloned())),
+    ]);
+    let payload_sha256 = canonical_sha256(&envelope)?;
+    envelope
+        .as_object_mut()
+        .expect("native candidate envelope is object")
+        .insert("payloadSha256".to_owned(), Value::String(payload_sha256));
+    Ok(envelope)
+}
+
+fn matching_native_plan(
+    program: &Value,
+    operator_authority: &crate::v5_operators::V5OperatorAuthority,
+    predicate: impl Fn(&Value) -> bool,
+    label: &str,
+) -> Result<Value> {
+    let matches = crate::v5_operators::enumerate_operator_plans(program, operator_authority)
+        .map_err(|error| invalid(format!("native topology study enumeration failed: {error}")))?
+        .into_iter()
+        .filter(predicate)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(invalid(format!(
+            "native topology study {label} matched {} plans",
+            matches.len()
+        )));
+    }
+    Ok(matches.into_iter().next().expect("one plan"))
+}
+
+/// Materialize one complete P/T/E/TE block entirely inside the native
+/// authority. The retained V38 row is a read-only source genome witness; all
+/// four new candidates, including P, receive fresh authority-v1 identities.
+pub fn author_v5_native_topology_study_block(
+    authority: &V5SharedConstructionAuthority,
+    parent_material_row: &Value,
+    block: &Value,
+    topology_record: &Value,
+    event_primitive: &Value,
+    native_authority: &Value,
+) -> Result<Value> {
+    let authority_sha = validate_native_authority_v1_binding(authority, native_authority)?;
+    let historical = reconstruct_v5_native_candidate_envelope(authority, parent_material_row)?;
+    let parent_candidate_id = text(
+        required(block, "parentCandidateId", "native topology study block")?,
+        "native topology study parent candidate ID",
+    )?;
+    if historical
+        .get("historicalCompatibility")
+        .and_then(|value| value.get("candidateId"))
+        .and_then(Value::as_str)
+        != Some(parent_candidate_id.as_str())
+    {
+        return Err(invalid(
+            "native topology study block parent does not match retained material",
+        ));
+    }
+    let block_id = text(
+        required(block, "blockId", "native topology study block")?,
+        "native topology study block ID",
+    )?;
+    let side = exact_side(&text(
+        required(block, "side", "native topology study block")?,
+        "native topology study side",
+    )?)?;
+    let material_parent = ParentReference {
+        pair_identity_sha256: text(
+            required(
+                parent_material_row,
+                "pairIdentitySha256",
+                "native topology retained row",
+            )?,
+            "native topology retained pair identity",
+        )?,
+        candidate_id: parent_candidate_id.clone(),
+        pair_payload: clone_value(required(
+            parent_material_row,
+            "pairPayload",
+            "native topology retained row",
+        )?)?,
+        selection_audit: None,
+    };
+    let material = load_v5_evolved_parent(authority, &material_parent)?;
+    let base_long = clone_value(&material.long_program)?;
+    let base_short = clone_value(&material.short_program)?;
+    let base_side = if side == "long" { &base_long } else { &base_short };
+    let projection = authority.operator_authority_projection()?;
+    let operator_authority = projection.operator_authority(side)?;
+    let topology_plan = required(
+        topology_record,
+        "topologyPlan",
+        "native topology study topology record",
+    )?;
+    let topology_native_plan = matching_native_plan(
+        base_side,
+        &operator_authority,
+        |plan| plan.get("construction") == Some(topology_plan),
+        "insert_setup",
+    )?;
+    let topology_application = crate::v5_operators::apply_operator_plan(
+        base_side,
+        &operator_authority,
+        &topology_native_plan,
+    )
+    .map_err(|error| invalid(format!("native topology application failed: {error}")))?;
+    let added_setup = text(
+        required(
+            topology_record,
+            "addedSetupNodeId",
+            "native topology study topology record",
+        )?,
+        "native topology study added setup node",
+    )?;
+    let event_indicator = text(
+        required(
+            event_primitive,
+            "indicatorId",
+            "native topology study event primitive",
+        )?,
+        "native topology study event indicator",
+    )?;
+    let event_contract = required(
+        event_primitive,
+        "contract",
+        "native topology study event primitive",
+    )?;
+    let original_node = text(
+        required(
+            event_primitive,
+            "originalNodeId",
+            "native topology study event primitive",
+        )?,
+        "native topology study original event node",
+    )?;
+    let event_predicate = |node_id: &str, plan: &Value| {
+        let construction = plan.get("construction")?;
+        (construction.get("kind").and_then(Value::as_str) == Some("directional_event_insert")
+            && construction.get("nodeId").and_then(Value::as_str) == Some(node_id)
+            && construction.get("indicatorId").and_then(Value::as_str)
+                == Some(event_indicator.as_str())
+            && construction.get("contract") == Some(event_contract))
+        .then_some(())
+    };
+    let event_plan = matching_native_plan(
+        base_side,
+        &operator_authority,
+        |plan| event_predicate(&original_node, plan).is_some(),
+        "event-only directional_event_insert",
+    )?;
+    let event_application = crate::v5_operators::apply_operator_plan(
+        base_side,
+        &operator_authority,
+        &event_plan,
+    )
+    .map_err(|error| invalid(format!("native event application failed: {error}")))?;
+    let combined_plan = matching_native_plan(
+        &topology_application.child_program,
+        &operator_authority,
+        |plan| event_predicate(&added_setup, plan).is_some(),
+        "topology-local directional_event_insert",
+    )?;
+    let combined_application = crate::v5_operators::apply_operator_plan(
+        &topology_application.child_program,
+        &operator_authority,
+        &combined_plan,
+    )
+    .map_err(|error| invalid(format!("native combined application failed: {error}")))?;
+    let arm_programs = [
+        ("P", base_side, Value::Null),
+        (
+            "T",
+            &topology_application.child_program,
+            clone_value(&topology_application.audit)?,
+        ),
+        (
+            "E",
+            &event_application.child_program,
+            clone_value(&event_application.audit)?,
+        ),
+        (
+            "TE",
+            &combined_application.child_program,
+            clone_value(&combined_application.audit)?,
+        ),
+    ];
+    let mut candidates = Vec::new();
+    for (arm, changed_program, application_audit) in arm_programs {
+        let candidate_lineage = vec![object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_native_topology_lineage_v1".to_owned()),
+            ),
+            ("blockId", Value::String(block_id.clone())),
+            ("arm", Value::String(arm.to_owned())),
+            ("side", Value::String(side.to_owned())),
+            (
+                "historicalParentCandidateId",
+                Value::String(parent_candidate_id.clone()),
+            ),
+            ("operatorApplicationAudit", application_audit),
+        ])];
+        let (long_program, short_program) = if side == "long" {
+            (changed_program, &base_short)
+        } else {
+            (&base_long, changed_program)
+        };
+        let changed_lineage = if arm == "P" {
+            &[][..]
+        } else {
+            candidate_lineage.as_slice()
+        };
+        let (long_lineage, short_lineage) = if side == "long" {
+            (changed_lineage, &[][..])
+        } else {
+            (&[][..], changed_lineage)
+        };
+        candidates.push(author_native_v1_candidate(
+            authority,
+            native_authority,
+            &authority_sha,
+            &parent_candidate_id,
+            &block_id,
+            arm,
+            long_program,
+            short_program,
+            long_lineage,
+            short_lineage,
+            &candidate_lineage,
+        )?);
+    }
+    let mut output = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_native_topology_block_v1".to_owned()),
+        ),
+        ("blockId", Value::String(block_id)),
+        ("parentCandidateId", Value::String(parent_candidate_id)),
+        ("side", Value::String(side.to_owned())),
+        ("addedSetupNodeId", Value::String(added_setup)),
+        ("eventIndicatorId", Value::String(event_indicator)),
+        ("candidates", array(candidates)),
+        (
+            "operatorEvidence",
+            object([
+                ("topologyPlan", topology_native_plan),
+                ("topologyApplication", topology_application.audit),
+                ("eventPlan", event_plan),
+                ("eventApplication", event_application.audit),
+                ("combinedEventPlan", combined_plan),
+                ("combinedEventApplication", combined_application.audit),
+            ]),
+        ),
+    ]);
+    let block_sha = canonical_sha256(&output)?;
+    output
+        .as_object_mut()
+        .expect("native topology block is object")
+        .insert("blockSha256".to_owned(), Value::String(block_sha));
+    Ok(output)
 }
 
 /// Compiler-owned, ephemeral pair state used only between structural steps.

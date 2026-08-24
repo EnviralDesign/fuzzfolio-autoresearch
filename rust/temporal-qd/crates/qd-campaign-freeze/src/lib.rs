@@ -719,6 +719,10 @@ fn build_task(
             .ok_or_else(|| anyhow!("candidate profile missing"))?,
         "candidate profile",
     )?;
+    ensure!(
+        canonical_sha256(&Value::Object(profile.clone()))? == source_sha,
+        "candidate source profile changed before task freeze"
+    );
     let execution = object(
         profile
             .get("executionConfig")
@@ -749,6 +753,66 @@ fn build_task(
         "inline_profile_snapshot".to_owned(),
         Value::Object(profile.clone()),
     );
+    if let Some(contract) = candidate.get("precompiledProfileExecutionContract") {
+        let contract_map = object(contract, "precompiled profile execution contract")?;
+        ensure!(
+            contract_map.get("schemaVersion").and_then(Value::as_str)
+                == Some("temporal_qd_precompiled_profile_execution_v1"),
+            "precompiled profile execution contract schema drifted"
+        );
+        ensure!(
+            string(contract_map, "candidateId")? == candidate_id
+                && string(contract_map, "rawProfileSha256")? == source_sha,
+            "precompiled profile execution contract does not bind candidate/profile"
+        );
+        ensure!(
+            candidate
+                .get("nativeAuthoritySha256")
+                .and_then(Value::as_str)
+                == Some(string(contract_map, "authoritySha256")?),
+            "precompiled profile execution contract does not bind native compiler authority"
+        );
+        for (contract_key, candidate_key) in [
+            ("candidatePayloadSha256", "candidatePayloadSha256"),
+            ("profileSnapshotSha256", "profileSnapshotSha256"),
+            ("programSha256", "programSha256"),
+        ] {
+            ensure!(
+                candidate.get(candidate_key).and_then(Value::as_str)
+                    == Some(string(contract_map, contract_key)?),
+                "precompiled profile execution contract does not bind candidate {candidate_key}"
+            );
+        }
+        for key in [
+            "authoritySha256",
+            "candidatePayloadSha256",
+            "profileSnapshotSha256",
+            "programSha256",
+            "contractSha256",
+        ] {
+            require_sha(string(contract_map, key)?, key)?;
+        }
+        ensure!(
+            canonical_sha256_without_object_field(contract, "contractSha256")?
+                == string(contract_map, "contractSha256")?,
+            "precompiled profile execution contract identity drifted"
+        );
+        ensure!(
+            contract_map
+                .get("compilerDisposition")
+                .and_then(Value::as_str)
+                == Some("precompiled_rust_profile_no_recompile"),
+            "precompiled profile execution contract permits compiler reinterpretation"
+        );
+        job.insert(
+            "precompiled_profile_execution_contract".to_owned(),
+            contract.clone(),
+        );
+        job.insert(
+            "raw_source_profile_sha256".to_owned(),
+            Value::String(source_sha.to_owned()),
+        );
+    }
     job.insert(
         "instruments".to_owned(),
         Value::Array(vec![
@@ -5341,6 +5405,99 @@ mod tests {
         )?;
         assert!(!payload.contains_key("raw_source_profile_sha256"));
         assert!(!payload.contains_key("temporal_source_profile_sha256"));
+        Ok(())
+    }
+
+    #[test]
+    fn rust_precompiled_profile_is_frozen_unchanged_and_mutation_is_rejected() -> Result<()> {
+        let profile = json!({
+            "version": "v3",
+            "instruments": ["EURUSD"],
+            "executionConfig": {"managementLibrary": {"version": "temporal_management_v1"}},
+        });
+        let profile_sha = canonical_sha256(&profile)?;
+        let native_authority_sha = test_sha("native-authority");
+        let payload_sha = test_sha("candidate-payload");
+        let normalized_sha = test_sha("normalized-profile");
+        let program_sha = test_sha("program");
+        let mut contract = json!({
+            "schemaVersion": "temporal_qd_precompiled_profile_execution_v1",
+            "candidateId": "candidate_1",
+            "authoritySha256": native_authority_sha,
+            "candidatePayloadSha256": payload_sha,
+            "rawProfileSha256": profile_sha,
+            "profileSnapshotSha256": normalized_sha,
+            "programSha256": program_sha,
+            "compilerDisposition": "precompiled_rust_profile_no_recompile",
+        });
+        let contract_sha = canonical_sha256(&contract)?;
+        contract
+            .as_object_mut()
+            .unwrap()
+            .insert("contractSha256".into(), Value::String(contract_sha.clone()));
+        let authority = json!({
+            "workerContract": {
+                "workerContractSha256": test_sha("worker"),
+                "workerContractSchema": "replay-worker-contract-v2",
+            },
+            "bounds": {"deadlineSeconds": 60.0, "maxAttempts": 2},
+        });
+        let candidate = json!({
+            "candidateId": "candidate_1",
+            "candidatePayloadSha256": payload_sha,
+            "nativeAuthoritySha256": native_authority_sha,
+            "sourceProfileSha256": profile_sha,
+            "sourceProfile": profile,
+            "profileSnapshotSha256": normalized_sha,
+            "programSha256": program_sha,
+            "precompiledProfileExecutionContract": contract,
+            "instrument": "EURUSD",
+            "timeframe": "M5",
+            "barLimit": 5000,
+            "windowInputs": [{
+                "windowId": "window-1",
+                "evidencePlanId": test_sha("evidence-plan"),
+                "lakeWindowSemanticSha256": test_sha("window-semantic"),
+                "evidencePlan": {"schema_version": "fuzzfolio.replay-evidence-plan.v2"},
+            }],
+        });
+        let window = json!({
+            "windowId": "window-1",
+            "analysisWindowStart": "2024-01-01T00:00:00Z",
+            "analysisWindowEnd": "2024-04-01T00:00:00Z",
+        });
+        let task = build_task(
+            authority.as_object().unwrap(),
+            &test_sha("campaign-authority"),
+            candidate.as_object().unwrap(),
+            window.as_object().unwrap(),
+            None,
+        )?;
+        let payload = object(task.get("payload").unwrap(), "task payload")?;
+        assert_eq!(
+            payload["inline_profile_snapshot"],
+            candidate["sourceProfile"]
+        );
+        assert_eq!(
+            payload["raw_source_profile_sha256"],
+            candidate["sourceProfileSha256"]
+        );
+        assert_eq!(
+            payload["precompiled_profile_execution_contract"]["contractSha256"],
+            contract_sha
+        );
+
+        let mut changed = candidate.clone();
+        changed["sourceProfile"]["name"] = Value::String("mutated by worker adapter".into());
+        let error = build_task(
+            authority.as_object().unwrap(),
+            &test_sha("campaign-authority"),
+            changed.as_object().unwrap(),
+            window.as_object().unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("source profile changed"));
         Ok(())
     }
 
