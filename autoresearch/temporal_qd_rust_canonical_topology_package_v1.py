@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,7 +26,10 @@ from .temporal_qd_rust_dashboard_differential_v1 import JsonlProcess
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST_ROOT = ROOT / "rust/temporal-qd"
+# Preserve the published V1 import for historical audit callers. New package
+# generation is explicitly directed to the V2 output and never rewrites V1.
 OUTPUT = ROOT / "research/temporal-qd/rust-canonical-authority-v1"
+OUTPUT_V2 = ROOT / "research/temporal-qd/rust-canonical-authority-v2"
 V38 = ROOT / "runs/temporal-qd-v5-fast-ephemeral-operator-family-matrix-20260820-v38"
 PARENT_MATERIAL = V38 / "run/g2-parents-800/generations/generation-0003/proposal/parent-material.jsonl"
 FROZEN_AUTHORITY = V38 / (
@@ -50,7 +54,12 @@ SOURCE_PATHS = (
     "rust/temporal-qd/crates/qd-kernel/src/v5.rs",
     "rust/temporal-qd/crates/qd-kernel/src/v5_operators.rs",
     "rust/temporal-qd/crates/qd-kernel/src/bin/temporal-qd-native-authority-jsonl.rs",
+    "rust/temporal-qd/crates/qd-campaign-freeze/Cargo.toml",
     "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs",
+    "rust/temporal-qd/crates/qd-campaign-freeze/src/bin/temporal-qd-precompiled-receipt-jsonl.rs",
+    "autoresearch/temporal_search.py",
+    "autoresearch/temporal_qd_rust_canonical_topology_package_v1.py",
+    "autoresearch/temporal_qd_worker_seam_conformance_v2.py",
 )
 
 
@@ -66,6 +75,56 @@ def _seal(value: Mapping[str, Any], field: str) -> dict[str, Any]:
     result = dict(value)
     result[field] = canonical_sha256(result)
     return result
+
+
+def _load_worker_contract(path: Path) -> dict[str, Any]:
+    contract = _json(path)
+    if contract.get("schema_version") != "replay-worker-contract-v2":
+        raise RuntimeError("Rust-precompiled launch requires replay-worker-contract-v2")
+    identity = dict(contract)
+    supplied = identity.pop("contract_hash", None)
+    identity.pop("git_sha", None)
+    identity.pop("git_dirty", None)
+    if supplied != canonical_sha256(identity):
+        raise RuntimeError("worker contract admission hash does not match its fields")
+    capabilities = set(contract.get("capabilities") or [])
+    required_capability = "temporal_qd_precompiled_profile_execution_v1"
+    if required_capability not in capabilities:
+        raise RuntimeError("worker contract lacks the Rust-precompiled capability")
+    git_sha = str(contract.get("git_sha") or "")
+    if len(git_sha) != 40 or any(char not in "0123456789abcdef" for char in git_sha):
+        raise RuntimeError("worker contract lacks an exact lowercase source Git commit")
+    if contract.get("git_dirty") is not False:
+        raise RuntimeError("worker contract source tree must be clean")
+    image_digest = str(contract.get("image_digest") or "")
+    rust_core_hash = str(contract.get("rust_core_hash") or "")
+    if (
+        contract.get("image_identity_mode") != "image_digest"
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", rust_core_hash)
+        or not isinstance(contract.get("rust_build_info"), Mapping)
+        or not contract["rust_build_info"]
+        or not isinstance(contract.get("runtime_platform"), Mapping)
+        or not contract["runtime_platform"]
+    ):
+        raise RuntimeError("worker contract lacks immutable image/Rust/runtime identity")
+    return {
+        "workerContractSchema": contract["schema_version"],
+        "workerContractSha256": supplied,
+        "imageDigest": image_digest,
+        "imageIdentityMode": contract["image_identity_mode"],
+        "sourceGitCommit": git_sha,
+        "rustCoreHash": rust_core_hash,
+        "rustBuildInfo": contract["rust_build_info"],
+        "rustBuildInfoSha256": canonical_sha256(contract["rust_build_info"]),
+        "runtimePlatform": contract["runtime_platform"],
+        "runtimePlatformSha256": canonical_sha256(contract["runtime_platform"]),
+        "capabilities": sorted(capabilities),
+        "workerContractArtifact": {
+            "path": str(path.resolve()),
+            "rawSha256": _sha_file(path),
+        },
+    }
 
 
 def _write(path: Path, value: Mapping[str, Any]) -> None:
@@ -227,10 +286,25 @@ def _candidate_contract(candidate: Mapping[str, Any], authority_sha: str) -> dic
         "rawProfileSha256": identity["rawProfileSha256"],
         "profileSnapshotSha256": identity["profileSnapshotSha256"],
         "programSha256": identity["programSha256"],
+        "expectedResolvedProfileSnapshotSha256": identity[
+            "profileSnapshotSha256"
+        ],
+        "expectedResolvedProgramSha256": identity["programSha256"],
         "validationReportSha256": identity["validationReportSha256"],
         "compilerDisposition": "precompiled_rust_profile_no_recompile",
-        "workerPermissions": ["parse", "schema_check", "execute_supplied_v3_profile", "verify_hashes"],
-        "workerProhibitions": ["compile_long_short_pair", "rewrite_defaults_or_transitions", "assign_competing_identity"],
+        "workerPermissions": [
+            "parse",
+            "schema_check",
+            "verify_hashes",
+            "hydrate_predeclared_catalog_inputs",
+            "execute_supplied_v3_profile",
+        ],
+        "workerProhibitions": [
+            "compile_long_short_pair",
+            "rewrite_defaults_or_transitions",
+            "assign_competing_identity",
+            "remove_precompiled_contract",
+        ],
     }
     return _seal(contract, "contractSha256")
 
@@ -295,13 +369,16 @@ def _panel_inputs(profile: Mapping[str, Any], panel: Mapping[str, Any], panel_id
 
 
 def _campaign_authority(
-    candidates: list[dict[str, Any]], native_authority: Mapping[str, Any]
+    candidates: list[dict[str, Any]],
+    native_authority: Mapping[str, Any],
+    worker_contract: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     panels = [_json(ROTATING / f"panel-{index}-template-preparation.json") for index in (1, 2, 3)]
     workers = {canonical_json(panel["workerContract"]) for panel in panels}
     if len(workers) != 1:
         raise RuntimeError("inspected panel worker contracts disagree")
-    worker = copy.deepcopy(panels[0]["workerContract"])
+    historical_panel_worker = copy.deepcopy(panels[0]["workerContract"])
+    worker = copy.deepcopy(worker_contract)
     windows: list[dict[str, Any]] = []
     for index, panel in enumerate(panels, 1):
         for window in panel["developmentWindows"]:
@@ -349,9 +426,11 @@ def _campaign_authority(
             "nativeCompilerAuthoritySha256": native_authority["authoritySha256"],
             "workerContract": worker,
             "workerContractCompatibilityObservation": {
-                "panelTemplateSha256": worker["workerContractSha256"],
+                "panelTemplateSha256": historical_panel_worker[
+                    "workerContractSha256"
+                ],
                 "historicalV38DiscoveryExpectedSha256": "sha256:40292e2a62171f1d13fda9c5e9ba953d3e04d4270845889caabb5aa80648f4c4",
-                "disposition": "bind_actual_predeclared_panel_template_contract",
+                "disposition": "historical_observation_only_bind_new_digest_attested_precompiled_worker",
             },
             "costViews": cost_views,
             "costViewsSha256": canonical_sha256(cost_views),
@@ -375,9 +454,11 @@ def _campaign_authority(
         "bounds": {"maxCandidates": 12, "maxDevelopmentWindows": 12, "maxTasks": 144, "maxAttempts": 8, "deadlineSeconds": 86400.0},
         "taskContract": {
             "taskKind": "temporal_graph_candidate_window",
-            "jobSchema": "temporal_graph_candidate_window_job_v1",
-            "resultSchema": "temporal_graph_candidate_window_result_v1",
+            "jobSchema": "temporal_graph_candidate_window_job_v2",
+            "resultSchema": "temporal_graph_candidate_window_result_v2",
             "profileExecutionContract": "temporal_qd_precompiled_profile_execution_v1",
+            "profileExecutionReceipt": "temporal_qd_precompiled_profile_execution_receipt_v1",
+            "requiredWorkerCapability": "temporal_qd_precompiled_profile_execution_v1",
         },
         "prohibitedEvidence": panels[0]["prohibitedEvidence"],
         "developmentWindows": windows,
@@ -429,6 +510,15 @@ def _task_index(task_manifest: Mapping[str, Any], windows: Iterable[Mapping[str,
         pairs.add(pair)
         task_ids.add(task["task_id"])
         contract = payload["precompiled_profile_execution_contract"]
+        if (
+            payload.get("schema_version")
+            != "temporal_graph_candidate_window_job_v2"
+            or "temporal_qd_precompiled_profile_execution_v1"
+            not in set(payload.get("required_capabilities") or [])
+            or "temporal_qd_precompiled_profile_execution_v1"
+            not in set(task.get("required_worker_capabilities") or [])
+        ):
+            raise RuntimeError("native freeze did not require the V2 precompiled worker path")
         if canonical_sha256(payload["inline_profile_snapshot"]) != payload["raw_source_profile_sha256"]:
             raise RuntimeError("native freeze mutated a Rust-canonical candidate profile")
         rows.append(
@@ -440,6 +530,15 @@ def _task_index(task_manifest: Mapping[str, Any], windows: Iterable[Mapping[str,
                 "taskPayloadSha256": canonical_sha256(payload),
                 "candidatePayloadSha256": contract["candidatePayloadSha256"],
                 "precompiledExecutionContractSha256": contract["contractSha256"],
+                "requiredWorkerContractSha256": payload[
+                    "required_worker_contract_hash"
+                ],
+                "requiredWorkerImageDigest": payload[
+                    "required_worker_image_digest"
+                ],
+                "requiredExecutionReceiptSchema": (
+                    "temporal_qd_precompiled_profile_execution_receipt_v1"
+                ),
                 "rawProfileSha256": payload["raw_source_profile_sha256"],
                 "profileSnapshotSha256": payload["normalized_profile_snapshot_sha256"],
                 "programSha256": payload["authored_program_sha256"],
@@ -591,7 +690,14 @@ def _science_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-def run(output_dir: Path, freeze_root: Path, *, source_commit: str, allow_uncommitted_source: bool = False) -> dict[str, Path]:
+def run(
+    output_dir: Path,
+    freeze_root: Path,
+    *,
+    source_commit: str,
+    worker_contract_path: Path,
+    allow_uncommitted_source: bool = False,
+) -> dict[str, Path]:
     required = [NATIVE_BIN, FREEZE_BIN, FROZEN_AUTHORITY, PARENT_MATERIAL, TOPOLOGY_SPEC]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -599,13 +705,18 @@ def run(output_dir: Path, freeze_root: Path, *, source_commit: str, allow_uncomm
     differential = _json(output_dir / "target-cross-compiler-transcript-v1.json")
     shared = _json(FROZEN_AUTHORITY)
     source = _source_manifest(source_commit, allow_uncommitted=allow_uncommitted_source)
+    worker_contract = _load_worker_contract(worker_contract_path)
     authority = _native_authority(shared, source)
     blocks = _author_blocks(shared, authority)
     _validate_native_blocks(blocks)
     candidates = [candidate for block in blocks for candidate in block["candidates"]]
     if len(candidates) != 12 or len({row["candidateId"] for row in candidates}) != 12 or len({row["payloadSha256"] for row in candidates}) != 12:
         raise RuntimeError("native topology candidates are not exactly 12 unique identities/payloads")
-    campaign, evaluation_authorities = _campaign_authority(candidates, authority)
+    campaign, evaluation_authorities = _campaign_authority(
+        candidates,
+        authority,
+        worker_contract,
+    )
     paths = {
         "source": output_dir / "native-source-manifest-v1.json",
         "authority": output_dir / "native-authority-v1.json",
@@ -658,22 +769,23 @@ def run(output_dir: Path, freeze_root: Path, *, source_commit: str, allow_uncomm
     )
     science = _science_contract(_json(TOPOLOGY_SPEC))
     _write(paths["science"], science)
-    go_nogo = _seal({"schemaVersion": "temporal_qd_topology_launch_go_nogo_v1", "readyForTopologyCaseStudyLaunch": True, "gates": {"exactRustCanonicalCandidateCount": 12, "rustValidationPassCount": 12, "completeBlockCount": 3, "workerConsumesFrozenProfileUnchanged": True, "campaignTaskValidationPassed": True, "inspectedTaskCount": 144, "uniqueCandidateWindowCount": 144, "differentialEvidenceComplete": True, "untouchedConfirmationPreregistered": True, "untouchedProjectedTaskCount": 48, "noTaskDispatched": True, "noMarketEvaluation": True, "noGeneration": True, "noProductionArchiveWrite": True}, "authoritySha256": authority["authoritySha256"], "campaignAuthorityId": campaign["authorityId"], "taskMatrixSha256": freeze_result["taskMatrixSha256"], "taskIndexSha256": task_index["taskIndexSha256"], "preregistrationSha256": confirmation["preregistrationSha256"], "semanticDecisionSha256": semantic["decisionSha256"], "scientificContractSha256": science["scientificContractSha256"]}, "goNogoSha256")
+    go_nogo = _seal({"schemaVersion": "temporal_qd_topology_launch_go_nogo_v2", "readyForTopologyCaseStudyLaunch": True, "gates": {"exactRustCanonicalCandidateCount": 12, "rustValidationPassCount": 12, "completeBlockCount": 3, "workerConsumesFrozenProfileUnchanged": True, "campaignTaskValidationPassed": True, "allTasksUseCandidateWindowJobV2": True, "dedicatedWorkerCapabilityRequired": True, "immutableWorkerImageDigestBound": True, "typedExecutionReceiptRequired": True, "receiptAdmissionImplemented": True, "inspectedTaskCount": 144, "uniqueCandidateWindowCount": 144, "differentialEvidenceComplete": True, "untouchedConfirmationPreregistered": True, "untouchedProjectedTaskCount": 48, "noTaskDispatched": True, "noMarketEvaluation": True, "noGeneration": True, "noProductionArchiveWrite": True}, "authoritySha256": authority["authoritySha256"], "campaignAuthorityId": campaign["authorityId"], "taskMatrixSha256": freeze_result["taskMatrixSha256"], "taskIndexSha256": task_index["taskIndexSha256"], "workerContractSha256": worker_contract["workerContractSha256"], "workerImageDigest": worker_contract["imageDigest"], "workerSourceGitCommit": worker_contract["sourceGitCommit"], "preregistrationSha256": confirmation["preregistrationSha256"], "semanticDecisionSha256": semantic["decisionSha256"], "scientificContractSha256": science["scientificContractSha256"]}, "goNogoSha256")
     _write(paths["goNogo"], go_nogo)
-    package = _seal({"schemaVersion": "temporal_qd_topology_no_dispatch_launch_package_v1", "nativeAuthoritySha256": authority["authoritySha256"], "campaignAuthorityId": campaign["authorityId"], "candidateCount": 12, "inspectedTaskCount": 144, "untouchedProjectedTaskCount": 48, "artifacts": {key: {"path": path.name, "rawSha256": _sha_file(path)} for key, path in paths.items() if key != "package"}, "externalUncommittedTaskFreeze": {"storageDisposition": "external_uncommitted_raw_task_manifest", "taskManifestRawSha256": _sha_file(freeze_root / "task-manifest.json"), "rawTaskPackCommitted": False}, "dispatchEnabled": False}, "packageSha256")
+    package = _seal({"schemaVersion": "temporal_qd_topology_no_dispatch_launch_package_v2", "nativeAuthoritySha256": authority["authoritySha256"], "campaignAuthorityId": campaign["authorityId"], "candidateCount": 12, "inspectedTaskCount": 144, "untouchedProjectedTaskCount": 48, "workerContract": worker_contract, "artifacts": {key: {"path": path.name, "rawSha256": _sha_file(path)} for key, path in paths.items() if key != "package"}, "externalUncommittedTaskFreeze": {"storageDisposition": "external_uncommitted_raw_task_manifest", "taskManifestRawSha256": _sha_file(freeze_root / "task-manifest.json"), "rawTaskPackCommitted": False}, "dispatchEnabled": False}, "packageSha256")
     _write(paths["package"], package)
     return paths
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, default=OUTPUT)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_V2)
     parser.add_argument("--freeze-root", type=Path)
     parser.add_argument("--rust-source-commit", default=str(_git("rev-parse", "HEAD")))
+    parser.add_argument("--worker-contract", type=Path, required=True)
     parser.add_argument("--allow-uncommitted-source", action="store_true")
     args = parser.parse_args()
     freeze_root = args.freeze_root or Path(tempfile.gettempdir()) / "fuzzfolio-rust-canonical-topology-inspected-v1"
-    for name, path in run(args.output_dir, freeze_root, source_commit=args.rust_source_commit, allow_uncommitted_source=args.allow_uncommitted_source).items():
+    for name, path in run(args.output_dir, freeze_root, source_commit=args.rust_source_commit, worker_contract_path=args.worker_contract, allow_uncommitted_source=args.allow_uncommitted_source).items():
         print(f"{name}={path}")
 
 

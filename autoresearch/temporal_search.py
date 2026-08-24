@@ -31,6 +31,7 @@ TEMPORAL_SEARCH_AUTHORITY_SCHEMA = "temporal_graph_candidate_window_authority_v1
 TEMPORAL_SEARCH_PREPARATION_SCHEMA = "temporal_graph_candidate_window_preparation_v1"
 TEMPORAL_SEARCH_TASK_KIND = "temporal_graph_candidate_window"
 TEMPORAL_SEARCH_JOB_SCHEMA = "temporal_graph_candidate_window_job_v1"
+TEMPORAL_SEARCH_JOB_SCHEMA_V2 = "temporal_graph_candidate_window_job_v2"
 TEMPORAL_SEARCH_CAPABILITY = "temporal_graph_candidate_window_v1"
 TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY = (
     "temporal_graph_bidirectional_replay_v1"
@@ -51,6 +52,13 @@ TEMPORAL_QD_BEHAVIOR_ATTRIBUTION_REQUIREMENT_SCHEMA = (
     "temporal_qd_behavior_attribution_requirement_v1"
 )
 TEMPORAL_SEARCH_RESULT_SCHEMA = "temporal_graph_candidate_window_result_v1"
+TEMPORAL_SEARCH_RESULT_SCHEMA_V2 = "temporal_graph_candidate_window_result_v2"
+TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY = (
+    "temporal_qd_precompiled_profile_execution_v1"
+)
+TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA = (
+    "temporal_qd_precompiled_profile_execution_receipt_v1"
+)
 TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA = "temporal_graph_candidate_window_rejected_result_v1"
 TEMPORAL_SEARCH_CHECKPOINT_SCHEMA = "temporal_graph_candidate_window_checkpoint_v1"
 TEMPORAL_SEARCH_MANIFEST_SCHEMA = "temporal_graph_candidate_window_manifest_v1"
@@ -1434,8 +1442,25 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
                         name="sourceProfile.executionConfig.exitPolicy.selectedCell",
                     )
                 }
+            precompiled_contract = candidate.get(
+                "precompiledProfileExecutionContract"
+            )
+            is_precompiled = isinstance(precompiled_contract, Mapping)
+            required_capabilities = list(_REQUIRED_WORKER_CAPABILITIES)
+            if is_precompiled:
+                required_capabilities.append(
+                    TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY
+                )
+                required_capabilities = sorted(set(required_capabilities))
+            worker_contract = _mapping(
+                frozen.get("workerContract"), name="authority workerContract"
+            )
             job = {
-                "schema_version": TEMPORAL_SEARCH_JOB_SCHEMA,
+                "schema_version": (
+                    TEMPORAL_SEARCH_JOB_SCHEMA_V2
+                    if is_precompiled
+                    else TEMPORAL_SEARCH_JOB_SCHEMA
+                ),
                 "job_id": task_id,
                 "candidate_id": candidate["candidateId"],
                 "window_id": window["windowId"],
@@ -1459,7 +1484,7 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
                 "required_worker_contract_schema": frozen["workerContract"][
                     "workerContractSchema"
                 ],
-                "required_capabilities": list(_REQUIRED_WORKER_CAPABILITIES),
+                "required_capabilities": required_capabilities,
                 "client_origin": "temporal_search_controller",
                 "campaign_id": frozen["authorityId"],
                 "lane_id": candidate["candidateId"],
@@ -1480,6 +1505,30 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
                     {"expected_resolved_program_sha256": candidate["resolvedProgramSha256"]}
                     if "resolvedProgramSha256" in candidate else {}
                 ),
+                **(
+                    {
+                        "precompiled_profile_execution_contract": dict(
+                            precompiled_contract
+                        ),
+                        "required_worker_image_digest": worker_contract[
+                            "imageDigest"
+                        ],
+                        "required_worker_source_git_commit": worker_contract[
+                            "sourceGitCommit"
+                        ],
+                        "required_worker_rust_core_hash": worker_contract[
+                            "rustCoreHash"
+                        ],
+                        "required_worker_rust_build_info_sha256": worker_contract[
+                            "rustBuildInfoSha256"
+                        ],
+                        "required_worker_runtime_platform_sha256": worker_contract[
+                            "runtimePlatformSha256"
+                        ],
+                    }
+                    if is_precompiled
+                    else {}
+                ),
                 **execution_binding,
             }
             tasks.append(
@@ -1489,7 +1538,7 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
                     "attempt_id": task_id,
                     "task_kind": TEMPORAL_SEARCH_TASK_KIND,
                     "payload": job,
-                    "required_worker_capabilities": list(_REQUIRED_WORKER_CAPABILITIES),
+                    "required_worker_capabilities": required_capabilities,
                     "deadline_seconds": frozen["bounds"]["deadlineSeconds"],
                     "max_attempts": frozen["bounds"]["maxAttempts"],
                 }
@@ -1907,6 +1956,172 @@ def _validate_candidate_behavior_attribution_artifact(
         )
 
 
+def _validate_precompiled_execution_receipt(
+    material: Mapping[str, Any],
+    *,
+    job: Mapping[str, Any],
+    required: bool,
+) -> None:
+    raw_receipt = material.get("precompiled_profile_execution_receipt")
+    if not required:
+        if raw_receipt is not None:
+            raise TemporalSearchContractError(
+                "legacy V1 result must not contain a Rust-precompiled receipt"
+            )
+        return
+    if (
+        TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY
+        not in set(job.get("required_capabilities") or [])
+    ):
+        raise TemporalSearchContractError(
+            "Rust-precompiled V2 task lacks the dedicated worker capability"
+        )
+    if job.get("required_worker_contract_schema") != "replay-worker-contract-v2":
+        raise TemporalSearchContractError(
+            "Rust-precompiled V2 task requires replay-worker-contract-v2"
+        )
+    contract = _mapping(
+        job.get("precompiled_profile_execution_contract"),
+        name="task precompiled_profile_execution_contract",
+    )
+    receipt = _mapping(
+        raw_receipt,
+        name="worker precompiled_profile_execution_receipt",
+    )
+    expected_keys = {
+        "schema_version",
+        "task_id",
+        "candidate_id",
+        "precompiled_contract_sha256",
+        "rust_authority_sha256",
+        "raw_source_profile_sha256",
+        "normalized_source_profile_sha256",
+        "authored_program_sha256",
+        "resolved_profile_sha256",
+        "resolved_program_sha256",
+        "worker_contract_hash",
+        "worker_contract_schema",
+        "worker_image_digest",
+        "worker_image_identity_mode",
+        "worker_source_git_commit",
+        "rust_core_hash",
+        "rust_build_info",
+        "runtime_platform",
+        "pair_recompile_attempted",
+        "source_profile_rewritten",
+        "receipt_sha256",
+    }
+    if set(receipt) != expected_keys:
+        raise TemporalSearchContractError(
+            "Rust-precompiled receipt does not have the exact V1 field set"
+        )
+    if (
+        receipt.get("schema_version")
+        != TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA
+    ):
+        raise TemporalSearchContractError("Rust-precompiled receipt schema is invalid")
+    receipt_identity = dict(receipt)
+    supplied_receipt_sha256 = _sha(
+        receipt_identity.pop("receipt_sha256", None),
+        name="worker precompiled receipt SHA-256",
+    )
+    if canonical_sha256(receipt_identity) != supplied_receipt_sha256:
+        raise TemporalSearchContractError("Rust-precompiled receipt identity mismatch")
+    bindings = {
+        "task ID": (receipt.get("task_id"), job.get("job_id")),
+        "candidate ID": (receipt.get("candidate_id"), job.get("candidate_id")),
+        "contract": (
+            receipt.get("precompiled_contract_sha256"),
+            contract.get("contractSha256"),
+        ),
+        "Rust authority": (
+            receipt.get("rust_authority_sha256"),
+            contract.get("authoritySha256"),
+        ),
+        "raw source profile": (
+            receipt.get("raw_source_profile_sha256"),
+            job.get("raw_source_profile_sha256"),
+        ),
+        "normalized source profile": (
+            receipt.get("normalized_source_profile_sha256"),
+            job.get("normalized_profile_snapshot_sha256"),
+        ),
+        "authored program": (
+            receipt.get("authored_program_sha256"),
+            job.get("authored_program_sha256"),
+        ),
+        "resolved profile": (
+            receipt.get("resolved_profile_sha256"),
+            job.get("expected_resolved_profile_snapshot_sha256"),
+        ),
+        "resolved program": (
+            receipt.get("resolved_program_sha256"),
+            job.get("expected_resolved_program_sha256"),
+        ),
+        "worker contract": (
+            receipt.get("worker_contract_hash"),
+            job.get("required_worker_contract_hash"),
+        ),
+        "worker contract schema": (
+            receipt.get("worker_contract_schema"),
+            job.get("required_worker_contract_schema"),
+        ),
+        "worker image digest": (
+            receipt.get("worker_image_digest"),
+            job.get("required_worker_image_digest"),
+        ),
+        "worker source commit": (
+            receipt.get("worker_source_git_commit"),
+            job.get("required_worker_source_git_commit"),
+        ),
+        "worker Rust core": (
+            receipt.get("rust_core_hash"),
+            job.get("required_worker_rust_core_hash"),
+        ),
+        "result normalized source profile": (
+            receipt.get("normalized_source_profile_sha256"),
+            material.get("source_profile_snapshot_sha256"),
+        ),
+        "result resolved profile": (
+            receipt.get("resolved_profile_sha256"),
+            material.get("resolved_profile_snapshot_sha256"),
+        ),
+        "result resolved program": (
+            receipt.get("resolved_program_sha256"),
+            material.get("program_sha256"),
+        ),
+    }
+    for label, (observed, expected) in bindings.items():
+        if observed != expected:
+            raise TemporalSearchContractError(
+                f"Rust-precompiled receipt {label} does not match frozen authority"
+            )
+    if receipt.get("worker_image_identity_mode") != "image_digest":
+        raise TemporalSearchContractError(
+            "Rust-precompiled receipt lacks immutable image identity"
+        )
+    if canonical_sha256(
+        _mapping(receipt.get("rust_build_info"), name="receipt rust_build_info")
+    ) != job.get("required_worker_rust_build_info_sha256"):
+        raise TemporalSearchContractError(
+            "Rust-precompiled receipt Rust build identity mismatch"
+        )
+    if canonical_sha256(
+        _mapping(receipt.get("runtime_platform"), name="receipt runtime_platform")
+    ) != job.get("required_worker_runtime_platform_sha256"):
+        raise TemporalSearchContractError(
+            "Rust-precompiled receipt runtime platform identity mismatch"
+        )
+    if receipt.get("pair_recompile_attempted") is not False:
+        raise TemporalSearchContractError(
+            "Rust-precompiled receipt reports a forbidden pair recompile"
+        )
+    if receipt.get("source_profile_rewritten") is not False:
+        raise TemporalSearchContractError(
+            "Rust-precompiled receipt reports a forbidden source-profile rewrite"
+        )
+
+
 def _result_material(
     task: Mapping[str, Any], completion: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1923,8 +2138,13 @@ def _result_material(
         )
     material = _mapping(envelope.get("result"), name="worker material result")
     job = _mapping(task.get("payload"), name="task payload")
+    precompiled_v2 = job.get("schema_version") == TEMPORAL_SEARCH_JOB_SCHEMA_V2
     required = {
-        "schema_version": TEMPORAL_SEARCH_RESULT_SCHEMA,
+        "schema_version": (
+            TEMPORAL_SEARCH_RESULT_SCHEMA_V2
+            if precompiled_v2
+            else TEMPORAL_SEARCH_RESULT_SCHEMA
+        ),
         "task_kind": TEMPORAL_SEARCH_TASK_KIND,
         "job_id": job["job_id"],
         "authority_id": job["authority_id"],
@@ -1966,6 +2186,11 @@ def _result_material(
             "both cost views must be evaluated from the identical observation stream"
         )
     validate_v3_candidate_window_result(material, task_payload=job)
+    _validate_precompiled_execution_receipt(
+        material,
+        job=job,
+        required=precompiled_v2,
+    )
     attribution_request = job.get("candidate_behavior_attribution_request")
     attribution = material.get("candidate_behavior_attribution")
     if attribution_request is None:

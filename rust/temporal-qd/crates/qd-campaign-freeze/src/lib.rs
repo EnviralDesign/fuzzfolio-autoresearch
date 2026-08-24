@@ -63,7 +63,11 @@ const TASK_MANIFEST_SCHEMA: &str = "temporal_graph_candidate_window_manifest_v1"
 const CHECKPOINT_SCHEMA: &str = "temporal_graph_candidate_window_checkpoint_v1";
 const TASK_KIND: &str = "temporal_graph_candidate_window";
 const JOB_SCHEMA: &str = "temporal_graph_candidate_window_job_v1";
+const JOB_SCHEMA_V2: &str = "temporal_graph_candidate_window_job_v2";
 const TASK_CAPABILITY: &str = "temporal_graph_candidate_window_v1";
+const PRECOMPILED_PROFILE_CAPABILITY: &str = "temporal_qd_precompiled_profile_execution_v1";
+const PRECOMPILED_PROFILE_RECEIPT_SCHEMA: &str =
+    "temporal_qd_precompiled_profile_execution_receipt_v1";
 const BIDIRECTIONAL_CAPABILITY: &str = "temporal_graph_bidirectional_replay_v1";
 const ATTRIBUTION_CAPABILITY: &str = "temporal_candidate_behavior_attribution_v1";
 pub const V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA: &str = "temporal_qd_v5_campaign_input_checkpoint_v1";
@@ -735,9 +739,17 @@ fn build_task(
             .ok_or_else(|| anyhow!("authority worker contract missing"))?,
         "authority worker contract",
     )?;
+    let precompiled = candidate.get("precompiledProfileExecutionContract");
     let mut job = Map::new();
     for (key, value) in [
-        ("schema_version", JOB_SCHEMA),
+        (
+            "schema_version",
+            if precompiled.is_some() {
+                JOB_SCHEMA_V2
+            } else {
+                JOB_SCHEMA
+            },
+        ),
         ("job_id", &task_id),
         ("candidate_id", candidate_id),
         ("window_id", window_id),
@@ -753,8 +765,28 @@ fn build_task(
         "inline_profile_snapshot".to_owned(),
         Value::Object(profile.clone()),
     );
-    if let Some(contract) = candidate.get("precompiledProfileExecutionContract") {
+    if let Some(contract) = precompiled {
         let contract_map = object(contract, "precompiled profile execution contract")?;
+        exact_keys(
+            contract_map,
+            &[
+                "schemaVersion",
+                "candidateId",
+                "authoritySha256",
+                "candidatePayloadSha256",
+                "rawProfileSha256",
+                "profileSnapshotSha256",
+                "programSha256",
+                "expectedResolvedProfileSnapshotSha256",
+                "expectedResolvedProgramSha256",
+                "validationReportSha256",
+                "compilerDisposition",
+                "workerPermissions",
+                "workerProhibitions",
+                "contractSha256",
+            ],
+            "precompiled profile execution contract",
+        )?;
         ensure!(
             contract_map.get("schemaVersion").and_then(Value::as_str)
                 == Some("temporal_qd_precompiled_profile_execution_v1"),
@@ -788,6 +820,9 @@ fn build_task(
             "candidatePayloadSha256",
             "profileSnapshotSha256",
             "programSha256",
+            "expectedResolvedProfileSnapshotSha256",
+            "expectedResolvedProgramSha256",
+            "validationReportSha256",
             "contractSha256",
         ] {
             require_sha(string(contract_map, key)?, key)?;
@@ -804,6 +839,58 @@ fn build_task(
                 == Some("precompiled_rust_profile_no_recompile"),
             "precompiled profile execution contract permits compiler reinterpretation"
         );
+        ensure!(
+            contract_map.get("workerPermissions")
+                == Some(&json!([
+                    "parse",
+                    "schema_check",
+                    "verify_hashes",
+                    "hydrate_predeclared_catalog_inputs",
+                    "execute_supplied_v3_profile"
+                ]))
+                && contract_map.get("workerProhibitions")
+                    == Some(&json!([
+                        "compile_long_short_pair",
+                        "rewrite_defaults_or_transitions",
+                        "assign_competing_identity",
+                        "remove_precompiled_contract"
+                    ])),
+            "precompiled profile execution operations drifted"
+        );
+        ensure!(
+            candidate
+                .get("resolvedProfileSnapshotSha256")
+                .and_then(Value::as_str)
+                == Some(string(
+                    contract_map,
+                    "expectedResolvedProfileSnapshotSha256"
+                )?)
+                && candidate
+                    .get("resolvedProgramSha256")
+                    .and_then(Value::as_str)
+                    == Some(string(contract_map, "expectedResolvedProgramSha256")?),
+            "precompiled profile execution contract does not bind resolved identities"
+        );
+        ensure!(
+            worker.get("workerContractSchema").and_then(Value::as_str)
+                == Some("replay-worker-contract-v2"),
+            "Rust-precompiled tasks require replay-worker-contract-v2"
+        );
+        for (source, target) in [
+            ("imageDigest", "required_worker_image_digest"),
+            ("sourceGitCommit", "required_worker_source_git_commit"),
+            ("rustCoreHash", "required_worker_rust_core_hash"),
+            (
+                "rustBuildInfoSha256",
+                "required_worker_rust_build_info_sha256",
+            ),
+            (
+                "runtimePlatformSha256",
+                "required_worker_runtime_platform_sha256",
+            ),
+        ] {
+            copy(&mut job, target, worker, source)?;
+        }
         job.insert(
             "precompiled_profile_execution_contract".to_owned(),
             contract.clone(),
@@ -853,7 +940,10 @@ fn build_task(
         worker,
         "workerContractSchema",
     )?;
-    job.insert("required_capabilities".to_owned(), capabilities(false));
+    job.insert(
+        "required_capabilities".to_owned(),
+        capabilities(false, precompiled.is_some()),
+    );
     put(&mut job, "client_origin", "temporal_search_controller");
     put(&mut job, "campaign_id", authority_id);
     put(&mut job, "lane_id", candidate_id);
@@ -896,7 +986,10 @@ fn build_task(
     let with_attribution = attribution.is_some();
     if let Some(requirement) = attribution {
         job.insert("candidate_behavior_attribution_request".to_owned(), json!({"schema_version":"temporal_candidate_behavior_attribution_request_v1","enabled":true,"attribution_schema":"temporal_candidate_behavior_attribution_v1","replay_cost_view":"research_conservative","behavior_attribution_requirement":requirement}));
-        job.insert("required_capabilities".to_owned(), capabilities(true));
+        job.insert(
+            "required_capabilities".to_owned(),
+            capabilities(true, precompiled.is_some()),
+        );
     }
     let bounds = object(
         authority
@@ -916,29 +1009,204 @@ fn build_task(
     task.insert("payload".to_owned(), Value::Object(job));
     task.insert(
         "required_worker_capabilities".to_owned(),
-        capabilities(with_attribution),
+        capabilities(with_attribution, precompiled.is_some()),
     );
     copy(&mut task, "deadline_seconds", bounds, "deadlineSeconds")?;
     copy(&mut task, "max_attempts", bounds, "maxAttempts")?;
     Ok(Value::Object(task))
 }
 
-fn capabilities(attribution: bool) -> Value {
-    if !attribution {
-        return Value::Array(
-            REQUIRED_CAPABILITIES
-                .iter()
-                .map(|v| Value::String((*v).to_owned()))
-                .collect(),
-        );
-    }
+fn capabilities(attribution: bool, precompiled: bool) -> Value {
     let mut values: BTreeSet<String> = REQUIRED_CAPABILITIES
         .iter()
         .map(|v| (*v).to_owned())
         .collect();
-    values.insert(ATTRIBUTION_CAPABILITY.to_owned());
+    if attribution {
+        values.insert(ATTRIBUTION_CAPABILITY.to_owned());
+    }
+    if precompiled {
+        values.insert(PRECOMPILED_PROFILE_CAPABILITY.to_owned());
+    }
     Value::Array(values.into_iter().map(Value::String).collect())
 }
+
+/// Admit only the exact execution receipt for a Rust-precompiled V2 task.
+///
+/// This boundary deliberately validates execution provenance, not economic
+/// output. Existing campaign result reduction remains responsible for all
+/// replay/scientific semantics after this authority check succeeds.
+pub fn validate_precompiled_execution_receipt(task: &Value, result: &Value) -> Result<()> {
+    let task = object(task, "precompiled receipt task")?;
+    let job = object(
+        task.get("payload")
+            .ok_or_else(|| anyhow!("precompiled receipt task payload is missing"))?,
+        "precompiled receipt task payload",
+    )?;
+    ensure!(
+        string(job, "schema_version")? == JOB_SCHEMA_V2,
+        "precompiled receipt admission requires candidate-window job v2"
+    );
+    let capabilities = array(job, "required_capabilities")?;
+    ensure!(
+        capabilities
+            .iter()
+            .any(|value| value.as_str() == Some(PRECOMPILED_PROFILE_CAPABILITY)),
+        "precompiled receipt task lacks its dedicated worker capability"
+    );
+    ensure!(
+        string(job, "required_worker_contract_schema")? == "replay-worker-contract-v2",
+        "precompiled receipt task requires replay-worker-contract-v2"
+    );
+    let contract = object(
+        job.get("precompiled_profile_execution_contract")
+            .ok_or_else(|| anyhow!("precompiled execution contract is missing"))?,
+        "precompiled execution contract",
+    )?;
+    let result = object(result, "precompiled candidate-window result")?;
+    ensure!(
+        string(result, "schema_version")? == "temporal_graph_candidate_window_result_v2",
+        "precompiled candidate-window result schema is incompatible"
+    );
+    let receipt_value = result
+        .get("precompiled_profile_execution_receipt")
+        .ok_or_else(|| anyhow!("precompiled execution receipt is missing"))?;
+    let receipt = object(receipt_value, "precompiled execution receipt")?;
+    exact_keys(
+        receipt,
+        &[
+            "schema_version",
+            "task_id",
+            "candidate_id",
+            "precompiled_contract_sha256",
+            "rust_authority_sha256",
+            "raw_source_profile_sha256",
+            "normalized_source_profile_sha256",
+            "authored_program_sha256",
+            "resolved_profile_sha256",
+            "resolved_program_sha256",
+            "worker_contract_hash",
+            "worker_contract_schema",
+            "worker_image_digest",
+            "worker_image_identity_mode",
+            "worker_source_git_commit",
+            "rust_core_hash",
+            "rust_build_info",
+            "runtime_platform",
+            "pair_recompile_attempted",
+            "source_profile_rewritten",
+            "receipt_sha256",
+        ],
+        "precompiled execution receipt",
+    )?;
+    ensure!(
+        string(receipt, "schema_version")? == PRECOMPILED_PROFILE_RECEIPT_SCHEMA,
+        "precompiled execution receipt schema is incompatible"
+    );
+    ensure!(
+        canonical_sha256_without_object_field(receipt_value, "receipt_sha256")?
+            == string(receipt, "receipt_sha256")?,
+        "precompiled execution receipt identity drifted"
+    );
+    for (receipt_key, expected) in [
+        ("task_id", string(job, "job_id")?),
+        ("candidate_id", string(job, "candidate_id")?),
+        (
+            "precompiled_contract_sha256",
+            string(contract, "contractSha256")?,
+        ),
+        (
+            "rust_authority_sha256",
+            string(contract, "authoritySha256")?,
+        ),
+        (
+            "raw_source_profile_sha256",
+            string(job, "raw_source_profile_sha256")?,
+        ),
+        (
+            "normalized_source_profile_sha256",
+            string(job, "normalized_profile_snapshot_sha256")?,
+        ),
+        (
+            "authored_program_sha256",
+            string(job, "authored_program_sha256")?,
+        ),
+        (
+            "resolved_profile_sha256",
+            string(job, "expected_resolved_profile_snapshot_sha256")?,
+        ),
+        (
+            "resolved_program_sha256",
+            string(job, "expected_resolved_program_sha256")?,
+        ),
+        (
+            "worker_contract_hash",
+            string(job, "required_worker_contract_hash")?,
+        ),
+        (
+            "worker_contract_schema",
+            string(job, "required_worker_contract_schema")?,
+        ),
+        (
+            "worker_image_digest",
+            string(job, "required_worker_image_digest")?,
+        ),
+        (
+            "worker_source_git_commit",
+            string(job, "required_worker_source_git_commit")?,
+        ),
+        (
+            "rust_core_hash",
+            string(job, "required_worker_rust_core_hash")?,
+        ),
+        (
+            "normalized_source_profile_sha256",
+            string(result, "source_profile_snapshot_sha256")?,
+        ),
+        (
+            "resolved_profile_sha256",
+            string(result, "resolved_profile_snapshot_sha256")?,
+        ),
+        ("resolved_program_sha256", string(result, "program_sha256")?),
+    ] {
+        ensure!(
+            string(receipt, receipt_key)? == expected,
+            "precompiled execution receipt {receipt_key} binding drifted"
+        );
+    }
+    ensure!(
+        string(receipt, "worker_image_identity_mode")? == "image_digest",
+        "precompiled execution receipt lacks immutable image identity"
+    );
+    ensure!(
+        canonical_sha256(
+            receipt
+                .get("rust_build_info")
+                .ok_or_else(|| anyhow!("precompiled receipt Rust build info is missing"))?
+        )? == string(job, "required_worker_rust_build_info_sha256")?,
+        "precompiled receipt Rust build identity drifted"
+    );
+    ensure!(
+        canonical_sha256(
+            receipt
+                .get("runtime_platform")
+                .ok_or_else(|| anyhow!("precompiled receipt runtime platform is missing"))?
+        )? == string(job, "required_worker_runtime_platform_sha256")?,
+        "precompiled receipt runtime platform identity drifted"
+    );
+    ensure!(
+        receipt
+            .get("pair_recompile_attempted")
+            .and_then(Value::as_bool)
+            == Some(false)
+            && receipt
+                .get("source_profile_rewritten")
+                .and_then(Value::as_bool)
+                == Some(false),
+        "precompiled execution receipt reports forbidden compiler/source mutation"
+    );
+    Ok(())
+}
+
 fn put(map: &mut Map<String, Value>, key: &str, value: &str) {
     map.insert(key.to_owned(), Value::String(value.to_owned()));
 }
@@ -5428,7 +5696,23 @@ mod tests {
             "rawProfileSha256": profile_sha,
             "profileSnapshotSha256": normalized_sha,
             "programSha256": program_sha,
+            "expectedResolvedProfileSnapshotSha256": normalized_sha,
+            "expectedResolvedProgramSha256": program_sha,
+            "validationReportSha256": test_sha("validation-report"),
             "compilerDisposition": "precompiled_rust_profile_no_recompile",
+            "workerPermissions": [
+                "parse",
+                "schema_check",
+                "verify_hashes",
+                "hydrate_predeclared_catalog_inputs",
+                "execute_supplied_v3_profile"
+            ],
+            "workerProhibitions": [
+                "compile_long_short_pair",
+                "rewrite_defaults_or_transitions",
+                "assign_competing_identity",
+                "remove_precompiled_contract"
+            ],
         });
         let contract_sha = canonical_sha256(&contract)?;
         contract
@@ -5439,6 +5723,11 @@ mod tests {
             "workerContract": {
                 "workerContractSha256": test_sha("worker"),
                 "workerContractSchema": "replay-worker-contract-v2",
+                "imageDigest": test_sha("image"),
+                "sourceGitCommit": "1".repeat(40),
+                "rustCoreHash": test_sha("rust-core"),
+                "rustBuildInfoSha256": test_sha("rust-build-info"),
+                "runtimePlatformSha256": test_sha("runtime-platform"),
             },
             "bounds": {"deadlineSeconds": 60.0, "maxAttempts": 2},
         });
@@ -5450,6 +5739,8 @@ mod tests {
             "sourceProfile": profile,
             "profileSnapshotSha256": normalized_sha,
             "programSha256": program_sha,
+            "resolvedProfileSnapshotSha256": normalized_sha,
+            "resolvedProgramSha256": program_sha,
             "precompiledProfileExecutionContract": contract,
             "instrument": "EURUSD",
             "timeframe": "M5",
@@ -5485,6 +5776,14 @@ mod tests {
         assert_eq!(
             payload["precompiled_profile_execution_contract"]["contractSha256"],
             contract_sha
+        );
+        assert_eq!(payload["schema_version"], JOB_SCHEMA_V2);
+        assert!(
+            payload["required_capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == PRECOMPILED_PROFILE_CAPABILITY)
         );
 
         let mut changed = candidate.clone();
