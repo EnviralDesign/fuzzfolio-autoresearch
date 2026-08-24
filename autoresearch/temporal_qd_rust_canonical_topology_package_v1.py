@@ -702,7 +702,9 @@ def run(
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise RuntimeError(f"required native/historical inputs are missing: {missing}")
-    differential = _json(output_dir / "target-cross-compiler-transcript-v1.json")
+    # V2 changes only the worker execution seam. Reuse the published immutable
+    # compiler differential as historical input without copying or rewriting it.
+    differential = _json(OUTPUT / "target-cross-compiler-transcript-v1.json")
     shared = _json(FROZEN_AUTHORITY)
     source = _source_manifest(source_commit, allow_uncommitted=allow_uncommitted_source)
     worker_contract = _load_worker_contract(worker_contract_path)
