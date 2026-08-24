@@ -110,3 +110,11 @@ Regenerate v6 with:
 
 `python -m autoresearch.temporal_qd_v38_followup_audit_v6 --output-dir research/temporal-qd/v38-followup`
 
+## v7
+
+v1-v6 files above are frozen. v7 binds the original V38 pair-run config, materializes canonical FrozenPair P/T/E/TE receipts with native validation, freezes the 144-task inspected matrix without dispatch, and records go/no-go. No market compute was launched.
+
+Regenerate v7 with:
+
+`uv run python -m autoresearch.temporal_qd_v38_followup_audit_v7 --output-dir research/temporal-qd/v38-followup`
+

@@ -1,0 +1,142 @@
+{
+  "adversarialCount": 15,
+  "allCasesMatch": true,
+  "canonicalFixtureAccepted": true,
+  "cases": [
+    {
+      "error": null,
+      "errorClass": null,
+      "fixture": "canonical_fixture",
+      "match": true,
+      "pythonAccepted": true,
+      "rustAccepted": true
+    },
+    {
+      "error": "receiptId must equal slotId",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "receipt_id_drift_only",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "topology receipt planSha256 must equal the declared topology plan",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "topology_plan_substitution",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "event receipt indicator must match the declared primitive",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "event_primitive_substitution",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "event audit must include an exact semantic delta",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "missing_semantic_delta",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "event receipt node must equal the declared event-only or added-setup site",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "fake_event_attaches_without_node",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "event audit must include an exact semantic delta",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "sparse_fake_audit",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "receipt parent/side does not match its slot",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "wrong_parent",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "receipt parent/side does not match its slot",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "wrong_side",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "pair candidate identity drifted",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "swapped_e_te",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "receipt count must equal declared slot count",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "missing_receipt",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "receipt count must equal declared slot count",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "extra_receipt",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "frozenPairIdentitySha256 must equal canonicalCompiledIdentities.frozenPairIdentitySha256",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "fake_pair_native_report",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "module hashes cannot be labeled as pair or native validation identities",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "mislabeled_pair_identity_field",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "topology coadaptation v7 successCalculation drifted",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "success_policy_drift",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    },
+    {
+      "error": "complete-block receipts must run native validation",
+      "errorClass": "TemporalDiscoveryContractError",
+      "fixture": "native_ran_false_while_compiled",
+      "match": true,
+      "pythonAccepted": false,
+      "rustAccepted": false
+    }
+  ],
+  "doNotLaunch": true,
+  "pythonValidator": "validate_topology_coadaptation_matrix_v7",
+  "reportSha256": "sha256:59083878842d6d61d410b34d073393072617a35c4fc376f96af069e3b4482199",
+  "rustTest": "cargo test -p temporal-qd-kernel --test topology_coadaptation_matrix_v7 python_rust_parity_corpus_agrees",
+  "rustTestPassed": true,
+  "rustValidator": "topology_coadaptation_matrix_v7::validate",
+  "schemaVersion": "temporal_qd_topology_coadaptation_executed_python_rust_parity_report_v7"
+}

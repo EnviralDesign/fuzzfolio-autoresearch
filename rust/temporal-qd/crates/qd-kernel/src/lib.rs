@@ -25,6 +25,7 @@ pub mod topology_coadaptation_matrix_v3;
 pub mod topology_coadaptation_matrix_v4;
 pub mod topology_coadaptation_matrix_v5;
 pub mod topology_coadaptation_matrix_v6;
+pub mod topology_coadaptation_matrix_v7;
 pub mod proposal;
 pub mod protection;
 pub mod publication;

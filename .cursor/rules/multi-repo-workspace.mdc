@@ -1,0 +1,16 @@
+---
+description: This Cursor workspace is an intentional multi-repo collection. Never collapse it to a single root.
+alwaysApply: true
+---
+
+# Multi-repo workspace
+
+This Cursor window is **intentionally** a collection of repos, not one project:
+
+- `C:\repos\fuzzfolio-autoresearch`
+- `C:\repos\FuzzFolio-MarketDataLake`
+- `C:\repos\Trading-Dashboard`
+
+**Never** call `move_agent_to_root` (or any other Cursor app-control call that pulls a multi-root workspace into a single folder). That call fails with `Cannot pull a multi-repo cloud agent into a single-folder workspace` and **stops the agent dead**.
+
+Stay in the multi-root workspace. Set `working_directory` on shell commands to the repo you mean (`C:\repos\fuzzfolio-autoresearch`, `C:\repos\Trading-Dashboard`, or `C:\repos\FuzzFolio-MarketDataLake`).
