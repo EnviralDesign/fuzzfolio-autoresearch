@@ -61,5 +61,7 @@ def test_v2_package_is_digest_bound_no_dispatch_and_self_consistent() -> None:
 def test_v2_package_manifest_raw_hashes_match_every_committed_artifact() -> None:
     package = _load("topology-launch-package-manifest-v1.json")
     for artifact in package["artifacts"].values():
-        content = (OUTPUT_V2 / artifact["path"]).read_bytes()
+        # Git may materialize text files with CRLF on Windows; the package's
+        # immutable raw hashes bind the generated LF bytes stored in Git.
+        content = (OUTPUT_V2 / artifact["path"]).read_bytes().replace(b"\r\n", b"\n")
         assert f"sha256:{hashlib.sha256(content).hexdigest()}" == artifact["rawSha256"]
