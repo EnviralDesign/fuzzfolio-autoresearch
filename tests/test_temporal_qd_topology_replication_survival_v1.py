@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+from autoresearch.evidence_plan import canonical_sha256
 from autoresearch.temporal_qd_topology_replication_survival_v1 import (
     build_replication_survival_rule,
     evaluate_replication_survival,
@@ -62,3 +63,35 @@ def test_committed_rule_and_corpus_are_bound_and_complete() -> None:
         "null-panel-1",
         "identity-drift",
     }
+
+
+def test_committed_production_launch_control_binds_three_exact_panels() -> None:
+    control = json.loads((AUTHORITY / "topology-production-launch-control-v1.json").read_text())
+    mapping = json.loads((AUTHORITY / "topology-production-task-mapping-v1.json").read_text())
+    outputs = json.loads((AUTHORITY / "topology-production-output-templates-v1.json").read_text())
+    unsigned_control = dict(control)
+    assert unsigned_control.pop("launchControlSha256") == canonical_sha256(unsigned_control)
+    unsigned_mapping = dict(mapping)
+    assert unsigned_mapping.pop("mappingSha256") == canonical_sha256(unsigned_mapping)
+    assert control["dispatchEnabled"] is False
+    assert control["panelTaskCounts"] == [48, 48, 48]
+    assert control["totalInspectedTaskCount"] == 144
+    assert [row["panelId"] for row in control["panels"]] == ["panel-1", "panel-2", "panel-3"]
+    assert mapping["mappedTaskCount"] == len(mapping["mappings"]) == 144
+    assert len({row["oldTaskId"] for row in mapping["mappings"]}) == 144
+    assert len({row["newTaskId"] for row in mapping["mappings"]}) == 144
+    unsigned_outputs = dict(outputs)
+    assert unsigned_outputs.pop("templatesSha256") == canonical_sha256(unsigned_outputs)
+    assert outputs["dispatchEnabled"] is False
+    assert [row["panelId"] for row in outputs["templates"]] == ["panel-1", "panel-2", "panel-3"]
+    assert all(row["cohortSource"]["candidateCount"] == 12 for row in outputs["templates"])
+
+
+def test_committed_v2_3_launch_gate_is_self_hashed_and_complete() -> None:
+    gate = json.loads((AUTHORITY / "topology-production-launch-gate-v1.json").read_text())
+    unsigned = dict(gate)
+    assert unsigned.pop("launchGateSha256") == canonical_sha256(unsigned)
+    assert gate["dispatchEnabled"] is False
+    assert gate["untouchedConfirmationStatus"] == "pending"
+    assert gate["readyForAuthorizedTopologyCaseStudyLaunch"] is True
+    assert all(gate["gates"].values())

@@ -1030,6 +1030,42 @@ fn capabilities(attribution: bool, precompiled: bool) -> Value {
     Value::Array(values.into_iter().map(Value::String).collect())
 }
 
+fn preserve_precompiled_candidate_material(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+) -> Result<()> {
+    const FIELDS: [&str; 7] = [
+        "candidatePayloadSha256",
+        "nativeAuthoritySha256",
+        "precompiledProfileExecutionContract",
+        "profileSnapshotSha256",
+        "programSha256",
+        "resolvedProfileSnapshotSha256",
+        "resolvedProgramSha256",
+    ];
+    let present = FIELDS
+        .iter()
+        .filter(|field| source.contains_key(**field))
+        .count();
+    if present == 0 {
+        return Ok(());
+    }
+    ensure!(
+        present == FIELDS.len(),
+        "v5 Rust-precompiled candidate material is incomplete"
+    );
+    for field in FIELDS {
+        target.insert(
+            field.to_owned(),
+            source
+                .get(field)
+                .cloned()
+                .ok_or_else(|| anyhow!("v5 Rust-precompiled candidate lacks {field}"))?,
+        );
+    }
+    Ok(())
+}
+
 /// Admit only the exact execution receipt for a Rust-precompiled V2 task.
 ///
 /// This boundary deliberately validates execution provenance, not economic
@@ -5179,7 +5215,14 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
                 })
             })
             .collect::<Vec<_>>();
-        finite.push(json!({"candidateId":id,"sourceProfile":profile,"sourceProfileSha256":profile_sha,"instrument":instrument,"timeframe":timeframe,"barLimit":bar_limit,"windowInputs":preparation_inputs}));
+        let mut finite_candidate = json!({"candidateId":id,"sourceProfile":profile,"sourceProfileSha256":profile_sha,"instrument":instrument,"timeframe":timeframe,"barLimit":bar_limit,"windowInputs":preparation_inputs});
+        preserve_precompiled_candidate_material(
+            candidate,
+            finite_candidate
+                .as_object_mut()
+                .expect("finite candidate object"),
+        )?;
+        finite.push(finite_candidate);
         let profile = object(finite.last().expect("finite candidate"), "finite candidate")?
             .get("sourceProfile")
             .expect("profile");
@@ -5210,7 +5253,7 @@ fn execute_v5_freeze_manifest(spec: &Map<String, Value>) -> Result<Value> {
     let preparation = json!({"schemaVersion":"temporal_graph_candidate_window_preparation_v1","authorityLabel":format!("{}-qd-generation-{generation}", string(template_map, "authorityLabel")?),"workerContract":worker_contract,"candidates":finite,"developmentWindows":windows,"prohibitedEvidence":template_map.get("prohibitedEvidence").cloned().ok_or_else(|| anyhow!("template prohibited evidence missing"))?,"bounds":{"maxCandidates":source_candidates.len(),"maxDevelopmentWindows":windows.len(),"maxTasks":task_count,"maxAttempts":bounds_template.get("maxAttempts").cloned().ok_or_else(|| anyhow!("template maxAttempts missing"))?,"deadlineSeconds":deadline}});
     let authority = build_native_authority(&preparation)?;
     let authority_map = object(&authority, "v5 authority")?;
-    let catalog_identity = json!({"path":catalog_path.to_string_lossy(),"catalogSha256":string(spec, "constructionCatalogSha256")?});
+    let catalog_identity = json!({"path":"construction-catalog.json","catalogSha256":string(spec, "constructionCatalogSha256")?});
     let mut identity = json!({"schemaVersion":"temporal_qd_evaluation_identity_v3","policyName":object(archive, "archive authority")?.get("policyName").cloned().unwrap_or(Value::Null),"policySha256":object(archive, "archive authority")?.get("policySha256").cloned().unwrap_or(Value::Null),"populationSha256":population_sha,"constructionCatalog":catalog_identity,"templatePreparationSha256":string(spec, "templatePreparationSha256")?,"workerContract":preparation.get("workerContract").cloned().unwrap_or(Value::Null),"executionEngineCommit":commit,"costViews":{"none":{"spreadBps":0.0,"slippageBps":0.0,"commissionBps":0.0},"research_conservative":{"spreadBps":2.0,"slippageBps":1.0,"commissionBps":0.5}},"predeclaredEvidenceContext":evidence_context,"predeclaredEvidenceContextSha256":object(&evidence_context, "evidence context")?.get("predeclaredEvidenceContextSha256").cloned().unwrap_or(Value::Null),"warmupAndEligibilityPolicy":{"coveragePolicy":"require_complete","barLimitBoundPerCandidate":true,"workerContractOwnsIndicatorWarmup":true,"reservedEvidencePermitted":false},"evaluationSeeds":[],"campaignRole":role,"proposalPopulation":proposal_population,"panelId":panel_id,"rotatingEvidence":rotating,"candidates":evaluation_candidates,"archivePolicyAuthority":archive,"behaviorAttributionRequirement":behavior});
     if let Some(value) = evaluation_population_sha {
         identity
@@ -5541,7 +5584,7 @@ fn validate_v5_rotating(
 }
 fn build_v5_evidence_context(
     template: &Value,
-    catalog_path: &Path,
+    _catalog_path: &Path,
     catalog: &Value,
     worker: &Value,
 ) -> Result<Value> {
@@ -5583,7 +5626,7 @@ fn build_v5_evidence_context(
         ordered.push(json!({"windowId":id,"window":window,"evidencePlanSemantic":plan}));
         drop(plan_map);
     }
-    let mut context = json!({"schemaVersion":"temporal_qd_predeclared_evidence_context_v3","baseDecisionTimeframe":string(exemplar, "timeframe")?.trim().to_ascii_uppercase(),"orderedWindowPlanSemantic":ordered,"workerContractSha256":object(worker, "worker")?.get("workerContractSha256").cloned().unwrap_or(Value::Null),"constructionCatalog":{"path":catalog_path.to_string_lossy(),"catalogSha256":canonical_sha256(catalog)?},"costViews":{"none":{"spreadBps":0.0,"slippageBps":0.0,"commissionBps":0.0},"research_conservative":{"spreadBps":2.0,"slippageBps":1.0,"commissionBps":0.5}}});
+    let mut context = json!({"schemaVersion":"temporal_qd_predeclared_evidence_context_v3","baseDecisionTimeframe":string(exemplar, "timeframe")?.trim().to_ascii_uppercase(),"orderedWindowPlanSemantic":ordered,"workerContractSha256":object(worker, "worker")?.get("workerContractSha256").cloned().unwrap_or(Value::Null),"constructionCatalog":{"path":"construction-catalog.json","catalogSha256":canonical_sha256(catalog)?},"costViews":{"none":{"spreadBps":0.0,"slippageBps":0.0,"commissionBps":0.0},"research_conservative":{"spreadBps":2.0,"slippageBps":1.0,"commissionBps":0.5}}});
     let sha = canonical_sha256(&context)?;
     context.as_object_mut().expect("context").insert(
         "predeclaredEvidenceContextSha256".into(),
@@ -5635,6 +5678,7 @@ fn build_native_authority(preparation: &Value) -> Result<Value> {
                     .ok_or_else(|| anyhow!("preparation candidate lacks {key}"))?,
             );
         }
+        preserve_precompiled_candidate_material(raw, &mut candidate)?;
         let mut inputs = Vec::new();
         for input in array(raw, "windowInputs")? {
             let input = object(input, "v5 window input")?;
@@ -5929,6 +5973,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("source profile changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn v5_projection_preserves_complete_precompiled_material_only() -> Result<()> {
+        let mut source = Map::new();
+        for (field, value) in [
+            ("candidatePayloadSha256", json!(test_sha("payload"))),
+            ("nativeAuthoritySha256", json!(test_sha("authority"))),
+            (
+                "precompiledProfileExecutionContract",
+                json!({"schemaVersion":"temporal_qd_precompiled_profile_execution_v1"}),
+            ),
+            ("profileSnapshotSha256", json!(test_sha("profile"))),
+            ("programSha256", json!(test_sha("program"))),
+            (
+                "resolvedProfileSnapshotSha256",
+                json!(test_sha("resolved-profile")),
+            ),
+            ("resolvedProgramSha256", json!(test_sha("resolved-program"))),
+        ] {
+            source.insert(field.to_owned(), value);
+        }
+        let mut projected = Map::new();
+        preserve_precompiled_candidate_material(&source, &mut projected)?;
+        assert_eq!(projected.len(), 7);
+
+        let mut legacy = Map::new();
+        preserve_precompiled_candidate_material(&Map::new(), &mut legacy)?;
+        assert!(legacy.is_empty());
+
+        source.remove("resolvedProgramSha256");
+        assert!(preserve_precompiled_candidate_material(&source, &mut Map::new()).is_err());
         Ok(())
     }
 
