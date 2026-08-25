@@ -405,6 +405,57 @@ def _git(*args: str, binary: bool = False) -> str | bytes:
     return result.stdout if binary else result.stdout.strip()
 
 
+def _git_json(commit: str, relative: str) -> dict[str, Any]:
+    raw = _git("show", f"{commit}:{relative}", binary=True)
+    assert isinstance(raw, bytes)
+    return json.loads(raw)
+
+
+def _validate_self_hash(value: Mapping[str, Any], field: str) -> None:
+    identity = dict(value)
+    supplied = identity.pop(field, None)
+    if supplied != canonical_sha256(identity):
+        raise RuntimeError(f"preserved native artifact identity is invalid: {field}")
+
+
+def _load_preserved_native_package(
+    package_commit: str,
+    *,
+    expected_source_commit: str,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    prefix = "research/temporal-qd/rust-canonical-authority-v2"
+    source = _git_json(package_commit, f"{prefix}/native-source-manifest-v1.json")
+    authority = _git_json(package_commit, f"{prefix}/native-authority-v1.json")
+    block_set = _git_json(package_commit, f"{prefix}/topology-native-blocks-v1.json")
+    candidate_set = _git_json(
+        package_commit, f"{prefix}/native-candidate-envelopes-v1.json"
+    )
+    for value, field in (
+        (source, "sourceManifestSha256"),
+        (authority, "authoritySha256"),
+        (block_set, "blockSetSha256"),
+        (candidate_set, "candidateSetSha256"),
+    ):
+        _validate_self_hash(value, field)
+    if (
+        source.get("rustSourceCommit") != expected_source_commit
+        or authority.get("rustSourceCommit") != expected_source_commit
+        or authority.get("sourceManifestSha256")
+        != source.get("sourceManifestSha256")
+        or block_set.get("nativeAuthoritySha256") != authority.get("authoritySha256")
+        or candidate_set.get("nativeAuthoritySha256")
+        != authority.get("authoritySha256")
+    ):
+        raise RuntimeError("preserved native package authority binding is invalid")
+    blocks = block_set.get("blocks") or []
+    candidates = candidate_set.get("candidates") or []
+    _validate_native_blocks(blocks)
+    flattened = [candidate for block in blocks for candidate in block["candidates"]]
+    if canonical_json(flattened) != canonical_json(candidates):
+        raise RuntimeError("preserved native block and candidate sets diverge")
+    return source, authority, blocks, candidates
+
+
 def _source_manifest(commit: str, *, allow_uncommitted: bool) -> dict[str, Any]:
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise RuntimeError("Rust authority source commit must be a lowercase 40-character Git SHA")
@@ -989,9 +1040,13 @@ def run(
     conformance_report_path: Path | None = None,
     production_admission_report_path: Path | None = None,
     portability_report_path: Path | None = None,
+    result_admission_source_commit: str | None = None,
+    preserve_native_package_commit: str | None = None,
     allow_uncommitted_source: bool = False,
 ) -> dict[str, Path]:
-    required = [NATIVE_BIN, FREEZE_BIN, FROZEN_AUTHORITY, PARENT_MATERIAL, TOPOLOGY_SPEC]
+    required = [FREEZE_BIN, FROZEN_AUTHORITY, PARENT_MATERIAL, TOPOLOGY_SPEC]
+    if preserve_native_package_commit is None:
+        required.append(NATIVE_BIN)
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise RuntimeError(f"required native/historical inputs are missing: {missing}")
@@ -999,26 +1054,37 @@ def run(
     # compiler differential as historical input without copying or rewriting it.
     differential = _json(OUTPUT / "target-cross-compiler-transcript-v1.json")
     shared = _json(FROZEN_AUTHORITY)
-    source = _source_manifest(source_commit, allow_uncommitted=allow_uncommitted_source)
+    admission_source_commit = result_admission_source_commit or source_commit
+    if preserve_native_package_commit is None:
+        source = _source_manifest(
+            source_commit, allow_uncommitted=allow_uncommitted_source
+        )
+        authority = _native_authority(shared, source)
+        blocks = _author_blocks(shared, authority)
+        _validate_native_blocks(blocks)
+        candidates = [
+            candidate for block in blocks for candidate in block["candidates"]
+        ]
+    else:
+        source, authority, blocks, candidates = _load_preserved_native_package(
+            preserve_native_package_commit,
+            expected_source_commit=source_commit,
+        )
     worker_contract = _load_worker_contract(worker_contract_path)
     launch_evidence = _load_launch_gate_evidence(
         conformance_report_path=conformance_report_path,
         production_admission_report_path=production_admission_report_path,
         portability_report_path=portability_report_path,
         worker_contract=worker_contract,
-        source_commit=source_commit,
+        source_commit=admission_source_commit,
     )
-    authority = _native_authority(shared, source)
-    blocks = _author_blocks(shared, authority)
-    _validate_native_blocks(blocks)
-    candidates = [candidate for block in blocks for candidate in block["candidates"]]
     if len(candidates) != 12 or len({row["candidateId"] for row in candidates}) != 12 or len({row["payloadSha256"] for row in candidates}) != 12:
         raise RuntimeError("native topology candidates are not exactly 12 unique identities/payloads")
     campaign, evaluation_authorities = _campaign_authority(
         candidates,
         authority,
         worker_contract,
-        source_commit,
+        admission_source_commit,
     )
     paths = {
         "source": output_dir / "native-source-manifest-v1.json",
@@ -1178,6 +1244,8 @@ def main() -> None:
     parser.add_argument("--conformance-report", type=Path)
     parser.add_argument("--production-admission-report", type=Path)
     parser.add_argument("--portability-report", type=Path)
+    parser.add_argument("--result-admission-source-commit")
+    parser.add_argument("--preserve-native-package-commit")
     parser.add_argument("--allow-uncommitted-source", action="store_true")
     args = parser.parse_args()
     freeze_root = args.freeze_root or Path(tempfile.gettempdir()) / "fuzzfolio-rust-canonical-topology-inspected-v1"
@@ -1189,6 +1257,8 @@ def main() -> None:
         conformance_report_path=args.conformance_report,
         production_admission_report_path=args.production_admission_report,
         portability_report_path=args.portability_report,
+        result_admission_source_commit=args.result_admission_source_commit,
+        preserve_native_package_commit=args.preserve_native_package_commit,
         allow_uncommitted_source=args.allow_uncommitted_source,
     ).items():
         print(f"{name}={path}")

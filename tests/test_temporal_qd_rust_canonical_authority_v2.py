@@ -11,6 +11,8 @@ WORKER_CONTRACT_SHA256 = "sha256:ae5d0e53aa19e1e241468c009e248457560ca63e2e3d785
 WORKER_IMAGE_DIGEST = "sha256:1817ddc68b55433bb81c59572e51d5dddc40e2a95ac9004fafee979adbb913fe"
 WORKER_SOURCE_COMMIT = "0fbe84a9f7b73b97789c8370b268f4d01eeb37ce"
 PRECOMPILED_CAPABILITY = "temporal_qd_precompiled_profile_execution_v1"
+V21_NATIVE_AUTHORITY_SHA256 = "sha256:ac45c314170daeeaa8e7a5628500bbdfd9e1af6cde2117f58c5f6db8b12c308f"
+V21_CANDIDATE_SET_SHA256 = "sha256:e8632f4a15a8e21e13fdd216d37d72e4097465a343395b36913eaecde49af7e3"
 
 
 def _load(name: str) -> dict:
@@ -24,6 +26,7 @@ def _assert_self_hash(value: dict, field: str) -> None:
 
 
 def test_v2_package_is_digest_bound_no_dispatch_and_self_consistent() -> None:
+    candidates = _load("native-candidate-envelopes-v1.json")
     tasks = _load("inspected-task-index-v1.json")
     go_nogo = _load("topology-launch-go-nogo-v1.json")
     package = _load("topology-launch-package-manifest-v1.json")
@@ -34,6 +37,8 @@ def test_v2_package_is_digest_bound_no_dispatch_and_self_consistent() -> None:
 
     assert package["schemaVersion"] == "temporal_qd_topology_no_dispatch_launch_package_v3"
     assert package["dispatchEnabled"] is False
+    assert candidates["nativeAuthoritySha256"] == V21_NATIVE_AUTHORITY_SHA256
+    assert candidates["candidateSetSha256"] == V21_CANDIDATE_SET_SHA256
     assert package["inspectedTaskCount"] == 144
     assert package["workerContract"]["workerContractSha256"] == WORKER_CONTRACT_SHA256
     assert package["workerContract"]["imageDigest"] == WORKER_IMAGE_DIGEST
