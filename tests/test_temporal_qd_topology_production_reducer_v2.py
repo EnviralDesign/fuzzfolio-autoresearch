@@ -17,6 +17,8 @@ from autoresearch.temporal_qd_topology_production_reducer_v2 import (
 from autoresearch.temporal_qd_topology_replication_survival_v2 import (
     evaluate_replication_survival_v2,
 )
+from autoresearch.temporal_qd_v2_3_launch_gate import build_gate as build_v2_3_gate
+from autoresearch.temporal_qd_v2_4_launch_gate import build_gate as build_v2_4_gate
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTHORITY = ROOT / "research" / "temporal-qd" / "rust-canonical-authority-v2-3"
@@ -48,6 +50,51 @@ def test_v2_3_analyzer_reproduces_caller_trust_weakness() -> None:
     result = analyze_block(block_id="fabricated", panels=fabricated, identities_valid=True)
     assert result["replication"]["inspectedPromising"] is True
     assert result["replication"]["evidenceCompleteAndIdentityValid"] is True
+
+
+def test_v2_3_gate_reproduces_summary_boolean_trust_weakness(tmp_path: Path) -> None:
+    def dump(name: str, value: dict) -> Path:
+        path = tmp_path / name
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    evidence = dump(
+        "evidence.json",
+        {
+            "allCheckpointsOpened": True,
+            "crossRootAllEqual": True,
+            "allCheckpointIdentitiesMatchExecutedSeamProof": True,
+        },
+    )
+    conformances = [
+        dump(f"conformance-{panel}.json", {"validatedCandidateCount": 12, "fullWorkerExecutionFixtureCount": 12, "marketDataRead": False})
+        for panel in range(3)
+    ]
+    full = dump("full.json", {"fullWorkerExecutionFixtureCount": 48, "validatedTaskCount": 48, "marketDataRead": False})
+    gateway_log = dump("gateway-log.json", {"loopbackOnly": True, "marketDataRead": False, "ackDurability": [{"journalDurableBeforeAck": True, "resultPackDurableBeforeAck": True}]})
+    gateway_receipt = dump("gateway-receipt.json", {"taskCount": 48, "completedTaskCount": 48, "resultCount": 48})
+    output = dump(
+        "campaign-output.json",
+        {
+            "freshRestart": False,
+            "reopenRestart": True,
+            "recoveredRestart": True,
+            "tamperRejected": True,
+            "taskCount": 48,
+            "evaluatedMemberCount": 12,
+            "panelBundleCount": 12,
+        },
+    )
+    gate = build_v2_3_gate(
+        authority_root=AUTHORITY,
+        production_evidence_path=evidence,
+        conformance_paths=conformances,
+        full_48_conformance_path=full,
+        gateway_log_path=gateway_log,
+        gateway_receipt_path=gateway_receipt,
+        campaign_output_proof_path=output,
+    )
+    assert gate["readyForAuthorizedTopologyCaseStudyLaunch"] is True
 
 
 def _candidate(block: int, arm: str) -> dict:
@@ -150,6 +197,8 @@ def _graph(panel_number: int) -> dict:
         "campaignOutputCheckpoint": {
             "receiptSha256": f"output-{panel_id}",
             "semanticReceiptSha256": f"output-semantic-{panel_id}",
+            "evaluatedMembers": {"rawSha256": f"members-{panel_id}"},
+            "candidatePanelBundles": {"rawSha256": f"bundles-{panel_id}"},
         },
         "gatewayExecutionReceipt": {"semanticReceiptSha256": f"gateway-semantic-{panel_id}"},
         "campaignInputCheckpoint": {
@@ -304,3 +353,18 @@ def test_exact_three_production_outputs_feed_reducer_without_hand_built_summarie
     assert result["status"] == "complete"
     assert len(result["authenticatedPanels"]) == 3
     assert len(result["blocks"]) == 3
+
+
+@pytest.mark.skipif(not os.getenv("FUZZFOLIO_V2_4_INTEGRATION_ROOT"), reason="audit-only production proof root not supplied")
+def test_v2_4_gate_recomputes_complete_production_authority() -> None:
+    proof_root = Path(os.environ["FUZZFOLIO_V2_4_INTEGRATION_ROOT"])
+    gate = build_v2_4_gate(
+        repo_root=ROOT,
+        authority_root=AUTHORITY,
+        proof_root=proof_root,
+        opener=ROOT / "rust" / "temporal-qd" / "target" / "debug" / "temporal-qd-campaign-output-graph-json.exe",
+        parity_bin=ROOT / "rust" / "temporal-qd" / "target" / "debug" / "temporal-qd-replication-survival-v2-jsonl.exe",
+        cross_root_report_path=proof_root / "topology-v2-4-cross-root-report.json",
+    )
+    assert gate["readyForAuthorizedTopologyCaseStudyLaunch"] is True
+    assert all(gate["gates"].values())

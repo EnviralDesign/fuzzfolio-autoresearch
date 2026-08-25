@@ -438,7 +438,8 @@ def reduce_authenticated_graphs(
                 # Root-bound receipt/path identities were authenticated by the
                 # Rust opener but are intentionally excluded from the semantic
                 # result so identical evidence reduces identically elsewhere.
-                "campaignOutputSemanticReceiptSha256": graph_by_panel[panel]["campaignOutputCheckpoint"]["semanticReceiptSha256"],
+                "evaluatedMembersRawSha256": graph_by_panel[panel]["campaignOutputCheckpoint"]["evaluatedMembers"]["rawSha256"],
+                "candidatePanelBundlesRawSha256": graph_by_panel[panel]["campaignOutputCheckpoint"]["candidatePanelBundles"]["rawSha256"],
                 "gatewaySemanticReceiptSha256": graph_by_panel[panel]["gatewayExecutionReceipt"]["semanticReceiptSha256"],
                 "campaignInputCheckpointSha256": graph_by_panel[panel]["campaignInputCheckpoint"]["checkpointSha256"],
                 "taskMatrixSha256": graph_by_panel[panel]["taskMatrixSha256"],
