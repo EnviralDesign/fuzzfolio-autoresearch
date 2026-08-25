@@ -8,24 +8,27 @@ receives one candidate/window/cost-view job and evaluates it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
 import re
 import tempfile
 import time
+from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 from .result_codec import (
     ResultCodecError,
-    read_json_object as _read_codec_json_object,
-    semantic_sha256 as _semantic_sha256,
     write_gzip_json_once,
 )
-
+from .result_codec import (
+    read_json_object as _read_codec_json_object,
+)
+from .result_codec import (
+    semantic_sha256 as _semantic_sha256,
+)
 
 TEMPORAL_SEARCH_AUTHORITY_SCHEMA = "temporal_graph_candidate_window_authority_v1"
 TEMPORAL_SEARCH_PREPARATION_SCHEMA = "temporal_graph_candidate_window_preparation_v1"
@@ -2120,6 +2123,134 @@ def _validate_precompiled_execution_receipt(
         raise TemporalSearchContractError(
             "Rust-precompiled receipt reports a forbidden source-profile rewrite"
         )
+    attestation = _mapping(
+        material.get("runtime_program_identity_attestation"),
+        name="worker runtime_program_identity_attestation",
+    )
+    expected_attestation_keys = {
+        "schema_version",
+        "program_identity_mode",
+        "observation_stream_program_sha256",
+        "checkpoint_program_sha256",
+        "graph_runtime_program_sha256",
+        "execution_state_program_sha256",
+        "attestation_sha256",
+    }
+    if set(attestation) != expected_attestation_keys:
+        raise TemporalSearchContractError(
+            "runtime program identity attestation does not have the exact V1 field set"
+        )
+    if (
+        attestation.get("schema_version")
+        != "temporal_qd_runtime_program_identity_attestation_v1"
+        or attestation.get("program_identity_mode") != "rust_canonical_v1"
+    ):
+        raise TemporalSearchContractError(
+            "runtime program identity attestation schema or mode is invalid"
+        )
+    attestation_identity = dict(attestation)
+    supplied_attestation_sha256 = _sha(
+        attestation_identity.pop("attestation_sha256", None),
+        name="runtime program identity attestation SHA-256",
+    )
+    if canonical_sha256(attestation_identity) != supplied_attestation_sha256:
+        raise TemporalSearchContractError(
+            "runtime program identity attestation identity mismatch"
+        )
+    expected_program = job.get("expected_resolved_program_sha256")
+    runtime_programs = {
+        attestation.get("observation_stream_program_sha256"),
+        attestation.get("checkpoint_program_sha256"),
+        attestation.get("graph_runtime_program_sha256"),
+        attestation.get("execution_state_program_sha256"),
+        material.get("program_sha256"),
+        receipt.get("resolved_program_sha256"),
+    }
+    if runtime_programs != {expected_program}:
+        raise TemporalSearchContractError(
+            "runtime program identity attestation contains a competing identity"
+        )
+    worker_attribution = _mapping(
+        material.get("worker_attribution"),
+        name="worker attribution",
+    )
+    worker_bindings = {
+        "contract hash": (
+            worker_attribution.get("worker_contract_hash"),
+            receipt.get("worker_contract_hash"),
+        ),
+        "contract schema": (
+            worker_attribution.get("worker_contract_schema"),
+            receipt.get("worker_contract_schema"),
+        ),
+        "image digest": (
+            worker_attribution.get("worker_image_digest"),
+            receipt.get("worker_image_digest"),
+        ),
+        "image identity mode": (
+            worker_attribution.get("worker_image_identity_mode"),
+            receipt.get("worker_image_identity_mode"),
+        ),
+        "source commit": (
+            worker_attribution.get("worker_source_git_commit"),
+            receipt.get("worker_source_git_commit"),
+        ),
+        "Rust core": (
+            worker_attribution.get("worker_rust_core_hash"),
+            receipt.get("rust_core_hash"),
+        ),
+        "Rust build info": (
+            worker_attribution.get("worker_rust_build_info"),
+            receipt.get("rust_build_info"),
+        ),
+        "runtime platform": (
+            worker_attribution.get("worker_runtime_platform"),
+            receipt.get("runtime_platform"),
+        ),
+    }
+    for label, (observed, expected) in worker_bindings.items():
+        if observed != expected:
+            raise TemporalSearchContractError(
+                f"worker attribution {label} does not match execution receipt"
+            )
+    cost_results = _mapping(
+        material.get("cost_view_results"),
+        name="Rust-precompiled result cost_view_results",
+    )
+    if set(cost_results) != set(_COST_VIEWS):
+        raise TemporalSearchContractError(
+            "Rust-precompiled result lacks the exact two cost views"
+        )
+    for cost_view in _COST_VIEWS:
+        view = _mapping(cost_results[cost_view], name=f"cost view {cost_view}")
+        if view.get("observation_stream_sha256") != material.get(
+            "observation_stream_sha256"
+        ):
+            raise TemporalSearchContractError(
+                "cost view observation stream identity drifted"
+            )
+        replay = _mapping(view.get("replay_result"), name=f"{cost_view} replay result")
+        graph_runtime = _mapping(
+            replay.get("finalGraphRuntime"), name=f"{cost_view} graph runtime"
+        )
+        execution_state = _mapping(
+            replay.get("finalExecutionState"), name=f"{cost_view} execution state"
+        )
+        replay_programs = {
+            replay.get("programSha256"),
+            graph_runtime.get("programSha256"),
+            execution_state.get("programSha256"),
+        }
+        for row in replay.get("trades") or []:
+            replay_programs.add(_mapping(row, name="trade").get("programSha256"))
+        for row in replay.get("executionTraces") or []:
+            replay_programs.add(
+                _mapping(row, name="execution trace").get("programSha256")
+            )
+        if replay_programs != {expected_program}:
+            raise TemporalSearchContractError(
+                f"{cost_view} replay emitted a competing program identity"
+            )
 
 
 def _result_material(

@@ -1204,6 +1204,138 @@ pub fn validate_precompiled_execution_receipt(task: &Value, result: &Value) -> R
                 == Some(false),
         "precompiled execution receipt reports forbidden compiler/source mutation"
     );
+    let attestation_value = result
+        .get("runtime_program_identity_attestation")
+        .ok_or_else(|| anyhow!("runtime program identity attestation is missing"))?;
+    let attestation = object(attestation_value, "runtime program identity attestation")?;
+    exact_keys(
+        attestation,
+        &[
+            "schema_version",
+            "program_identity_mode",
+            "observation_stream_program_sha256",
+            "checkpoint_program_sha256",
+            "graph_runtime_program_sha256",
+            "execution_state_program_sha256",
+            "attestation_sha256",
+        ],
+        "runtime program identity attestation",
+    )?;
+    ensure!(
+        string(attestation, "schema_version")?
+            == "temporal_qd_runtime_program_identity_attestation_v1"
+            && string(attestation, "program_identity_mode")? == "rust_canonical_v1",
+        "runtime program identity attestation schema or mode is incompatible"
+    );
+    ensure!(
+        canonical_sha256_without_object_field(attestation_value, "attestation_sha256")?
+            == string(attestation, "attestation_sha256")?,
+        "runtime program identity attestation identity drifted"
+    );
+    let expected_program = string(job, "expected_resolved_program_sha256")?;
+    for key in [
+        "observation_stream_program_sha256",
+        "checkpoint_program_sha256",
+        "graph_runtime_program_sha256",
+        "execution_state_program_sha256",
+    ] {
+        ensure!(
+            string(attestation, key)? == expected_program,
+            "runtime program identity attestation {key} drifted"
+        );
+    }
+    ensure!(
+        string(result, "program_sha256")? == expected_program
+            && string(receipt, "resolved_program_sha256")? == expected_program,
+        "result or receipt contains a competing program identity"
+    );
+    let worker = object(
+        result
+            .get("worker_attribution")
+            .ok_or_else(|| anyhow!("worker attribution is missing"))?,
+        "worker attribution",
+    )?;
+    for (worker_key, receipt_key) in [
+        ("worker_contract_hash", "worker_contract_hash"),
+        ("worker_contract_schema", "worker_contract_schema"),
+        ("worker_image_digest", "worker_image_digest"),
+        ("worker_image_identity_mode", "worker_image_identity_mode"),
+        ("worker_source_git_commit", "worker_source_git_commit"),
+        ("worker_rust_core_hash", "rust_core_hash"),
+    ] {
+        ensure!(
+            string(worker, worker_key)? == string(receipt, receipt_key)?,
+            "worker attribution {worker_key} drifted from receipt"
+        );
+    }
+    for (worker_key, receipt_key) in [
+        ("worker_rust_build_info", "rust_build_info"),
+        ("worker_runtime_platform", "runtime_platform"),
+    ] {
+        ensure!(
+            worker.get(worker_key) == receipt.get(receipt_key),
+            "worker attribution {worker_key} drifted from receipt"
+        );
+    }
+    let cost_results = object(
+        result
+            .get("cost_view_results")
+            .ok_or_else(|| anyhow!("precompiled result cost views are missing"))?,
+        "precompiled result cost views",
+    )?;
+    exact_keys(
+        cost_results,
+        &["none", "research_conservative"],
+        "precompiled result cost views",
+    )?;
+    for cost_view in ["none", "research_conservative"] {
+        let view = object(
+            cost_results
+                .get(cost_view)
+                .ok_or_else(|| anyhow!("cost view {cost_view} is missing"))?,
+            "cost view",
+        )?;
+        ensure!(
+            string(view, "observation_stream_sha256")?
+                == string(result, "observation_stream_sha256")?,
+            "cost view observation stream identity drifted"
+        );
+        let replay = object(
+            view.get("replay_result")
+                .ok_or_else(|| anyhow!("cost view replay result is missing"))?,
+            "cost view replay result",
+        )?;
+        let graph_runtime = object(
+            replay
+                .get("finalGraphRuntime")
+                .ok_or_else(|| anyhow!("final graph runtime is missing"))?,
+            "final graph runtime",
+        )?;
+        let execution_state = object(
+            replay
+                .get("finalExecutionState")
+                .ok_or_else(|| anyhow!("final execution state is missing"))?,
+            "final execution state",
+        )?;
+        ensure!(
+            string(replay, "programSha256")? == expected_program
+                && string(graph_runtime, "programSha256")? == expected_program
+                && string(execution_state, "programSha256")? == expected_program,
+            "cost view replay contains a competing program identity"
+        );
+        for trade in array(replay, "trades")? {
+            ensure!(
+                string(object(trade, "trade")?, "programSha256")? == expected_program,
+                "trade contains a competing program identity"
+            );
+        }
+        for trace in array(replay, "executionTraces")? {
+            ensure!(
+                string(object(trace, "execution trace")?, "programSha256")? == expected_program,
+                "execution trace contains a competing program identity"
+            );
+        }
+    }
     Ok(())
 }
 

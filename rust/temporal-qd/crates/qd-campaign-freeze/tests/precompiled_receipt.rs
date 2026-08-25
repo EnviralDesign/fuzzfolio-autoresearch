@@ -11,6 +11,12 @@ fn reseal(receipt: &mut Value) {
     receipt["receipt_sha256"] = Value::String(identity);
 }
 
+fn reseal_attestation(attestation: &mut Value) {
+    let identity =
+        canonical_sha256_without_object_field(attestation, "attestation_sha256").unwrap();
+    attestation["attestation_sha256"] = Value::String(identity);
+}
+
 fn fixture() -> (Value, Value) {
     let rust_build_info = json!({"source_sha256": sha('b')});
     let runtime_platform = json!({"machine":"x86_64","system":"Linux"});
@@ -64,12 +70,45 @@ fn fixture() -> (Value, Value) {
         "receipt_sha256":sha('0')
     });
     reseal(&mut receipt);
+    let mut attestation = json!({
+        "schema_version":"temporal_qd_runtime_program_identity_attestation_v1",
+        "program_identity_mode":"rust_canonical_v1",
+        "observation_stream_program_sha256":sha('2'),
+        "checkpoint_program_sha256":sha('2'),
+        "graph_runtime_program_sha256":sha('2'),
+        "execution_state_program_sha256":sha('2'),
+        "attestation_sha256":sha('0')
+    });
+    reseal_attestation(&mut attestation);
+    let replay = json!({
+        "programSha256":sha('2'),
+        "finalGraphRuntime":{"programSha256":sha('2')},
+        "finalExecutionState":{"programSha256":sha('2')},
+        "trades":[],
+        "executionTraces":[]
+    });
     let result = json!({
         "schema_version":"temporal_graph_candidate_window_result_v2",
         "source_profile_snapshot_sha256":sha('e'),
         "resolved_profile_snapshot_sha256":sha('1'),
         "program_sha256":sha('2'),
-        "precompiled_profile_execution_receipt":receipt
+        "observation_stream_sha256":sha('7'),
+        "precompiled_profile_execution_receipt":receipt,
+        "runtime_program_identity_attestation":attestation,
+        "worker_attribution":{
+            "worker_contract_hash":sha('3'),
+            "worker_contract_schema":"replay-worker-contract-v2",
+            "worker_image_digest":sha('4'),
+            "worker_image_identity_mode":"image_digest",
+            "worker_source_git_commit":"5".repeat(40),
+            "worker_rust_core_hash":sha('6'),
+            "worker_rust_build_info":rust_build_info,
+            "worker_runtime_platform":runtime_platform
+        },
+        "cost_view_results":{
+            "none":{"observation_stream_sha256":sha('7'),"replay_result":replay.clone()},
+            "research_conservative":{"observation_stream_sha256":sha('7'),"replay_result":replay}
+        }
     });
     (task, result)
 }

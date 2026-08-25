@@ -23,7 +23,6 @@ from typing import Any, Iterable, Mapping
 from .evidence_plan import build_replay_evidence_plan, canonical_json, canonical_sha256
 from .temporal_qd_rust_dashboard_differential_v1 import JsonlProcess
 
-
 ROOT = Path(__file__).resolve().parents[1]
 RUST_ROOT = ROOT / "rust/temporal-qd"
 # Preserve the published V1 import for historical audit callers. New package
@@ -121,10 +120,109 @@ def _load_worker_contract(path: Path) -> dict[str, Any]:
         "runtimePlatformSha256": canonical_sha256(contract["runtime_platform"]),
         "capabilities": sorted(capabilities),
         "workerContractArtifact": {
-            "path": str(path.resolve()),
+            "artifactRole": "resolved_replay_worker_runtime_contract_v2",
+            "logicalId": "worker-contract.json",
             "rawSha256": _sha_file(path),
         },
     }
+
+
+def _load_launch_gate_evidence(
+    *,
+    conformance_report_path: Path | None,
+    portability_report_path: Path | None,
+    worker_contract: Mapping[str, Any],
+    source_commit: str,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "conformanceReport": None,
+        "portabilityReport": None,
+        "realWorkerReplayConformancePassed": False,
+        "expandedAdversarialAdmissionPassed": False,
+        "crossRootDeterminismPassed": False,
+    }
+    if conformance_report_path is not None:
+        report = _json(conformance_report_path)
+        identity = dict(report)
+        supplied = identity.pop("reportSha256", None)
+        if supplied != canonical_sha256(identity):
+            raise RuntimeError("worker-seam conformance report identity is invalid")
+        adversarial = report.get("adversarialCases") or []
+        real_worker_passed = (
+            report.get("schemaVersion")
+            == "temporal_qd_worker_seam_conformance_report_v2_1"
+            and report.get("marketDataRead") is False
+            and report.get("replayExecuted") is True
+            and int(report.get("fullWorkerExecutionFixtureCount") or 0) >= 5
+            and int(report.get("exactWorkerResultsAcceptedByFuzzFolio") or 0) >= 5
+            and int(report.get("exactWorkerResultsAcceptedByPythonAdmission") or 0)
+            >= 5
+            and int(report.get("exactWorkerResultsAcceptedByRustAdmission") or 0) >= 5
+            and report.get("workerContractHash")
+            == worker_contract["workerContractSha256"]
+            and report.get("workerImageDigest") == worker_contract["imageDigest"]
+        )
+        adversarial_passed = (
+            len(adversarial) >= 26
+            and int(report.get("adversarialRejectCount") or 0) == len(adversarial)
+            and all(
+                row.get("fuzzFolioRejected") is True
+                and row.get("pythonAdmissionRejected") is True
+                and row.get("rustAdmissionRejected") is True
+                for row in adversarial
+            )
+        )
+        evidence.update(
+            {
+                "conformanceReport": {
+                    "artifactRole": "worker_seam_conformance_v2_1",
+                    "logicalId": "worker-seam-conformance.json",
+                    "rawSha256": _sha_file(conformance_report_path),
+                    "reportSha256": supplied,
+                },
+                "realWorkerReplayConformancePassed": real_worker_passed,
+                "expandedAdversarialAdmissionPassed": adversarial_passed,
+            }
+        )
+    if portability_report_path is not None:
+        report = _json(portability_report_path)
+        identity = dict(report)
+        supplied = identity.pop("reportSha256", None)
+        if supplied != canonical_sha256(identity):
+            raise RuntimeError("cross-root determinism report identity is invalid")
+        portability_passed = (
+            report.get("schemaVersion")
+            == "temporal_qd_authority_cross_root_determinism_report_v1"
+            and report.get("authorityProjectionMatches") is True
+            and report.get("taskManifestMatches") is True
+            and report.get("candidateIdsMatch") is True
+            and report.get("artifactRawSha256Matches") is True
+            and int(report.get("comparedArtifactCount") or 0) >= 15
+            and int(report.get("hostSpecificPathLeakCount", -1)) == 0
+            and report.get("workerContractSha256")
+            == worker_contract["workerContractSha256"]
+            and report.get("sourceCommit") == source_commit
+        )
+        evidence.update(
+            {
+                "portabilityReport": {
+                    "artifactRole": "cross_root_determinism_v1",
+                    "logicalId": "cross-root-determinism.json",
+                    "rawSha256": _sha_file(portability_report_path),
+                    "reportSha256": supplied,
+                },
+                "crossRootDeterminismPassed": portability_passed,
+            }
+        )
+    evidence["launchEvidenceComplete"] = all(
+        evidence[key]
+        for key in (
+            "realWorkerReplayConformancePassed",
+            "expandedAdversarialAdmissionPassed",
+            "crossRootDeterminismPassed",
+        )
+    )
+    return evidence
 
 
 def _write(path: Path, value: Mapping[str, Any]) -> None:
@@ -434,7 +532,10 @@ def _campaign_authority(
             },
             "costViews": cost_views,
             "costViewsSha256": canonical_sha256(cost_views),
-            "constructionCatalog": {"path": str(catalog), "rawSha256": _sha_file(catalog)},
+            "constructionCatalog": {
+                "path": catalog.relative_to(ROOT).as_posix(),
+                "rawSha256": _sha_file(catalog),
+            },
             "pairRunConfigSha256": native_authority["pairRunConfigSha256"],
             "sourceAuthority": "rust_canonical_native_v1",
         },
@@ -696,6 +797,8 @@ def run(
     *,
     source_commit: str,
     worker_contract_path: Path,
+    conformance_report_path: Path | None = None,
+    portability_report_path: Path | None = None,
     allow_uncommitted_source: bool = False,
 ) -> dict[str, Path]:
     required = [NATIVE_BIN, FREEZE_BIN, FROZEN_AUTHORITY, PARENT_MATERIAL, TOPOLOGY_SPEC]
@@ -708,6 +811,12 @@ def run(
     shared = _json(FROZEN_AUTHORITY)
     source = _source_manifest(source_commit, allow_uncommitted=allow_uncommitted_source)
     worker_contract = _load_worker_contract(worker_contract_path)
+    launch_evidence = _load_launch_gate_evidence(
+        conformance_report_path=conformance_report_path,
+        portability_report_path=portability_report_path,
+        worker_contract=worker_contract,
+        source_commit=source_commit,
+    )
     authority = _native_authority(shared, source)
     blocks = _author_blocks(shared, authority)
     _validate_native_blocks(blocks)
@@ -771,9 +880,84 @@ def run(
     )
     science = _science_contract(_json(TOPOLOGY_SPEC))
     _write(paths["science"], science)
-    go_nogo = _seal({"schemaVersion": "temporal_qd_topology_launch_go_nogo_v2", "readyForTopologyCaseStudyLaunch": True, "gates": {"exactRustCanonicalCandidateCount": 12, "rustValidationPassCount": 12, "completeBlockCount": 3, "workerConsumesFrozenProfileUnchanged": True, "campaignTaskValidationPassed": True, "allTasksUseCandidateWindowJobV2": True, "dedicatedWorkerCapabilityRequired": True, "immutableWorkerImageDigestBound": True, "typedExecutionReceiptRequired": True, "receiptAdmissionImplemented": True, "inspectedTaskCount": 144, "uniqueCandidateWindowCount": 144, "differentialEvidenceComplete": True, "untouchedConfirmationPreregistered": True, "untouchedProjectedTaskCount": 48, "noTaskDispatched": True, "noMarketEvaluation": True, "noGeneration": True, "noProductionArchiveWrite": True}, "authoritySha256": authority["authoritySha256"], "campaignAuthorityId": campaign["authorityId"], "taskMatrixSha256": freeze_result["taskMatrixSha256"], "taskIndexSha256": task_index["taskIndexSha256"], "workerContractSha256": worker_contract["workerContractSha256"], "workerImageDigest": worker_contract["imageDigest"], "workerSourceGitCommit": worker_contract["sourceGitCommit"], "preregistrationSha256": confirmation["preregistrationSha256"], "semanticDecisionSha256": semantic["decisionSha256"], "scientificContractSha256": science["scientificContractSha256"]}, "goNogoSha256")
+    gates = {
+        "exactRustCanonicalCandidateCount": 12,
+        "rustValidationPassCount": 12,
+        "completeBlockCount": 3,
+        "workerConsumesFrozenProfileUnchanged": True,
+        "campaignTaskValidationPassed": True,
+        "allTasksUseCandidateWindowJobV2": True,
+        "dedicatedWorkerCapabilityRequired": True,
+        "immutableWorkerImageDigestBound": True,
+        "typedExecutionReceiptRequired": True,
+        "receiptAdmissionImplemented": True,
+        "realWorkerReplayConformancePassed": launch_evidence[
+            "realWorkerReplayConformancePassed"
+        ],
+        "expandedAdversarialAdmissionPassed": launch_evidence[
+            "expandedAdversarialAdmissionPassed"
+        ],
+        "crossRootDeterminismPassed": launch_evidence[
+            "crossRootDeterminismPassed"
+        ],
+        "inspectedTaskCount": 144,
+        "uniqueCandidateWindowCount": 144,
+        "differentialEvidenceComplete": True,
+        "untouchedConfirmationPreregistered": True,
+        "untouchedProjectedTaskCount": 48,
+        "noTaskDispatched": True,
+        "noMarketEvaluation": True,
+        "noGeneration": True,
+        "noProductionArchiveWrite": True,
+    }
+    go_nogo = _seal(
+        {
+            "schemaVersion": "temporal_qd_topology_launch_go_nogo_v3",
+            "readyForTopologyCaseStudyLaunch": launch_evidence[
+                "launchEvidenceComplete"
+            ],
+            "gates": gates,
+            "launchGateEvidence": launch_evidence,
+            "authoritySha256": authority["authoritySha256"],
+            "campaignAuthorityId": campaign["authorityId"],
+            "taskMatrixSha256": freeze_result["taskMatrixSha256"],
+            "taskIndexSha256": task_index["taskIndexSha256"],
+            "workerContractSha256": worker_contract["workerContractSha256"],
+            "workerImageDigest": worker_contract["imageDigest"],
+            "workerSourceGitCommit": worker_contract["sourceGitCommit"],
+            "preregistrationSha256": confirmation["preregistrationSha256"],
+            "semanticDecisionSha256": semantic["decisionSha256"],
+            "scientificContractSha256": science["scientificContractSha256"],
+        },
+        "goNogoSha256",
+    )
     _write(paths["goNogo"], go_nogo)
-    package = _seal({"schemaVersion": "temporal_qd_topology_no_dispatch_launch_package_v2", "nativeAuthoritySha256": authority["authoritySha256"], "campaignAuthorityId": campaign["authorityId"], "candidateCount": 12, "inspectedTaskCount": 144, "untouchedProjectedTaskCount": 48, "workerContract": worker_contract, "artifacts": {key: {"path": path.name, "rawSha256": _sha_file(path)} for key, path in paths.items() if key != "package"}, "externalUncommittedTaskFreeze": {"storageDisposition": "external_uncommitted_raw_task_manifest", "taskManifestRawSha256": _sha_file(freeze_root / "task-manifest.json"), "rawTaskPackCommitted": False}, "dispatchEnabled": False}, "packageSha256")
+    package = _seal(
+        {
+            "schemaVersion": "temporal_qd_topology_no_dispatch_launch_package_v3",
+            "nativeAuthoritySha256": authority["authoritySha256"],
+            "campaignAuthorityId": campaign["authorityId"],
+            "candidateCount": 12,
+            "inspectedTaskCount": 144,
+            "untouchedProjectedTaskCount": 48,
+            "workerContract": worker_contract,
+            "launchGateEvidence": launch_evidence,
+            "artifacts": {
+                key: {"path": path.name, "rawSha256": _sha_file(path)}
+                for key, path in paths.items()
+                if key != "package"
+            },
+            "externalUncommittedTaskFreeze": {
+                "storageDisposition": "external_uncommitted_raw_task_manifest",
+                "taskManifestRawSha256": _sha_file(
+                    freeze_root / "task-manifest.json"
+                ),
+                "rawTaskPackCommitted": False,
+            },
+            "dispatchEnabled": False,
+        },
+        "packageSha256",
+    )
     _write(paths["package"], package)
     return paths
 
@@ -784,10 +968,20 @@ def main() -> None:
     parser.add_argument("--freeze-root", type=Path)
     parser.add_argument("--rust-source-commit", default=str(_git("rev-parse", "HEAD")))
     parser.add_argument("--worker-contract", type=Path, required=True)
+    parser.add_argument("--conformance-report", type=Path)
+    parser.add_argument("--portability-report", type=Path)
     parser.add_argument("--allow-uncommitted-source", action="store_true")
     args = parser.parse_args()
     freeze_root = args.freeze_root or Path(tempfile.gettempdir()) / "fuzzfolio-rust-canonical-topology-inspected-v1"
-    for name, path in run(args.output_dir, freeze_root, source_commit=args.rust_source_commit, worker_contract_path=args.worker_contract, allow_uncommitted_source=args.allow_uncommitted_source).items():
+    for name, path in run(
+        args.output_dir,
+        freeze_root,
+        source_commit=args.rust_source_commit,
+        worker_contract_path=args.worker_contract,
+        conformance_report_path=args.conformance_report,
+        portability_report_path=args.portability_report,
+        allow_uncommitted_source=args.allow_uncommitted_source,
+    ).items():
         print(f"{name}={path}")
 
 
