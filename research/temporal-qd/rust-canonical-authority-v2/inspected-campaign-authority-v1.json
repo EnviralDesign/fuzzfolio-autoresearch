@@ -1,5 +1,5 @@
 {
-  "authorityId": "sha256:ad57f99cdc5f596b7d5696eb1f8489cd02fef08b5504f50cfc25b917641213cd",
+  "authorityId": "sha256:f169533d8326787a0cb4595de609d89d001a6661619362e4a69b493c6c07628f",
   "authorityLabel": "rust-canonical-topology-case-study-inspected-v1",
   "bounds": {
     "deadlineSeconds": 86400.0,
@@ -24371,7 +24371,7 @@
       "windowId": "panel-3-year-4-q2"
     }
   ],
-  "evaluationAuthoritiesSha256": "sha256:c72f63e6ae0c281329cfa3a30eb519dc4745496adf40828338218793592a5d74",
+  "evaluationAuthoritiesSha256": "sha256:ce07314df8c1d8724d5d7ff2af49a644a009d0a18c4d024933ed3fe9afb37625",
   "executionPolicy": {
     "dispatchEnabled": false,
     "generationPermitted": false,
@@ -24394,6 +24394,7 @@
     "profileExecutionContract": "temporal_qd_precompiled_profile_execution_v1",
     "profileExecutionReceipt": "temporal_qd_precompiled_profile_execution_receipt_v1",
     "requiredWorkerCapability": "temporal_qd_precompiled_profile_execution_v1",
+    "resultAdmissionAuthoritySha256": "sha256:cc090565ab9921f0f62f115ffc42eb682a8484a3dad3df7e782e4f7cc61fcb36",
     "resultSchema": "temporal_graph_candidate_window_result_v2",
     "taskKind": "temporal_graph_candidate_window"
   },
