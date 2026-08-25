@@ -2928,7 +2928,9 @@ mod tests {
         reject_enqueues: bool,
         fail_ack_once: bool,
         journal_path: PathBuf,
+        result_pack_path: PathBuf,
         saw_durable_journal_before_ack: bool,
+        saw_durable_result_pack_before_ack: bool,
         max_enqueue_batch: usize,
         max_read_limit: usize,
         acknowledgement_calls: u64,
@@ -2945,7 +2947,9 @@ mod tests {
                 reject_enqueues: false,
                 fail_ack_once: false,
                 journal_path: root.join(SIDECAR_DIR).join(COMPLETION_JOURNAL_NAME),
+                result_pack_path: root.join(SIDECAR_DIR).join(RESULT_PACK_NAME),
                 saw_durable_journal_before_ack: false,
+                saw_durable_result_pack_before_ack: false,
                 max_enqueue_batch: 0,
                 max_read_limit: 0,
                 acknowledgement_calls: 0,
@@ -3014,6 +3018,8 @@ mod tests {
             self.acknowledgement_calls += 1;
             self.saw_durable_journal_before_ack =
                 self.journal_path.is_file() && fs::metadata(&self.journal_path)?.len() > 0;
+            self.saw_durable_result_pack_before_ack =
+                self.result_pack_path.is_file() && fs::metadata(&self.result_pack_path)?.len() > 0;
             if self.fail_ack_once {
                 self.fail_ack_once = false;
                 bail!("injected acknowledgement crash")
@@ -3435,6 +3441,31 @@ mod tests {
         }))
     }
 
+    fn successful_completion_with_material(
+        task: &Value,
+        material: Value,
+        lease: &str,
+    ) -> Result<Value> {
+        let task_map = object(task, "fixture task")?;
+        Ok(json!({
+            "task_id":field(task_map,"task_id")?,
+            "lease_id":lease,
+            "worker_id":"fixture-worker",
+            "lane_id":field(task_map,"lane_id")?,
+            "attempt_id":field(task_map,"attempt_id")?,
+            "status":"success",
+            "result":{"status":"success","job_kind":TASK_KIND,"result":material}
+        }))
+    }
+
+    fn exact_v2_worker_fixture() -> Result<(Value, Value)> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/v2_1_exact_worker_fixture.json"
+        ))
+        .context("parse exact V2.1 worker fixture")?;
+        Ok((fixture["task"].clone(), fixture["result"].clone()))
+    }
+
     fn warmup_failure_completion(task: &Value, lease: &str) -> Result<Value> {
         let task_map = object(task, "fixture task")?;
         Ok(json!({
@@ -3636,6 +3667,68 @@ mod tests {
         assert!(
             root.join(FAILURES_DIR)
                 .join("fixture-task-b.json")
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_v2_worker_result_is_durable_before_ack_and_runtime_tamper_is_not_acknowledged()
+    -> Result<()> {
+        let (task, result) = exact_v2_worker_fixture()?;
+        let directory = TempDir::new()?;
+        let root = directory.path();
+        let manifest = write_fixture_manifest(root, std::slice::from_ref(&task))?;
+        let completion = successful_completion_with_material(&task, result.clone(), "v2-lease")?;
+        let mut gateway = FakeLocalGateway::new(root, [completion]);
+        let dispatch = execute_gateway_dispatch_with_client(
+            &request(&manifest, root, DispatchMode::Fresh),
+            &mut gateway,
+        )?;
+        assert_eq!(dispatch["completedTaskCount"], json!(1));
+        assert_eq!(
+            dispatch["telemetry"]["acknowledgedCompletionCount"],
+            json!(1)
+        );
+        assert_eq!(gateway.acknowledgement_calls, 1);
+        assert!(gateway.saw_durable_journal_before_ack);
+        assert!(gateway.saw_durable_result_pack_before_ack);
+        let receipt = read_canonical_line(
+            &root.join(SIDECAR_DIR).join(EXECUTION_RECEIPT_NAME),
+            "exact V2 dispatcher receipt",
+        )?;
+        assert_eq!(receipt["resultCount"], json!(1));
+        assert_eq!(receipt["completedTaskCount"], json!(1));
+
+        let tampered_directory = TempDir::new()?;
+        let tampered_root = tampered_directory.path();
+        let tampered_manifest = write_fixture_manifest(tampered_root, std::slice::from_ref(&task))?;
+        let mut tampered_result = result;
+        tampered_result["cost_view_results"]["research_conservative"]["replay_result"]["programSha256"] =
+            json!(SHA_A);
+        let tampered_completion =
+            successful_completion_with_material(&task, tampered_result, "v2-tampered-lease")?;
+        let mut tampered_gateway = FakeLocalGateway::new(tampered_root, [tampered_completion]);
+        let error = execute_gateway_dispatch_with_client(
+            &request(&tampered_manifest, tampered_root, DispatchMode::Fresh),
+            &mut tampered_gateway,
+        )
+        .expect_err("runtime-program tamper must fail before durable completion/ack");
+        assert!(
+            format!("{error:#}")
+                .contains("candidate-window result v2 receipt/runtime admission failed")
+        );
+        assert_eq!(tampered_gateway.acknowledgement_calls, 0);
+        assert!(!tampered_gateway.saw_durable_journal_before_ack);
+        assert!(!tampered_gateway.saw_durable_result_pack_before_ack);
+        let journal_path = tampered_root
+            .join(SIDECAR_DIR)
+            .join(COMPLETION_JOURNAL_NAME);
+        assert!(!journal_path.is_file() || fs::metadata(journal_path)?.len() == 0);
+        assert!(
+            !tampered_root
+                .join(SIDECAR_DIR)
+                .join(EXECUTION_RECEIPT_NAME)
                 .is_file()
         );
         Ok(())

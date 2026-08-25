@@ -57,11 +57,34 @@ def test_v2_package_is_digest_bound_no_dispatch_and_self_consistent() -> None:
     assert go_nogo["gates"]["typedExecutionReceiptRequired"] is True
     assert go_nogo["gates"]["realWorkerReplayConformancePassed"] is True
     assert go_nogo["gates"]["expandedAdversarialAdmissionPassed"] is True
+    assert go_nogo["gates"]["productionCampaignSealAdmissionPassed"] is True
+    assert go_nogo["gates"]["productionGatewayDispatchAdmissionPassed"] is True
+    assert go_nogo["gates"]["productionOfflineCampaignSealPassed"] is True
+    assert (
+        go_nogo["gates"][
+            "allExactV2WorkerResultsAcceptedThroughProductionAdmission"
+        ]
+        is True
+    )
+    assert (
+        go_nogo["gates"][
+            "allAdversarialV2ResultsRejectedThroughProductionAdmission"
+        ]
+        is True
+    )
     assert go_nogo["gates"]["crossRootDeterminismPassed"] is True
     assert go_nogo["gates"]["noTaskDispatched"] is True
     assert go_nogo["gates"]["noMarketEvaluation"] is True
     assert go_nogo["launchGateEvidence"]["launchEvidenceComplete"] is True
     assert package["launchGateEvidence"] == go_nogo["launchGateEvidence"]
+
+    authorities = _load("evaluation-authorities-v1.json")
+    result_admission = authorities["resultAdmissionAuthority"]
+    _assert_self_hash(result_admission, "resultAdmissionAuthoritySha256")
+    assert result_admission["productionAdmissionPolicy"] == "campaign_seal_shared_receipt_v2_2"
+    assert "temporal_graph_candidate_window_result_v2" in result_admission[
+        "admittedResultSchemas"
+    ]
 
 
 def test_v2_authority_contains_no_windows_host_paths() -> None:

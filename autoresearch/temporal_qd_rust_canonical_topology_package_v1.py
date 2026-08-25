@@ -130,19 +130,28 @@ def _load_worker_contract(path: Path) -> dict[str, Any]:
 def _load_launch_gate_evidence(
     *,
     conformance_report_path: Path | None,
+    production_admission_report_path: Path | None,
     portability_report_path: Path | None,
     worker_contract: Mapping[str, Any],
     source_commit: str,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "conformanceReport": None,
+        "productionAdmissionReport": None,
         "portabilityReport": None,
         "realWorkerReplayConformancePassed": False,
         "expandedAdversarialAdmissionPassed": False,
+        "productionCampaignSealAdmissionPassed": False,
+        "productionGatewayDispatchAdmissionPassed": False,
+        "productionOfflineCampaignSealPassed": False,
+        "allExactV2WorkerResultsAcceptedThroughProductionAdmission": False,
+        "allAdversarialV2ResultsRejectedThroughProductionAdmission": False,
         "crossRootDeterminismPassed": False,
     }
+    conformance_report: dict[str, Any] | None = None
     if conformance_report_path is not None:
         report = _json(conformance_report_path)
+        conformance_report = report
         identity = dict(report)
         supplied = identity.pop("reportSha256", None)
         if supplied != canonical_sha256(identity):
@@ -150,7 +159,7 @@ def _load_launch_gate_evidence(
         adversarial = report.get("adversarialCases") or []
         real_worker_passed = (
             report.get("schemaVersion")
-            == "temporal_qd_worker_seam_conformance_report_v2_1"
+            == "temporal_qd_worker_seam_conformance_report_v2_2"
             and report.get("marketDataRead") is False
             and report.get("replayExecuted") is True
             and int(report.get("fullWorkerExecutionFixtureCount") or 0) >= 5
@@ -169,19 +178,124 @@ def _load_launch_gate_evidence(
                 row.get("fuzzFolioRejected") is True
                 and row.get("pythonAdmissionRejected") is True
                 and row.get("rustAdmissionRejected") is True
+                and row.get("productionCampaignSealRejected") is True
                 for row in adversarial
             )
         )
         evidence.update(
             {
                 "conformanceReport": {
-                    "artifactRole": "worker_seam_conformance_v2_1",
+                    "artifactRole": "worker_seam_conformance_v2_2",
                     "logicalId": "worker-seam-conformance.json",
                     "rawSha256": _sha_file(conformance_report_path),
                     "reportSha256": supplied,
                 },
                 "realWorkerReplayConformancePassed": real_worker_passed,
                 "expandedAdversarialAdmissionPassed": adversarial_passed,
+            }
+        )
+    if production_admission_report_path is not None:
+        report = _json(production_admission_report_path)
+        identity = dict(report)
+        supplied = identity.pop("reportSha256", None)
+        if supplied != canonical_sha256(identity):
+            raise RuntimeError("production admission report identity is invalid")
+        expected_source_hashes = {
+            "campaignSeal": _sha_file(
+                ROOT / "rust/temporal-qd/crates/qd-campaign-seal/src/lib.rs"
+            ),
+            "gatewayDispatch": _sha_file(
+                ROOT / "rust/temporal-qd/crates/qd-gateway-dispatch/src/lib.rs"
+            ),
+            "sharedReceiptValidator": _sha_file(
+                ROOT / "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs"
+            ),
+        }
+        adversarial = report.get("adversarialCases") or []
+        production_raw_sha256 = _sha_file(production_admission_report_path)
+        conformance_reference = (
+            conformance_report.get("productionAdmissionReport")
+            if conformance_report is not None
+            else None
+        )
+        reports_cross_bound = (
+            isinstance(conformance_reference, Mapping)
+            and conformance_reference.get("rawSha256") == production_raw_sha256
+            and conformance_reference.get("reportSha256") == supplied
+            and conformance_report.get("exactFixtures")
+            == report.get("exactFixtures")
+            and [
+                {
+                    "case": row.get("case"),
+                    "taskSha256": row.get("taskSha256"),
+                    "resultSha256": row.get("resultSha256"),
+                }
+                for row in conformance_report.get("adversarialCases") or []
+            ]
+            == [
+                {
+                    "case": row.get("case"),
+                    "taskSha256": row.get("taskSha256"),
+                    "resultSha256": row.get("resultSha256"),
+                }
+                for row in adversarial
+            ]
+        )
+        if conformance_report is not None and not reports_cross_bound:
+            raise RuntimeError(
+                "production admission report is not bound to worker-seam conformance"
+            )
+        exact_passed = int(
+            report.get("productionCampaignSealExactAcceptCount") or 0
+        ) >= 5
+        adversarial_passed = (
+            int(report.get("productionCampaignSealAdversarialRejectCount") or 0)
+            == len(adversarial)
+            and len(adversarial) >= 26
+            and all(
+                row.get("productionCampaignSealRejected") is True
+                for row in adversarial
+            )
+        )
+        source_bound = (
+            report.get("schemaVersion")
+            == "temporal_qd_production_result_admission_report_v1"
+            and report.get("sourceCommit") == source_commit
+            and report.get("sourceHashes") == expected_source_hashes
+            and report.get("productionAdmissionPolicy")
+            == "campaign_seal_shared_receipt_v2_2"
+            and set(report.get("productionBinaryHashes") or {})
+            == {
+                "temporal-qd-campaign-admission-jsonl",
+                "temporal-qd-precompiled-receipt-jsonl",
+            }
+            and report.get("marketDataRead") is False
+            and report.get("gatewayNetworkAccess") is False
+            and int(report.get("taskDispatchCount") or 0) == 0
+            and report.get("workerContractHash")
+            == worker_contract["workerContractSha256"]
+            and report.get("workerImageDigest") == worker_contract["imageDigest"]
+            and len(report.get("exactFixtures") or []) >= 5
+            and reports_cross_bound
+        )
+        evidence.update(
+            {
+                "productionAdmissionReport": {
+                    "artifactRole": "production_result_admission_v2_2",
+                    "logicalId": "production-admission.json",
+                    "rawSha256": production_raw_sha256,
+                    "reportSha256": supplied,
+                },
+                "productionCampaignSealAdmissionPassed": source_bound
+                and exact_passed,
+                "productionGatewayDispatchAdmissionPassed": source_bound
+                and report.get("productionGatewayDispatchFixturePassed") is True,
+                "productionOfflineCampaignSealPassed": source_bound
+                and report.get("productionOfflineSealFixturePassed") is True,
+                "allExactV2WorkerResultsAcceptedThroughProductionAdmission": source_bound
+                and exact_passed,
+                "allAdversarialV2ResultsRejectedThroughProductionAdmission": source_bound
+                and adversarial_passed,
             }
         )
     if portability_report_path is not None:
@@ -219,6 +333,11 @@ def _load_launch_gate_evidence(
         for key in (
             "realWorkerReplayConformancePassed",
             "expandedAdversarialAdmissionPassed",
+            "productionCampaignSealAdmissionPassed",
+            "productionGatewayDispatchAdmissionPassed",
+            "productionOfflineCampaignSealPassed",
+            "allExactV2WorkerResultsAcceptedThroughProductionAdmission",
+            "allAdversarialV2ResultsRejectedThroughProductionAdmission",
             "crossRootDeterminismPassed",
         )
     )
@@ -469,6 +588,7 @@ def _campaign_authority(
     candidates: list[dict[str, Any]],
     native_authority: Mapping[str, Any],
     worker_contract: Mapping[str, Any],
+    source_commit: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     panels = [_json(ROTATING / f"panel-{index}-template-preparation.json") for index in (1, 2, 3)]
     workers = {canonical_json(panel["workerContract"]) for panel in panels}
@@ -517,10 +637,35 @@ def _campaign_authority(
         "none": {"spreadBps": 0.0, "slippageBps": 0.0, "commissionBps": 0.0},
         "research_conservative": {"spreadBps": 2.0, "slippageBps": 1.0, "commissionBps": 0.5},
     }
+    result_admission_sources = {
+        "campaignSeal": ROOT / "rust/temporal-qd/crates/qd-campaign-seal/src/lib.rs",
+        "gatewayDispatch": ROOT / "rust/temporal-qd/crates/qd-gateway-dispatch/src/lib.rs",
+        "sharedReceiptValidator": ROOT / "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs",
+    }
+    result_admission_authority = _seal(
+        {
+            "schemaVersion": "temporal_qd_result_admission_authority_v1",
+            "sourceCommit": source_commit,
+            "sourceHashes": {
+                name: _sha_file(path)
+                for name, path in sorted(result_admission_sources.items())
+            },
+            "admittedResultSchemas": [
+                "temporal_graph_candidate_window_result_v1",
+                "temporal_graph_candidate_window_result_v2",
+                "temporal_graph_candidate_window_rejected_result_v1",
+            ],
+            "precompiledReceiptSchema": "temporal_qd_precompiled_profile_execution_receipt_v1",
+            "runtimeAttestationSchema": "temporal_qd_runtime_program_identity_attestation_v1",
+            "productionAdmissionPolicy": "campaign_seal_shared_receipt_v2_2",
+        },
+        "resultAdmissionAuthoritySha256",
+    )
     authorities = _seal(
         {
             "schemaVersion": "temporal_qd_topology_evaluation_authorities_v1",
             "nativeCompilerAuthoritySha256": native_authority["authoritySha256"],
+            "resultAdmissionAuthority": result_admission_authority,
             "workerContract": worker,
             "workerContractCompatibilityObservation": {
                 "panelTemplateSha256": historical_panel_worker[
@@ -559,6 +704,9 @@ def _campaign_authority(
             "profileExecutionContract": "temporal_qd_precompiled_profile_execution_v1",
             "profileExecutionReceipt": "temporal_qd_precompiled_profile_execution_receipt_v1",
             "requiredWorkerCapability": "temporal_qd_precompiled_profile_execution_v1",
+            "resultAdmissionAuthoritySha256": result_admission_authority[
+                "resultAdmissionAuthoritySha256"
+            ],
         },
         "prohibitedEvidence": panels[0]["prohibitedEvidence"],
         "developmentWindows": windows,
@@ -797,6 +945,7 @@ def run(
     source_commit: str,
     worker_contract_path: Path,
     conformance_report_path: Path | None = None,
+    production_admission_report_path: Path | None = None,
     portability_report_path: Path | None = None,
     allow_uncommitted_source: bool = False,
 ) -> dict[str, Path]:
@@ -812,6 +961,7 @@ def run(
     worker_contract = _load_worker_contract(worker_contract_path)
     launch_evidence = _load_launch_gate_evidence(
         conformance_report_path=conformance_report_path,
+        production_admission_report_path=production_admission_report_path,
         portability_report_path=portability_report_path,
         worker_contract=worker_contract,
         source_commit=source_commit,
@@ -826,6 +976,7 @@ def run(
         candidates,
         authority,
         worker_contract,
+        source_commit,
     )
     paths = {
         "source": output_dir / "native-source-manifest-v1.json",
@@ -895,6 +1046,21 @@ def run(
         ],
         "expandedAdversarialAdmissionPassed": launch_evidence[
             "expandedAdversarialAdmissionPassed"
+        ],
+        "productionCampaignSealAdmissionPassed": launch_evidence[
+            "productionCampaignSealAdmissionPassed"
+        ],
+        "productionGatewayDispatchAdmissionPassed": launch_evidence[
+            "productionGatewayDispatchAdmissionPassed"
+        ],
+        "productionOfflineCampaignSealPassed": launch_evidence[
+            "productionOfflineCampaignSealPassed"
+        ],
+        "allExactV2WorkerResultsAcceptedThroughProductionAdmission": launch_evidence[
+            "allExactV2WorkerResultsAcceptedThroughProductionAdmission"
+        ],
+        "allAdversarialV2ResultsRejectedThroughProductionAdmission": launch_evidence[
+            "allAdversarialV2ResultsRejectedThroughProductionAdmission"
         ],
         "crossRootDeterminismPassed": launch_evidence[
             "crossRootDeterminismPassed"
@@ -968,6 +1134,7 @@ def main() -> None:
     parser.add_argument("--rust-source-commit", default=str(_git("rev-parse", "HEAD")))
     parser.add_argument("--worker-contract", type=Path, required=True)
     parser.add_argument("--conformance-report", type=Path)
+    parser.add_argument("--production-admission-report", type=Path)
     parser.add_argument("--portability-report", type=Path)
     parser.add_argument("--allow-uncommitted-source", action="store_true")
     args = parser.parse_args()
@@ -978,6 +1145,7 @@ def main() -> None:
         source_commit=args.rust_source_commit,
         worker_contract_path=args.worker_contract,
         conformance_report_path=args.conformance_report,
+        production_admission_report_path=args.production_admission_report,
         portability_report_path=args.portability_report,
         allow_uncommitted_source=args.allow_uncommitted_source,
     ).items():

@@ -30,6 +30,7 @@ use base64::Engine as _;
 use flate2::{Compression, GzBuilder, read::GzDecoder};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
+use temporal_qd_campaign_freeze::validate_precompiled_execution_receipt;
 use temporal_qd_contract::{
     CONTRACT_VERSION, canonical_json_bytes, canonical_json_line, canonical_sha256,
     canonical_sha256_without_object_field,
@@ -46,8 +47,10 @@ const DIRECTIONAL_INDEX_SCHEMA: &str = "temporal_qd_tail_result_index_v4";
 const DIRECTIONAL_TAIL_AUTHORITY_SCHEMA: &str = "temporal_qd_v5_directional_tail_authority_v1";
 const RAW_ROTATING_PROVENANCE_SCHEMA: &str = "temporal_qd_v5_raw_rotating_provenance_v1";
 const STAGE_SCHEMA: &str = "temporal_qd_tail_stage_projection_v1";
-const ADMITTED_SCHEMA: &str = "temporal_graph_candidate_window_result_v1";
-const REJECTED_SCHEMA: &str = "temporal_graph_candidate_window_rejected_result_v1";
+const ADMITTED_SCHEMA_V1: &str = "temporal_graph_candidate_window_result_v1";
+const ADMITTED_SCHEMA_V2: &str = "temporal_graph_candidate_window_result_v2";
+const REJECTED_SCHEMA_V1: &str = "temporal_graph_candidate_window_rejected_result_v1";
+const JOB_SCHEMA_V2: &str = "temporal_graph_candidate_window_job_v2";
 
 /// Terminal disposition after the exact candidate-window raw-result admission
 /// that the campaign seal uses before it makes a task result restartable.
@@ -78,16 +81,11 @@ pub fn admit_candidate_window_task_result(
     let material_map = object(material, "candidate-window task material")?;
     verify_result_binding(material, &source_task)?;
     match text(material_map, "schema_version")?.as_str() {
-        ADMITTED_SCHEMA => {
-            validate_v3_candidate_window_result(
-                material,
-                Some(&source_task.task),
-                Some(&source_task.task_payload),
-            )?;
-            validate_worker_material_identity(material)?;
+        ADMITTED_SCHEMA_V1 | ADMITTED_SCHEMA_V2 => {
+            validate_admitted_candidate_window_result(material, &source_task)?;
             Ok(CandidateWindowResultAdmission::Admitted)
         }
-        REJECTED_SCHEMA => {
+        REJECTED_SCHEMA_V1 => {
             validate_warmup_rejected_candidate_window_result(material, &source_task)?;
             Ok(CandidateWindowResultAdmission::Rejected)
         }
@@ -110,6 +108,7 @@ struct Manifest {
 
 #[derive(Clone, Debug)]
 struct SourceTask {
+    manifest_row: Value,
     task: Value,
     task_payload: Value,
     raw_result_path: PathBuf,
@@ -262,6 +261,7 @@ fn source_task_from_manifest_row(task_manifest_row: &Value) -> Result<SourceTask
         "sharedObservationStreamId": shared_observation_stream_id,
     });
     Ok(SourceTask {
+        manifest_row: task_manifest_row.clone(),
         task,
         task_payload: payload,
         // The online dispatcher does not have (or need) a raw gzip path/ref at
@@ -322,15 +322,14 @@ fn build_index_and_inventory(source: &Source) -> Result<(Value, Vec<u8>, ReadMet
             .checked_add(semantic.len() as u64)
             .ok_or_else(|| anyhow!("semantic byte overflow"))?;
         verify_result_binding(&result, source_task)?;
-        if text(object(&result, "raw result")?, "schema_version")? == ADMITTED_SCHEMA {
-            validate_v3_candidate_window_result(
-                &result,
-                Some(&source_task.task),
-                Some(&source_task.task_payload),
-            )?;
-            validate_worker_material_identity(&result)?;
-        } else if text(object(&result, "raw result")?, "schema_version")? == REJECTED_SCHEMA {
-            validate_warmup_rejected_candidate_window_result(&result, source_task)?;
+        match text(object(&result, "raw result")?, "schema_version")?.as_str() {
+            ADMITTED_SCHEMA_V1 | ADMITTED_SCHEMA_V2 => {
+                validate_admitted_candidate_window_result(&result, source_task)?;
+            }
+            REJECTED_SCHEMA_V1 => {
+                validate_warmup_rejected_candidate_window_result(&result, source_task)?;
+            }
+            schema => bail!("candidate-window material schema is not admitted: {schema}"),
         }
         let entry = build_entry(
             &result,
@@ -361,6 +360,51 @@ fn build_index_and_inventory(source: &Source) -> Result<(Value, Vec<u8>, ReadMet
     });
     add_identity(&mut index, "tailResultIndexSha256")?;
     Ok((index, inventory, metrics))
+}
+
+fn validate_admitted_candidate_window_result(
+    result: &Value,
+    source_task: &SourceTask,
+) -> Result<()> {
+    let result_map = object(result, "admitted candidate-window result")?;
+    let schema = text(result_map, "schema_version")?;
+    match schema.as_str() {
+        ADMITTED_SCHEMA_V1 => {
+            let task_payload = object(
+                &source_task.task_payload,
+                "admitted candidate-window task payload",
+            )?;
+            ensure!(
+                task_payload.get("schema_version").and_then(Value::as_str) != Some(JOB_SCHEMA_V2),
+                "candidate-window result v1 is not admitted for task v2"
+            );
+            ensure!(
+                !result_map.contains_key("precompiled_profile_execution_receipt")
+                    && !result_map.contains_key("runtime_program_identity_attestation"),
+                "candidate-window result v1 must not carry v2 execution authority"
+            );
+        }
+        ADMITTED_SCHEMA_V2 => {
+            ensure!(
+                result_map.contains_key("precompiled_profile_execution_receipt"),
+                "candidate-window result v2 lacks its precompiled execution receipt"
+            );
+            ensure!(
+                result_map.contains_key("runtime_program_identity_attestation"),
+                "candidate-window result v2 lacks its runtime program identity attestation"
+            );
+            validate_precompiled_execution_receipt(&source_task.manifest_row, result)
+                .context("candidate-window result v2 receipt/runtime admission failed")?;
+        }
+        _ => bail!("raw admitted result schema is invalid: {schema}"),
+    }
+    validate_v3_candidate_window_result(
+        result,
+        Some(&source_task.task),
+        Some(&source_task.task_payload),
+    )?;
+    validate_worker_material_identity(result)?;
+    Ok(())
 }
 
 fn verify_raw_blob(blob_sha256: &str, blob_bytes: u64, raw_ref: &Value) -> Result<()> {
@@ -777,7 +821,7 @@ fn validate_warmup_rejected_candidate_window_result(
 ) -> Result<()> {
     let material = object(result, "warmup rejection material")?;
     ensure!(
-        material.get("schema_version") == Some(&Value::String(REJECTED_SCHEMA.into())),
+        material.get("schema_version") == Some(&Value::String(REJECTED_SCHEMA_V1.into())),
         "candidate-window result is not a warmup rejection"
     );
     ensure!(
@@ -1580,7 +1624,9 @@ fn build_entry(
     let task = object(&source_task.task, "source task")?;
     let schema = text(result_map, "schema_version")?;
     ensure!(
-        schema == ADMITTED_SCHEMA || schema == REJECTED_SCHEMA,
+        schema == ADMITTED_SCHEMA_V1
+            || schema == ADMITTED_SCHEMA_V2
+            || schema == REJECTED_SCHEMA_V1,
         "raw result schema is unsupported"
     );
     let record = window_record(result)?;
@@ -1656,7 +1702,7 @@ fn build_entry(
 
 fn window_record(result: &Value) -> Result<Map<String, Value>> {
     let root = object(result, "raw result")?;
-    if text(root, "schema_version")? == REJECTED_SCHEMA {
+    if text(root, "schema_version")? == REJECTED_SCHEMA_V1 {
         let outcome = object(
             field(root, "evaluation_outcome")?,
             "warmup rejection outcome",
@@ -1674,7 +1720,10 @@ fn window_record(result: &Value) -> Result<Map<String, Value>> {
         }).as_object().expect("object").clone());
     }
     ensure!(
-        text(root, "schema_version")? == ADMITTED_SCHEMA,
+        matches!(
+            text(root, "schema_version")?.as_str(),
+            ADMITTED_SCHEMA_V1 | ADMITTED_SCHEMA_V2
+        ),
         "raw admitted result schema is invalid"
     );
     let cost_views = object(field(root, "cost_view_results")?, "cost view results")?;
@@ -2877,11 +2926,12 @@ mod tests {
         let replay = json!({"streamSha256":stream,"profileSnapshotSha256":SHA_B,"programSha256":SHA_C,"graphTraces":[],"executionTraces":[],"trades":[],"metrics":metrics});
         let evidence = json!({"schema_version":"temporal_graph_candidate_window_evidence_contract_v1","analysis_window_start":start,"analysis_window_end":"2024-02-01T00:00:00Z","analysis_window_end_exclusive":true,"requested_bar_limit":100,"effective_bar_limit":120,"observation_count":10,"first_admitted_observation_timestamp":start,"last_admitted_observation_timestamp":last,"warmup_sufficient":true,"warmup_sufficiency":{"sufficient":true,"source":"aligned_scoring"},"excluded_provisional_count":1,"excluded_outside_analysis_window_count":2});
         let path = cost_view_path_sha256(replay.as_object().unwrap(), "fixture").unwrap();
-        json!({"schema_version":ADMITTED_SCHEMA,"candidate_id":"fixture","analysis_window_start":start,"analysis_window_end":"2024-02-01T00:00:00Z","source_profile_snapshot_sha256":SHA_A,"resolved_profile_snapshot_sha256":SHA_B,"program_sha256":SHA_C,"observation_stream_sha256":stream,"observation_summary":{"observation_count":10,"first_bar_start":start,"last_bar_start":last},"evidence_contract":evidence,"cost_view_results":{"research_conservative":{"cost_view":"research_conservative","observation_stream_sha256":stream,"replay_result":replay},"none":{"cost_view":"none","observation_stream_sha256":stream,"replay_result":replay}},"diagnostics":{"observation_count":10,"requested_bar_limit":100,"effective_bar_limit":120,"warmup_sufficient":true,"warmup_sufficiency":{"sufficient":true,"source":"aligned_scoring"},"first_admitted_observation_timestamp":start,"last_admitted_observation_timestamp":last,"excluded_provisional_count":1,"excluded_outside_analysis_window_count":2,"cost_view_decision_path_sha256":path,"cost_view_path_parity":"matched","cost_view_count":2,"shared_stream_required":true}})
+        json!({"schema_version":ADMITTED_SCHEMA_V1,"candidate_id":"fixture","analysis_window_start":start,"analysis_window_end":"2024-02-01T00:00:00Z","source_profile_snapshot_sha256":SHA_A,"resolved_profile_snapshot_sha256":SHA_B,"program_sha256":SHA_C,"observation_stream_sha256":stream,"observation_summary":{"observation_count":10,"first_bar_start":start,"last_bar_start":last},"evidence_contract":evidence,"cost_view_results":{"research_conservative":{"cost_view":"research_conservative","observation_stream_sha256":stream,"replay_result":replay},"none":{"cost_view":"none","observation_stream_sha256":stream,"replay_result":replay}},"diagnostics":{"observation_count":10,"requested_bar_limit":100,"effective_bar_limit":120,"warmup_sufficient":true,"warmup_sufficiency":{"sufficient":true,"source":"aligned_scoring"},"first_admitted_observation_timestamp":start,"last_admitted_observation_timestamp":last,"excluded_provisional_count":1,"excluded_outside_analysis_window_count":2,"cost_view_decision_path_sha256":path,"cost_view_path_parity":"matched","cost_view_count":2,"shared_stream_required":true}})
     }
 
     fn rejection_task() -> SourceTask {
         SourceTask {
+            manifest_row: Value::Null,
             task: json!({"taskId":"fixture-task","candidateId":"fixture","analysisWindowStart":"2024-01-01T00:00:00Z","analysisWindowEnd":"2024-02-01T00:00:00Z","evidencePlanSemanticSha256":SHA_A,"taskPayloadSha256":SHA_B}),
             task_payload: Value::Null,
             raw_result_path: PathBuf::from("fixture-result.json.gz"),
@@ -2915,7 +2965,7 @@ mod tests {
             outcome["replay_completed"] = json!(false);
         }
         freeze_rejected_artifact(
-            json!({"schema_version":REJECTED_SCHEMA,"task_kind":"temporal_graph_candidate_window","job_id":"fixture-job","authority_id":"fixture-authority","candidate_id":"fixture","evidence_plan_id":SHA_A,"lake_window_semantic_sha256":SHA_B,"shared_observation_stream_id":"fixture-stream","analysis_window_start":"2024-01-01T00:00:00Z","analysis_window_end":"2024-02-01T00:00:00Z","evaluation_outcome":outcome}),
+            json!({"schema_version":REJECTED_SCHEMA_V1,"task_kind":"temporal_graph_candidate_window","job_id":"fixture-job","authority_id":"fixture-authority","candidate_id":"fixture","evidence_plan_id":SHA_A,"lake_window_semantic_sha256":SHA_B,"shared_observation_stream_id":"fixture-stream","analysis_window_start":"2024-01-01T00:00:00Z","analysis_window_end":"2024-02-01T00:00:00Z","evaluation_outcome":outcome}),
         )
     }
 
@@ -2975,6 +3025,53 @@ mod tests {
         material
     }
 
+    fn exact_v2_worker_fixture() -> Result<(Value, Value)> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/v2_1_exact_worker_fixture.json"
+        ))
+        .context("parse exact V2.1 worker fixture")?;
+        Ok((fixture["task"].clone(), fixture["result"].clone()))
+    }
+
+    fn offline_source(root: &Path, task_row: &Value, result: &Value) -> Result<Source> {
+        let semantic = canonical_json_bytes(result)?;
+        let uncompressed = semantic.clone();
+        let mut encoder = GzBuilder::new()
+            .mtime(0)
+            .operating_system(255)
+            .write(Vec::new(), Compression::best());
+        encoder.write_all(&uncompressed)?;
+        let blob = encoder.finish()?;
+        let path = root.join("results.pack");
+        fs::write(&path, &blob)?;
+
+        let mut task = source_task_from_manifest_row(task_row)?;
+        task.raw_result_path = path;
+        task.raw_result_offset_bytes = Some(0);
+        task.raw_result_length_bytes = Some(blob.len() as u64);
+        task.raw_ref = json!({
+            "schemaVersion":"temporal_qd_tail_raw_result_ref_v1",
+            "relativePath":"results.pack",
+            "resultSha256":sha_bytes(&semantic),
+            "codec":"gzip-json-v1",
+            "semanticSizeBytes":semantic.len(),
+            "uncompressedSha256":sha_bytes(&uncompressed),
+            "uncompressedSizeBytes":uncompressed.len(),
+            "blobSha256":sha_bytes(&blob),
+            "blobSizeBytes":blob.len(),
+        });
+        Ok(Source {
+            authority_id: SHA_A.into(),
+            authority_sha256: SHA_A.into(),
+            task_matrix_sha256: SHA_B.into(),
+            task_manifest_sha256: SHA_C.into(),
+            checkpoint_sha256: SHA_A.into(),
+            include_funnel: false,
+            tasks: vec![task],
+            source_sha256: SHA_B.into(),
+        })
+    }
+
     #[test]
     fn public_task_row_admission_reuses_campaign_seal_validators() -> Result<()> {
         let task = manifest_task_row();
@@ -2995,6 +3092,48 @@ mod tests {
         let mut tampered = admitted;
         tampered["job_id"] = json!("other-task");
         assert!(admit_candidate_window_task_result(&task, &tampered).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn offline_index_reduction_accepts_exact_v2_and_preserves_raw_receipt_provenance() -> Result<()>
+    {
+        let (task, result) = exact_v2_worker_fixture()?;
+        let directory = tempfile::TempDir::new()?;
+        let source = offline_source(directory.path(), &task, &result)?;
+        let (index, inventory, metrics) = build_index_and_inventory(&source)?;
+        assert_eq!(index["taskCount"], json!(1));
+        assert_eq!(index["entries"].as_array().map(Vec::len), Some(1));
+        assert_eq!(metrics.raw_reads, 1);
+        assert!(!inventory.is_empty());
+
+        let raw_path = &source.tasks[0].raw_result_path;
+        let mut decoded = Vec::new();
+        GzDecoder::new(File::open(raw_path)?).read_to_end(&mut decoded)?;
+        let reopened: Value = serde_json::from_slice(&decoded)?;
+        assert_eq!(reopened, result);
+        assert!(
+            reopened
+                .get("precompiled_profile_execution_receipt")
+                .is_some()
+        );
+        assert!(
+            reopened
+                .get("runtime_program_identity_attestation")
+                .is_some()
+        );
+
+        let mut tampered = result;
+        tampered["cost_view_results"]["research_conservative"]["replay_result"]["programSha256"] =
+            json!(SHA_A);
+        let tampered_directory = tempfile::TempDir::new()?;
+        let tampered_source = offline_source(tampered_directory.path(), &task, &tampered)?;
+        let error = build_index_and_inventory(&tampered_source)
+            .expect_err("offline reduction must reject runtime-program drift before projection");
+        assert!(
+            format!("{error:#}")
+                .contains("candidate-window result v2 receipt/runtime admission failed")
+        );
         Ok(())
     }
 

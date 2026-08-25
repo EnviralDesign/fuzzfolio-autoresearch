@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +22,28 @@ RUST_ROOT = ROOT / "rust/temporal-qd"
 RECEIPT_BIN = (
     RUST_ROOT / "target/debug/temporal-qd-precompiled-receipt-jsonl.exe"
 )
+CAMPAIGN_ADMISSION_BIN = (
+    RUST_ROOT / "target/debug/temporal-qd-campaign-admission-jsonl.exe"
+)
+PRODUCTION_SOURCE_PATHS = {
+    "campaignSeal": RUST_ROOT / "crates/qd-campaign-seal/src/lib.rs",
+    "gatewayDispatch": RUST_ROOT / "crates/qd-gateway-dispatch/src/lib.rs",
+    "sharedReceiptValidator": RUST_ROOT / "crates/qd-campaign-freeze/src/lib.rs",
+}
+
+
+def _sha_file(path: Path) -> str:
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def _source_commit() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _reseal_receipt(result: dict[str, Any]) -> None:
@@ -97,6 +121,84 @@ def _python_admits(task: dict[str, Any], result: dict[str, Any]) -> bool:
     return True
 
 
+def _campaign_seal_admits(task: dict[str, Any], result: dict[str, Any]) -> bool:
+    request = {
+        "schemaVersion": "temporal_qd_campaign_admission_request_v1",
+        "task": task,
+        "result": result,
+    }
+    completed = subprocess.run(
+        [str(CAMPAIGN_ADMISSION_BIN)],
+        input=json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=ROOT,
+    )
+    return completed.returncode == 0
+
+
+def _build_admission_binaries() -> dict[str, str]:
+    builds = (
+        (
+            "temporal-qd-campaign-freeze",
+            "temporal-qd-precompiled-receipt-jsonl",
+            RECEIPT_BIN,
+        ),
+        (
+            "temporal-qd-campaign-seal",
+            "temporal-qd-campaign-admission-jsonl",
+            CAMPAIGN_ADMISSION_BIN,
+        ),
+    )
+    hashes: dict[str, str] = {}
+    for package, binary, path in builds:
+        subprocess.run(
+            ["cargo", "build", "-q", "-p", package, "--bin", binary],
+            cwd=RUST_ROOT,
+            check=True,
+        )
+        if not path.is_file():
+            raise RuntimeError(f"built admission binary is unavailable: {binary}")
+        hashes[binary] = _sha_file(path)
+    return hashes
+
+
+def _run_production_fixture_test(package: str, test_name: str) -> None:
+    completed = subprocess.run(
+        [
+            "cargo",
+            "test",
+            "-q",
+            "-p",
+            package,
+            "--lib",
+            test_name,
+            "--",
+            "--exact",
+        ],
+        cwd=RUST_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    combined = completed.stdout + completed.stderr
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"production fixture test failed: {package}::{test_name}\n{combined}"
+        )
+    summaries = re.findall(
+        r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+        r"(\d+) measured; (\d+) filtered out",
+        combined,
+    )
+    if len(summaries) != 1 or summaries[0][:4] != ("1", "0", "0", "0"):
+        raise RuntimeError(
+            f"production fixture test did not execute exactly one test: "
+            f"{package}::{test_name}\n{combined}"
+        )
+
+
 def _mutation(
     task: dict[str, Any],
     result: dict[str, Any],
@@ -152,8 +254,7 @@ def run(
     dashboard_script = dashboard_root / "scripts/temporal_qd_precompiled_conformance.py"
     if not dashboard_python.is_file() or not dashboard_script.is_file():
         raise RuntimeError("exact FuzzFolio conformance runtime is unavailable")
-    if not RECEIPT_BIN.is_file():
-        raise RuntimeError("Rust precompiled-receipt admission binary is unavailable")
+    production_binary_hashes = _build_admission_binaries()
     fuzz_report_path = output.with_suffix(".fuzzfolio.json")
     subprocess.run(
         [
@@ -174,15 +275,30 @@ def run(
     if len(fixtures) < 5 or fuzz_report.get("replayExecuted") is not True:
         raise RuntimeError("FuzzFolio did not produce five real worker execution fixtures")
     for executed in fixtures:
-        if not _python_admits(executed["task"], executed["result"]) or not _rust_admits(
-            executed["task"], executed["result"]
+        if (
+            not _python_admits(executed["task"], executed["result"])
+            or not _rust_admits(executed["task"], executed["result"])
+            or not _campaign_seal_admits(executed["task"], executed["result"])
         ):
             raise RuntimeError("a real FuzzFolio worker result was not admitted")
     fixture = fuzz_report["fixture"]
     task = fixture["task"]
     result = fixture["result"]
-    if not _python_admits(task, result) or not _rust_admits(task, result):
+    if (
+        not _python_admits(task, result)
+        or not _rust_admits(task, result)
+        or not _campaign_seal_admits(task, result)
+    ):
         raise RuntimeError("exact FuzzFolio-produced receipt was not admitted")
+
+    _run_production_fixture_test(
+        "temporal-qd-gateway-dispatch",
+        "tests::exact_v2_worker_result_is_durable_before_ack_and_runtime_tamper_is_not_acknowledged",
+    )
+    _run_production_fixture_test(
+        "temporal-qd-campaign-seal",
+        "tests::offline_index_reduction_accepts_exact_v2_and_preserves_raw_receipt_provenance",
+    )
 
     historical_program_sha256 = fixture["historicalDashboardProgramSha256"]
     receipt_mutations: list[
@@ -230,13 +346,19 @@ def run(
         )
         python_rejected = not _python_admits(changed_task, changed_result)
         rust_rejected = not _rust_admits(changed_task, changed_result)
-        if not python_rejected or not rust_rejected:
+        campaign_seal_rejected = not _campaign_seal_admits(
+            changed_task, changed_result
+        )
+        if not python_rejected or not rust_rejected or not campaign_seal_rejected:
             raise RuntimeError(f"cross-repository tamper fixture was admitted: {name}")
         adversarial.append(
             {
                 "case": name,
+                "taskSha256": canonical_sha256(changed_task),
+                "resultSha256": canonical_sha256(changed_result),
                 "pythonAdmissionRejected": python_rejected,
                 "rustAdmissionRejected": rust_rejected,
+                "productionCampaignSealRejected": campaign_seal_rejected,
             }
         )
         fuzz_batch.append(
@@ -279,8 +401,59 @@ def run(
                 f"FuzzFolio admitted adversarial worker result: {row['case']}"
             )
         row["fuzzFolioRejected"] = True
+    output.parent.mkdir(parents=True, exist_ok=True)
+    production_report_path = output.with_name(
+        output.stem + ".production-admission.json"
+    )
+    production_report: dict[str, Any] = {
+        "schemaVersion": "temporal_qd_production_result_admission_report_v1",
+        "sourceCommit": _source_commit(),
+        "sourceHashes": {
+            name: _sha_file(path)
+            for name, path in sorted(PRODUCTION_SOURCE_PATHS.items())
+        },
+        "productionAdmissionPolicy": "campaign_seal_shared_receipt_v2_2",
+        "productionBinaryHashes": production_binary_hashes,
+        "workerContractHash": fuzz_report["workerContractHash"],
+        "workerImageDigest": fuzz_report["workerImageDigest"],
+        "marketDataRead": False,
+        "gatewayNetworkAccess": False,
+        "taskDispatchCount": 0,
+        "productionCampaignSealExactAcceptCount": len(fixtures),
+        "productionCampaignSealAdversarialRejectCount": len(adversarial),
+        "productionGatewayDispatchFixturePassed": True,
+        "productionOfflineSealFixturePassed": True,
+        "exactFixtures": [
+            {
+                "candidateId": executed["task"]["payload"]["candidate_id"],
+                "taskId": executed["task"]["task_id"],
+                "taskSha256": canonical_sha256(executed["task"]),
+                "resultSha256": canonical_sha256(executed["result"]),
+            }
+            for executed in fixtures
+        ],
+        "adversarialCases": [
+            {
+                "case": row["case"],
+                "taskSha256": row["taskSha256"],
+                "resultSha256": row["resultSha256"],
+                "productionCampaignSealRejected": row[
+                    "productionCampaignSealRejected"
+                ],
+            }
+            for row in adversarial
+        ],
+    }
+    production_report["reportSha256"] = canonical_sha256(production_report)
+    production_report_path.write_text(
+        json.dumps(production_report, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
     report: dict[str, Any] = {
-        "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_1",
+        "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_2",
         "marketDataRead": False,
         "replayExecuted": True,
         "fullWorkerExecutionFixtureCount": len(fixtures),
@@ -293,6 +466,16 @@ def run(
         "exactWorkerResultsAcceptedByFuzzFolio": len(fixtures),
         "exactWorkerResultsAcceptedByPythonAdmission": len(fixtures),
         "exactWorkerResultsAcceptedByRustAdmission": len(fixtures),
+        "productionCampaignSealExactAcceptCount": len(fixtures),
+        "productionCampaignSealAdversarialRejectCount": len(adversarial),
+        "productionGatewayDispatchFixturePassed": True,
+        "productionOfflineSealFixturePassed": True,
+        "exactFixtures": production_report["exactFixtures"],
+        "productionAdmissionReport": {
+            "logicalId": production_report_path.name,
+            "rawSha256": _sha_file(production_report_path),
+            "reportSha256": production_report["reportSha256"],
+        },
         "validatedTaskCount": fuzz_report["validatedTaskCount"],
         "workerContractHash": fuzz_report["workerContractHash"],
         "workerImageDigest": fuzz_report["workerImageDigest"],
@@ -301,7 +484,6 @@ def run(
         "adversarialRejectCount": len(adversarial),
     }
     report["reportSha256"] = canonical_sha256(report)
-    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
