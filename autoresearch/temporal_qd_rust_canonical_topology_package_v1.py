@@ -56,6 +56,9 @@ SOURCE_PATHS = (
     "rust/temporal-qd/crates/qd-campaign-freeze/Cargo.toml",
     "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs",
     "rust/temporal-qd/crates/qd-campaign-freeze/src/bin/temporal-qd-precompiled-receipt-jsonl.rs",
+    "rust/temporal-qd/crates/qd-campaign-seal/src/lib.rs",
+    "rust/temporal-qd/crates/qd-campaign-seal/src/bin/temporal-qd-campaign-admission-jsonl.rs",
+    "rust/temporal-qd/crates/qd-gateway-dispatch/src/lib.rs",
     "autoresearch/temporal_search.py",
     "autoresearch/temporal_qd_rust_canonical_topology_package_v1.py",
     "autoresearch/temporal_qd_worker_seam_conformance_v2.py",
@@ -68,6 +71,35 @@ def _json(path: Path) -> Any:
 
 def _sha_file(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git_blob_sha256(source_commit: str, path: Path) -> str:
+    relative = path.relative_to(ROOT).as_posix()
+    committed_blob = subprocess.run(
+        ["git", "rev-parse", f"{source_commit}:{relative}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    worktree_blob = subprocess.run(
+        ["git", "hash-object", "--path", relative, relative],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if committed_blob != worktree_blob:
+        raise RuntimeError(
+            f"result-admission source differs from {source_commit}: {relative}"
+        )
+    completed = subprocess.run(
+        ["git", "show", f"{source_commit}:{relative}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return "sha256:" + hashlib.sha256(completed.stdout).hexdigest()
 
 
 def _seal(value: Mapping[str, Any], field: str) -> dict[str, Any]:
@@ -201,13 +233,21 @@ def _load_launch_gate_evidence(
         if supplied != canonical_sha256(identity):
             raise RuntimeError("production admission report identity is invalid")
         expected_source_hashes = {
-            "campaignSeal": _sha_file(
+            "campaignAdmissionAdapter": _git_blob_sha256(
+                source_commit,
+                ROOT
+                / "rust/temporal-qd/crates/qd-campaign-seal/src/bin/temporal-qd-campaign-admission-jsonl.rs",
+            ),
+            "campaignSeal": _git_blob_sha256(
+                source_commit,
                 ROOT / "rust/temporal-qd/crates/qd-campaign-seal/src/lib.rs"
             ),
-            "gatewayDispatch": _sha_file(
+            "gatewayDispatch": _git_blob_sha256(
+                source_commit,
                 ROOT / "rust/temporal-qd/crates/qd-gateway-dispatch/src/lib.rs"
             ),
-            "sharedReceiptValidator": _sha_file(
+            "sharedReceiptValidator": _git_blob_sha256(
+                source_commit,
                 ROOT / "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs"
             ),
         }
@@ -638,6 +678,8 @@ def _campaign_authority(
         "research_conservative": {"spreadBps": 2.0, "slippageBps": 1.0, "commissionBps": 0.5},
     }
     result_admission_sources = {
+        "campaignAdmissionAdapter": ROOT
+        / "rust/temporal-qd/crates/qd-campaign-seal/src/bin/temporal-qd-campaign-admission-jsonl.rs",
         "campaignSeal": ROOT / "rust/temporal-qd/crates/qd-campaign-seal/src/lib.rs",
         "gatewayDispatch": ROOT / "rust/temporal-qd/crates/qd-gateway-dispatch/src/lib.rs",
         "sharedReceiptValidator": ROOT / "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs",
@@ -647,7 +689,7 @@ def _campaign_authority(
             "schemaVersion": "temporal_qd_result_admission_authority_v1",
             "sourceCommit": source_commit,
             "sourceHashes": {
-                name: _sha_file(path)
+                name: _git_blob_sha256(source_commit, path)
                 for name, path in sorted(result_admission_sources.items())
             },
             "admittedResultSchemas": [

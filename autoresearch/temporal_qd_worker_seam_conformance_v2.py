@@ -26,6 +26,8 @@ CAMPAIGN_ADMISSION_BIN = (
     RUST_ROOT / "target/debug/temporal-qd-campaign-admission-jsonl.exe"
 )
 PRODUCTION_SOURCE_PATHS = {
+    "campaignAdmissionAdapter": RUST_ROOT
+    / "crates/qd-campaign-seal/src/bin/temporal-qd-campaign-admission-jsonl.rs",
     "campaignSeal": RUST_ROOT / "crates/qd-campaign-seal/src/lib.rs",
     "gatewayDispatch": RUST_ROOT / "crates/qd-gateway-dispatch/src/lib.rs",
     "sharedReceiptValidator": RUST_ROOT / "crates/qd-campaign-freeze/src/lib.rs",
@@ -44,6 +46,51 @@ def _source_commit() -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _assert_tracked_worktree_clean(source_commit: str) -> None:
+    if _source_commit() != source_commit:
+        raise RuntimeError("production admission source commit changed during run")
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if status:
+        raise RuntimeError(
+            "production admission conformance requires a clean tracked worktree"
+        )
+
+
+def _git_blob_sha256(source_commit: str, path: Path) -> str:
+    relative = path.relative_to(ROOT).as_posix()
+    committed_blob = subprocess.run(
+        ["git", "rev-parse", f"{source_commit}:{relative}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    worktree_blob = subprocess.run(
+        ["git", "hash-object", "--path", relative, relative],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if committed_blob != worktree_blob:
+        raise RuntimeError(
+            f"production admission source differs from {source_commit}: {relative}"
+        )
+    completed = subprocess.run(
+        ["git", "show", f"{source_commit}:{relative}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return f"sha256:{hashlib.sha256(completed.stdout).hexdigest()}"
 
 
 def _reseal_receipt(result: dict[str, Any]) -> None:
@@ -254,6 +301,8 @@ def run(
     dashboard_script = dashboard_root / "scripts/temporal_qd_precompiled_conformance.py"
     if not dashboard_python.is_file() or not dashboard_script.is_file():
         raise RuntimeError("exact FuzzFolio conformance runtime is unavailable")
+    source_commit = _source_commit()
+    _assert_tracked_worktree_clean(source_commit)
     production_binary_hashes = _build_admission_binaries()
     fuzz_report_path = output.with_suffix(".fuzzfolio.json")
     subprocess.run(
@@ -407,9 +456,9 @@ def run(
     )
     production_report: dict[str, Any] = {
         "schemaVersion": "temporal_qd_production_result_admission_report_v1",
-        "sourceCommit": _source_commit(),
+        "sourceCommit": source_commit,
         "sourceHashes": {
-            name: _sha_file(path)
+            name: _git_blob_sha256(source_commit, path)
             for name, path in sorted(PRODUCTION_SOURCE_PATHS.items())
         },
         "productionAdmissionPolicy": "campaign_seal_shared_receipt_v2_2",

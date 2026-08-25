@@ -1,10 +1,12 @@
 import json
+import subprocess
 
 import pytest
 
 from autoresearch.evidence_plan import canonical_json, canonical_sha256
 from autoresearch.temporal_qd_rust_canonical_topology_package_v1 import (
     ROOT,
+    _git_blob_sha256,
     _load_launch_gate_evidence,
     _sha_file,
 )
@@ -12,7 +14,13 @@ from autoresearch.temporal_qd_rust_canonical_topology_package_v1 import (
 
 HASH_A = "sha256:" + "a" * 64
 HASH_B = "sha256:" + "b" * 64
-SOURCE_COMMIT = "c" * 40
+SOURCE_COMMIT = subprocess.run(
+    ["git", "rev-parse", "HEAD"],
+    cwd=ROOT,
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
 
 
 def _write_sealed(path, payload):
@@ -79,13 +87,21 @@ def test_launch_readiness_requires_both_external_gate_reports(tmp_path) -> None:
             "schemaVersion": "temporal_qd_production_result_admission_report_v1",
             "sourceCommit": SOURCE_COMMIT,
             "sourceHashes": {
-                "campaignSeal": _sha_file(
+                "campaignAdmissionAdapter": _git_blob_sha256(
+                    SOURCE_COMMIT,
+                    ROOT
+                    / "rust/temporal-qd/crates/qd-campaign-seal/src/bin/temporal-qd-campaign-admission-jsonl.rs",
+                ),
+                "campaignSeal": _git_blob_sha256(
+                    SOURCE_COMMIT,
                     ROOT / "rust/temporal-qd/crates/qd-campaign-seal/src/lib.rs"
                 ),
-                "gatewayDispatch": _sha_file(
+                "gatewayDispatch": _git_blob_sha256(
+                    SOURCE_COMMIT,
                     ROOT / "rust/temporal-qd/crates/qd-gateway-dispatch/src/lib.rs"
                 ),
-                "sharedReceiptValidator": _sha_file(
+                "sharedReceiptValidator": _git_blob_sha256(
+                    SOURCE_COMMIT,
                     ROOT / "rust/temporal-qd/crates/qd-campaign-freeze/src/lib.rs"
                 ),
             },
