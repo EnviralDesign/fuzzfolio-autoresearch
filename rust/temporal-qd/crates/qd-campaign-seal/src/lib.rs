@@ -10,11 +10,13 @@
 
 mod campaign_output;
 pub use campaign_output::{
+    AUTHENTICATED_GRAPH_SCHEMA as CAMPAIGN_OUTPUT_AUTHENTICATED_GRAPH_SCHEMA,
     CHECKPOINT_PATH as CAMPAIGN_OUTPUT_CHECKPOINT_PATH,
     CHECKPOINT_SCHEMA as CAMPAIGN_OUTPUT_CHECKPOINT_SCHEMA, CampaignOutputCheckpoint,
     MANIFEST_PATH as CAMPAIGN_OUTPUT_MANIFEST_PATH,
     MANIFEST_SCHEMA as CAMPAIGN_OUTPUT_MANIFEST_SCHEMA, OPERATION as CAMPAIGN_OUTPUT_OPERATION,
     RESULT_SCHEMA as CAMPAIGN_OUTPUT_RESULT_SCHEMA,
+    authenticate_output_graph as authenticate_campaign_output_graph,
     execute_manifest as execute_campaign_output_manifest,
     open_checkpoint as open_campaign_output_checkpoint,
 };

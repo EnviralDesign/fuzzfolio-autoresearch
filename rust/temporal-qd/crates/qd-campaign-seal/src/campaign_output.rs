@@ -1,5 +1,5 @@
 use super::*;
-use temporal_qd_campaign_freeze::{V5CampaignInputCheckpoint, open_v5_campaign_input_checkpoint};
+use temporal_qd_campaign_freeze::{open_v5_campaign_input_checkpoint, V5CampaignInputCheckpoint};
 use temporal_qd_rotating_prefinalizer::panel_receipt;
 
 pub const MANIFEST_SCHEMA: &str = "temporal_qd_v5_campaign_output_manifest_v1";
@@ -9,6 +9,8 @@ pub const OPERATION: &str = "commit_campaign_output_checkpoint";
 pub const MANIFEST_PATH: &str = "campaign-output-manifest.json";
 pub const CHECKPOINT_PATH: &str = "campaign-output-checkpoint.json";
 pub const PANEL_BUNDLES_PATH: &str = "candidate-panel-bundles.jsonl";
+pub const AUTHENTICATED_GRAPH_SCHEMA: &str =
+    "temporal_qd_v5_authenticated_campaign_output_graph_v1";
 const GATEWAY_RECEIPT_SCHEMA: &str = "temporal_qd_native_gateway_execution_receipt_v3";
 const SOURCE_ROOT_SCHEMA: &str = "temporal_qd_v5_campaign_output_source_roots_v1";
 const ARTIFACT_DESCRIPTOR_SCHEMA: &str = "temporal_qd_v5_campaign_output_artifact_v1";
@@ -372,6 +374,130 @@ pub fn open_checkpoint(path: &Path) -> Result<CampaignOutputCheckpoint> {
         panel_bundles_path,
         panel_bundle_count,
     })
+}
+
+/// Open the complete durable campaign-output graph for scientific reduction.
+///
+/// `open_checkpoint` deliberately remains a compact restart boundary.  This
+/// stricter opener is for post-run analysis: it reopens the manifest, campaign
+/// input, cohort, task pack, gateway receipt/journal/result pack, tail index,
+/// evaluated members, and panel bundles before returning any scientific data.
+/// Callers therefore cannot substitute precomputed summaries for production
+/// evidence while claiming that the underlying identities were checked.
+pub fn authenticate_output_graph(path: &Path) -> Result<Value> {
+    let checkpoint = open_checkpoint(path)?;
+    let manifest_path = checkpoint.root.join(MANIFEST_PATH);
+    let manifest = parse_manifest(&manifest_path)?;
+    validate_manifest_checkpoint_binding(&manifest, &checkpoint)?;
+
+    let input = open_v5_campaign_input_checkpoint(&manifest.campaign_input_checkpoint_path)?;
+    validate_input_binding(&manifest, &input)?;
+    let (_source, gateway_receipt) = build_source(&manifest, &input)?;
+
+    let checkpoint_map = object(&checkpoint.value, "campaign-output checkpoint")?;
+    let execution = object(
+        field(checkpoint_map, "executionBindings")?,
+        "campaign-output execution bindings",
+    )?;
+    validate_external_execution_binding(
+        field(execution, "campaignInputCheckpoint")?,
+        &manifest.campaign_input_checkpoint_path,
+        "campaign-input checkpoint",
+    )?;
+    validate_external_execution_binding(
+        field(execution, "gatewayExecutionReceipt")?,
+        &manifest.gateway_execution_receipt_path,
+        "gateway execution receipt",
+    )?;
+
+    let cohort_population = read_authenticated_json_value(
+        &input.cohort_population_path,
+        "authenticated cohort population",
+    )?;
+    let task_rows = read_canonical_jsonl_values(
+        &input.task_pack_path,
+        input.task_count,
+        "authenticated campaign task pack",
+    )?;
+    let evaluated_members = read_canonical_jsonl_values(
+        &checkpoint.evaluated_members_path,
+        checkpoint.evaluated_member_count,
+        "authenticated evaluated members",
+    )?;
+    let candidate_panel_bundles = read_canonical_jsonl_values(
+        &checkpoint.panel_bundles_path,
+        checkpoint.panel_bundle_count,
+        "authenticated candidate panel bundles",
+    )?;
+    let tail_result_index = read_authenticated_json_value(
+        &checkpoint.root.join(DIRECTIONAL_INDEX_PATH),
+        "authenticated tail result index",
+    )?;
+
+    let mut graph = json!({
+        "schemaVersion": AUTHENTICATED_GRAPH_SCHEMA,
+        "checkpointPath": absolute_string(&checkpoint.root.join(CHECKPOINT_PATH))?,
+        "checkpointSha256": checkpoint.checkpoint_sha256,
+        "manifestSha256": manifest.manifest_sha256,
+        "runtimeAuthoritySha256": manifest.runtime_authority_sha256,
+        "generationIndex": checkpoint.generation_index,
+        "campaignRole": checkpoint.campaign_role,
+        "panelId": checkpoint.panel_id,
+        "rotatingEvidenceSha256": checkpoint.rotating_evidence_sha256,
+        "taskMatrixSha256": checkpoint.task_matrix_sha256,
+        "taskCount": checkpoint.task_count,
+        "campaignOutputCheckpoint": checkpoint.value,
+        "campaignInputCheckpoint": input.value,
+        "gatewayExecutionReceipt": gateway_receipt,
+        "cohortPopulation": cohort_population,
+        "campaignTasks": task_rows,
+        "tailResultIndex": tail_result_index,
+        "evaluatedMembers": evaluated_members,
+        "candidatePanelBundles": candidate_panel_bundles,
+    });
+    add_identity(&mut graph, "authenticatedGraphSha256")?;
+    Ok(graph)
+}
+
+fn validate_external_execution_binding(
+    descriptor: &Value,
+    expected_path: &Path,
+    label: &str,
+) -> Result<()> {
+    let map = object(descriptor, label)?;
+    let expected = existing_file(expected_path, label)?.canonicalize()?;
+    let bound = PathBuf::from(text(map, "path")?)
+        .canonicalize()
+        .with_context(|| format!("open bound {label}"))?;
+    ensure!(
+        bound == expected
+            && fs::metadata(&expected)?.len() == unsigned(map, "sizeBytes")?
+            && sha_file(&expected)? == sha_field(map, "rawSha256")?,
+        "campaign-output external execution binding drifted for {label}"
+    );
+    Ok(())
+}
+
+fn read_canonical_jsonl_values(path: &Path, expected: u64, label: &str) -> Result<Vec<Value>> {
+    let path = existing_file(path, label)?;
+    let mut rows = Vec::new();
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        ensure!(!line.is_empty(), "{label} contains a blank row");
+        let row: Value = serde_json::from_str(&line).with_context(|| format!("parse {label}"))?;
+        ensure!(
+            canonical_json_bytes(&row)? == line.as_bytes(),
+            "{label} contains a noncanonical row"
+        );
+        rows.push(row);
+    }
+    ensure!(rows.len() as u64 == expected, "{label} count drifted");
+    Ok(rows)
+}
+
+fn read_authenticated_json_value(path: &Path, label: &str) -> Result<Value> {
+    let path = existing_file(path, label)?;
+    serde_json::from_reader(File::open(path)?).with_context(|| format!("parse {label}"))
 }
 
 fn validate_bound_output(
@@ -1387,6 +1513,22 @@ mod tests {
         assert!(open_checkpoint(&checkpoint_path).is_err());
         fs::write(root.join(PANEL_BUNDLES_PATH), original)?;
         open_checkpoint(&checkpoint_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn strict_analysis_opener_refuses_a_compact_checkpoint_without_its_source_graph() -> Result<()>
+    {
+        let directory = tempfile::TempDir::new()?;
+        let root = directory.path();
+        let checkpoint = checkpoint_fixture(root)?;
+        let checkpoint_path = root.join(CHECKPOINT_PATH);
+        write_value(&checkpoint_path, &checkpoint, true)?;
+
+        // Compact restart remains intentionally valid, but post-run analysis
+        // cannot claim authentication without the manifest/input/gateway graph.
+        open_checkpoint(&checkpoint_path)?;
+        assert!(authenticate_output_graph(&checkpoint_path).is_err());
         Ok(())
     }
 

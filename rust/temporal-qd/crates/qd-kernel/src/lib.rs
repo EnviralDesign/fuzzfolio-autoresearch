@@ -32,6 +32,7 @@ pub mod topology_coadaptation_matrix_v5;
 pub mod topology_coadaptation_matrix_v6;
 pub mod topology_coadaptation_matrix_v7;
 pub mod topology_replication_survival_v1;
+pub mod topology_replication_survival_v2;
 /// Native v5 evolvable-module proposal construction.  This is intentionally
 /// separate from the legacy typed-fragment runtime: it never starts or calls
 /// the Dashboard JSONL Python authority in production.
