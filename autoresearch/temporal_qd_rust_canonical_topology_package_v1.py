@@ -272,7 +272,6 @@ def _source_manifest(commit: str, *, allow_uncommitted: bool) -> dict[str, Any]:
                 "path": relative,
                 "sha256": commit_sha or worktree_sha,
                 "commitBlobSha256": commit_sha,
-                "worktreeRawSha256": worktree_sha,
                 "matchesCommitAfterGitFilters": commit_blob == worktree_blob,
             }
         )
