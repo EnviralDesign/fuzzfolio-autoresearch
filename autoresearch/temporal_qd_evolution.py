@@ -1204,6 +1204,18 @@ def _direction_selection_for_aggregate(aggregate: Mapping[str, Any]) -> dict[str
     return selection
 
 
+def production_quality_member_eligible(member: Mapping[str, Any]) -> bool:
+    """Public pure projection of the production quality-lane predicate."""
+
+    return _quality_member(member)
+
+
+def production_direction_selection(aggregate: Mapping[str, Any]) -> dict[str, Any]:
+    """Public pure projection of the frozen production direction policy."""
+
+    return _direction_selection_for_aggregate(aggregate)
+
+
 _DIRECTION_PROJECTION_KEYS = (
     "directionSelection",
     "directionBehaviorLane",
@@ -5673,6 +5685,8 @@ __all__ = [
     "build_qd_archive",
     "canonical_empty_directional_bidirectional_archive_template",
     "directional_qd_archive_policy_authority",
+    "production_direction_selection",
+    "production_quality_member_eligible",
     "initialize_empty_directional_bidirectional_archive",
     "build_rotating_qd_parent_archive",
     "generate_qd_generation",
