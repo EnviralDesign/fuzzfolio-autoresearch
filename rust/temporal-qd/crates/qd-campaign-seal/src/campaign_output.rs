@@ -1,5 +1,7 @@
 use super::*;
-use temporal_qd_campaign_freeze::{open_v5_campaign_input_checkpoint, V5CampaignInputCheckpoint};
+use temporal_qd_campaign_freeze::{
+    V5CampaignInputCheckpoint, open_v5_campaign_input_checkpoint, open_v5_campaign_policy_authority,
+};
 use temporal_qd_rotating_prefinalizer::panel_receipt;
 
 pub const MANIFEST_SCHEMA: &str = "temporal_qd_v5_campaign_output_manifest_v1";
@@ -11,6 +13,8 @@ pub const CHECKPOINT_PATH: &str = "campaign-output-checkpoint.json";
 pub const PANEL_BUNDLES_PATH: &str = "candidate-panel-bundles.jsonl";
 pub const AUTHENTICATED_GRAPH_SCHEMA: &str =
     "temporal_qd_v5_authenticated_campaign_output_graph_v1";
+pub const AUTHENTICATED_GRAPH_SCHEMA_V2: &str =
+    "temporal_qd_v5_authenticated_campaign_output_graph_v2";
 const GATEWAY_RECEIPT_SCHEMA: &str = "temporal_qd_native_gateway_execution_receipt_v3";
 const SOURCE_ROOT_SCHEMA: &str = "temporal_qd_v5_campaign_output_source_roots_v1";
 const ARTIFACT_DESCRIPTOR_SCHEMA: &str = "temporal_qd_v5_campaign_output_artifact_v1";
@@ -455,6 +459,31 @@ pub fn authenticate_output_graph(path: &Path) -> Result<Value> {
         "evaluatedMembers": evaluated_members,
         "candidatePanelBundles": candidate_panel_bundles,
     });
+    add_identity(&mut graph, "authenticatedGraphSha256")?;
+    Ok(graph)
+}
+
+/// Versioned post-run graph that additionally reopens the exact production
+/// archive/support/direction policy authority bound by campaign freeze.
+///
+/// The V1 graph remains byte- and behavior-compatible for the historical V2.4
+/// reducer.  V2 is the scientific-policy successor used by V2.5.
+pub fn authenticate_output_graph_v2(path: &Path) -> Result<Value> {
+    let mut graph = authenticate_output_graph(path)?;
+    let checkpoint = open_checkpoint(path)?;
+    let manifest = parse_manifest(&checkpoint.root.join(MANIFEST_PATH))?;
+    validate_manifest_checkpoint_binding(&manifest, &checkpoint)?;
+    let policy_authority =
+        open_v5_campaign_policy_authority(&manifest.campaign_input_checkpoint_path)?;
+    let fields = graph
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("authenticated campaign-output graph is not an object"))?;
+    fields.remove("authenticatedGraphSha256");
+    fields.insert(
+        "schemaVersion".into(),
+        Value::String(AUTHENTICATED_GRAPH_SCHEMA_V2.into()),
+    );
+    fields.insert("campaignPolicyAuthority".into(), policy_authority);
     add_identity(&mut graph, "authenticatedGraphSha256")?;
     Ok(graph)
 }

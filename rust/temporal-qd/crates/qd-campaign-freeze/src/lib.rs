@@ -73,6 +73,8 @@ const ATTRIBUTION_CAPABILITY: &str = "temporal_candidate_behavior_attribution_v1
 pub const V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA: &str = "temporal_qd_v5_campaign_input_checkpoint_v1";
 pub const V5_CAMPAIGN_INPUT_RESULT_SCHEMA: &str = "temporal_qd_v5_campaign_input_result_v1";
 pub const V5_CAMPAIGN_INPUT_CHECKPOINT_PATH: &str = "campaign-input-checkpoint.json";
+pub const V5_CAMPAIGN_FREEZE_MANIFEST_PATH: &str = ".native-v5-campaign-freeze-manifest.json";
+pub const V5_CAMPAIGN_POLICY_AUTHORITY_SCHEMA: &str = "temporal_qd_v5_campaign_policy_authority_v1";
 pub const V5_CAMPAIGN_TASK_PACK_RELATIVE_PATH: &str = "screening-run/tasks.jsonl";
 pub const V5_CAMPAIGN_COHORT_POPULATION_RELATIVE_PATH: &str = "cohort-population.json";
 const V5_RUNTIME_AUTHORITY_SCHEMA: &str = "temporal_qd_native_campaign_freeze_runtime_authority_v1";
@@ -108,6 +110,97 @@ pub struct V5CampaignInputCheckpoint {
     pub cohort_population_path: PathBuf,
     pub cohort_population_raw_sha256: String,
     pub cohort_population_size_bytes: u64,
+}
+
+/// Reopen the immutable scientific-policy fields that produced a campaign.
+/// This intentionally returns a compact, portable authority rather than the
+/// path-bearing freezer manifest.
+pub fn open_v5_campaign_policy_authority(path: &Path) -> Result<Value> {
+    let checkpoint = open_v5_campaign_input_checkpoint(path)?;
+    let manifest_path = checkpoint.root.join(V5_CAMPAIGN_FREEZE_MANIFEST_PATH);
+    ensure!(
+        manifest_path.is_file(),
+        "v5 campaign-freeze manifest is missing"
+    );
+    ensure!(
+        !fs::symlink_metadata(&manifest_path)?
+            .file_type()
+            .is_symlink(),
+        "v5 campaign-freeze manifest symlink is forbidden"
+    );
+    let manifest = read_pretty_json(&manifest_path, "v5 campaign-freeze manifest")?;
+    let spec = object(&manifest, "v5 campaign-freeze manifest")?;
+    let mut expected = vec![
+        "schemaVersion",
+        "evaluationPopulationPath",
+        "evaluationPopulationSha256",
+        "cohortSelectionPath",
+        "templatePreparationPath",
+        "templatePreparationSha256",
+        "constructionCatalogPath",
+        "constructionCatalogSha256",
+        "outputRoot",
+        "executionEngineCommit",
+        "workerContractSha256",
+        "campaignRole",
+        "panelId",
+        "rotatingEvidence",
+        "archivePolicyAuthority",
+        "behaviorAttributionRequirement",
+        "nativeRuntimeAuthority",
+        "nativeRuntimeAuthoritySha256",
+        "manifestSha256",
+    ];
+    if spec.contains_key("ladderInputSha256") {
+        expected.push("ladderInputSha256");
+    }
+    exact_keys(spec, &expected, "v5 campaign-freeze manifest")?;
+    ensure!(
+        string(spec, "schemaVersion")? == V5_FREEZE_MANIFEST_SCHEMA,
+        "v5 campaign-freeze manifest schema is incompatible"
+    );
+    let manifest_sha256 = v5_manifest_sha256(spec)?;
+    ensure!(
+        string(spec, "manifestSha256")? == manifest_sha256
+            && checkpoint.manifest_sha256 == manifest_sha256,
+        "v5 campaign policy manifest/checkpoint binding drifted"
+    );
+    let runtime_authority = spec
+        .get("nativeRuntimeAuthority")
+        .ok_or_else(|| anyhow!("v5 native runtime authority missing"))?;
+    validate_v5_runtime_authority(runtime_authority)?;
+    ensure!(
+        canonical_sha256(runtime_authority)? == string(spec, "nativeRuntimeAuthoritySha256")?
+            && checkpoint.native_runtime_authority_sha256
+                == string(spec, "nativeRuntimeAuthoritySha256")?,
+        "v5 campaign policy runtime binding drifted"
+    );
+    // `outputRoot` is intentionally transport-only in `v5_manifest_sha256`.
+    // The fixed local manifest name plus the checkpoint's semantic manifest
+    // identity allow an authenticated package to be reopened after relocation.
+    let archive = spec
+        .get("archivePolicyAuthority")
+        .ok_or_else(|| anyhow!("v5 archive authority missing"))?;
+    validate_v5_archive_authority(archive)?;
+    let behavior = spec
+        .get("behaviorAttributionRequirement")
+        .ok_or_else(|| anyhow!("v5 behavior requirement missing"))?;
+    validate_v5_behavior_requirement(behavior)?;
+    let mut authority = json!({
+        "schemaVersion": V5_CAMPAIGN_POLICY_AUTHORITY_SCHEMA,
+        "campaignInputManifestSha256": manifest_sha256,
+        "archivePolicyAuthority": archive,
+        "behaviorAttributionRequirement": behavior,
+    });
+    let policy_sha256 = canonical_sha256(&authority)?;
+    authority
+        .as_object_mut()
+        .expect("campaign policy authority object")
+        .insert(
+            "policyAuthoritySha256".to_owned(),
+            Value::String(policy_sha256),
+        );
+    Ok(authority)
 }
 
 /// Open the one durable campaign-input boundary used by gateway dispatch and
