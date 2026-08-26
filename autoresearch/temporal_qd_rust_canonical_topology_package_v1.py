@@ -194,11 +194,11 @@ def _load_launch_gate_evidence(
             == "temporal_qd_worker_seam_conformance_report_v2_2"
             and report.get("marketDataRead") is False
             and report.get("replayExecuted") is True
-            and int(report.get("fullWorkerExecutionFixtureCount") or 0) >= 5
-            and int(report.get("exactWorkerResultsAcceptedByFuzzFolio") or 0) >= 5
+            and int(report.get("fullWorkerExecutionFixtureCount") or 0) >= 12
+            and int(report.get("exactWorkerResultsAcceptedByFuzzFolio") or 0) >= 12
             and int(report.get("exactWorkerResultsAcceptedByPythonAdmission") or 0)
-            >= 5
-            and int(report.get("exactWorkerResultsAcceptedByRustAdmission") or 0) >= 5
+            >= 12
+            and int(report.get("exactWorkerResultsAcceptedByRustAdmission") or 0) >= 12
             and report.get("workerContractHash")
             == worker_contract["workerContractSha256"]
             and report.get("workerImageDigest") == worker_contract["imageDigest"]
@@ -287,7 +287,7 @@ def _load_launch_gate_evidence(
             )
         exact_passed = int(
             report.get("productionCampaignSealExactAcceptCount") or 0
-        ) >= 5
+        ) >= 12
         adversarial_passed = (
             int(report.get("productionCampaignSealAdversarialRejectCount") or 0)
             == len(adversarial)
@@ -315,7 +315,7 @@ def _load_launch_gate_evidence(
             and report.get("workerContractHash")
             == worker_contract["workerContractSha256"]
             and report.get("workerImageDigest") == worker_contract["imageDigest"]
-            and len(report.get("exactFixtures") or []) >= 5
+            and len(report.get("exactFixtures") or []) >= 12
             and reports_cross_bound
         )
         evidence.update(

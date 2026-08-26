@@ -63,7 +63,7 @@ def test_launch_readiness_requires_both_external_gate_reports(tmp_path) -> None:
             "taskSha256": HASH_A,
             "resultSha256": HASH_B,
         }
-        for index in range(5)
+        for index in range(12)
     ]
     portability = tmp_path / "portability.json"
     _write_sealed(
@@ -115,7 +115,7 @@ def test_launch_readiness_requires_both_external_gate_reports(tmp_path) -> None:
             "marketDataRead": False,
             "gatewayNetworkAccess": False,
             "taskDispatchCount": 0,
-            "productionCampaignSealExactAcceptCount": 5,
+            "productionCampaignSealExactAcceptCount": 12,
             "productionCampaignSealAdversarialRejectCount": 26,
             "productionGatewayDispatchFixturePassed": True,
             "productionOfflineSealFixturePassed": True,
@@ -138,11 +138,11 @@ def test_launch_readiness_requires_both_external_gate_reports(tmp_path) -> None:
             "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_2",
             "marketDataRead": False,
             "replayExecuted": True,
-            "fullWorkerExecutionFixtureCount": 5,
-            "exactWorkerResultsAcceptedByFuzzFolio": 5,
-            "exactWorkerResultsAcceptedByPythonAdmission": 5,
-            "exactWorkerResultsAcceptedByRustAdmission": 5,
-            "productionCampaignSealExactAcceptCount": 5,
+            "fullWorkerExecutionFixtureCount": 12,
+            "exactWorkerResultsAcceptedByFuzzFolio": 12,
+            "exactWorkerResultsAcceptedByPythonAdmission": 12,
+            "exactWorkerResultsAcceptedByRustAdmission": 12,
+            "productionCampaignSealExactAcceptCount": 12,
             "productionCampaignSealAdversarialRejectCount": 26,
             "productionGatewayDispatchFixturePassed": True,
             "productionOfflineSealFixturePassed": True,
