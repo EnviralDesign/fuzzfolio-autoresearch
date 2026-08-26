@@ -59,8 +59,14 @@ TEMPORAL_SEARCH_RESULT_SCHEMA_V2 = "temporal_graph_candidate_window_result_v2"
 TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY = (
     "temporal_qd_precompiled_profile_execution_v1"
 )
+TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY_V2 = (
+    "temporal_qd_precompiled_profile_execution_v2"
+)
 TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA = (
     "temporal_qd_precompiled_profile_execution_receipt_v1"
+)
+TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA_V2 = (
+    "temporal_qd_precompiled_profile_execution_receipt_v2"
 )
 TEMPORAL_SEARCH_REJECTED_RESULT_SCHEMA = "temporal_graph_candidate_window_rejected_result_v1"
 TEMPORAL_SEARCH_CHECKPOINT_SCHEMA = "temporal_graph_candidate_window_checkpoint_v1"
@@ -1451,8 +1457,15 @@ def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, An
             is_precompiled = isinstance(precompiled_contract, Mapping)
             required_capabilities = list(_REQUIRED_WORKER_CAPABILITIES)
             if is_precompiled:
+                contract_schema = precompiled_contract.get("schemaVersion")
+                precompiled_capability = (
+                    TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY_V2
+                    if contract_schema
+                    == "temporal_qd_precompiled_profile_execution_v2"
+                    else TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY
+                )
                 required_capabilities.append(
-                    TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY
+                    precompiled_capability
                 )
                 required_capabilities = sorted(set(required_capabilities))
             worker_contract = _mapping(
@@ -1972,13 +1985,6 @@ def _validate_precompiled_execution_receipt(
                 "legacy V1 result must not contain a Rust-precompiled receipt"
             )
         return
-    if (
-        TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY
-        not in set(job.get("required_capabilities") or [])
-    ):
-        raise TemporalSearchContractError(
-            "Rust-precompiled V2 task lacks the dedicated worker capability"
-        )
     if job.get("required_worker_contract_schema") != "replay-worker-contract-v2":
         raise TemporalSearchContractError(
             "Rust-precompiled V2 task requires replay-worker-contract-v2"
@@ -1987,6 +1993,26 @@ def _validate_precompiled_execution_receipt(
         job.get("precompiled_profile_execution_contract"),
         name="task precompiled_profile_execution_contract",
     )
+    is_v2 = (
+        contract.get("schemaVersion")
+        == "temporal_qd_precompiled_profile_execution_v2"
+    )
+    if not is_v2 and (
+        contract.get("schemaVersion")
+        != "temporal_qd_precompiled_profile_execution_v1"
+    ):
+        raise TemporalSearchContractError(
+            "Rust-precompiled execution contract schema is invalid"
+        )
+    required_capability = (
+        TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY_V2
+        if is_v2
+        else TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_CAPABILITY
+    )
+    if required_capability not in set(job.get("required_capabilities") or []):
+        raise TemporalSearchContractError(
+            "Rust-precompiled V2 task lacks the dedicated worker capability"
+        )
     receipt = _mapping(
         raw_receipt,
         name="worker precompiled_profile_execution_receipt",
@@ -2014,14 +2040,17 @@ def _validate_precompiled_execution_receipt(
         "source_profile_rewritten",
         "receipt_sha256",
     }
+    expected_receipt_schema = TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA
+    if is_v2:
+        expected_keys.update({"catalog_sha256", "catalog_resolution_mode"})
+        expected_receipt_schema = (
+            TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA_V2
+        )
     if set(receipt) != expected_keys:
         raise TemporalSearchContractError(
-            "Rust-precompiled receipt does not have the exact V1 field set"
+            "Rust-precompiled receipt does not have the exact versioned field set"
         )
-    if (
-        receipt.get("schema_version")
-        != TEMPORAL_QD_PRECOMPILED_PROFILE_EXECUTION_RECEIPT_SCHEMA
-    ):
+    if receipt.get("schema_version") != expected_receipt_schema:
         raise TemporalSearchContractError("Rust-precompiled receipt schema is invalid")
     receipt_identity = dict(receipt)
     supplied_receipt_sha256 = _sha(
@@ -2123,6 +2152,26 @@ def _validate_precompiled_execution_receipt(
         raise TemporalSearchContractError(
             "Rust-precompiled receipt reports a forbidden source-profile rewrite"
         )
+    if is_v2:
+        if (
+            receipt.get("catalog_sha256") != contract.get("catalogSha256")
+            or receipt.get("catalog_resolution_mode")
+            != contract.get("catalogResolutionMode")
+            or receipt.get("catalog_resolution_mode")
+            != "verify_exact_no_rewrite_v1"
+        ):
+            raise TemporalSearchContractError(
+                "Rust-precompiled V2 receipt catalog binding mismatch"
+            )
+        if (
+            receipt.get("normalized_source_profile_sha256")
+            != receipt.get("resolved_profile_sha256")
+            or receipt.get("authored_program_sha256")
+            != receipt.get("resolved_program_sha256")
+        ):
+            raise TemporalSearchContractError(
+                "Rust-precompiled V2 receipt contains competing source/resolved identities"
+            )
     attestation = _mapping(
         material.get("runtime_program_identity_attestation"),
         name="worker runtime_program_identity_attestation",

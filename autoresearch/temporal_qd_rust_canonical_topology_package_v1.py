@@ -119,7 +119,7 @@ def _load_worker_contract(path: Path) -> dict[str, Any]:
     if supplied != canonical_sha256(identity):
         raise RuntimeError("worker contract admission hash does not match its fields")
     capabilities = set(contract.get("capabilities") or [])
-    required_capability = "temporal_qd_precompiled_profile_execution_v1"
+    required_capability = "temporal_qd_precompiled_profile_execution_v2"
     if required_capability not in capabilities:
         raise RuntimeError("worker contract lacks the Rust-precompiled capability")
     git_sha = str(contract.get("git_sha") or "")
@@ -583,10 +583,14 @@ def _author_blocks(
     return output
 
 
-def _candidate_contract(candidate: Mapping[str, Any], authority_sha: str) -> dict[str, Any]:
+def _candidate_contract(
+    candidate: Mapping[str, Any],
+    authority_sha: str,
+    catalog_sha256: str,
+) -> dict[str, Any]:
     identity = candidate["compiledPair"]["identityMaterial"]
     contract = {
-        "schemaVersion": "temporal_qd_precompiled_profile_execution_v1",
+        "schemaVersion": "temporal_qd_precompiled_profile_execution_v2",
         "candidateId": candidate["candidateId"],
         "authoritySha256": authority_sha,
         "candidatePayloadSha256": candidate["payloadSha256"],
@@ -598,12 +602,16 @@ def _candidate_contract(candidate: Mapping[str, Any], authority_sha: str) -> dic
         ],
         "expectedResolvedProgramSha256": identity["programSha256"],
         "validationReportSha256": identity["validationReportSha256"],
+        "catalogSha256": catalog_sha256,
+        "catalogResolutionMode": "verify_exact_no_rewrite_v1",
+        "sourceProfileRewritePermitted": False,
+        "resolvedProfileMustEqualAuthoredProfile": True,
         "compilerDisposition": "precompiled_rust_profile_no_recompile",
         "workerPermissions": [
             "parse",
             "schema_check",
             "verify_hashes",
-            "hydrate_predeclared_catalog_inputs",
+            "verify_exact_catalog_inputs",
             "execute_supplied_v3_profile",
         ],
         "workerProhibitions": [
@@ -680,6 +688,7 @@ def _campaign_authority(
     native_authority: Mapping[str, Any],
     worker_contract: Mapping[str, Any],
     source_commit: str,
+    catalog_sha256: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     panels = [_json(ROTATING / f"panel-{index}-template-preparation.json") for index in (1, 2, 3)]
     workers = {canonical_json(panel["workerContract"]) for panel in panels}
@@ -701,7 +710,9 @@ def _campaign_authority(
     for candidate in candidates:
         profile = candidate["compiledPair"]["profile"]
         identity = candidate["compiledPair"]["identityMaterial"]
-        contract = _candidate_contract(candidate, native_authority["authoritySha256"])
+        contract = _candidate_contract(
+            candidate, native_authority["authoritySha256"], catalog_sha256
+        )
         inputs: list[dict[str, Any]] = []
         for index, panel in enumerate(panels, 1):
             inputs.extend(_panel_inputs(profile, panel, f"panel-{index}"))
@@ -748,7 +759,7 @@ def _campaign_authority(
                 "temporal_graph_candidate_window_result_v2",
                 "temporal_graph_candidate_window_rejected_result_v1",
             ],
-            "precompiledReceiptSchema": "temporal_qd_precompiled_profile_execution_receipt_v1",
+            "precompiledReceiptSchema": "temporal_qd_precompiled_profile_execution_receipt_v2",
             "runtimeAttestationSchema": "temporal_qd_runtime_program_identity_attestation_v1",
             "productionAdmissionPolicy": "campaign_seal_shared_receipt_v2_2",
         },
@@ -794,9 +805,9 @@ def _campaign_authority(
             "taskKind": "temporal_graph_candidate_window",
             "jobSchema": "temporal_graph_candidate_window_job_v2",
             "resultSchema": "temporal_graph_candidate_window_result_v2",
-            "profileExecutionContract": "temporal_qd_precompiled_profile_execution_v1",
-            "profileExecutionReceipt": "temporal_qd_precompiled_profile_execution_receipt_v1",
-            "requiredWorkerCapability": "temporal_qd_precompiled_profile_execution_v1",
+            "profileExecutionContract": "temporal_qd_precompiled_profile_execution_v2",
+            "profileExecutionReceipt": "temporal_qd_precompiled_profile_execution_receipt_v2",
+            "requiredWorkerCapability": "temporal_qd_precompiled_profile_execution_v2",
             "resultAdmissionAuthoritySha256": result_admission_authority[
                 "resultAdmissionAuthoritySha256"
             ],
@@ -854,9 +865,9 @@ def _task_index(task_manifest: Mapping[str, Any], windows: Iterable[Mapping[str,
         if (
             payload.get("schema_version")
             != "temporal_graph_candidate_window_job_v2"
-            or "temporal_qd_precompiled_profile_execution_v1"
+            or "temporal_qd_precompiled_profile_execution_v2"
             not in set(payload.get("required_capabilities") or [])
-            or "temporal_qd_precompiled_profile_execution_v1"
+            or "temporal_qd_precompiled_profile_execution_v2"
             not in set(task.get("required_worker_capabilities") or [])
         ):
             raise RuntimeError("native freeze did not require the V2 precompiled worker path")
@@ -878,7 +889,7 @@ def _task_index(task_manifest: Mapping[str, Any], windows: Iterable[Mapping[str,
                     "required_worker_image_digest"
                 ],
                 "requiredExecutionReceiptSchema": (
-                    "temporal_qd_precompiled_profile_execution_receipt_v1"
+                    "temporal_qd_precompiled_profile_execution_receipt_v2"
                 ),
                 "rawProfileSha256": payload["raw_source_profile_sha256"],
                 "profileSnapshotSha256": payload["normalized_profile_snapshot_sha256"],
@@ -1037,6 +1048,7 @@ def run(
     *,
     source_commit: str,
     worker_contract_path: Path,
+    catalog_sha256: str,
     conformance_report_path: Path | None = None,
     production_admission_report_path: Path | None = None,
     portability_report_path: Path | None = None,
@@ -1045,6 +1057,8 @@ def run(
     allow_uncommitted_source: bool = False,
 ) -> dict[str, Path]:
     required = [FREEZE_BIN, FROZEN_AUTHORITY, PARENT_MATERIAL, TOPOLOGY_SPEC]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", catalog_sha256):
+        raise RuntimeError("exact runtime indicator catalog SHA-256 is required")
     if preserve_native_package_commit is None:
         required.append(NATIVE_BIN)
     missing = [str(path) for path in required if not path.exists()]
@@ -1085,6 +1099,7 @@ def run(
         authority,
         worker_contract,
         admission_source_commit,
+        catalog_sha256,
     )
     paths = {
         "source": output_dir / "native-source-manifest-v1.json",
@@ -1241,6 +1256,7 @@ def main() -> None:
     parser.add_argument("--freeze-root", type=Path)
     parser.add_argument("--rust-source-commit", default=str(_git("rev-parse", "HEAD")))
     parser.add_argument("--worker-contract", type=Path, required=True)
+    parser.add_argument("--catalog-sha256", required=True)
     parser.add_argument("--conformance-report", type=Path)
     parser.add_argument("--production-admission-report", type=Path)
     parser.add_argument("--portability-report", type=Path)
@@ -1254,6 +1270,7 @@ def main() -> None:
         freeze_root,
         source_commit=args.rust_source_commit,
         worker_contract_path=args.worker_contract,
+        catalog_sha256=args.catalog_sha256,
         conformance_report_path=args.conformance_report,
         production_admission_report_path=args.production_admission_report,
         portability_report_path=args.portability_report,

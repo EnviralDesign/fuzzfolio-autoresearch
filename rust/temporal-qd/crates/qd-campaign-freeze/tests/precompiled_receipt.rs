@@ -29,6 +29,7 @@ fn fixture() -> (Value, Value) {
             "candidate_id":"candidate_1",
             "required_capabilities":["temporal_qd_precompiled_profile_execution_v1"],
             "precompiled_profile_execution_contract":{
+                "schemaVersion":"temporal_qd_precompiled_profile_execution_v1",
                 "contractSha256":sha('c'),
                 "authoritySha256":sha('a')
             },
@@ -113,10 +114,61 @@ fn fixture() -> (Value, Value) {
     (task, result)
 }
 
+fn fixture_v2() -> (Value, Value) {
+    let (mut task, mut result) = fixture();
+    task["payload"]["required_capabilities"] =
+        json!(["temporal_qd_precompiled_profile_execution_v2"]);
+    task["payload"]["precompiled_profile_execution_contract"]["schemaVersion"] =
+        json!("temporal_qd_precompiled_profile_execution_v2");
+    task["payload"]["precompiled_profile_execution_contract"]["catalogSha256"] = json!(sha('8'));
+    task["payload"]["precompiled_profile_execution_contract"]["catalogResolutionMode"] =
+        json!("verify_exact_no_rewrite_v1");
+    task["payload"]["expected_resolved_profile_snapshot_sha256"] = json!(sha('e'));
+    task["payload"]["expected_resolved_program_sha256"] = json!(sha('f'));
+
+    result["resolved_profile_snapshot_sha256"] = json!(sha('e'));
+    result["program_sha256"] = json!(sha('f'));
+    let receipt = &mut result["precompiled_profile_execution_receipt"];
+    receipt["schema_version"] = json!("temporal_qd_precompiled_profile_execution_receipt_v2");
+    receipt["resolved_profile_sha256"] = json!(sha('e'));
+    receipt["resolved_program_sha256"] = json!(sha('f'));
+    receipt["catalog_sha256"] = json!(sha('8'));
+    receipt["catalog_resolution_mode"] = json!("verify_exact_no_rewrite_v1");
+    reseal(receipt);
+    let attestation = &mut result["runtime_program_identity_attestation"];
+    for key in [
+        "observation_stream_program_sha256",
+        "checkpoint_program_sha256",
+        "graph_runtime_program_sha256",
+        "execution_state_program_sha256",
+    ] {
+        attestation[key] = json!(sha('f'));
+    }
+    reseal_attestation(attestation);
+    for view in ["none", "research_conservative"] {
+        let replay = &mut result["cost_view_results"][view]["replay_result"];
+        replay["programSha256"] = json!(sha('f'));
+        replay["finalGraphRuntime"]["programSha256"] = json!(sha('f'));
+        replay["finalExecutionState"]["programSha256"] = json!(sha('f'));
+    }
+    (task, result)
+}
+
 #[test]
 fn exact_precompiled_receipt_is_admitted() {
     let (task, result) = fixture();
     validate_precompiled_execution_receipt(&task, &result).unwrap();
+}
+
+#[test]
+fn exact_no_rewrite_v2_receipt_is_admitted_and_old_capability_is_rejected() {
+    let (task, result) = fixture_v2();
+    validate_precompiled_execution_receipt(&task, &result).unwrap();
+
+    let (mut old_capability, result) = fixture_v2();
+    old_capability["payload"]["required_capabilities"] =
+        json!(["temporal_qd_precompiled_profile_execution_v1"]);
+    assert!(validate_precompiled_execution_receipt(&old_capability, &result).is_err());
 }
 
 #[test]

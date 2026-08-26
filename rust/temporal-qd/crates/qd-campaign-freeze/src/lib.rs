@@ -65,9 +65,12 @@ const TASK_KIND: &str = "temporal_graph_candidate_window";
 const JOB_SCHEMA: &str = "temporal_graph_candidate_window_job_v1";
 const JOB_SCHEMA_V2: &str = "temporal_graph_candidate_window_job_v2";
 const TASK_CAPABILITY: &str = "temporal_graph_candidate_window_v1";
-const PRECOMPILED_PROFILE_CAPABILITY: &str = "temporal_qd_precompiled_profile_execution_v1";
-const PRECOMPILED_PROFILE_RECEIPT_SCHEMA: &str =
+const PRECOMPILED_PROFILE_CAPABILITY_V1: &str = "temporal_qd_precompiled_profile_execution_v1";
+const PRECOMPILED_PROFILE_CAPABILITY_V2: &str = "temporal_qd_precompiled_profile_execution_v2";
+const PRECOMPILED_PROFILE_RECEIPT_SCHEMA_V1: &str =
     "temporal_qd_precompiled_profile_execution_receipt_v1";
+const PRECOMPILED_PROFILE_RECEIPT_SCHEMA_V2: &str =
+    "temporal_qd_precompiled_profile_execution_receipt_v2";
 const BIDIRECTIONAL_CAPABILITY: &str = "temporal_graph_bidirectional_replay_v1";
 const ATTRIBUTION_CAPABILITY: &str = "temporal_candidate_behavior_attribution_v1";
 pub const V5_CAMPAIGN_INPUT_CHECKPOINT_SCHEMA: &str = "temporal_qd_v5_campaign_input_checkpoint_v1";
@@ -858,33 +861,49 @@ fn build_task(
         "inline_profile_snapshot".to_owned(),
         Value::Object(profile.clone()),
     );
+    let mut precompiled_capability: Option<&str> = None;
     if let Some(contract) = precompiled {
         let contract_map = object(contract, "precompiled profile execution contract")?;
-        exact_keys(
-            contract_map,
-            &[
-                "schemaVersion",
-                "candidateId",
-                "authoritySha256",
-                "candidatePayloadSha256",
-                "rawProfileSha256",
-                "profileSnapshotSha256",
-                "programSha256",
-                "expectedResolvedProfileSnapshotSha256",
-                "expectedResolvedProgramSha256",
-                "validationReportSha256",
-                "compilerDisposition",
-                "workerPermissions",
-                "workerProhibitions",
-                "contractSha256",
-            ],
-            "precompiled profile execution contract",
-        )?;
+        let contract_schema = string(contract_map, "schemaVersion")?;
+        let is_v2 = contract_schema == "temporal_qd_precompiled_profile_execution_v2";
         ensure!(
-            contract_map.get("schemaVersion").and_then(Value::as_str)
-                == Some("temporal_qd_precompiled_profile_execution_v1"),
+            is_v2 || contract_schema == "temporal_qd_precompiled_profile_execution_v1",
             "precompiled profile execution contract schema drifted"
         );
+        let mut contract_keys = vec![
+            "schemaVersion",
+            "candidateId",
+            "authoritySha256",
+            "candidatePayloadSha256",
+            "rawProfileSha256",
+            "profileSnapshotSha256",
+            "programSha256",
+            "expectedResolvedProfileSnapshotSha256",
+            "expectedResolvedProgramSha256",
+            "validationReportSha256",
+            "compilerDisposition",
+            "workerPermissions",
+            "workerProhibitions",
+            "contractSha256",
+        ];
+        if is_v2 {
+            contract_keys.extend([
+                "catalogSha256",
+                "catalogResolutionMode",
+                "sourceProfileRewritePermitted",
+                "resolvedProfileMustEqualAuthoredProfile",
+            ]);
+        }
+        exact_keys(
+            contract_map,
+            &contract_keys,
+            "precompiled profile execution contract",
+        )?;
+        precompiled_capability = Some(if is_v2 {
+            PRECOMPILED_PROFILE_CAPABILITY_V2
+        } else {
+            PRECOMPILED_PROFILE_CAPABILITY_V1
+        });
         ensure!(
             string(contract_map, "candidateId")? == candidate_id
                 && string(contract_map, "rawProfileSha256")? == source_sha,
@@ -920,6 +939,24 @@ fn build_task(
         ] {
             require_sha(string(contract_map, key)?, key)?;
         }
+        if is_v2 {
+            require_sha(string(contract_map, "catalogSha256")?, "catalogSha256")?;
+            ensure!(
+                contract_map
+                    .get("catalogResolutionMode")
+                    .and_then(Value::as_str)
+                    == Some("verify_exact_no_rewrite_v1")
+                    && contract_map
+                        .get("sourceProfileRewritePermitted")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    && contract_map
+                        .get("resolvedProfileMustEqualAuthoredProfile")
+                        .and_then(Value::as_bool)
+                        == Some(true),
+                "V2 precompiled profile resolution semantics drifted"
+            );
+        }
         ensure!(
             canonical_sha256_without_object_field(contract, "contractSha256")?
                 == string(contract_map, "contractSha256")?,
@@ -932,15 +969,25 @@ fn build_task(
                 == Some("precompiled_rust_profile_no_recompile"),
             "precompiled profile execution contract permits compiler reinterpretation"
         );
+        let expected_permissions = if is_v2 {
+            json!([
+                "parse",
+                "schema_check",
+                "verify_hashes",
+                "verify_exact_catalog_inputs",
+                "execute_supplied_v3_profile"
+            ])
+        } else {
+            json!([
+                "parse",
+                "schema_check",
+                "verify_hashes",
+                "hydrate_predeclared_catalog_inputs",
+                "execute_supplied_v3_profile"
+            ])
+        };
         ensure!(
-            contract_map.get("workerPermissions")
-                == Some(&json!([
-                    "parse",
-                    "schema_check",
-                    "verify_hashes",
-                    "hydrate_predeclared_catalog_inputs",
-                    "execute_supplied_v3_profile"
-                ]))
+            contract_map.get("workerPermissions") == Some(&expected_permissions)
                 && contract_map.get("workerProhibitions")
                     == Some(&json!([
                         "compile_long_short_pair",
@@ -964,6 +1011,15 @@ fn build_task(
                     == Some(string(contract_map, "expectedResolvedProgramSha256")?),
             "precompiled profile execution contract does not bind resolved identities"
         );
+        if is_v2 {
+            ensure!(
+                string(contract_map, "profileSnapshotSha256")?
+                    == string(contract_map, "expectedResolvedProfileSnapshotSha256")?
+                    && string(contract_map, "programSha256")?
+                        == string(contract_map, "expectedResolvedProgramSha256")?,
+                "V2 precompiled source/resolved identities differ"
+            );
+        }
         ensure!(
             worker.get("workerContractSchema").and_then(Value::as_str)
                 == Some("replay-worker-contract-v2"),
@@ -1035,7 +1091,7 @@ fn build_task(
     )?;
     job.insert(
         "required_capabilities".to_owned(),
-        capabilities(false, precompiled.is_some()),
+        capabilities(false, precompiled_capability),
     );
     put(&mut job, "client_origin", "temporal_search_controller");
     put(&mut job, "campaign_id", authority_id);
@@ -1081,7 +1137,7 @@ fn build_task(
         job.insert("candidate_behavior_attribution_request".to_owned(), json!({"schema_version":"temporal_candidate_behavior_attribution_request_v1","enabled":true,"attribution_schema":"temporal_candidate_behavior_attribution_v1","replay_cost_view":"research_conservative","behavior_attribution_requirement":requirement}));
         job.insert(
             "required_capabilities".to_owned(),
-            capabilities(true, precompiled.is_some()),
+            capabilities(true, precompiled_capability),
         );
     }
     let bounds = object(
@@ -1102,14 +1158,14 @@ fn build_task(
     task.insert("payload".to_owned(), Value::Object(job));
     task.insert(
         "required_worker_capabilities".to_owned(),
-        capabilities(with_attribution, precompiled.is_some()),
+        capabilities(with_attribution, precompiled_capability),
     );
     copy(&mut task, "deadline_seconds", bounds, "deadlineSeconds")?;
     copy(&mut task, "max_attempts", bounds, "maxAttempts")?;
     Ok(Value::Object(task))
 }
 
-fn capabilities(attribution: bool, precompiled: bool) -> Value {
+fn capabilities(attribution: bool, precompiled_capability: Option<&str>) -> Value {
     let mut values: BTreeSet<String> = REQUIRED_CAPABILITIES
         .iter()
         .map(|v| (*v).to_owned())
@@ -1117,8 +1173,8 @@ fn capabilities(attribution: bool, precompiled: bool) -> Value {
     if attribution {
         values.insert(ATTRIBUTION_CAPABILITY.to_owned());
     }
-    if precompiled {
-        values.insert(PRECOMPILED_PROFILE_CAPABILITY.to_owned());
+    if let Some(capability) = precompiled_capability {
+        values.insert(capability.to_owned());
     }
     Value::Array(values.into_iter().map(Value::String).collect())
 }
@@ -1175,13 +1231,6 @@ pub fn validate_precompiled_execution_receipt(task: &Value, result: &Value) -> R
         string(job, "schema_version")? == JOB_SCHEMA_V2,
         "precompiled receipt admission requires candidate-window job v2"
     );
-    let capabilities = array(job, "required_capabilities")?;
-    ensure!(
-        capabilities
-            .iter()
-            .any(|value| value.as_str() == Some(PRECOMPILED_PROFILE_CAPABILITY)),
-        "precompiled receipt task lacks its dedicated worker capability"
-    );
     ensure!(
         string(job, "required_worker_contract_schema")? == "replay-worker-contract-v2",
         "precompiled receipt task requires replay-worker-contract-v2"
@@ -1191,6 +1240,30 @@ pub fn validate_precompiled_execution_receipt(task: &Value, result: &Value) -> R
             .ok_or_else(|| anyhow!("precompiled execution contract is missing"))?,
         "precompiled execution contract",
     )?;
+    let is_v2 =
+        string(contract, "schemaVersion")? == "temporal_qd_precompiled_profile_execution_v2";
+    let (expected_capability, expected_receipt_schema) = if is_v2 {
+        (
+            PRECOMPILED_PROFILE_CAPABILITY_V2,
+            PRECOMPILED_PROFILE_RECEIPT_SCHEMA_V2,
+        )
+    } else {
+        ensure!(
+            string(contract, "schemaVersion")? == "temporal_qd_precompiled_profile_execution_v1",
+            "precompiled receipt contract schema is incompatible"
+        );
+        (
+            PRECOMPILED_PROFILE_CAPABILITY_V1,
+            PRECOMPILED_PROFILE_RECEIPT_SCHEMA_V1,
+        )
+    };
+    let capabilities = array(job, "required_capabilities")?;
+    ensure!(
+        capabilities
+            .iter()
+            .any(|value| value.as_str() == Some(expected_capability)),
+        "precompiled receipt task lacks its dedicated worker capability"
+    );
     let result = object(result, "precompiled candidate-window result")?;
     ensure!(
         string(result, "schema_version")? == "temporal_graph_candidate_window_result_v2",
@@ -1200,35 +1273,35 @@ pub fn validate_precompiled_execution_receipt(task: &Value, result: &Value) -> R
         .get("precompiled_profile_execution_receipt")
         .ok_or_else(|| anyhow!("precompiled execution receipt is missing"))?;
     let receipt = object(receipt_value, "precompiled execution receipt")?;
-    exact_keys(
-        receipt,
-        &[
-            "schema_version",
-            "task_id",
-            "candidate_id",
-            "precompiled_contract_sha256",
-            "rust_authority_sha256",
-            "raw_source_profile_sha256",
-            "normalized_source_profile_sha256",
-            "authored_program_sha256",
-            "resolved_profile_sha256",
-            "resolved_program_sha256",
-            "worker_contract_hash",
-            "worker_contract_schema",
-            "worker_image_digest",
-            "worker_image_identity_mode",
-            "worker_source_git_commit",
-            "rust_core_hash",
-            "rust_build_info",
-            "runtime_platform",
-            "pair_recompile_attempted",
-            "source_profile_rewritten",
-            "receipt_sha256",
-        ],
-        "precompiled execution receipt",
-    )?;
+    let mut receipt_keys = vec![
+        "schema_version",
+        "task_id",
+        "candidate_id",
+        "precompiled_contract_sha256",
+        "rust_authority_sha256",
+        "raw_source_profile_sha256",
+        "normalized_source_profile_sha256",
+        "authored_program_sha256",
+        "resolved_profile_sha256",
+        "resolved_program_sha256",
+        "worker_contract_hash",
+        "worker_contract_schema",
+        "worker_image_digest",
+        "worker_image_identity_mode",
+        "worker_source_git_commit",
+        "rust_core_hash",
+        "rust_build_info",
+        "runtime_platform",
+        "pair_recompile_attempted",
+        "source_profile_rewritten",
+        "receipt_sha256",
+    ];
+    if is_v2 {
+        receipt_keys.extend(["catalog_sha256", "catalog_resolution_mode"]);
+    }
+    exact_keys(receipt, &receipt_keys, "precompiled execution receipt")?;
     ensure!(
-        string(receipt, "schema_version")? == PRECOMPILED_PROFILE_RECEIPT_SCHEMA,
+        string(receipt, "schema_version")? == expected_receipt_schema,
         "precompiled execution receipt schema is incompatible"
     );
     ensure!(
@@ -1333,6 +1406,22 @@ pub fn validate_precompiled_execution_receipt(task: &Value, result: &Value) -> R
                 == Some(false),
         "precompiled execution receipt reports forbidden compiler/source mutation"
     );
+    if is_v2 {
+        ensure!(
+            string(receipt, "catalog_sha256")? == string(contract, "catalogSha256")?
+                && string(receipt, "catalog_resolution_mode")?
+                    == string(contract, "catalogResolutionMode")?
+                && string(receipt, "catalog_resolution_mode")? == "verify_exact_no_rewrite_v1",
+            "V2 precompiled receipt catalog binding drifted"
+        );
+        ensure!(
+            string(receipt, "normalized_source_profile_sha256")?
+                == string(receipt, "resolved_profile_sha256")?
+                && string(receipt, "authored_program_sha256")?
+                    == string(receipt, "resolved_program_sha256")?,
+            "V2 precompiled receipt contains competing source/resolved identities"
+        );
+    }
     let attestation_value = result
         .get("runtime_program_identity_attestation")
         .ok_or_else(|| anyhow!("runtime program identity attestation is missing"))?;
@@ -6052,7 +6141,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|value| value == PRECOMPILED_PROFILE_CAPABILITY)
+                .any(|value| value == PRECOMPILED_PROFILE_CAPABILITY_V1)
         );
 
         let mut changed = candidate.clone();

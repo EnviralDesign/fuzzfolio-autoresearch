@@ -367,7 +367,15 @@ def run(
         ("pair_recompiled", lambda _t, r: r["precompiled_profile_execution_receipt"].update(pair_recompile_attempted=True), True),
         ("unknown_receipt_field", lambda _t, r: r["precompiled_profile_execution_receipt"].update(unknown=True), True),
         ("contract_removed", lambda t, _r: t["payload"].pop("precompiled_profile_execution_contract"), False),
-        ("dedicated_capability_removed", lambda t, _r: t["payload"]["required_capabilities"].remove("temporal_qd_precompiled_profile_execution_v1"), False),
+        (
+            "dedicated_capability_removed",
+            lambda t, _r: t["payload"]["required_capabilities"].remove(
+                t["payload"]["precompiled_profile_execution_contract"][
+                    "schemaVersion"
+                ]
+            ),
+            False,
+        ),
         ("legacy_worker_contract", lambda t, r: (t["payload"].update(required_worker_contract_schema="replay-worker-contract-v1"), r["precompiled_profile_execution_receipt"].update(worker_contract_schema="replay-worker-contract-v1")), True),
         ("worker_image_digest", lambda _t, r: r["precompiled_profile_execution_receipt"].update(worker_image_digest="sha256:" + "0" * 64), True),
         ("worker_image_identity_mode", lambda _t, r: r["precompiled_profile_execution_receipt"].update(worker_image_identity_mode="local_unattested"), True),
