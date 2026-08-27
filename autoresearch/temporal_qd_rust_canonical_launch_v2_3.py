@@ -45,8 +45,10 @@ def _raw_sha(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _candidate_rows(generic: dict[str, Any]) -> list[dict[str, Any]]:
-    envelopes = _load(V2 / "native-candidate-envelopes-v1.json")
+def _candidate_rows(
+    generic: dict[str, Any], *, authority_package_root: Path = V2
+) -> list[dict[str, Any]]:
+    envelopes = _load(authority_package_root / "native-candidate-envelopes-v1.json")
     metadata = {row["candidateId"]: row for row in envelopes["candidates"]}
     first: dict[str, dict[str, Any]] = {}
     for task in generic["tasks"]:
@@ -121,13 +123,18 @@ def _template_authority_id(template: dict[str, Any]) -> str:
     return canonical_sha256(authority)
 
 
-def _templates(input_root: Path, worker: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Path]]:
-    raw_config = _load(ROTATING / "rotating-evidence-config.json")
+def _templates(
+    input_root: Path,
+    worker: dict[str, Any],
+    *,
+    rotating_evidence_root: Path = ROTATING,
+) -> tuple[dict[str, Any], dict[str, Path]]:
+    raw_config = _load(rotating_evidence_root / "rotating-evidence-config.json")
     paths: dict[str, Path] = {}
     descriptors: dict[str, Any] = {}
     for index in range(1, 5):
         panel_id = f"panel-{index}"
-        template = _load(ROTATING / f"{panel_id}-template-preparation.json")
+        template = _load(rotating_evidence_root / f"{panel_id}-template-preparation.json")
         template["authorityLabel"] = f"rust-canonical-topology-v2-3-{panel_id}"
         template["workerContract"] = copy.deepcopy(worker)
         template["bounds"].update({"maxCandidates": 12, "maxDevelopmentWindows": 4, "maxTasks": 48})
@@ -214,20 +221,37 @@ def generate(
     output_root: Path,
     native_binary: Path,
     compact_root: Path | None = None,
+    authority_package_root: Path = V2,
+    rotating_evidence_root: Path = ROTATING,
+    execution_engine_commit: str = SOURCE_COMMIT,
 ) -> dict[str, Any]:
     if output_root.exists():
         raise RuntimeError("V2.3 output root already exists")
     generic = _load(generic_manifest)
-    candidates = _candidate_rows(generic)
-    authority = _load(V2 / "inspected-campaign-authority-v1.json")
+    candidates = _candidate_rows(generic, authority_package_root=authority_package_root)
+    authority = _load(authority_package_root / "inspected-campaign-authority-v1.json")
     worker = authority["workerContract"]
-    if worker["workerContractSha256"] != WORKER_SHA:
-        raise RuntimeError("worker contract drift")
+    worker_sha = worker["workerContractSha256"]
+    worker_bindings = {
+        (
+            row["payload"].get("required_worker_contract_hash"),
+            row["payload"].get("required_worker_image_digest"),
+            row["payload"].get("required_worker_source_git_commit"),
+        )
+        for row in generic["tasks"]
+    }
+    expected_worker_binding = {
+        (worker_sha, worker["imageDigest"], worker["sourceGitCommit"])
+    }
+    if worker_bindings != expected_worker_binding:
+        raise RuntimeError("generic task worker binding does not match authority package")
     input_root = output_root / "freeze-inputs"
     input_root.mkdir(parents=True)
-    rotating, templates = _templates(input_root, worker)
+    rotating, templates = _templates(
+        input_root, worker, rotating_evidence_root=rotating_evidence_root
+    )
     catalog_path = input_root / "construction-catalog.json"
-    _write_pretty(catalog_path, _load(ROTATING / "construction-catalog.json"))
+    _write_pretty(catalog_path, _load(rotating_evidence_root / "construction-catalog.json"))
     catalog_sha = canonical_sha256(_load(catalog_path))
     panels = []
     new_tasks: list[dict[str, Any]] = []
@@ -244,8 +268,8 @@ def generate(
             construction_catalog_path=catalog_path,
             construction_catalog_sha256=catalog_sha,
             output_root=panel_root,
-            execution_engine_commit=SOURCE_COMMIT,
-            worker_contract_sha256=WORKER_SHA,
+            execution_engine_commit=execution_engine_commit,
+            worker_contract_sha256=worker_sha,
             rotating_evidence=rotating,
             archive_policy_authority=directional_qd_archive_policy_authority(),
             behavior_attribution_requirement=evolvable_behavior_attribution_requirement(),
@@ -336,8 +360,19 @@ def _main() -> int:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--native-binary", required=True, type=Path)
     parser.add_argument("--compact-root", type=Path)
+    parser.add_argument("--authority-package-root", type=Path, default=V2)
+    parser.add_argument("--rotating-evidence-root", type=Path, default=ROTATING)
+    parser.add_argument("--execution-engine-commit", default=SOURCE_COMMIT)
     args = parser.parse_args()
-    print(canonical_json(generate(generic_manifest=args.generic_task_manifest, output_root=args.output_root, native_binary=args.native_binary, compact_root=args.compact_root)))
+    print(canonical_json(generate(
+        generic_manifest=args.generic_task_manifest,
+        output_root=args.output_root,
+        native_binary=args.native_binary,
+        compact_root=args.compact_root,
+        authority_package_root=args.authority_package_root,
+        rotating_evidence_root=args.rotating_evidence_root,
+        execution_engine_commit=args.execution_engine_commit,
+    )))
     return 0
 
 
