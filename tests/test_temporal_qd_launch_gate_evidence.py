@@ -135,10 +135,17 @@ def test_launch_readiness_requires_both_external_gate_reports(tmp_path) -> None:
     _write_sealed(
         conformance,
         {
-            "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_2",
+            "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_3",
             "marketDataRead": False,
             "replayExecuted": True,
             "fullWorkerExecutionFixtureCount": 12,
+            "fullWorkerExecutionCandidateCount": 12,
+            "runtimeWorkerContractUsed": True,
+            "catalogVerificationExecuted": True,
+            "sourceProfileRewriteCount": 0,
+            "networkEnabled": False,
+            "gatewayContact": False,
+            "taskDispatchCount": 0,
             "exactWorkerResultsAcceptedByFuzzFolio": 12,
             "exactWorkerResultsAcceptedByPythonAdmission": 12,
             "exactWorkerResultsAcceptedByRustAdmission": 12,
@@ -172,6 +179,21 @@ def test_launch_readiness_requires_both_external_gate_reports(tmp_path) -> None:
     assert complete["productionOfflineCampaignSealPassed"] is True
     assert complete["allExactV2WorkerResultsAcceptedThroughProductionAdmission"] is True
     assert complete["allAdversarialV2ResultsRejectedThroughProductionAdmission"] is True
+
+    source_only_payload = json.loads(conformance.read_text(encoding="utf-8"))
+    source_only_payload.pop("reportSha256")
+    source_only_payload["runtimeWorkerContractUsed"] = False
+    source_only_conformance = tmp_path / "source-only-conformance.json"
+    _write_sealed(source_only_conformance, source_only_payload)
+    source_only = _load_launch_gate_evidence(
+        conformance_report_path=source_only_conformance,
+        production_admission_report_path=production,
+        portability_report_path=portability,
+        worker_contract=_worker_contract(),
+        source_commit=SOURCE_COMMIT,
+    )
+    assert source_only["realWorkerReplayConformancePassed"] is False
+    assert source_only["launchEvidenceComplete"] is False
 
     mismatched_production = tmp_path / "mismatched-production-admission.json"
     mismatched_payload = dict(production_payload)

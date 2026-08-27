@@ -191,10 +191,17 @@ def _load_launch_gate_evidence(
         adversarial = report.get("adversarialCases") or []
         real_worker_passed = (
             report.get("schemaVersion")
-            == "temporal_qd_worker_seam_conformance_report_v2_2"
+            == "temporal_qd_worker_seam_conformance_report_v2_3"
             and report.get("marketDataRead") is False
             and report.get("replayExecuted") is True
             and int(report.get("fullWorkerExecutionFixtureCount") or 0) >= 12
+            and report.get("fullWorkerExecutionCandidateCount") == 12
+            and report.get("runtimeWorkerContractUsed") is True
+            and report.get("catalogVerificationExecuted") is True
+            and report.get("sourceProfileRewriteCount") == 0
+            and report.get("networkEnabled") is False
+            and report.get("gatewayContact") is False
+            and report.get("taskDispatchCount") == 0
             and int(report.get("exactWorkerResultsAcceptedByFuzzFolio") or 0) >= 12
             and int(report.get("exactWorkerResultsAcceptedByPythonAdmission") or 0)
             >= 12
@@ -217,7 +224,7 @@ def _load_launch_gate_evidence(
         evidence.update(
             {
                 "conformanceReport": {
-                    "artifactRole": "worker_seam_conformance_v2_2",
+                    "artifactRole": "worker_seam_conformance_v2_3",
                     "logicalId": "worker-seam-conformance.json",
                     "rawSha256": _sha_file(conformance_report_path),
                     "reportSha256": supplied,

@@ -296,6 +296,7 @@ def run(
     task_manifest: Path,
     worker_contract: Path,
     output: Path,
+    fuzz_report: Path,
 ) -> dict[str, Any]:
     dashboard_python = dashboard_root / "compute-service/.venv/Scripts/python.exe"
     dashboard_script = dashboard_root / "scripts/temporal_qd_precompiled_conformance.py"
@@ -304,25 +305,26 @@ def run(
     source_commit = _source_commit()
     _assert_tracked_worktree_clean(source_commit)
     production_binary_hashes = _build_admission_binaries()
-    fuzz_report_path = output.with_suffix(".fuzzfolio.json")
-    subprocess.run(
-        [
-            str(dashboard_python),
-            str(dashboard_script),
-            "--task-manifest",
-            str(task_manifest),
-            "--worker-contract",
-            str(worker_contract),
-            "--output",
-            str(fuzz_report_path),
-        ],
-        cwd=dashboard_root,
-        check=True,
-    )
+    fuzz_report_path = fuzz_report
     fuzz_report = json.loads(fuzz_report_path.read_text(encoding="utf-8"))
     fixtures = fuzz_report.get("executedFixtures") or []
-    if len(fixtures) < 5 or fuzz_report.get("replayExecuted") is not True:
-        raise RuntimeError("FuzzFolio did not produce five real worker execution fixtures")
+    exact_image_complete = (
+        len(fixtures) == 12
+        and fuzz_report.get("replayExecuted") is True
+        and fuzz_report.get("fullWorkerExecutionCandidateCount") == 12
+        and fuzz_report.get("runtimeWorkerContractUsed") is True
+        and fuzz_report.get("catalogVerificationExecuted") is True
+        and fuzz_report.get("sourceProfileRewriteCount") == 0
+        and fuzz_report.get("networkEnabled") is False
+        and fuzz_report.get("marketDataRead") is False
+        and fuzz_report.get("gatewayContact") is False
+        and fuzz_report.get("taskDispatchCount") == 0
+    )
+    if not exact_image_complete:
+        raise RuntimeError(
+            "FuzzFolio exact-image conformance did not execute all twelve candidates "
+            "through the runtime contract with network and dispatch disabled"
+        )
     for executed in fixtures:
         if (
             not _python_admits(executed["task"], executed["result"])
@@ -510,10 +512,21 @@ def run(
     )
 
     report: dict[str, Any] = {
-        "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_2",
+        "schemaVersion": "temporal_qd_worker_seam_conformance_report_v2_3",
         "marketDataRead": False,
         "replayExecuted": True,
         "fullWorkerExecutionFixtureCount": len(fixtures),
+        "fullWorkerExecutionCandidateCount": fuzz_report[
+            "fullWorkerExecutionCandidateCount"
+        ],
+        "runtimeWorkerContractUsed": fuzz_report["runtimeWorkerContractUsed"],
+        "catalogVerificationExecuted": fuzz_report[
+            "catalogVerificationExecuted"
+        ],
+        "sourceProfileRewriteCount": fuzz_report["sourceProfileRewriteCount"],
+        "networkEnabled": fuzz_report["networkEnabled"],
+        "gatewayContact": fuzz_report["gatewayContact"],
+        "taskDispatchCount": fuzz_report["taskDispatchCount"],
         "fullWorkerExecutionCandidateIds": [
             executed["task"]["payload"]["candidate_id"] for executed in fixtures
         ],
@@ -555,6 +568,7 @@ def main() -> None:
     parser.add_argument("--task-manifest", type=Path, required=True)
     parser.add_argument("--worker-contract", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fuzz-report", type=Path, required=True)
     args = parser.parse_args()
     print(
         json.dumps(
@@ -563,6 +577,7 @@ def main() -> None:
                 task_manifest=args.task_manifest,
                 worker_contract=args.worker_contract,
                 output=args.output,
+                fuzz_report=args.fuzz_report,
             ),
             sort_keys=True,
         )
