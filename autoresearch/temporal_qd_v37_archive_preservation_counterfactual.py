@@ -1,9 +1,11 @@
-"""Fail-closed V37 archive-counterfactual control-replay preflight.
+"""V37 Python-parity diagnostic for archive-counterfactual recovery.
 
 The V37 archive-preservation study may only begin after its frozen historical
-control can be reconstructed.  This module deliberately stops at that boundary
-when the retained source lacks the direction-behavior identity required by the
-recorded cumulative reducer.  It never launches work or synthesizes a variant.
+control can be reconstructed.  It reports when the retained legacy window
+shape cannot be opened through the Python cumulative reducer.  That is a
+Python-parity diagnostic only: the native finalizer may construct aggregate
+behavior identity from the same retained records.  It never launches work or
+synthesizes a variant.
 """
 
 from __future__ import annotations
@@ -104,7 +106,7 @@ def _file_binding(path: Path, *, root: Path) -> dict[str, Any]:
 
 
 def analyze_v37_control_replay(v37_root: Path | str) -> dict[str, Any]:
-    """Inspect the frozen V37 control and fail closed on missing replay authority."""
+    """Inspect the frozen V37 Python-parity boundary without running a replay."""
     supplied_root = Path(v37_root).resolve()
     run_root = _run_root(supplied_root)
     launch_path = supplied_root / "launch-identity.json"
@@ -195,7 +197,7 @@ def analyze_v37_control_replay(v37_root: Path | str) -> dict[str, Any]:
     }
     blocker = {
         "stage": "cumulative_direction_behavior_reconstruction",
-        "reason": "missing_realized_behavior_identity_authority",
+        "reason": "legacy_window_identity_absent_for_python_reducer",
         "recordedCommit": source_commit,
         "recordedWorktree": source_worktree,
         "requiredFields": ["identityMaterial", "identitySha256"],
@@ -204,9 +206,9 @@ def analyze_v37_control_replay(v37_root: Path | str) -> dict[str, Any]:
         "firstMissingRecords": missing_identity_records[:8],
         "explanation": (
             "The frozen panel metrics retain legacy realizedBehavior objects without the "
-            "identity material required to reconstruct cumulative direction selection. "
-            "The launch identifies a dirty source worktree, but does not retain that "
-            "uncommitted finalizer source."
+            "per-window identity material required by the Python cumulative reducer. "
+            "This does not establish missing native finalization authority: the historical "
+            "Rust finalizer derives aggregate identity from the retained window records."
         ),
     }
     return {
@@ -214,10 +216,10 @@ def analyze_v37_control_replay(v37_root: Path | str) -> dict[str, Any]:
         "v37Root": str(supplied_root),
         "runRoot": str(run_root),
         "controlReplay": observed_control,
-        "status": "blocked_source_drift",
+        "status": "python_parity_incompatible",
         "blocker": blocker,
         "counterfactualExecution": {
-            "state": "not_authorized_without_exact_control_replay",
+            "state": "not_authorized_without_exact_native_control_replay",
             "executedVariants": [],
             "marketEvaluation": False,
             "workerGatewayOrVast": False,
@@ -236,17 +238,18 @@ def write_control_replay_report(*, v37_root: Path | str, output_dir: Path | str)
     report_path.write_bytes(_canonical_bytes(report) + b"\n")
     markdown = "\n".join(
         [
-            "# V37 archive-preservation counterfactual — control replay",
+            "# V37 archive-preservation counterfactual — Python parity diagnostic",
             "",
-            "Status: **blocked before counterfactual execution**.",
+            "Status: **Python parity incompatible; native control not evaluated here**.",
             "",
             f"Historical trajectory: `{report['controlReplay']['memberCounts']}`.",
             f"Recorded source commit: `{report['blocker']['recordedCommit']}`.",
             f"Recorded source worktree: `{report['blocker']['recordedWorktree']}`.",
             "",
-            "The retained G1 panel metrics omit `identityMaterial` and `identitySha256` "
-            "for realized behavior. Those fields are required to reconstruct the frozen "
-            "cumulative direction-selection path, so the exact control cannot be replayed.",
+            "The retained G1 panel metrics omit per-window `identityMaterial` and "
+            "`identitySha256` for realized behavior. The Python cumulative reducer cannot "
+            "open that legacy shape. This diagnostic does not decide whether the historical "
+            "native finalizer can replay it.",
             "",
             "No archive counterfactual, market evaluation, worker/gateway/Vast work, generation, "
             "or archive mutation was executed.",

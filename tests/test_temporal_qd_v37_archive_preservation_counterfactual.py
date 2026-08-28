@@ -99,17 +99,18 @@ def _v37_fixture(tmp_path: Path) -> Path:
     return root
 
 
-def test_v37_control_replay_stops_before_counterfactual_without_identity_authority(
+def test_v37_python_parity_diagnostic_stops_before_counterfactual_execution(
     tmp_path: Path,
 ) -> None:
     root = _v37_fixture(tmp_path)
 
     report = analyze_v37_control_replay(root)
 
-    assert report["status"] == "blocked_source_drift"
+    assert report["status"] == "python_parity_incompatible"
     assert report["controlReplay"]["memberCounts"] == [3, 3, 0, 0, 0]
     assert report["controlReplay"]["matchesRequiredTrajectory"] is True
     assert report["blocker"]["missingIdentityRecordCount"] == 1
+    assert report["counterfactualExecution"]["state"] == "not_authorized_without_exact_native_control_replay"
     assert report["counterfactualExecution"]["executedVariants"] == []
     assert report["counterfactualExecution"]["marketEvaluation"] is False
 
@@ -120,7 +121,7 @@ def test_v37_control_replay_report_is_compact_and_checksum_bound(tmp_path: Path)
 
     report = write_control_replay_report(v37_root=root, output_dir=output)
 
-    assert report["status"] == "blocked_source_drift"
+    assert report["status"] == "python_parity_incompatible"
     assert (output / "control-replay-preflight.json").is_file()
     assert (output / "README.md").is_file()
     checksums = (output / "CHECKSUMS.sha256").read_text(encoding="utf-8")
