@@ -312,14 +312,7 @@ fn execute_fast_ephemeral_manifest(
         "fast-ephemeral manifest/source identity drifted"
     );
     let source = load_fast_ephemeral_source(source_value)?;
-    let plan = build_auxiliary_plan(&source)?;
-    ensure!(
-        array(&plan, "obligations")?.is_empty(),
-        "fast-ephemeral finalization source lacks complete panel evidence"
-    );
-    let bundles = admit_receipts(&source, &plan)?;
-    let cumulative = build_cumulative_archive(&source, &bundles)?;
-    let archive = build_parent_archive(&source, &cumulative)?;
+    let (cumulative, archive) = reduce_fast_ephemeral_loaded_source(&source)?;
     let cumulative_path = output_dir.join(CUMULATIVE_PATH);
     let archive_path = output_dir.join(ARCHIVE_PATH);
     write_fast_value(
@@ -356,6 +349,30 @@ fn execute_fast_ephemeral_manifest(
     )?;
     let _ = manifest_path;
     Ok(result)
+}
+
+/// Apply the exact historical fast-ephemeral reducer to one sealed source.
+///
+/// This is deliberately a narrow research seam: it opens the same source
+/// contract and calls the same cumulative and parent-archive builders as the
+/// production fast-ephemeral manifest path, but leaves publication and path
+/// binding to the caller. Counterfactual work may use it only after proving
+/// byte-for-byte Variant-0 parity against a sealed source.
+pub fn reduce_fast_ephemeral_source(source_value: Value) -> Result<(Value, Value)> {
+    let source = load_fast_ephemeral_source(source_value)?;
+    reduce_fast_ephemeral_loaded_source(&source)
+}
+
+fn reduce_fast_ephemeral_loaded_source(source: &Source) -> Result<(Value, Value)> {
+    let plan = build_auxiliary_plan(source)?;
+    ensure!(
+        array(&plan, "obligations")?.is_empty(),
+        "fast-ephemeral finalization source lacks complete panel evidence"
+    );
+    let bundles = admit_receipts(source, &plan)?;
+    let cumulative = build_cumulative_archive(source, &bundles)?;
+    let archive = build_parent_archive(source, &cumulative)?;
+    Ok((cumulative, archive))
 }
 
 fn load_fast_ephemeral_source(value: Value) -> Result<Source> {
@@ -3993,6 +4010,27 @@ mod tests {
                 "operational output root changed a semantic artifact"
             );
         }
+    }
+
+    #[test]
+    fn fast_ephemeral_research_seam_uses_the_same_native_builders() {
+        let source = current_policy_parity_source();
+        let plan = build_auxiliary_plan(&source).unwrap();
+        let bundles = admit_receipts(&source, &plan).unwrap();
+        let expected_cumulative = build_cumulative_archive(&source, &bundles).unwrap();
+        let expected_archive = build_parent_archive(&source, &expected_cumulative).unwrap();
+
+        let (actual_cumulative, actual_archive) =
+            reduce_fast_ephemeral_loaded_source(&source).unwrap();
+
+        assert_eq!(
+            canonical_json_line(&actual_cumulative).unwrap(),
+            canonical_json_line(&expected_cumulative).unwrap()
+        );
+        assert_eq!(
+            canonical_json_line(&actual_archive).unwrap(),
+            canonical_json_line(&expected_archive).unwrap()
+        );
     }
 
     #[test]
