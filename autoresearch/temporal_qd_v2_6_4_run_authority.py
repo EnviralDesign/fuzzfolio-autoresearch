@@ -152,6 +152,41 @@ def _verify_mapping_matches_inputs(mapping: Mapping[str, Any], task_ids: set[str
         raise RunAuthorityError("copied inputs do not match the selected authority task mapping")
 
 
+def _verify_control_matches_input_bindings(
+    control: Mapping[str, Any], input_bindings: list[dict[str, Any]]
+) -> None:
+    """Require the launch control to name the exact copied panel inputs."""
+
+    panels = control.get("panels")
+    if not isinstance(panels, list) or len(panels) != len(PANELS):
+        raise RunAuthorityError("launch control must describe exactly three panels")
+    if control.get("panelTaskCounts") != [48, 48, 48]:
+        raise RunAuthorityError("launch control panel task counts drifted")
+    expected_by_id = {binding["panelId"]: binding for binding in input_bindings}
+    seen: set[str] = set()
+    for descriptor in panels:
+        if not isinstance(descriptor, Mapping):
+            raise RunAuthorityError("launch control panel descriptor is invalid")
+        panel_id = descriptor.get("panelId")
+        if panel_id not in expected_by_id or panel_id in seen:
+            raise RunAuthorityError("launch control panel IDs must be panel-1, panel-2, and panel-3 exactly once")
+        seen.add(panel_id)
+        binding = expected_by_id[panel_id]
+        if (
+            descriptor.get("checkpointSha256") != binding["checkpointSha256"]
+            or descriptor.get("taskMatrixSha256") != binding["taskMatrixSha256"]
+        ):
+            raise RunAuthorityError(f"{panel_id} launch-control/input identity drifted")
+        if (
+            descriptor.get("candidateCount") != 12
+            or descriptor.get("windowCount") != 4
+            or descriptor.get("taskCount") != 48
+        ):
+            raise RunAuthorityError(f"{panel_id} launch-control panel cardinality drifted")
+    if seen != set(PANELS):
+        raise RunAuthorityError("launch control panel IDs must be panel-1, panel-2, and panel-3 exactly once")
+
+
 def snapshot_run_authority(
     *,
     run_root: Path,
@@ -172,6 +207,7 @@ def snapshot_run_authority(
         raise RunAuthorityError("fresh run already contains a topology authority snapshot")
     documents = _authority_documents(authority_sources)
     input_bindings, task_ids = _input_bindings(run_root, input_roots)
+    _verify_control_matches_input_bindings(documents["launchControl"][1], input_bindings)
     _verify_mapping_matches_inputs(documents["taskMapping"][1], task_ids)
     snapshot_files: dict[str, dict[str, Any]] = {}
     snapshot_root.mkdir(parents=True)

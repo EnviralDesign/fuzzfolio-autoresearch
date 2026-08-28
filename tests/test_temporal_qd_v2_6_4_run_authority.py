@@ -58,7 +58,14 @@ def _input_roots(run_root: Path) -> tuple[dict[str, Path], list[str]]:
     return roots, task_ids
 
 
-def _authority_sources(tmp_path: Path, task_ids: list[str], *, stale_mapping: bool = False) -> dict[str, Path]:
+def _authority_sources(
+    tmp_path: Path,
+    task_ids: list[str],
+    *,
+    stale_mapping: bool = False,
+    panels: list[dict] | None = None,
+    panel_task_counts: list[int] | None = None,
+) -> dict[str, Path]:
     source_root = tmp_path / "external-authority"
     mapping_ids = [f"stale-{index:03d}" for index in range(144)] if stale_mapping else task_ids
     mapping = _self_hashed(
@@ -73,6 +80,22 @@ def _authority_sources(tmp_path: Path, task_ids: list[str], *, stale_mapping: bo
             "dispatchEnabled": False,
             "panelCount": 3,
             "totalInspectedTaskCount": 144,
+            "panelTaskCounts": [48, 48, 48] if panel_task_counts is None else panel_task_counts,
+            "panels": (
+                [
+                {
+                    "panelId": f"panel-{panel_index}",
+                    "checkpointSha256": f"sha256:checkpoint-{panel_index}",
+                    "taskMatrixSha256": f"sha256:matrix-{panel_index}",
+                    "candidateCount": 12,
+                    "windowCount": 4,
+                    "taskCount": 48,
+                }
+                for panel_index in range(1, 4)
+                ]
+                if panels is None
+                else panels
+            ),
             "mappingSha256": mapping["mappingSha256"],
         },
         "launchControlSha256",
@@ -172,6 +195,140 @@ def test_copied_input_drift_fails_closed_after_snapshot(tmp_path: Path) -> None:
     task_path = inputs["panel-1"] / "screening-run" / "tasks.jsonl"
     task_path.write_text(task_path.read_text(encoding="utf-8") + "\n", encoding="utf-8", newline="\n")
     with pytest.raises(authority.RunAuthorityError, match="copied input binding drifted"):
+        authority.reducer_authority_from_run_receipt(run_root)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "match"),
+    [
+        ("checkpointSha256", "sha256:wrong-checkpoint", "launch-control/input identity drifted"),
+        ("taskMatrixSha256", "sha256:wrong-task-matrix", "launch-control/input identity drifted"),
+    ],
+)
+def test_stale_control_panel_identity_fails_before_snapshot(
+    tmp_path: Path, field: str, bad_value: str, match: str
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    input_roots, task_ids = _input_roots(run_root)
+    panels = [
+        {
+            "panelId": f"panel-{panel_index}",
+            "checkpointSha256": f"sha256:checkpoint-{panel_index}",
+            "taskMatrixSha256": f"sha256:matrix-{panel_index}",
+            "candidateCount": 12,
+            "windowCount": 4,
+            "taskCount": 48,
+        }
+        for panel_index in range(1, 4)
+    ]
+    panels[1][field] = bad_value
+    sources = _authority_sources(tmp_path, task_ids, panels=panels)
+    with pytest.raises(authority.RunAuthorityError, match=match):
+        authority.snapshot_run_authority(
+            run_root=run_root,
+            input_roots=input_roots,
+            authority_sources=sources,
+        )
+    assert not (run_root / authority.SNAPSHOT_DIRECTORY).exists()
+    assert not (run_root / authority.RECEIPT_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("panels", "panel_task_counts", "match"),
+    [
+        (
+            [
+                {
+                    "panelId": "panel-1",
+                    "checkpointSha256": "sha256:checkpoint-1",
+                    "taskMatrixSha256": "sha256:matrix-1",
+                    "candidateCount": 12,
+                    "windowCount": 4,
+                    "taskCount": 48,
+                },
+                {
+                    "panelId": "panel-1",
+                    "checkpointSha256": "sha256:checkpoint-2",
+                    "taskMatrixSha256": "sha256:matrix-2",
+                    "candidateCount": 12,
+                    "windowCount": 4,
+                    "taskCount": 48,
+                },
+                {
+                    "panelId": "panel-3",
+                    "checkpointSha256": "sha256:checkpoint-3",
+                    "taskMatrixSha256": "sha256:matrix-3",
+                    "candidateCount": 12,
+                    "windowCount": 4,
+                    "taskCount": 48,
+                },
+            ],
+            [48, 48, 48],
+            "launch control panel IDs",
+        ),
+        (None, [48, 47, 49], "launch control panel task counts drifted"),
+    ],
+)
+def test_control_panel_shape_drift_fails_before_snapshot(
+    tmp_path: Path, panels: list[dict] | None, panel_task_counts: list[int], match: str
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    input_roots, task_ids = _input_roots(run_root)
+    sources = _authority_sources(
+        tmp_path,
+        task_ids,
+        panels=panels,
+        panel_task_counts=panel_task_counts,
+    )
+    with pytest.raises(authority.RunAuthorityError, match=match):
+        authority.snapshot_run_authority(
+            run_root=run_root,
+            input_roots=input_roots,
+            authority_sources=sources,
+        )
+    assert not (run_root / authority.SNAPSHOT_DIRECTORY).exists()
+    assert not (run_root / authority.RECEIPT_NAME).exists()
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [("candidateCount", 11), ("windowCount", 5), ("taskCount", 47)])
+def test_control_panel_cardinality_drift_fails_before_snapshot(
+    tmp_path: Path, field: str, bad_value: int
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    input_roots, task_ids = _input_roots(run_root)
+    panels = [
+        {
+            "panelId": f"panel-{panel_index}",
+            "checkpointSha256": f"sha256:checkpoint-{panel_index}",
+            "taskMatrixSha256": f"sha256:matrix-{panel_index}",
+            "candidateCount": 12,
+            "windowCount": 4,
+            "taskCount": 48,
+        }
+        for panel_index in range(1, 4)
+    ]
+    panels[2][field] = bad_value
+    sources = _authority_sources(tmp_path, task_ids, panels=panels)
+    with pytest.raises(authority.RunAuthorityError, match="launch-control panel cardinality drifted"):
+        authority.snapshot_run_authority(
+            run_root=run_root,
+            input_roots=input_roots,
+            authority_sources=sources,
+        )
+    assert not (run_root / authority.SNAPSHOT_DIRECTORY).exists()
+    assert not (run_root / authority.RECEIPT_NAME).exists()
+
+
+def test_copied_checkpoint_drift_fails_closed_after_snapshot(tmp_path: Path) -> None:
+    run_root, inputs, _ = _ready_run(tmp_path)
+    checkpoint_path = inputs["panel-1"] / "campaign-input-checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint["checkpointSha256"] = "sha256:changed-after-snapshot"
+    _write(checkpoint_path, checkpoint)
+    with pytest.raises(authority.RunAuthorityError, match="copied inputs differ"):
         authority.reducer_authority_from_run_receipt(run_root)
 
 
