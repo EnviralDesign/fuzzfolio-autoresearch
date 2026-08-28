@@ -1730,6 +1730,190 @@ fn make_provisional(
     add(&mut v, "provisionalSha256")?;
     Ok(v)
 }
+
+/// Rebuild one sealed fast-ephemeral finalizer source with a different
+/// newcomer admission limit, while reusing the historical v5 cohorting,
+/// provisional-selection, and rich-member construction exactly.
+///
+/// This is intentionally a research-only source-preparation seam.  It does
+/// not evaluate candidates, backfill missing panels, or alter finalizer
+/// policy.  Callers must supply the authenticated current-panel members and
+/// bundles; the returned source remains subject to the historical finalizer.
+pub fn rebuild_fast_ephemeral_source_with_newcomer_limit(
+    source: Value,
+    evaluated_members: &[Value],
+    candidate_bundles: &[Value],
+    newcomer_limit: usize,
+) -> Result<Value> {
+    ensure!(
+        text(&source, "schemaVersion")? == "temporal_qd_v5_fast_ephemeral_finalization_source_v1",
+        "research source must be fast-ephemeral v5 finalization source"
+    );
+    self_hash(&source, "sourceSha256", "research source")?;
+
+    let generation = unsigned(&source, "generationIndex")?;
+    let rotating = member(&source, "rotatingEvidence")?;
+    let cohort = member(&source, "cohort")?;
+    let archive_policy = member(&source, "archivePolicy")?;
+    let panel = text(cohort, "panelId")?;
+    let panels = array(rotating, "panels")?;
+    let cycle = unsigned(
+        member(rotating, "absoluteGenerationMapping")?,
+        "cycleLength",
+    )? as usize;
+    ensure!(
+        cycle > 0 && cycle == panels.len(),
+        "research source rotating panel authority is invalid"
+    );
+    ensure!(
+        text(&panels[(generation as usize - 1) % cycle], "panelId")? == panel,
+        "research source cohort panel does not match generation"
+    );
+    ensure!(
+        hash_of(cohort, "rotatingEvidenceSha256")? == hash_of(rotating, "rotatingEvidenceSha256")?,
+        "research source cohort rotating authority drifted"
+    );
+
+    let proposal_ids = array(cohort, "newProposalCandidateIds")?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<BTreeSet<_>>>()
+        .ok_or_else(|| anyhow!("research source proposal candidate IDs must be strings"))?;
+    let retained_ids = array(cohort, "retainedParentEvaluationCandidateIds")?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<BTreeSet<_>>>()
+        .ok_or_else(|| anyhow!("research source retained candidate IDs must be strings"))?;
+    ensure!(
+        proposal_ids.is_disjoint(&retained_ids),
+        "research source candidate roles overlap"
+    );
+    let cohort_candidates = array(cohort, "candidates")?
+        .iter()
+        .map(|candidate| {
+            Ok((
+                text(candidate, "candidateId")?.to_owned(),
+                hash_of(candidate, "candidateIdentitySha256")?.to_owned(),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let expected_ids = proposal_ids
+        .iter()
+        .chain(retained_ids.iter())
+        .map(|id| (*id).to_owned())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        cohort_candidates.keys().collect::<BTreeSet<_>>()
+            == expected_ids.iter().collect::<BTreeSet<_>>(),
+        "research source cohort candidate roles drifted"
+    );
+
+    let mut selection_rows = BTreeMap::new();
+    let mut member_records = BTreeMap::new();
+    for raw in evaluated_members {
+        ensure!(
+            text(raw, "schemaVersion")? == "temporal_qd_evaluated_member_v1",
+            "research evaluated member schema is invalid"
+        );
+        let selection = candidate_with_member_selection_fields(raw)?;
+        let id = text(&selection, "candidateId")?.to_owned();
+        let identity = hash_of(&selection, "candidateIdentitySha256")?;
+        ensure!(
+            cohort_candidates.get(&id).map(String::as_str) == Some(identity),
+            "research evaluated member is absent from or conflicts with cohort"
+        );
+        ensure!(
+            selection_rows.insert(id.clone(), selection).is_none()
+                && member_records.insert(id, raw.clone()).is_none(),
+            "research evaluated members repeat a candidate"
+        );
+    }
+    ensure!(
+        selection_rows.keys().collect::<BTreeSet<_>>()
+            == expected_ids.iter().collect::<BTreeSet<_>>(),
+        "research evaluated members do not exactly cover the cohort"
+    );
+    let proposal_ids = proposal_ids
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let retained_ids = retained_ids
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let selection = make_provisional(
+        generation,
+        panel,
+        cohort,
+        &selection_rows.values().cloned().collect::<Vec<_>>(),
+        &member_records,
+        &proposal_ids,
+        &retained_ids,
+        &robust_selection_policy(rotating)?,
+        &direction_selection_policy(archive_policy)?,
+        current_panel_covered_months(rotating, panel)?,
+        newcomer_limit,
+    )?;
+    let selected = array(&selection, "candidates")?
+        .iter()
+        .map(|candidate| {
+            let id = text(candidate, "candidateId")?;
+            selection_rows.get(id).cloned().ok_or_else(|| {
+                anyhow!("research provisional candidate is absent from selection rows")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rich = make_rich(generation, cohort, &selection, &selected, &member_records)?;
+
+    let selected_ids = array(&selection, "candidates")?
+        .iter()
+        .map(|candidate| text(candidate, "candidateId").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut selected_bundles = BTreeMap::new();
+    for bundle in candidate_bundles {
+        ensure!(
+            text(bundle, "schemaVersion")? == "temporal_qd_candidate_panel_evidence_bundle_v1",
+            "research candidate panel bundle schema is invalid"
+        );
+        self_hash(bundle, "bundleSha256", "research candidate panel bundle")?;
+        ensure!(
+            hash_of(bundle, "rotatingEvidenceSha256")?
+                == hash_of(rotating, "rotatingEvidenceSha256")?,
+            "research candidate panel bundle rotating authority drifted"
+        );
+        let id = text(bundle, "candidateId")?;
+        ensure!(
+            cohort_candidates.contains_key(id),
+            "research candidate panel bundle is absent from cohort"
+        );
+        let key = (id.to_owned(), text(bundle, "panelId")?.to_owned());
+        ensure!(
+            selected_bundles.insert(key, bundle.clone()).is_none(),
+            "research candidate panel bundles repeat a candidate/panel"
+        );
+    }
+    for id in &selected_ids {
+        ensure!(
+            selected_bundles.contains_key(&(id.clone(), panel.to_owned())),
+            "research selected candidate lacks its current-panel bundle"
+        );
+    }
+    selected_bundles.retain(|(candidate_id, _), _| selected_ids.contains(candidate_id));
+
+    let mut output = source;
+    let output_map = output
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("research source must be an object"))?;
+    output_map.insert("provisional".into(), selection);
+    output_map.insert("selectedRichMembers".into(), rich);
+    output_map.insert(
+        "candidatePanelBundles".into(),
+        Value::Array(selected_bundles.into_values().collect()),
+    );
+    output_map.remove("sourceSha256");
+    add(&mut output, "sourceSha256")?;
+    Ok(output)
+}
 fn task(
     ord: u64,
     role: &str,
