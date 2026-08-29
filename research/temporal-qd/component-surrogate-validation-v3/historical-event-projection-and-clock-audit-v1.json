@@ -1,0 +1,70 @@
+{
+  "schemaVersion": "temporal_qd_component_surrogate_projection_clock_audit_v1",
+  "historicalEngine": {
+    "repository": "EnviralDesign/FuzzFolio",
+    "commit": "2bd50ccb3af1700d286da88cbcaecb4aca24f1a2"
+  },
+  "sourceFiles": [
+    {
+      "path": "shared/constants/indicators.json",
+      "sha256": "sha256:7a23e188358830a3edf179c21a26c1650d5e9beddfb6f5fc93c5ce0dcc817742",
+      "role": "Pinned historical indicator catalog used to hydrate the frozen indicator metadata."
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/temporal_graph/graph_models.py",
+      "sha256": "sha256:022d1eee7ae6111185b4e8ef91b78951be4ed1c669d0d8905076a80984582e2e",
+      "role": "EventBinding defines the named longOutput and shortOutput tokens."
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/temporal_graph/observation_adapter.py",
+      "sha256": "sha256:a439d8ae724981244dae40f72a4bdfd8a04fb1303beb28fb38cd4e005035aa04",
+      "role": "Historical observation construction selects the named raw binding output and places active bindings in freshEvents."
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/compute/aligned_scoring.py",
+      "sha256": "sha256:5c09681e3d5faf245b8c9ad4e7df616f4a2561f07cb3ea38224f8771a9641d25",
+      "role": "Historical multi-timeframe source availability and raw-output alignment."
+    }
+  ],
+  "eventProjection": {
+    "sourceOfGraphEvent": "named_raw_binding_output",
+    "notSourceOfGraphEvent": "processed_long_short_score",
+    "bindingSelection": "observation_adapter chooses longOutput for a long-owned event binding and shortOutput for a short-owned event binding.",
+    "rawEventValueContract": "After the historical visual-alignment boundary converts a missing raw event sample to false, each selected raw output is accepted only as Boolean or exact numeric 0/1 before becoming an event series.",
+    "rawIndicatorWarmupAtVisualBoundary": "aligned_scoring._build_output_series converts None or NaN visual event samples to false before exact reindexing; this is distinct from coercing a non-missing event value.",
+    "lookbackAndPersistence": {
+      "eventBindingRequiresLookbackBars": 1,
+      "acceptedSignalPersistence": [
+        "event",
+        "event-with-lookback"
+      ],
+      "interpretation": "The graph event path reads the named raw output; it does not derive events from instance.process(). The indicator's process lookback therefore is retained as diagnostic processed-score evidence, not substituted as the event source."
+    },
+    "emissionRule": "Every completed observation whose aligned selected raw output is active carries that binding ID in freshEvents; the adapter contains no inactive-to-active edge filter.",
+    "componentOnlyTerminology": {
+      "componentEventLong": "aligned named raw long output for the bound component",
+      "componentEventShort": "aligned named raw short output for the bound component",
+      "freshEventAvailability": "unavailable_component_only",
+      "reason": "The canaries reproduce the source-defined raw-event projection without executing TemporalGraph runtime."
+    }
+  },
+  "clockProjection": {
+    "noFormingBar": "Event bindings reject useFormingBar=true during historical temporal-projection construction.",
+    "baseDecisionClock": "clock.completed_bar",
+    "availabilityRule": "For useFormingBar=false, an indicator source timestamp is shifted by max(indicatorTimeframeMinutes - baseTimeframeMinutes, 0) before it is exposed on the base decision clock.",
+    "m15ToM5": {
+      "sourceTimeframeMinutes": 15,
+      "baseTimeframeMinutes": 5,
+      "availabilityShiftMinutes": 10,
+      "firstObservableM5Bar": "The M5 bar whose close coincides with the completed M15 bar close; for M15 source start T, this is M5 bar start T+10 minutes.",
+      "rawEventRepetition": "Raw event outputs are exact-reindexed onto the M5 clock without forward fill, so a source event is exposed only at its aligned completed-bar observation unless the source itself emits another event.",
+      "processedScoreRepetition": "Processed long/short scores are forward-filled after the same availability shift; they remain a separate diagnostic representation."
+    },
+    "featureClocks": {
+      "componentNativeClock": "the source indicator timeframe's completed bars",
+      "historicalM5DecisionClock": "the M5 completed-bar observation clock after the historical availability shift",
+      "m5Coincidence": "For an M5 component on an M5 decision clock, the shift is zero and the clocks coincide."
+    }
+  },
+  "projectionAuditCanonicalPayloadSha256": "sha256:9c3261e460b5a202c4ff31ff5c390cd80e62efc358c669e7daabc637c3c82b52"
+}

@@ -1,0 +1,4404 @@
+{
+  "cohortCounts": {
+    "acceptedDirectionalEventInsertContexts": 41,
+    "childrenWithP1P2Backfill": 11,
+    "exactParentComparableP1P2Cases": 9,
+    "p3SamePanelParentComparableContexts": 25,
+    "realizedPhenotypesAmongP3Contexts": 17,
+    "uniqueComponentIdentities": 19
+  },
+  "contexts": [
+    {
+      "candidateId": "qd_773d39fa0bef7d3efa80d6dc875e",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:773d39fa0bef7d3efa80d6dc875e308323cbe9a85cc2f721dfc1ea516cad58ab",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:9a7687b8d54aca875120cd1bfd956b5dcb3c76c13ea98f279b2a4841e3844207",
+        "programSha256": "sha256:39a6c010d1b2f7a76434b24d186eefcd94355d0088eb073f07d18604097aa418",
+        "proposalEntrySha256": "sha256:b26235021ff085e20fd13d174ca15047897b25d592b6aab76c82bf0ebdcee57d",
+        "sourceProfileSha256": "sha256:3556e9e63acfd64fd6fb935519d66d228b1943047b33981834941f987d68e4f9",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:12f2073a842d4c116176aeb9bdd79e82b43e21618bbd242d8075102424862054",
+          "terminalOperatorApplicationSha256": "sha256:a34120e0d0c843a11f7fc28ec059c3e4e686e728b5c075b1479e1f0fe5f5de53",
+          "terminalOperatorPlanSha256": "sha256:6e8d203459e3c6458e063bf2793743ced39210969e616e4e527a4ae2ae648970"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "CHANNEL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Channel Re-entry",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "channel_type",
+              "value": "donchian"
+            },
+            {
+              "name": "timeperiod",
+              "value": 20
+            },
+            {
+              "name": "matype",
+              "value": 0
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 2
+            },
+            {
+              "name": "price_type",
+              "value": "typical"
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "CHANNEL_REENTRY",
+        "indicatorInstanceId": "long_evtind_83dede93edc5",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:04d667575968d19f3d04bf15de34ca5f7488f1cb72829805ba47471f9448bf1e",
+      "componentIdentity": "sha256:85d93131b19d93ad7010e0cb96ed5407e2cb4c20c1e37069abdc110efd3ed24f",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_83dede93edc5",
+        "exactBindingId": "long_evt_890841164d87",
+        "forensicEventId": "evt_890841164d87",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[7].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:39a6c010d1b2f7a76434b24d186eefcd94355d0088eb073f07d18604097aa418",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:f91a20a9678968ec7cbe04e247b1b3d47eedc8403bcb458e643e7ae8ad45d84f",
+        "proposalEntrySha256": "sha256:b26235021ff085e20fd13d174ca15047897b25d592b6aab76c82bf0ebdcee57d",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:6366c40f3af4d45189d859d3e367f8ba1486ee41f9395e8cf31e8544b78cadc5",
+        "sourceProfileSha256": "sha256:3556e9e63acfd64fd6fb935519d66d228b1943047b33981834941f987d68e4f9",
+        "sourceProfileSnapshotSha256": "sha256:9a7687b8d54aca875120cd1bfd956b5dcb3c76c13ea98f279b2a4841e3844207",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_bfdc5cea2ba2b4142c35cdf32755",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:bfdc5cea2ba2b4142c35cdf327551ed16b1d0c624b8de8b43dbd1be5cce4cb6b",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:8486c3f4049a382f0a6e0a3c36040c07ccfc0f8677dd12c2c269590eddac3b7d",
+        "programSha256": "sha256:0cf6cd561053380ce452d1fd85fccb0fb56f8f9ff3eabc1e34f2d3dcc7c335fa",
+        "proposalEntrySha256": "sha256:429327292fefe7244cae0823ec3169a94d6a7f3ab848d516b0d7a9bb085cfb4c",
+        "sourceProfileSha256": "sha256:761a2def22851fae68177b3b445573010034b3a06d26d1df49a9e826c374aed2",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:4e678e222019ce49dca1a369d3030f4b113494ba060cc45e6ce93f6024e9aafc",
+          "terminalOperatorApplicationSha256": "sha256:e3dd2b050bf216d840843051d6dc84b32eadce04e0e0354fd841603bdb869acb",
+          "terminalOperatorPlanSha256": "sha256:ad18411d0db5446ed7c4036c71ca2d2587bbe98044697b16ae405f7a3373618d"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "KST",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "KST Cross (Know Sure Thing)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "roc1",
+              "value": 10
+            },
+            {
+              "name": "roc2",
+              "value": 15
+            },
+            {
+              "name": "roc3",
+              "value": 20
+            },
+            {
+              "name": "roc4",
+              "value": 30
+            },
+            {
+              "name": "sma1",
+              "value": 10
+            },
+            {
+              "name": "sma2",
+              "value": 10
+            },
+            {
+              "name": "sma3",
+              "value": 10
+            },
+            {
+              "name": "sma4",
+              "value": 15
+            },
+            {
+              "name": "signalperiod",
+              "value": 9
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "KST_CROSSOVER",
+        "indicatorInstanceId": "long_evtind_3125b2569145",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:07466d7c001ca5e004eff24cadd321fdb45dc67a9fe6b2f931691bdf033d60a8",
+      "componentIdentity": "sha256:577f3b50765464c62d6946ec84a2772153e6d00947d1f2a0ec1af6cb1b38e34b",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_3125b2569145",
+        "exactBindingId": "long_evt_9a6b996e71e9",
+        "forensicEventId": "evt_9a6b996e71e9",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:0cf6cd561053380ce452d1fd85fccb0fb56f8f9ff3eabc1e34f2d3dcc7c335fa",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:429327292fefe7244cae0823ec3169a94d6a7f3ab848d516b0d7a9bb085cfb4c",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:4c8386161970c2cd19a5b1571f1490cf7190badf4c0fece1c07df0432c11774a",
+        "sourceProfileSha256": "sha256:761a2def22851fae68177b3b445573010034b3a06d26d1df49a9e826c374aed2",
+        "sourceProfileSnapshotSha256": "sha256:8486c3f4049a382f0a6e0a3c36040c07ccfc0f8677dd12c2c269590eddac3b7d",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_c287a683a44adf0eab8a51cb482c",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:c287a683a44adf0eab8a51cb482c516210079d476af845f97f5b87cc89b9d618",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:05fd7a47d575e16fe4066d75904e9033fc1d820eb07e3a21c86152211dcb796d",
+        "programSha256": "sha256:aea56cc731667a6d024e97815af2a0facbe61cad4953dc5aec40d1e7a9a0b815",
+        "proposalEntrySha256": "sha256:c1da5e5f088b9bffa35a1c33f0a490616b6316c93d42387afbff0d07f81d16fe",
+        "sourceProfileSha256": "sha256:8c470603cad79b4fb574e8edfca5b29e3ced259500b675aff28d5dc9e90cecda",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:af33b8ad84175a6552af2450394bb2262f1446d213d6263aca5040cf6bc49d5d",
+          "terminalOperatorApplicationSha256": "sha256:6dcc73e9cac6694001e0055b6aad5b85cb3c47cdacc0c31c05faaec9c57c8095",
+          "terminalOperatorPlanSha256": "sha256:421830e6d6b1fed652604dc0a736b1f3d5f14a6a155b75f43fd9648d85a9beec"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "WAVETREND",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "WaveTrend Cross",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "wave_period",
+              "value": 10
+            },
+            {
+              "name": "avg_period",
+              "value": 21
+            },
+            {
+              "name": "signal_period",
+              "value": 4
+            },
+            {
+              "name": "buy_level",
+              "value": -53
+            },
+            {
+              "name": "sell_level",
+              "value": 53
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "WAVETREND_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_009012fde9f6",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:0b2f46193faf648f36879191bd3b4c270e67018875a3966778b7fbe10e200f7c",
+      "componentIdentity": "sha256:fcd0850e48422c847e595bfea5323b17cfa09e48be9a5aaf9417e7e2d8ad0a11",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_009012fde9f6",
+        "exactBindingId": "short_evt_1f9aed38c1ac",
+        "forensicEventId": "evt_1f9aed38c1ac",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[15].guard.guards[1].guards[2].eventId",
+          "graph.transitions[16].guard.guards[1].guards[2].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_ed27f99ba0a8dfd7c76c69687efb",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:aea56cc731667a6d024e97815af2a0facbe61cad4953dc5aec40d1e7a9a0b815",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:c1da5e5f088b9bffa35a1c33f0a490616b6316c93d42387afbff0d07f81d16fe",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:53a52a81523aa4ec81eca2c1d7376ad4e1d06056d7e222fbd294ff689acb0fbc",
+        "sourceProfileSha256": "sha256:8c470603cad79b4fb574e8edfca5b29e3ced259500b675aff28d5dc9e90cecda",
+        "sourceProfileSnapshotSha256": "sha256:05fd7a47d575e16fe4066d75904e9033fc1d820eb07e3a21c86152211dcb796d",
+        "terminalOperatorApplicationSha256": "sha256:6dcc73e9cac6694001e0055b6aad5b85cb3c47cdacc0c31c05faaec9c57c8095",
+        "terminalOperatorPlanSha256": "sha256:421830e6d6b1fed652604dc0a736b1f3d5f14a6a155b75f43fd9648d85a9beec"
+      }
+    },
+    {
+      "candidateId": "qd_9f539bd8633a23f7da2f4bfa0b0b",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:9f539bd8633a23f7da2f4bfa0b0b3bfa1af1a2cf6c2d70be46763821e935972d",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:c0b6a63412521c5a6a72d8978da68a6ab5a88e8ae2502695f8cf98115d9875e4",
+        "programSha256": "sha256:c8aec1863fa56b4aa7463ec8d9e3a6442cedc4f20475b209123eee7c9ea636fb",
+        "proposalEntrySha256": "sha256:23bcf0b3a7edb6d6521a9322619aa2c5b036d7db2c1868ae7c948917921c3e31",
+        "sourceProfileSha256": "sha256:f33b0d9f2f4466640e1717ea31d6d9d4abe97f5ef1e64566b86091b5e1931ad5",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:b674f6e18d01ffa7e842b354dd3f2507d6a622433666cf483e7fb9799d653e8a",
+          "terminalOperatorApplicationSha256": "sha256:f51db1c0ad32fcee218127421a23587aeaaf3c6d27d8f8d8baf213a4a722298c",
+          "terminalOperatorPlanSha256": "sha256:36010a650f8d89afd6cd892b1229aa85170457a9e88a08e9e8978b7f0cc3139a"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "BUFFERED_RANGE_BREAKOUT",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Buffered Range Breakout",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 9
+            },
+            {
+              "name": "risk_percent",
+              "value": 30
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+        "indicatorInstanceId": "long_evtind_3a3b7d949def",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:18d7d1e69b556c72290bcc18450bd054195197b397291ed3ae78e41843a5a44c",
+      "componentIdentity": "sha256:ff845cca1a0d5503fd30096cd1215e8b5bdf10a9a11d08b407df63382acb61c9",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_3a3b7d949def",
+        "exactBindingId": "long_evt_be47be3a0210",
+        "forensicEventId": "evt_be47be3a0210",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:c8aec1863fa56b4aa7463ec8d9e3a6442cedc4f20475b209123eee7c9ea636fb",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:23bcf0b3a7edb6d6521a9322619aa2c5b036d7db2c1868ae7c948917921c3e31",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:98b2c45859dba317b8672356087509c5a9f31761543afb89c189105d76ddcda7",
+        "sourceProfileSha256": "sha256:f33b0d9f2f4466640e1717ea31d6d9d4abe97f5ef1e64566b86091b5e1931ad5",
+        "sourceProfileSnapshotSha256": "sha256:c0b6a63412521c5a6a72d8978da68a6ab5a88e8ae2502695f8cf98115d9875e4",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_11671dc1f419e3e72a30da6f6d18",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:11671dc1f419e3e72a30da6f6d18cfc829dc9d6226f1a092331f5bb49476f152",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:56dfc9fb04c3e8320d819abb8edf980161550a2dc15a020038ba77d608a5fd7e",
+        "programSha256": "sha256:62e31ac82a0b7449aabb711e8aa8acb613c816c6dfaa6e3378f3aba17f9dc709",
+        "proposalEntrySha256": "sha256:087c468c1b8f1104bcb9e8ed0a5eecbedacc3313a06d6a9a71b0e37ffd5af87d",
+        "sourceProfileSha256": "sha256:c8357afca807003bfc11da1f116c2a73830133102121ab23179448c22e57614e",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:c45eeaa72bac49109499a7a410330c286384b081cd8936ad18a2b40488aca4c1",
+          "terminalOperatorApplicationSha256": "sha256:34a97bb9014088057a679344685639e8e8e947a4ce5de61ffa41790ed94926a8",
+          "terminalOperatorPlanSha256": "sha256:121ef631427a56378329db4392a553564826bf73af4a4cfa1673cef5ee0b5784"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "TREND_TRIGGER_FACTOR",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "TTF DSL Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 15
+            },
+            {
+              "name": "avg_period",
+              "value": 5
+            },
+            {
+              "name": "avg_method",
+              "value": 1
+            },
+            {
+              "name": "signal_period",
+              "value": 10
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "TTF_DSL_TRANSITION",
+        "indicatorInstanceId": "long_evtind_033b1fc5ab76",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:1c6a591902652f01a851c58012035de01a7b6d8aa230088bb951bc8d11725447",
+      "componentIdentity": "sha256:07a2fb394883cde9ea3d38d544e4e7bc444d5b5d75551d157d7ccb0589fbb204",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_033b1fc5ab76",
+        "exactBindingId": "long_evt_932baa1f2d97",
+        "forensicEventId": "evt_932baa1f2d97",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[0]",
+          "graph.eventBindings[0].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:62e31ac82a0b7449aabb711e8aa8acb613c816c6dfaa6e3378f3aba17f9dc709",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:087c468c1b8f1104bcb9e8ed0a5eecbedacc3313a06d6a9a71b0e37ffd5af87d",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:15d0f7ae122ecc75ae6944b9f792658b62803bad8de3364937025cf513d05a95",
+        "sourceProfileSha256": "sha256:c8357afca807003bfc11da1f116c2a73830133102121ab23179448c22e57614e",
+        "sourceProfileSnapshotSha256": "sha256:56dfc9fb04c3e8320d819abb8edf980161550a2dc15a020038ba77d608a5fd7e",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_b372cbc519c95a3056a54c52560b",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:b372cbc519c95a3056a54c52560b7a72239309098167e0e51b0b6e0fda27f7a2",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:94056afbce9fd14c6036e0a612e501fb408d992c01aca2220422ee48e906f182",
+        "programSha256": "sha256:bcc05a7686a43fec1a9e0721a07b3f19ac217f61dfc5608eed5649c8fb9ced53",
+        "proposalEntrySha256": "sha256:008c94577d6eb26c41e6badbc823d0d491aca7ced012ca16085fa735774de181",
+        "sourceProfileSha256": "sha256:f70a8f7a79deca60e9da3a4fd929870dba57c287e8f85443b998efe2df37d72b",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:578267b36fab30cc5f9e4076d9660260f1c77bce31bb3882b1e566d5eeb8cac4",
+          "terminalOperatorApplicationSha256": "sha256:0aae0918a0abe54c338357c18a7582946f134d8fc9bd71722f01797be5919cd2",
+          "terminalOperatorPlanSha256": "sha256:2ca2a0eaab5af904b7af81f03048e2eefc5a200b9b395c2204b2874ea9cc396d"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "NVO",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "NVO Volume Impulse",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "volume_period",
+              "value": 10
+            },
+            {
+              "name": "breakout_bars",
+              "value": 3
+            },
+            {
+              "name": "spike_ratio",
+              "value": 1.786
+            },
+            {
+              "name": "prior_max_ratio",
+              "value": 1.618
+            },
+            {
+              "name": "volume_clip",
+              "value": 6
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "NVO_VOLUME_IMPULSE",
+        "indicatorInstanceId": "long_evtind_d073bd8060db",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:1fab1936cf0111c0e94facff4a3c4cc98648651c2296cfd17b58d3ec882190ad",
+      "componentIdentity": "sha256:17aa6f9dc665e7b8f28160b2898f0aeba1db16d641471452b1277a5dfd3eb0df",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_d073bd8060db",
+        "exactBindingId": "long_evt_123d20969ef1",
+        "forensicEventId": "evt_123d20969ef1",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_19e9a2130a8f91feea60349066ca",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:bcc05a7686a43fec1a9e0721a07b3f19ac217f61dfc5608eed5649c8fb9ced53",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:8f3ea0bd61a565ffa2ec3c11b8b8596cb936fbe1c6e80e4713ce586a49cb8881",
+        "proposalEntrySha256": "sha256:008c94577d6eb26c41e6badbc823d0d491aca7ced012ca16085fa735774de181",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:1d4691fcb912b4ef23c461126edfac0023c93b9285fd0a8376cbce7276c87aa7",
+        "sourceProfileSha256": "sha256:f70a8f7a79deca60e9da3a4fd929870dba57c287e8f85443b998efe2df37d72b",
+        "sourceProfileSnapshotSha256": "sha256:94056afbce9fd14c6036e0a612e501fb408d992c01aca2220422ee48e906f182",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_432b9d9c251838c29c769cac4818",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:432b9d9c251838c29c769cac4818db0e5973a6394c7968711fb86b82261d3eff",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:88b64b632369082d1be56b59b88f69e7a910116849afdd93f81c2e5fa0e2c8e4",
+        "programSha256": "sha256:1c79490b9c8b1034b5440a36d8fc60b62ccac66ed6de9fd1c5070ea9b376229a",
+        "proposalEntrySha256": "sha256:f686c35e7b6e81774639dacde69ad636a3ceb902c6e1a81abfe7a8e7013a0929",
+        "sourceProfileSha256": "sha256:5d9cb655bd7d5bbd12e844bf919ed3e7506e4284f72d5dbabe5fd1e474bdcd83",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:8e93d568eb4c0b71525a33f223e7327260c85e689c55a2751b4e432e1f4acc46",
+          "terminalOperatorApplicationSha256": "sha256:3c32aadca2bb37ee4724aa8dd122d6ea0b7294ad619320cfe7358fbcf87e4c66",
+          "terminalOperatorPlanSha256": "sha256:fc522aed6255f7997b06d2491af793cc9ac6f5d9798d57a7c15b6091917d0723"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "MARKET_MODE",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Market Mode Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 20
+            },
+            {
+              "name": "levels",
+              "value": 10
+            },
+            {
+              "name": "delta",
+              "value": 0.5
+            },
+            {
+              "name": "fraction",
+              "value": 0.8
+            },
+            {
+              "name": "price_type",
+              "value": "median"
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "MARKET_MODE_TRANSITION",
+        "indicatorInstanceId": "short_evtind_99f9673af321",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M15"
+      },
+      "componentContextIdentity": "sha256:21d5da4e0083bcd98db6cd91c636b6b995fbf7744c45b3c8e309f6bca6288492",
+      "componentIdentity": "sha256:1a6ad9b8d12b02e3d3d25b6d88758441714d3aa409a35a35b87d58c1513a08ea",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_99f9673af321",
+        "exactBindingId": "short_evt_e26ec83b4023",
+        "forensicEventId": "evt_e26ec83b4023",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[16].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_ed27f99ba0a8dfd7c76c69687efb",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:1c79490b9c8b1034b5440a36d8fc60b62ccac66ed6de9fd1c5070ea9b376229a",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:c47e283c69b67b18766a6c1d0c29f68aaf3b12843dca5413f7401951dff588c4",
+        "proposalEntrySha256": "sha256:f686c35e7b6e81774639dacde69ad636a3ceb902c6e1a81abfe7a8e7013a0929",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:3ee45ce7fcb5b7815ac720eb1d08e2067fe101033427344347e4c9e50eb09178",
+        "sourceProfileSha256": "sha256:5d9cb655bd7d5bbd12e844bf919ed3e7506e4284f72d5dbabe5fd1e474bdcd83",
+        "sourceProfileSnapshotSha256": "sha256:88b64b632369082d1be56b59b88f69e7a910116849afdd93f81c2e5fa0e2c8e4",
+        "terminalOperatorApplicationSha256": "sha256:3c32aadca2bb37ee4724aa8dd122d6ea0b7294ad619320cfe7358fbcf87e4c66",
+        "terminalOperatorPlanSha256": "sha256:fc522aed6255f7997b06d2491af793cc9ac6f5d9798d57a7c15b6091917d0723"
+      }
+    },
+    {
+      "candidateId": "qd_e3a9aaa349c52a0b211319fc6c42",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:e3a9aaa349c52a0b211319fc6c427e109a4f632ddc6c3a6a1570d24ff8c15791",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:bb1e26d458fc2ab06975d26dbd27cd7912912f6e6f60e2e494e39c2386aa6c89",
+        "programSha256": "sha256:f2b933a246f3c1481ff9bb324157f62e351ebcbedd757ed797ffa8afd9753b9d",
+        "proposalEntrySha256": "sha256:1c549aea4ae4da1f3a81d07fd49fb98f3d36b926c8ec89ab010a4c32c6e37d36",
+        "sourceProfileSha256": "sha256:7f78e5cd1d48b9058dd4f0c13b91e1e549139cee68a884cc49827ea728755ed4",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:9dca111896f4b2634618aa3002810d62079c43e2dffece0d5fd2db810bc1dd75",
+          "terminalOperatorApplicationSha256": "sha256:127df0acd053f1b1311828e0e86d60bed2f5dd74c2cacc90af07fc35c7164ebf",
+          "terminalOperatorPlanSha256": "sha256:6df7499faae0778c0a583909e26c49eead869dfad17bb2b816083fbe8d498d18"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "KEY_REVERSAL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Key Reversal Signal",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 2
+            },
+            {
+              "name": "use_filter",
+              "value": 1
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "KEY_REVERSAL_SIGNAL",
+        "indicatorInstanceId": "long_evtind_456ff83fea8e",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:235da2355fdf97feaaa68456377a6a7d28219f056e35012f4a3cd41f98764ada",
+      "componentIdentity": "sha256:8a58f0290e643fa2b8272ccafc0af5b4800c36a520e16bcb4942eb3448aff898",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_456ff83fea8e",
+        "exactBindingId": "long_evt_4b6e2cac1ae5",
+        "forensicEventId": "evt_4b6e2cac1ae5",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:f2b933a246f3c1481ff9bb324157f62e351ebcbedd757ed797ffa8afd9753b9d",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:1c549aea4ae4da1f3a81d07fd49fb98f3d36b926c8ec89ab010a4c32c6e37d36",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:9d615a06899437da78602981ab8121b71f95f26deca25bdd9040123e1305b560",
+        "sourceProfileSha256": "sha256:7f78e5cd1d48b9058dd4f0c13b91e1e549139cee68a884cc49827ea728755ed4",
+        "sourceProfileSnapshotSha256": "sha256:bb1e26d458fc2ab06975d26dbd27cd7912912f6e6f60e2e494e39c2386aa6c89",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_5d3414e1293cfe285e348e6c02ff",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:5d3414e1293cfe285e348e6c02ffe5e6f3fd9ed776355026f0acbe2b0f1b24ae",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:ee8ac660ce08dd109bd56095153ca6155adfc5576a02a687d91dbf907febc77a",
+        "programSha256": "sha256:47bb03c75e8016e2f5e15bf6a452d827c2042109f38ef9df315bba0e143d5d4f",
+        "proposalEntrySha256": "sha256:ab8618554beccbd6874a56b52a57ce72db8b5ffbae001487fe19f6df93aabbd9",
+        "sourceProfileSha256": "sha256:c7b7d7fa44c32c80af5918b9358dff260582301ce9da1321ad52e150793c0ef6",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:4632db7b388a045d7188f15b4a79c0562a72e7bb797909146415f89ca778a54c",
+          "terminalOperatorApplicationSha256": "sha256:29879abaab83117e7d88b05e09e287a5b0cf6db066fcd475486be078a2f979d4",
+          "terminalOperatorPlanSha256": "sha256:e5914a3815f8090cd618bfb43533d9866e6b31acfce18640cdc9b072e46d561a"
+        }
+      },
+      "component": {
+        "baseIndicatorId": null,
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Stoch Cross (Stochastic Crossover)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "fastk_period",
+              "value": 5
+            },
+            {
+              "name": "slowk_period",
+              "value": 3
+            },
+            {
+              "name": "slowk_matype",
+              "value": 0
+            },
+            {
+              "name": "slowd_period",
+              "value": 3
+            },
+            {
+              "name": "slowd_matype",
+              "value": 0
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "STOCH_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_8858bcc35c6d",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:2deb4e6c3f143ffb10472286f441bbe41cc345740a3a97ae7697f8fc401bd575",
+      "componentIdentity": "sha256:7687222310e397c1bf4c2e2ed127ff3dd7eb26881201d7da29ca6b236bc0a2d4",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_8858bcc35c6d",
+        "exactBindingId": "short_evt_3da36473c621",
+        "forensicEventId": "evt_3da36473c621",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:47bb03c75e8016e2f5e15bf6a452d827c2042109f38ef9df315bba0e143d5d4f",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:c5fba240603e233c91bc4dd02a9ea338536969e17ca92de1a56ee86da6705cd2",
+        "proposalEntrySha256": "sha256:ab8618554beccbd6874a56b52a57ce72db8b5ffbae001487fe19f6df93aabbd9",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:dffd6871607ec4719f127bdc91b1623b3160303879595b0f9846160ade02e753",
+        "sourceProfileSha256": "sha256:c7b7d7fa44c32c80af5918b9358dff260582301ce9da1321ad52e150793c0ef6",
+        "sourceProfileSnapshotSha256": "sha256:ee8ac660ce08dd109bd56095153ca6155adfc5576a02a687d91dbf907febc77a",
+        "terminalOperatorApplicationSha256": "sha256:29879abaab83117e7d88b05e09e287a5b0cf6db066fcd475486be078a2f979d4",
+        "terminalOperatorPlanSha256": "sha256:e5914a3815f8090cd618bfb43533d9866e6b31acfce18640cdc9b072e46d561a"
+      }
+    },
+    {
+      "candidateId": "qd_ccbf65f667e312dbfc978bc78fa7",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:ccbf65f667e312dbfc978bc78fa7867c1dadef19be37c22c8a9fefb947053c42",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:990bb2f35899592221380a461609c3493350424ed0a20dc510ea017929a2b483",
+        "programSha256": "sha256:649b160c9bb34a35cd2a6c92238449512fa1d575a8e5f2d71628e27db885fbee",
+        "proposalEntrySha256": "sha256:106e9d61d9eff20ae10b4eef1dde2941a63512bac272c1ff220f7a9140e7e2ce",
+        "sourceProfileSha256": "sha256:511bb7c8f33d5e98fd09d6bb454470aa00dcb5d5833a7885c150272cfba40d29",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:96d28fd38403dd8ea849adba685ce3cad62bae45a5e03de80250ed026dc4bb74",
+          "terminalOperatorApplicationSha256": "sha256:c2e1b32f2a7ff35649bc6dd807f69d38d111809bb3f7f954eeed6e0bde9a8f1c",
+          "terminalOperatorPlanSha256": "sha256:9c03b1128bfbb885054a1555a232ff30865ce7e4cd086f65cc8e74b4237888bb"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "BUFFERED_RANGE_BREAKOUT",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Buffered Range Breakout",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 9
+            },
+            {
+              "name": "risk_percent",
+              "value": 30
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+        "indicatorInstanceId": "short_evtind_c788681e8dcd",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:2f72aaceb0f3a7989a7e555f4b30ee5834b02625fd82b44fcd2d1ffa3d4408cd",
+      "componentIdentity": "sha256:ff845cca1a0d5503fd30096cd1215e8b5bdf10a9a11d08b407df63382acb61c9",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_c788681e8dcd",
+        "exactBindingId": "short_evt_3233a538892e",
+        "forensicEventId": "evt_3233a538892e",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:649b160c9bb34a35cd2a6c92238449512fa1d575a8e5f2d71628e27db885fbee",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:c5fba240603e233c91bc4dd02a9ea338536969e17ca92de1a56ee86da6705cd2",
+        "proposalEntrySha256": "sha256:106e9d61d9eff20ae10b4eef1dde2941a63512bac272c1ff220f7a9140e7e2ce",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:30ab1b4634dce9b000a6ae65c1a90db05fca9fcf335159d5e73738857a560eb8",
+        "sourceProfileSha256": "sha256:511bb7c8f33d5e98fd09d6bb454470aa00dcb5d5833a7885c150272cfba40d29",
+        "sourceProfileSnapshotSha256": "sha256:990bb2f35899592221380a461609c3493350424ed0a20dc510ea017929a2b483",
+        "terminalOperatorApplicationSha256": "sha256:c2e1b32f2a7ff35649bc6dd807f69d38d111809bb3f7f954eeed6e0bde9a8f1c",
+        "terminalOperatorPlanSha256": "sha256:9c03b1128bfbb885054a1555a232ff30865ce7e4cd086f65cc8e74b4237888bb"
+      }
+    },
+    {
+      "candidateId": "qd_63a7a2c4076f224cbd17fe35d186",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:63a7a2c4076f224cbd17fe35d18629b7f6073e070b19ca9f4e328083bb023e21",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:1c682c44e3615d72bfb0e1e0b413f717a5b9ab6ab691c915863878c9bce570d8",
+        "programSha256": "sha256:023d32d65e3d2b237c6b1a44c447456785f37639209fceb161eee003a001fb36",
+        "proposalEntrySha256": "sha256:df6f1fa6ca017610be8f5b196be412f517aebdee4add98551708889caf3eb73b",
+        "sourceProfileSha256": "sha256:3cc6a0cff0cc9206c5ac578b745571b3f8804b0e70803db13f34ae94afff4ec9",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:e768a0d87126c45b5c9623ea9f5485d2ef5518a8a4c3aaa0575ef587b5ec5142",
+          "terminalOperatorApplicationSha256": "sha256:17b0276e25955466fc2cc9c98ee26ba4233c8bc497dfb2c0c19592b48b672ae2",
+          "terminalOperatorPlanSha256": "sha256:56120dccd440ca35fcab514488ce1247bc949996fe2b80dce02b43c10eef827c"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "MA",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Price Reclaim MA",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 21
+            },
+            {
+              "name": "matype",
+              "value": 1
+            },
+            {
+              "name": "min_prior_displacement",
+              "value": 0
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "PRICE_RECLAIM_MA",
+        "indicatorInstanceId": "long_evtind_c42b80df3cff",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:3a3126bf6c93143b444b6463a885cd9cf78a85b9a357c80383d10284409453cb",
+      "componentIdentity": "sha256:c919b040f708c05bdbea92a3600ec0cc2d3cab806ae655ad5fad88f200100478",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_c42b80df3cff",
+        "exactBindingId": "long_evt_f03b55dba08c",
+        "forensicEventId": "evt_f03b55dba08c",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:023d32d65e3d2b237c6b1a44c447456785f37639209fceb161eee003a001fb36",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:df6f1fa6ca017610be8f5b196be412f517aebdee4add98551708889caf3eb73b",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:e3b76b7a6d2be6e3c33be4c2d8a46ce3c904521046d6737712630914d24ae6ab",
+        "sourceProfileSha256": "sha256:3cc6a0cff0cc9206c5ac578b745571b3f8804b0e70803db13f34ae94afff4ec9",
+        "sourceProfileSnapshotSha256": "sha256:1c682c44e3615d72bfb0e1e0b413f717a5b9ab6ab691c915863878c9bce570d8",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_686f15941b1f07e6273929c8c2a0",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:686f15941b1f07e6273929c8c2a0bd25a77fa5beb0250125407b2dd1f2b64a77",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:65d89b005931eb2e50d90f24f4b42fa8dd3b479d0806695f6d34d19209b15e2d",
+        "programSha256": "sha256:30d105247d1cdb20c8f062e6a33d4d88b0abf71a1c769e73c8474706c3be73b6",
+        "proposalEntrySha256": "sha256:39d747ff5b67a955b7e82d25fab4729629b4c1e2c797a9e4874cabcc9fb3cb2b",
+        "sourceProfileSha256": "sha256:8e3197fd05c551cb6bc46edc420e9622c680152667431569ec141cebdbef11e7",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:543848cfc3429a9647a2baba5c00fe6d1ea32f1ae8e10fc8a7e07e83905fcace",
+          "terminalOperatorApplicationSha256": "sha256:2a11c31834dd0921f4bb9e24ec189387667b9d04d4b236206061463364ce1562",
+          "terminalOperatorPlanSha256": "sha256:ccb864b658b96307a37e2026499b0a3b6948914fa46122e05cd3ae1d081959bb"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "KST",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "KST Cross (Know Sure Thing)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "roc1",
+              "value": 10
+            },
+            {
+              "name": "roc2",
+              "value": 15
+            },
+            {
+              "name": "roc3",
+              "value": 20
+            },
+            {
+              "name": "roc4",
+              "value": 30
+            },
+            {
+              "name": "sma1",
+              "value": 10
+            },
+            {
+              "name": "sma2",
+              "value": 10
+            },
+            {
+              "name": "sma3",
+              "value": 10
+            },
+            {
+              "name": "sma4",
+              "value": 15
+            },
+            {
+              "name": "signalperiod",
+              "value": 9
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "KST_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_47257a650684",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:43296c516f30947b62367f65140501f8d2fcbe02eed661de8bd3ec0fced8d180",
+      "componentIdentity": "sha256:577f3b50765464c62d6946ec84a2772153e6d00947d1f2a0ec1af6cb1b38e34b",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_47257a650684",
+        "exactBindingId": "short_evt_6a9260e2c385",
+        "forensicEventId": "evt_6a9260e2c385",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[21].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:30d105247d1cdb20c8f062e6a33d4d88b0abf71a1c769e73c8474706c3be73b6",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:881fdfb8c1eb4648d01d5cd5c3d7dc2a063c1b0f877a8ddad2ffcbe6422a44e6",
+        "proposalEntrySha256": "sha256:39d747ff5b67a955b7e82d25fab4729629b4c1e2c797a9e4874cabcc9fb3cb2b",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:ca1503124d7b97cf2aa19e98e250428f755e9c4e7444b293df4d4d8a42b700d9",
+        "sourceProfileSha256": "sha256:8e3197fd05c551cb6bc46edc420e9622c680152667431569ec141cebdbef11e7",
+        "sourceProfileSnapshotSha256": "sha256:65d89b005931eb2e50d90f24f4b42fa8dd3b479d0806695f6d34d19209b15e2d",
+        "terminalOperatorApplicationSha256": "sha256:2a11c31834dd0921f4bb9e24ec189387667b9d04d4b236206061463364ce1562",
+        "terminalOperatorPlanSha256": "sha256:ccb864b658b96307a37e2026499b0a3b6948914fa46122e05cd3ae1d081959bb"
+      }
+    },
+    {
+      "candidateId": "qd_648d40529949287785cfd71d264d",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:648d40529949287785cfd71d264d764d2af561c29a9e3e1dbd7a6abfc0e70465",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:6413614e5c3936464ee18ef83d944f5b65eb9231076880a7c58b202f2436c8fa",
+        "programSha256": "sha256:40b924995bf23a112bece20c72472ce591956e5a72681662a8df80b3598881aa",
+        "proposalEntrySha256": "sha256:7b8ba5250de63f94b6b84b5fe898145d9545ffa188d1517519ce67125c21dca6",
+        "sourceProfileSha256": "sha256:3e6e25443d4c43b33f28ab9c0fe590be753323a1ff02fc1bfb28f65c28221487",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:736daee53e93901e61a8ff6f36e56facb7da5e409cab288f58b0da6165a0eecf",
+          "terminalOperatorApplicationSha256": "sha256:8c5dbd145694a6e617714efb3af3b4c872420abe50d4e63487c776884e73d659",
+          "terminalOperatorPlanSha256": "sha256:7708fa502ccd93fb3b2520599e79e434096b2b89d19df98dadaf344e93bdfd2d"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "MARKET_MODE",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Market Mode Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 20
+            },
+            {
+              "name": "levels",
+              "value": 10
+            },
+            {
+              "name": "delta",
+              "value": 0.5
+            },
+            {
+              "name": "fraction",
+              "value": 0.8
+            },
+            {
+              "name": "price_type",
+              "value": "median"
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "MARKET_MODE_TRANSITION",
+        "indicatorInstanceId": "long_evtind_048c89f8105a",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M15"
+      },
+      "componentContextIdentity": "sha256:4571514eed1c94ea6c54697dac6086434f326e0560896320cf23fb99e3ace11b",
+      "componentIdentity": "sha256:1a6ad9b8d12b02e3d3d25b6d88758441714d3aa409a35a35b87d58c1513a08ea",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_048c89f8105a",
+        "exactBindingId": "long_evt_ea9aa590e404",
+        "forensicEventId": "evt_ea9aa590e404",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[0]",
+          "graph.eventBindings[0].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:40b924995bf23a112bece20c72472ce591956e5a72681662a8df80b3598881aa",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:cc47a28893da5aa710a0abd3d3eaa2c22361fd4737e938c66b75a76fb743d900",
+        "proposalEntrySha256": "sha256:7b8ba5250de63f94b6b84b5fe898145d9545ffa188d1517519ce67125c21dca6",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:1f90782e6bffe6cac9b81c1d1c89c577762def48603e65de33a7924b055dffc0",
+        "sourceProfileSha256": "sha256:3e6e25443d4c43b33f28ab9c0fe590be753323a1ff02fc1bfb28f65c28221487",
+        "sourceProfileSnapshotSha256": "sha256:6413614e5c3936464ee18ef83d944f5b65eb9231076880a7c58b202f2436c8fa",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_2829ed17b26ae870927fc6aa01d7",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:2829ed17b26ae870927fc6aa01d7339029f7c6bd3e56937794bbe8417c8e8f10",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:49587289adab895be433dccce96dc49f88b5a3614a383b67857644465abcdecb",
+        "programSha256": "sha256:59cb600fb1e9252c02eae47a24617c0ae3a8e416a91fcac7c2456a5c974950d9",
+        "proposalEntrySha256": "sha256:e78f482bb2bc8ed7408453acbc78ef3cbaa3d51af4e25b3f6338c163cbc4e62a",
+        "sourceProfileSha256": "sha256:5a67ab1b48ce36fe21f7201eb96481ba15caab4e8d3cd8ee4afc92b664dece9f",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:85d0dcf7f293d4ed195030e2963008d6d98f22540c7a00667f7b3b3ad7a83532",
+          "terminalOperatorApplicationSha256": "sha256:e387bf4c58b96328026dead12ed5776824e7b93159f7d990d6ed251bfd3d8748",
+          "terminalOperatorPlanSha256": "sha256:66e69b11a91b1650e3092a4ce7ae3b3f5b58b81ecd59fd321dd81071d9aabd50"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "KEY_REVERSAL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Key Reversal Signal",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 2
+            },
+            {
+              "name": "use_filter",
+              "value": 1
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "KEY_REVERSAL_SIGNAL",
+        "indicatorInstanceId": "short_evtind_a84174e4aee0",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:4ac0820dc595cd5de7a1a93f95d553ea9184c88681d1bda5027c2c4a41979b42",
+      "componentIdentity": "sha256:8a58f0290e643fa2b8272ccafc0af5b4800c36a520e16bcb4942eb3448aff898",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_a84174e4aee0",
+        "exactBindingId": "short_evt_994b98654981",
+        "forensicEventId": "evt_994b98654981",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[16].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_ed27f99ba0a8dfd7c76c69687efb",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:59cb600fb1e9252c02eae47a24617c0ae3a8e416a91fcac7c2456a5c974950d9",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:1f48f037ed6dc320e09f400aeba5eeaa6d65547330249947462886355e4676a8",
+        "proposalEntrySha256": "sha256:e78f482bb2bc8ed7408453acbc78ef3cbaa3d51af4e25b3f6338c163cbc4e62a",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:aea558cebf29c2062eeeac974b72e5c6cf18c42327434114e4ffe72fc886276f",
+        "sourceProfileSha256": "sha256:5a67ab1b48ce36fe21f7201eb96481ba15caab4e8d3cd8ee4afc92b664dece9f",
+        "sourceProfileSnapshotSha256": "sha256:49587289adab895be433dccce96dc49f88b5a3614a383b67857644465abcdecb",
+        "terminalOperatorApplicationSha256": "sha256:e387bf4c58b96328026dead12ed5776824e7b93159f7d990d6ed251bfd3d8748",
+        "terminalOperatorPlanSha256": "sha256:66e69b11a91b1650e3092a4ce7ae3b3f5b58b81ecd59fd321dd81071d9aabd50"
+      }
+    },
+    {
+      "candidateId": "qd_2e5e758649a401d6b46bbd005ad1",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:2e5e758649a401d6b46bbd005ad1057843ea77dbcb6499f12245bc40d4433fad",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:9021629d8ecfbab2771166a891e748a17aa7d6f05abe33ecb5ab375ae27cb46c",
+        "programSha256": "sha256:92473829d5c76b5696ee4b02b00f2bc41ec9f74b08f074effe1969c24c05fee9",
+        "proposalEntrySha256": "sha256:45e0213cde8f88a9ab890cf643d74e0c3fa87e465b5a841bbed6f56efad1f0d9",
+        "sourceProfileSha256": "sha256:f605dd1a97ab690d6b33aa6e3976fed58749a2856fb974e25b4d5b54ea0e383d",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:bf6d2003320f14928141cc704ec7ba979e2158d3af1a0196073f11d495abdfdb",
+          "terminalOperatorApplicationSha256": "sha256:68847958bd2c4c2e1cd123c9491dbf7dc4836294cf10ff8883ee4efa6213cbe1",
+          "terminalOperatorPlanSha256": "sha256:e390f795c07805d2fc48cdc42771c6be0772168bafb8fb599092610e433c2175"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "WAVETREND",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "WaveTrend Cross",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "wave_period",
+              "value": 10
+            },
+            {
+              "name": "avg_period",
+              "value": 21
+            },
+            {
+              "name": "signal_period",
+              "value": 4
+            },
+            {
+              "name": "buy_level",
+              "value": -53
+            },
+            {
+              "name": "sell_level",
+              "value": 53
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "WAVETREND_CROSSOVER",
+        "indicatorInstanceId": "long_evtind_a59ced0a4bf9",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:500474e0c04786e13c9f257b372d16865a7391249406638f2055a97d12cc44eb",
+      "componentIdentity": "sha256:fcd0850e48422c847e595bfea5323b17cfa09e48be9a5aaf9417e7e2d8ad0a11",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_a59ced0a4bf9",
+        "exactBindingId": "long_evt_31b5d216418a",
+        "forensicEventId": "evt_31b5d216418a",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:92473829d5c76b5696ee4b02b00f2bc41ec9f74b08f074effe1969c24c05fee9",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:45e0213cde8f88a9ab890cf643d74e0c3fa87e465b5a841bbed6f56efad1f0d9",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:f4f27fca170d24924a8a460785650768d2654984fa3f2a662b86a63d5ef88573",
+        "sourceProfileSha256": "sha256:f605dd1a97ab690d6b33aa6e3976fed58749a2856fb974e25b4d5b54ea0e383d",
+        "sourceProfileSnapshotSha256": "sha256:9021629d8ecfbab2771166a891e748a17aa7d6f05abe33ecb5ab375ae27cb46c",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_7b80f321ab59055c88163a98c7eb",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:7b80f321ab59055c88163a98c7eb6bd31b4736db9ebb89497b6647a5f70371b6",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:e2c8fedbd608dd6787367e3e06923110893dde991b8e5a182f4e9ef5764f8f48",
+        "programSha256": "sha256:fea6dc722227a05229eccdeeaffb77627136efd146aaccfc0ba3bb0caf05473e",
+        "proposalEntrySha256": "sha256:2b1f111065d67f2f1e9412a94167aa5e06af4e43e75aae35284e6d12c793f4b4",
+        "sourceProfileSha256": "sha256:0efc90a30d37e4842189dd29f06fa2b10c0f71fabe3c5bca8422d6fee3a14e4b",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:8ed59c799690db84839bf7934bc7c3ca6da4ddb278cda27c862bdbc18cefeca9",
+          "terminalOperatorApplicationSha256": "sha256:f15a294ce1900dd24aa455962669dcfc8e3c5074c12eb3a3c2c91740ae3f8f43",
+          "terminalOperatorPlanSha256": "sha256:43baa7959a1a08c39cbce828cd47826dd5c8068360635dea8aacce1a474fd045"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "TREND_TRIGGER_FACTOR",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "TTF DSL Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 15
+            },
+            {
+              "name": "avg_period",
+              "value": 5
+            },
+            {
+              "name": "avg_method",
+              "value": 1
+            },
+            {
+              "name": "signal_period",
+              "value": 10
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "TTF_DSL_TRANSITION",
+        "indicatorInstanceId": "long_evtind_78c89810c3c5",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:50c276ca67023ab7eb333540c4d1a4afb4191896c6186b3d38a28692cf5b359a",
+      "componentIdentity": "sha256:07a2fb394883cde9ea3d38d544e4e7bc444d5b5d75551d157d7ccb0589fbb204",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_78c89810c3c5",
+        "exactBindingId": "long_evt_235bfa6ffd53",
+        "forensicEventId": "evt_235bfa6ffd53",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[7].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:fea6dc722227a05229eccdeeaffb77627136efd146aaccfc0ba3bb0caf05473e",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:d4ca74bf148a9e1eebfd9e880e25336002c4c10a99fd44dafd77319fedbefcc0",
+        "proposalEntrySha256": "sha256:2b1f111065d67f2f1e9412a94167aa5e06af4e43e75aae35284e6d12c793f4b4",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:b7b6eb6345bad6b3f1c96b48d7048e6996924e1bf3d74b2fd64d4120388bec40",
+        "sourceProfileSha256": "sha256:0efc90a30d37e4842189dd29f06fa2b10c0f71fabe3c5bca8422d6fee3a14e4b",
+        "sourceProfileSnapshotSha256": "sha256:e2c8fedbd608dd6787367e3e06923110893dde991b8e5a182f4e9ef5764f8f48",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_255a45cbadae025a934d49bd5f1d",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:255a45cbadae025a934d49bd5f1da601fcc93c2d25bbf2ec99e0c0717dc5e407",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:e82eb739bd1e2009410ee0d5542428413fa7951033ac07b0d71d62a39a0fa6b3",
+        "programSha256": "sha256:2534aebacc5a7fad69f77b82af7e907e33630eb04244d07221a171dc2f49282b",
+        "proposalEntrySha256": "sha256:b4521d6a14d33a0427d0323cd4b4b0330d8032241bcff71a334288d5dea07822",
+        "sourceProfileSha256": "sha256:e21dbadfc839b36fe0feba33558d83068fdd940366e6354feb26cd10b85073a2",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:ce9dcb0c669e5a7672ee99db115f214edd4d9a8ac0bbc99fe44fb4742b7ce2ea",
+          "terminalOperatorApplicationSha256": "sha256:984f85666b7ff0c9a75b9de8bc3e825ba61bc9ff279df3de5e560aca0b2f2855",
+          "terminalOperatorPlanSha256": "sha256:376e73b8548bc33ee4d97575a5d2ca246a4ece42a81e96f2636d591053cf2125"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "THRUST_BAR",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Thrust Bar Signal",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "atr_period",
+              "value": 14
+            },
+            {
+              "name": "multiplier",
+              "value": 2
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "THRUST_BAR_SIGNAL",
+        "indicatorInstanceId": "short_evtind_d706eb2e9ebb",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:50d88adca5fa4590a2f689710ed3f3b9d76eb697f405c958f752c5504a74906b",
+      "componentIdentity": "sha256:88ed5826fb48f7b52c59e9654ea3159693f66c9fb6d9b1cb368c60b030924a82",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_d706eb2e9ebb",
+        "exactBindingId": "short_evt_d52b9ad432d5",
+        "forensicEventId": "evt_d52b9ad432d5",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:2534aebacc5a7fad69f77b82af7e907e33630eb04244d07221a171dc2f49282b",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:c5fba240603e233c91bc4dd02a9ea338536969e17ca92de1a56ee86da6705cd2",
+        "proposalEntrySha256": "sha256:b4521d6a14d33a0427d0323cd4b4b0330d8032241bcff71a334288d5dea07822",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:2b03cd2dfc12f4f8622922e546c5fad6d9603d2f408d329cac4b624352c0b2c1",
+        "sourceProfileSha256": "sha256:e21dbadfc839b36fe0feba33558d83068fdd940366e6354feb26cd10b85073a2",
+        "sourceProfileSnapshotSha256": "sha256:e82eb739bd1e2009410ee0d5542428413fa7951033ac07b0d71d62a39a0fa6b3",
+        "terminalOperatorApplicationSha256": "sha256:984f85666b7ff0c9a75b9de8bc3e825ba61bc9ff279df3de5e560aca0b2f2855",
+        "terminalOperatorPlanSha256": "sha256:376e73b8548bc33ee4d97575a5d2ca246a4ece42a81e96f2636d591053cf2125"
+      }
+    },
+    {
+      "candidateId": "qd_e32e5118e51329aa9489498b51b3",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:e32e5118e51329aa9489498b51b31558eb8cb3dd7e05264cf55644ac011b604b",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:f00774437e2fb981fa6b10bba6332ca39f345718c90e7feaa5c8a0ab26b91f4d",
+        "programSha256": "sha256:ee973815f8a4c5bc610755c6116f14a55ab71e0c3e7b0a95c0151fd2716ed2e2",
+        "proposalEntrySha256": "sha256:b7b8cc8fe8832e295834a15f5acb7ac3b186d243dacee59ba2e86b9d6e71d9e6",
+        "sourceProfileSha256": "sha256:ca649983bd03de16fd41a794c6c827fa6780b81b59609beac7bd0f70aa57b448",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:b14b3f25461cd00b901a32a41be0e1fcf7f45addae67226f9de29692e839d9e6",
+          "terminalOperatorApplicationSha256": "sha256:8527dbc99e1aae08855310051b4b0b453cf8a2cd71dea3856174aea2c6ad043b",
+          "terminalOperatorPlanSha256": "sha256:57c6d80c5466eebbebdb68b85e4af6f1d5b73c22e05ea065cc578e7ba84c358d"
+        }
+      },
+      "component": {
+        "baseIndicatorId": null,
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "MA Cross (Moving Average Crossover)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "fastperiod",
+              "value": 9
+            },
+            {
+              "name": "slowperiod",
+              "value": 21
+            },
+            {
+              "name": "matype",
+              "value": 1
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "MA_CROSSOVER",
+        "indicatorInstanceId": "long_evtind_44319c011a21",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:5188e5c425b9408d9d98d2cabdb3ad0d08c32baefea1f4ff0b5ee32550efde58",
+      "componentIdentity": "sha256:86f9b96177f7433880110dd6149f7cec955f69d966d8fc9927743f2ecbdeb6d2",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_44319c011a21",
+        "exactBindingId": "long_evt_e78446b35ffa",
+        "forensicEventId": "evt_e78446b35ffa",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_19e9a2130a8f91feea60349066ca",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:ee973815f8a4c5bc610755c6116f14a55ab71e0c3e7b0a95c0151fd2716ed2e2",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:8f3ea0bd61a565ffa2ec3c11b8b8596cb936fbe1c6e80e4713ce586a49cb8881",
+        "proposalEntrySha256": "sha256:b7b8cc8fe8832e295834a15f5acb7ac3b186d243dacee59ba2e86b9d6e71d9e6",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:9aabdb1199d2ee58e319734f2ba46e3309eb8bac22c0a0a48c71a28d25568edb",
+        "sourceProfileSha256": "sha256:ca649983bd03de16fd41a794c6c827fa6780b81b59609beac7bd0f70aa57b448",
+        "sourceProfileSnapshotSha256": "sha256:f00774437e2fb981fa6b10bba6332ca39f345718c90e7feaa5c8a0ab26b91f4d",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_382718e49b9a6378b9ef72b23e9b",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:382718e49b9a6378b9ef72b23e9bc85f9d7858c6ba34ffba551474d730102f14",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:cbbb1deea868b43e5aef732d38f04c7c414b489888dd0458b0683302224ca8cc",
+        "programSha256": "sha256:ccf308a0cefc77a63688ffd560c436799f9d78cbd25d9e190afd2e8401443d89",
+        "proposalEntrySha256": "sha256:7f710bd8eacfd0a39998fd27e906d6f69f04f59147840fcadf56d09f1e93a087",
+        "sourceProfileSha256": "sha256:661154dd7185a2a4d20337848311839c81a16f58d4e4a92b4c2a51a40cac296e",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:2e29e6709098e8356159ab512d1f369e54935de9b2a9be2a59ba1237b5f90c57",
+          "terminalOperatorApplicationSha256": "sha256:27a221c5c9407f1fe6f87d79b54a5af8eb8c12602a15abe94e5ec84abb70ce80",
+          "terminalOperatorPlanSha256": "sha256:42e02298ed693e3e8386d51e7dce2f02288fa8bb8c20d694ef7798ab29a6bb37"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "EHLERS_FISHER",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Ehlers Fisher Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 32
+            },
+            {
+              "name": "price_type",
+              "value": "median"
+            },
+            {
+              "name": "use_high_low_bounds",
+              "value": 0
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "EHLERS_FISHER_TRANSITION",
+        "indicatorInstanceId": "long_evtind_0b5aa094ffca",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:55ac53197d008ddc0ebc74edb77b21da899912239f6f8af410a58990e882c71f",
+      "componentIdentity": "sha256:7b021434bbaaa8a235cbc45718daf1907b9a219b09c8754f2a60f206e8135733",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_0b5aa094ffca",
+        "exactBindingId": "long_evt_89824d119d5d",
+        "forensicEventId": "evt_89824d119d5d",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[0]",
+          "graph.eventBindings[0].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:ccf308a0cefc77a63688ffd560c436799f9d78cbd25d9e190afd2e8401443d89",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:be679920bf9586c5e4f0e0e4579eb9a2e801ebe1bbc126980a6fe232cc0dcb83",
+        "proposalEntrySha256": "sha256:7f710bd8eacfd0a39998fd27e906d6f69f04f59147840fcadf56d09f1e93a087",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:43b72556f3fec3732fde8fa2fba5469a72cf31b84c5f77d7564f0f86d01d009a",
+        "sourceProfileSha256": "sha256:661154dd7185a2a4d20337848311839c81a16f58d4e4a92b4c2a51a40cac296e",
+        "sourceProfileSnapshotSha256": "sha256:cbbb1deea868b43e5aef732d38f04c7c414b489888dd0458b0683302224ca8cc",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_5f4c4f8b40c1cdbae532cc986848",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:5f4c4f8b40c1cdbae532cc9868489222a055e639947d8146ef9273d2b41ff988",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:f04786c5f4bbd6e552cbecabc62b2f4ca794e23c6b7e2ac118f84dc78aff313e",
+        "programSha256": "sha256:c72bf4209f51e4a6119d054a696fe9b85163923a8df2f4a2229d063ea4661aec",
+        "proposalEntrySha256": "sha256:09ac333ef1ea252cb79da327e6755784acd08031ed83fa405491f174b89c0c48",
+        "sourceProfileSha256": "sha256:4875bf086e7410da8f0fa8649153a5b3715cd4a4e7e0d34246cca5dc34e248a1",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:3482ae28ebc6c550eb7cd9a03440b79559c26cbb3657e413841dc5c53accff38",
+          "terminalOperatorApplicationSha256": "sha256:eba1ccd714259c9e889bfebbfd1052706264dc2918bf33c8339d2943895f657f",
+          "terminalOperatorPlanSha256": "sha256:0e428983cc83f65329da46d8c2aed38bc1369442f32378d6c25aba33d369c7a5"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "CHANNEL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Breakout First Close",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "channel_type",
+              "value": "donchian"
+            },
+            {
+              "name": "timeperiod",
+              "value": 20
+            },
+            {
+              "name": "matype",
+              "value": 0
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 2
+            },
+            {
+              "name": "price_type",
+              "value": "typical"
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "BREAKOUT_FIRST_CLOSE",
+        "indicatorInstanceId": "short_evtind_b9f1e46c821c",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:662a9789660e3713e9c89d91e77d1468c472df77364988b85856eee0aebc1c7a",
+      "componentIdentity": "sha256:da7bea2a30120c0c0d221ecb7690385984b7d92467590ecc4fcd237aefa30734",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_b9f1e46c821c",
+        "exactBindingId": "short_evt_ddc468c4baf6",
+        "forensicEventId": "evt_ddc468c4baf6",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[15].guard.guards[1].guards[2].eventId",
+          "graph.transitions[16].guard.guards[1].guards[2].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_ed27f99ba0a8dfd7c76c69687efb",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:c72bf4209f51e4a6119d054a696fe9b85163923a8df2f4a2229d063ea4661aec",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:50a7b6520cff3fbda8f34570af93b5cdfd86b55cfbb587a232f48eb8420a0fe4",
+        "proposalEntrySha256": "sha256:09ac333ef1ea252cb79da327e6755784acd08031ed83fa405491f174b89c0c48",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:97d54bde45c404c4aa8c930dc6b84fffec1d7c6ead3f9b5c40302908ece9d667",
+        "sourceProfileSha256": "sha256:4875bf086e7410da8f0fa8649153a5b3715cd4a4e7e0d34246cca5dc34e248a1",
+        "sourceProfileSnapshotSha256": "sha256:f04786c5f4bbd6e552cbecabc62b2f4ca794e23c6b7e2ac118f84dc78aff313e",
+        "terminalOperatorApplicationSha256": "sha256:eba1ccd714259c9e889bfebbfd1052706264dc2918bf33c8339d2943895f657f",
+        "terminalOperatorPlanSha256": "sha256:0e428983cc83f65329da46d8c2aed38bc1369442f32378d6c25aba33d369c7a5"
+      }
+    },
+    {
+      "candidateId": "qd_319c3eba7f1f19226c70104ed9ac",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:319c3eba7f1f19226c70104ed9ac9ee4233d32a91fe5bc40b56237e9fd73e3ef",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:ac7bb9e1a65bfc456fdfa013699f3d84fdb80af61f776a0ac4565caba4c92cf6",
+        "programSha256": "sha256:e1a9c5d33ae1911ccd1fbddf1bd793dfbbb511e9d5fb4491ac6a579a9c1d1b74",
+        "proposalEntrySha256": "sha256:599736feab14a656f936b1886bc89fab968ac25a70d2329486b9d68536116358",
+        "sourceProfileSha256": "sha256:aed18b5039bed095bcaf0ea3fa510068bd9694d48eb3af79fe30e62bd66e14f8",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:3f6228b5a0471ba4e31c01cbb21c46b256699e8c29f5aae04c99501d4d7e1448",
+          "terminalOperatorApplicationSha256": "sha256:ad6b4cd0cd6be45157294b27fe5de283ccb53f691658a25df7d24283afbed769",
+          "terminalOperatorPlanSha256": "sha256:d5e4e80dc0d0e1efed8c913f68b927f4601d622b3596363aef6138b6148136cd"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "PRICE_ACTION",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Wick Rejection",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "min_wick_body_ratio",
+              "value": 2
+            },
+            {
+              "name": "min_wick_range_ratio",
+              "value": 0.5
+            },
+            {
+              "name": "min_candle_range",
+              "value": 0
+            },
+            {
+              "name": "close_position_threshold",
+              "value": 0.6
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "WICK_REJECTION",
+        "indicatorInstanceId": "long_evtind_3e85d55cb276",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:68999c7d5d30c934eeb46e63271827fa0dc611ab5a365b71c8103161dc48ca30",
+      "componentIdentity": "sha256:6ae2d95ced67ee6c926b3332480d21bd9ede5f72a330a3344436c3d72f41c594",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_3e85d55cb276",
+        "exactBindingId": "long_evt_7723978a11d8",
+        "forensicEventId": "evt_7723978a11d8",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[7].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:e1a9c5d33ae1911ccd1fbddf1bd793dfbbb511e9d5fb4491ac6a579a9c1d1b74",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:f91a20a9678968ec7cbe04e247b1b3d47eedc8403bcb458e643e7ae8ad45d84f",
+        "proposalEntrySha256": "sha256:599736feab14a656f936b1886bc89fab968ac25a70d2329486b9d68536116358",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:faf8780ee3bf15dc3e9cc0aa4f94d3bff202feab7e1aa797bc63aee15547ec0b",
+        "sourceProfileSha256": "sha256:aed18b5039bed095bcaf0ea3fa510068bd9694d48eb3af79fe30e62bd66e14f8",
+        "sourceProfileSnapshotSha256": "sha256:ac7bb9e1a65bfc456fdfa013699f3d84fdb80af61f776a0ac4565caba4c92cf6",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_f116b70859a56247efbc9adf4a79",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:f116b70859a56247efbc9adf4a79b8e8cbbf9963098f66aba1c9822e97c5ec0c",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:4526d66fc828f026a14d040c20bce1a8d9a5a90b889ef9d3dc1730cc1b5e2c3e",
+        "programSha256": "sha256:5acb6af96f162849385e05fd87ab310e864279dbae1874d2dbe772b618bf5850",
+        "proposalEntrySha256": "sha256:d5cd23739efc0bb7de62f4710c691d471f27dc621af696271892988d88056965",
+        "sourceProfileSha256": "sha256:28185f3b2e3bdeec75b9f099938e60775652bebd072dde4e24282ca3da86a486",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:9ea51709595c5669344b0827e8d195cad515db3182de639881b55614058aaa70",
+          "terminalOperatorApplicationSha256": "sha256:824f47514d0ed161d030be5aed349c39a6ac0c753a08c29d6f4daf81ca21c52a",
+          "terminalOperatorPlanSha256": "sha256:f0d41f6efb38b8985b31ac65ffa6f665983951c8e0d1b75db8bfb5830f9072ac"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "KST",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "KST Cross (Know Sure Thing)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "roc1",
+              "value": 10
+            },
+            {
+              "name": "roc2",
+              "value": 15
+            },
+            {
+              "name": "roc3",
+              "value": 20
+            },
+            {
+              "name": "roc4",
+              "value": 30
+            },
+            {
+              "name": "sma1",
+              "value": 10
+            },
+            {
+              "name": "sma2",
+              "value": 10
+            },
+            {
+              "name": "sma3",
+              "value": 10
+            },
+            {
+              "name": "sma4",
+              "value": 15
+            },
+            {
+              "name": "signalperiod",
+              "value": 9
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "KST_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_a8e858fecade",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:6bd16caba3840a52f7281bc3927b0dca67b2ca35ee78e6d13aa5e9999dce4924",
+      "componentIdentity": "sha256:577f3b50765464c62d6946ec84a2772153e6d00947d1f2a0ec1af6cb1b38e34b",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_a8e858fecade",
+        "exactBindingId": "short_evt_c84a6353309e",
+        "forensicEventId": "evt_c84a6353309e",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[1].guards[1].eventId",
+          "graph.transitions[21].guard.guards[1].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:5acb6af96f162849385e05fd87ab310e864279dbae1874d2dbe772b618bf5850",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:e84c42a71bdc43315e5492be3d8f4a9bb4afee8533fcc852c907c9a32bd27e15",
+        "proposalEntrySha256": "sha256:d5cd23739efc0bb7de62f4710c691d471f27dc621af696271892988d88056965",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:32e4801de1eb5889f189a91cffe60a6d6b9aeb21743e7563938c1f8518523466",
+        "sourceProfileSha256": "sha256:28185f3b2e3bdeec75b9f099938e60775652bebd072dde4e24282ca3da86a486",
+        "sourceProfileSnapshotSha256": "sha256:4526d66fc828f026a14d040c20bce1a8d9a5a90b889ef9d3dc1730cc1b5e2c3e",
+        "terminalOperatorApplicationSha256": "sha256:824f47514d0ed161d030be5aed349c39a6ac0c753a08c29d6f4daf81ca21c52a",
+        "terminalOperatorPlanSha256": "sha256:f0d41f6efb38b8985b31ac65ffa6f665983951c8e0d1b75db8bfb5830f9072ac"
+      }
+    },
+    {
+      "candidateId": "qd_8af42e3251a391f240592b3a8f83",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:8af42e3251a391f240592b3a8f831904697799e74edb8cf09cb79a0f4d4684c8",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:f399a206d4c0b87b45cfe2add89edbb6cc382e92ac256fad006ee295f397902d",
+        "programSha256": "sha256:0c909abded1c4e7db621a7cfff488113ab470dba0b154d247c5ce2fdff1485ec",
+        "proposalEntrySha256": "sha256:22c32e12b0c91fec9a1fef901765cd8616ff20a5d9067e2558f05634d755fa9d",
+        "sourceProfileSha256": "sha256:90228690ffbe1b4004e671c109e70153881cbcbd5f65b57bee5c487b269e5a33",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:0764f8da96e969d91da52c25cb0326b45efd8086e2ff934f96b3e7a3a6f42fef",
+          "terminalOperatorApplicationSha256": "sha256:1af1a641ebe37c8d1a47143b4bab7f3ae9ca6c9dd0b95c9eaaa9628de2605929",
+          "terminalOperatorPlanSha256": "sha256:3e14bd086471d249b5f093ece073b8457efc60f3fc75b6c30be661c70df8295b"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "WAVETREND",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "WaveTrend Cross",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "wave_period",
+              "value": 10
+            },
+            {
+              "name": "avg_period",
+              "value": 21
+            },
+            {
+              "name": "signal_period",
+              "value": 4
+            },
+            {
+              "name": "buy_level",
+              "value": -53
+            },
+            {
+              "name": "sell_level",
+              "value": 53
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "WAVETREND_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_5d87fd00c663",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:788127c4908dd04fa1167f1aaf87bd4ce3d2560fe8d8c7ecd6ce0a2f1a3f8194",
+      "componentIdentity": "sha256:fcd0850e48422c847e595bfea5323b17cfa09e48be9a5aaf9417e7e2d8ad0a11",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_5d87fd00c663",
+        "exactBindingId": "short_evt_c34c331da3f9",
+        "forensicEventId": "evt_c34c331da3f9",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[21].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:0c909abded1c4e7db621a7cfff488113ab470dba0b154d247c5ce2fdff1485ec",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:2368405deb9ede648b51d609b1eee0b86e934e67c92e308d955801cc5e7cecd3",
+        "proposalEntrySha256": "sha256:22c32e12b0c91fec9a1fef901765cd8616ff20a5d9067e2558f05634d755fa9d",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:ec943e47c7c3a43fc6dd80d3f34342870e7555cb31235845c5da6214a79a5c35",
+        "sourceProfileSha256": "sha256:90228690ffbe1b4004e671c109e70153881cbcbd5f65b57bee5c487b269e5a33",
+        "sourceProfileSnapshotSha256": "sha256:f399a206d4c0b87b45cfe2add89edbb6cc382e92ac256fad006ee295f397902d",
+        "terminalOperatorApplicationSha256": "sha256:1af1a641ebe37c8d1a47143b4bab7f3ae9ca6c9dd0b95c9eaaa9628de2605929",
+        "terminalOperatorPlanSha256": "sha256:3e14bd086471d249b5f093ece073b8457efc60f3fc75b6c30be661c70df8295b"
+      }
+    },
+    {
+      "candidateId": "qd_0c005b3d6abf2a575e0ff8d5484e",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:0c005b3d6abf2a575e0ff8d5484e95024332f4bb462a719c7364edfdce779b1d",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:83482be0176a30814f315d137efcac2bdb79a715cf6e3b73908c990bb8f4eef3",
+        "programSha256": "sha256:61ed15f773e0c6751342d0f311a2b6aa594349afb84adf6fe4776404bf009a77",
+        "proposalEntrySha256": "sha256:135d87dc67877a579bb13aeae122eba0f621a0f044c35597a1b4f275b6575d71",
+        "sourceProfileSha256": "sha256:668a95270f29a321f931f3ea2391b90fc39732c7d81091c6c87bdac502969d08",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:9b943826f824fc878103606cd71cf8bda67fc0f7f683c148919b837d220025e8",
+          "terminalOperatorApplicationSha256": "sha256:fd28aff464948e15abd41855011e79defb36e17fc99aeae5c60cf3cb937b7218",
+          "terminalOperatorPlanSha256": "sha256:a127491f3fa41820581d3949d0222105cf4e13c8cb2d6b2bb2c64583b8af52b2"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "CHANNEL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Channel Re-entry",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "channel_type",
+              "value": "donchian"
+            },
+            {
+              "name": "timeperiod",
+              "value": 20
+            },
+            {
+              "name": "matype",
+              "value": 0
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 2
+            },
+            {
+              "name": "price_type",
+              "value": "typical"
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "CHANNEL_REENTRY",
+        "indicatorInstanceId": "short_evtind_eb8499f97ead",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:7af47cbbe46760c132ed7f9800c738708f5ce68468c9a1e901fb451bbe772b17",
+      "componentIdentity": "sha256:85d93131b19d93ad7010e0cb96ed5407e2cb4c20c1e37069abdc110efd3ed24f",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_eb8499f97ead",
+        "exactBindingId": "short_evt_48b9b5ced5f0",
+        "forensicEventId": "evt_48b9b5ced5f0",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[1].guards[1].eventId",
+          "graph.transitions[21].guard.guards[1].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:61ed15f773e0c6751342d0f311a2b6aa594349afb84adf6fe4776404bf009a77",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:2368405deb9ede648b51d609b1eee0b86e934e67c92e308d955801cc5e7cecd3",
+        "proposalEntrySha256": "sha256:135d87dc67877a579bb13aeae122eba0f621a0f044c35597a1b4f275b6575d71",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:df7db1005b002369a9b77dda49d4de2507ee467c24d413d48903d30d58ab39f2",
+        "sourceProfileSha256": "sha256:668a95270f29a321f931f3ea2391b90fc39732c7d81091c6c87bdac502969d08",
+        "sourceProfileSnapshotSha256": "sha256:83482be0176a30814f315d137efcac2bdb79a715cf6e3b73908c990bb8f4eef3",
+        "terminalOperatorApplicationSha256": "sha256:fd28aff464948e15abd41855011e79defb36e17fc99aeae5c60cf3cb937b7218",
+        "terminalOperatorPlanSha256": "sha256:a127491f3fa41820581d3949d0222105cf4e13c8cb2d6b2bb2c64583b8af52b2"
+      }
+    },
+    {
+      "candidateId": "qd_6325457c6200c8c9da8eff0a4e96",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:6325457c6200c8c9da8eff0a4e96724138605a0264a982ab8a1320b276468fca",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:851bc3c4d7cad70e9a6136a78fee2fafb1c489ddcbd3fb644e6433686d2c2ea6",
+        "programSha256": "sha256:cda12a4baa35fc1e6cbb9ef67234bdbef343c6bafb0a06088c51cf941736f779",
+        "proposalEntrySha256": "sha256:6e4f60dc5300d6e95b1bbb3ad5352ab570bf7f70316fcb77e72c2a01dbf07c69",
+        "sourceProfileSha256": "sha256:a327695a5d271bda1aeafb25fd4c1477f7d1290b039df6d3da2cc35159808f9f",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:3fa760abb1c60e88d0dde62f4b8b3c4e6c2344babda3f85528f54959ff722cd9",
+          "terminalOperatorApplicationSha256": "sha256:9e179a6d62f3718040c38a274e43bb3db8ada4e42f3b1eb5fe21b741ecb40268",
+          "terminalOperatorPlanSha256": "sha256:e7028a57526309d435bc4a7fcce5dcff748a692f0bbc2f0d74f942fc196d55c0"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "CHANNEL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Breakout First Close",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "channel_type",
+              "value": "donchian"
+            },
+            {
+              "name": "timeperiod",
+              "value": 20
+            },
+            {
+              "name": "matype",
+              "value": 0
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 2
+            },
+            {
+              "name": "price_type",
+              "value": "typical"
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "BREAKOUT_FIRST_CLOSE",
+        "indicatorInstanceId": "short_evtind_904e96c546c9",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:814d821d470bc5ddd3655bc270d546a8b3acf698bd89f0875ace0f7f16d1f84d",
+      "componentIdentity": "sha256:da7bea2a30120c0c0d221ecb7690385984b7d92467590ecc4fcd237aefa30734",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_904e96c546c9",
+        "exactBindingId": "short_evt_1f8f55a7dee8",
+        "forensicEventId": "evt_1f8f55a7dee8",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[21].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:cda12a4baa35fc1e6cbb9ef67234bdbef343c6bafb0a06088c51cf941736f779",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:8f32d8a27f8c4fdee8ddcc02ae4a049c898a50ad8eadc1c77af63ddd5920307d",
+        "proposalEntrySha256": "sha256:6e4f60dc5300d6e95b1bbb3ad5352ab570bf7f70316fcb77e72c2a01dbf07c69",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:30f55a11b155e870d15816fbee03bbc3068acbbd6427d37e7ce0bc57a9ecabfa",
+        "sourceProfileSha256": "sha256:a327695a5d271bda1aeafb25fd4c1477f7d1290b039df6d3da2cc35159808f9f",
+        "sourceProfileSnapshotSha256": "sha256:851bc3c4d7cad70e9a6136a78fee2fafb1c489ddcbd3fb644e6433686d2c2ea6",
+        "terminalOperatorApplicationSha256": "sha256:9e179a6d62f3718040c38a274e43bb3db8ada4e42f3b1eb5fe21b741ecb40268",
+        "terminalOperatorPlanSha256": "sha256:e7028a57526309d435bc4a7fcce5dcff748a692f0bbc2f0d74f942fc196d55c0"
+      }
+    },
+    {
+      "candidateId": "qd_e4f4253e9281a7c2f5cfc654a07c",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:e4f4253e9281a7c2f5cfc654a07c8db18df322ac7b521c2c6710461c0d0f3501",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:20400fb94e65d07be243329265b5a1a98ba2ab8433ffcf8b886ad7f1214aa89e",
+        "programSha256": "sha256:bbbac95e5400cf51bec6b26774d76d745d303527f7b701bf4986b5f8a0a0e97b",
+        "proposalEntrySha256": "sha256:048bd4cc38e4a5b6818aaa494bf097b23f0bcb175e9870032aa01feda36735fe",
+        "sourceProfileSha256": "sha256:5525c9597ab46b54db6cdb91ba3e5b5d5a70d8cec4c501926fc25d7a99438b48",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:961b26ae7562cef2af08cb4a5bddf356b8c93f49dd579890708765c309b383d4",
+          "terminalOperatorApplicationSha256": "sha256:67a553c6a0cd847199240cf7378dc582387664d4e740ff4138d7bd7e97143eed",
+          "terminalOperatorPlanSha256": "sha256:b30e23ef31015868300940560678e83393581cd386b6ccd4274e5cc02ebb0976"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "KST",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "KST Cross (Know Sure Thing)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "roc1",
+              "value": 10
+            },
+            {
+              "name": "roc2",
+              "value": 15
+            },
+            {
+              "name": "roc3",
+              "value": 20
+            },
+            {
+              "name": "roc4",
+              "value": 30
+            },
+            {
+              "name": "sma1",
+              "value": 10
+            },
+            {
+              "name": "sma2",
+              "value": 10
+            },
+            {
+              "name": "sma3",
+              "value": 10
+            },
+            {
+              "name": "sma4",
+              "value": 15
+            },
+            {
+              "name": "signalperiod",
+              "value": 9
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "KST_CROSSOVER",
+        "indicatorInstanceId": "long_evtind_3e0ed29c8880",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:84701b4f67c2a0b25656b2344b89da437125cfc7cc05b909d7d161472b6bcc81",
+      "componentIdentity": "sha256:577f3b50765464c62d6946ec84a2772153e6d00947d1f2a0ec1af6cb1b38e34b",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_3e0ed29c8880",
+        "exactBindingId": "long_evt_42146772e5ce",
+        "forensicEventId": "evt_42146772e5ce",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_19e9a2130a8f91feea60349066ca",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:bbbac95e5400cf51bec6b26774d76d745d303527f7b701bf4986b5f8a0a0e97b",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:8f3ea0bd61a565ffa2ec3c11b8b8596cb936fbe1c6e80e4713ce586a49cb8881",
+        "proposalEntrySha256": "sha256:048bd4cc38e4a5b6818aaa494bf097b23f0bcb175e9870032aa01feda36735fe",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:d1162cda3b1f050b3eb1bf666c63bcd53d42e5a30a1de3cb25353eb7d0be468a",
+        "sourceProfileSha256": "sha256:5525c9597ab46b54db6cdb91ba3e5b5d5a70d8cec4c501926fc25d7a99438b48",
+        "sourceProfileSnapshotSha256": "sha256:20400fb94e65d07be243329265b5a1a98ba2ab8433ffcf8b886ad7f1214aa89e",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_fbd1192a69c4eea2fffe8d4d91a4",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:fbd1192a69c4eea2fffe8d4d91a484ece2fb9dcb2ae57c4265748e4c07a2e955",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:bf7a9773239e1e1bd225623a6e7a2ae43e11cf6e9a8c64863d300fd5b03c1e09",
+        "programSha256": "sha256:4da77920ab494ab9b2135c284946355fddd22357e480bd6a8364fbca9617f57a",
+        "proposalEntrySha256": "sha256:3d2fbc5d372c8f8bc133893e2bd9d8ca03274b63732345ae754228f1b8a97390",
+        "sourceProfileSha256": "sha256:afb6b5bf25d32752d9f3353e2177537a06fcd0b627309f615acdbf9890f02fb2",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:08e98bbbcc766ac0b676b91d701e06bf2b0a90ab39abd89b46cce3a2ff032edd",
+          "terminalOperatorApplicationSha256": "sha256:a3f6090da38d82ecdcaaded2c902779f2d1f2f301fdacc5a8e9830476ccfe511",
+          "terminalOperatorPlanSha256": "sha256:0a45666d674f9597b5f71bc21abebd14e11885d2226b8b0ecda79e8dee85defd"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "RSI",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "RSI Crossback",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            },
+            {
+              "name": "lower_threshold",
+              "value": 30
+            },
+            {
+              "name": "upper_threshold",
+              "value": 70
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "RSI_CROSSBACK",
+        "indicatorInstanceId": "short_evtind_3788437a6a2c",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:98c364e1db41347cbd391b3abf1fab2ea279d34e22e5e3f2d4b9c29837d3d8b4",
+      "componentIdentity": "sha256:849615dbfa5dbd2f7d5c1042fcc656b72a900fc2ec021bea24b9139078ebbbcd",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_3788437a6a2c",
+        "exactBindingId": "short_evt_48d36adb9899",
+        "forensicEventId": "evt_48d36adb9899",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[1].guards[1].eventId",
+          "graph.transitions[21].guard.guards[1].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:4da77920ab494ab9b2135c284946355fddd22357e480bd6a8364fbca9617f57a",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:2368405deb9ede648b51d609b1eee0b86e934e67c92e308d955801cc5e7cecd3",
+        "proposalEntrySha256": "sha256:3d2fbc5d372c8f8bc133893e2bd9d8ca03274b63732345ae754228f1b8a97390",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:1d6cfebbf9ab565605045bd3304bbc06bf5e8ab057aae0ec76b1401f91573bdb",
+        "sourceProfileSha256": "sha256:afb6b5bf25d32752d9f3353e2177537a06fcd0b627309f615acdbf9890f02fb2",
+        "sourceProfileSnapshotSha256": "sha256:bf7a9773239e1e1bd225623a6e7a2ae43e11cf6e9a8c64863d300fd5b03c1e09",
+        "terminalOperatorApplicationSha256": "sha256:a3f6090da38d82ecdcaaded2c902779f2d1f2f301fdacc5a8e9830476ccfe511",
+        "terminalOperatorPlanSha256": "sha256:0a45666d674f9597b5f71bc21abebd14e11885d2226b8b0ecda79e8dee85defd"
+      }
+    },
+    {
+      "candidateId": "qd_6c5dc2686ce2484fa8cedef99ce0",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:6c5dc2686ce2484fa8cedef99ce0ade7e8d0eadd5171bffd7d78cbc4ed2b67f2",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:dbdeae7684831e1b65c82e0288174fa32ceaae15ee40e785ebd72cfea7f60d1c",
+        "programSha256": "sha256:40d094acf471beead22c53fbeb936b8dcb68d18679d092c47bc93bbc54038f20",
+        "proposalEntrySha256": "sha256:dd3c69312d908fa9703ea07876a5a8b87ce20f1d5bc6d601f4e2c52e7426a55b",
+        "sourceProfileSha256": "sha256:ef5965f26283b09d99d16ea14d99629a7a5fd16e44f11297d6c6508eb36739cf",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:130e3f9091325b36f07c0b1b0a6be650c7722f79ee9f6a2c5629abac51beb677",
+          "terminalOperatorApplicationSha256": "sha256:6f0cc5d029bea106e1476fef240f27da9f6d59ab79314500d6d3195526ef4f30",
+          "terminalOperatorPlanSha256": "sha256:17100c4e78e22fcf9df2f02b35e7b6dcc2202b0c1c13ae9d88e69b7da990e42a"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "MARKET_MODE",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Market Mode Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 20
+            },
+            {
+              "name": "levels",
+              "value": 10
+            },
+            {
+              "name": "delta",
+              "value": 0.5
+            },
+            {
+              "name": "fraction",
+              "value": 0.8
+            },
+            {
+              "name": "price_type",
+              "value": "median"
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "MARKET_MODE_TRANSITION",
+        "indicatorInstanceId": "short_evtind_6f1c471a1785",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M15"
+      },
+      "componentContextIdentity": "sha256:9cc1ba88c6a1a63bdebe25f8565c7edf493c2b07db9641e4af8aeabe3b68e9b8",
+      "componentIdentity": "sha256:1a6ad9b8d12b02e3d3d25b6d88758441714d3aa409a35a35b87d58c1513a08ea",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_6f1c471a1785",
+        "exactBindingId": "short_evt_e02ed7ab9afa",
+        "forensicEventId": "evt_e02ed7ab9afa",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[21].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:40d094acf471beead22c53fbeb936b8dcb68d18679d092c47bc93bbc54038f20",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:0c8753160ce03cf05261bcc8ddc3d8634be70e98f31d3c08108891092ee11c72",
+        "proposalEntrySha256": "sha256:dd3c69312d908fa9703ea07876a5a8b87ce20f1d5bc6d601f4e2c52e7426a55b",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:388dc982eee8471fee150c503b84190f3c44b398569fdca1f8311a38c8ecef22",
+        "sourceProfileSha256": "sha256:ef5965f26283b09d99d16ea14d99629a7a5fd16e44f11297d6c6508eb36739cf",
+        "sourceProfileSnapshotSha256": "sha256:dbdeae7684831e1b65c82e0288174fa32ceaae15ee40e785ebd72cfea7f60d1c",
+        "terminalOperatorApplicationSha256": "sha256:6f0cc5d029bea106e1476fef240f27da9f6d59ab79314500d6d3195526ef4f30",
+        "terminalOperatorPlanSha256": "sha256:17100c4e78e22fcf9df2f02b35e7b6dcc2202b0c1c13ae9d88e69b7da990e42a"
+      }
+    },
+    {
+      "candidateId": "qd_e740817636e458d21d034a4eb4ad",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:e740817636e458d21d034a4eb4adfe52e3df1828c4fee9b1106c64c7e356eccf",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:6e3148ef3fb4ddbb6583ab2773844b22554440813a9c134997a893adf31a3617",
+        "programSha256": "sha256:cd9008dff21694d2bb6b5b20c8cae8dbfa94e1b388283bd9f57786789aed447e",
+        "proposalEntrySha256": "sha256:6aa8875ec3cbb83214f9a983c6941aafbb482b958ac54122321f30fed94d3916",
+        "sourceProfileSha256": "sha256:5c61a77f9a1612e451d5edc3bd6f3c70d7d2f15c88b05425a09ce2d277d0e0f7",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:5abb946f68c013f1f80953456d113cf940e929422496fe4f1029877ce680ea53",
+          "terminalOperatorApplicationSha256": "sha256:4ecae5f3be76882211cc776e7d1caedd0cf3e78998aa01ca4b5e96324a4d3fe0",
+          "terminalOperatorPlanSha256": "sha256:4a99128eb9eba2e4bdd537c9310295742df30f1d30578becd0c1087db6dd0ed0"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "CHANNEL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Breakout First Close",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "channel_type",
+              "value": "donchian"
+            },
+            {
+              "name": "timeperiod",
+              "value": 20
+            },
+            {
+              "name": "matype",
+              "value": 0
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 2
+            },
+            {
+              "name": "price_type",
+              "value": "typical"
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "BREAKOUT_FIRST_CLOSE",
+        "indicatorInstanceId": "long_evtind_d338515e79e8",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:9ea7c8c4dfdb21aa3da5dc2afdf9ff82c3512921f6472bc431909142e7a58f4e",
+      "componentIdentity": "sha256:da7bea2a30120c0c0d221ecb7690385984b7d92467590ecc4fcd237aefa30734",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_d338515e79e8",
+        "exactBindingId": "long_evt_d14f9086ff0d",
+        "forensicEventId": "evt_d14f9086ff0d",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_19e9a2130a8f91feea60349066ca",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:cd9008dff21694d2bb6b5b20c8cae8dbfa94e1b388283bd9f57786789aed447e",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:8f3ea0bd61a565ffa2ec3c11b8b8596cb936fbe1c6e80e4713ce586a49cb8881",
+        "proposalEntrySha256": "sha256:6aa8875ec3cbb83214f9a983c6941aafbb482b958ac54122321f30fed94d3916",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:0feeb1a96396c1e398399595a39707e48b5e15fac74ba7045cb3e750434e90f8",
+        "sourceProfileSha256": "sha256:5c61a77f9a1612e451d5edc3bd6f3c70d7d2f15c88b05425a09ce2d277d0e0f7",
+        "sourceProfileSnapshotSha256": "sha256:6e3148ef3fb4ddbb6583ab2773844b22554440813a9c134997a893adf31a3617",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_2e5c207ac3a10258908dc47916fa",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:2e5c207ac3a10258908dc47916fa95d2bd6bb37115d2629b553eb1295b9e7f7e",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:cb686b86683d297ad8374cf9334b41a22845ccd08c6fa3b5dbbf6835e2e36172",
+        "programSha256": "sha256:223ccc55e4877c0da942400a4b42a9da5d6dedd4d71a23887bedc2ce81435e13",
+        "proposalEntrySha256": "sha256:97c2d6d86e5d6976a6a93ba2b0e4da680135778b87799cafbc972026f8d06588",
+        "sourceProfileSha256": "sha256:fadccdec5610e6f71143258d8d89a239adafe8fc1baaad2f231ae3d9ef6f2599",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:50e5a53c711805962ce57f2e516a7e9d2983bd04b76447b18be2611f8213f75e",
+          "terminalOperatorApplicationSha256": "sha256:8e5754bcef4fc36756f0c2f6844779ef9fef8069c7914bd8b68f39f322f8c1ab",
+          "terminalOperatorPlanSha256": "sha256:30920201d145d6bc762789461e1a0fb3c5e9d3a7912b0bd5f1e54100e595314b"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "MA",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Price Reclaim MA",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 21
+            },
+            {
+              "name": "matype",
+              "value": 1
+            },
+            {
+              "name": "min_prior_displacement",
+              "value": 0
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "PRICE_RECLAIM_MA",
+        "indicatorInstanceId": "short_evtind_3975ec3880af",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:a4102f607c99e58624494e4bbadb3c07cb345a85d7e5e27d72c5b819fa6ed4e1",
+      "componentIdentity": "sha256:c919b040f708c05bdbea92a3600ec0cc2d3cab806ae655ad5fad88f200100478",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_3975ec3880af",
+        "exactBindingId": "short_evt_a49c2417d4d6",
+        "forensicEventId": "evt_a49c2417d4d6",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[15].guard.guards[1].guards[2].eventId",
+          "graph.transitions[16].guard.guards[1].guards[2].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_ed27f99ba0a8dfd7c76c69687efb",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:223ccc55e4877c0da942400a4b42a9da5d6dedd4d71a23887bedc2ce81435e13",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:97c2d6d86e5d6976a6a93ba2b0e4da680135778b87799cafbc972026f8d06588",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:db61e8b1791c56272282d6abb53895b66ede710e174a1b3912aa8e06fe6b80df",
+        "sourceProfileSha256": "sha256:fadccdec5610e6f71143258d8d89a239adafe8fc1baaad2f231ae3d9ef6f2599",
+        "sourceProfileSnapshotSha256": "sha256:cb686b86683d297ad8374cf9334b41a22845ccd08c6fa3b5dbbf6835e2e36172",
+        "terminalOperatorApplicationSha256": "sha256:8e5754bcef4fc36756f0c2f6844779ef9fef8069c7914bd8b68f39f322f8c1ab",
+        "terminalOperatorPlanSha256": "sha256:30920201d145d6bc762789461e1a0fb3c5e9d3a7912b0bd5f1e54100e595314b"
+      }
+    },
+    {
+      "candidateId": "qd_7166f047f79ef574f6e9c29c034b",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:7166f047f79ef574f6e9c29c034b525a34e8c46ba95c5689915853de1a615ba2",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:d43857334dac5f83bd0f8b1892a663de0c47cc46af792bc43f8b94a2d0d4c29f",
+        "programSha256": "sha256:4d269a19439b5916ac870f69050841fc48769f20a824347bfce72840265b8a2a",
+        "proposalEntrySha256": "sha256:d3ba27b420c65ad5a6c5e8516503e5c0d8714bcf10ce42a7a021c89ecaeb2f67",
+        "sourceProfileSha256": "sha256:a99c96e63f5eb82eee834c7412a290b70d87112f94a5237ecda2e9629efe802d",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:ca20b1bbc981b23a43f55961e58b40473fa039fa554a367298f46a41d6e5e429",
+          "terminalOperatorApplicationSha256": "sha256:d9ef6ff9baf8018a33c1b37caacb425808bfdcecda3351902958553e5736f1a9",
+          "terminalOperatorPlanSha256": "sha256:d6086605c8fa1ac9ea463fa3020a8e065d7de6a1cbb1d9d11707a1ced241685e"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "STOCHRSI",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "StochRSI Crossback",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            },
+            {
+              "name": "fastk_period",
+              "value": 5
+            },
+            {
+              "name": "fastd_period",
+              "value": 3
+            },
+            {
+              "name": "fastd_matype",
+              "value": 0
+            },
+            {
+              "name": "lower_threshold",
+              "value": 20
+            },
+            {
+              "name": "upper_threshold",
+              "value": 80
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "STOCHRSI_CROSSBACK",
+        "indicatorInstanceId": "short_evtind_5aa61a7c3d5e",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:b1d1206bbc4ee9e4bbc4b78d5faa98901349bb3d90bfaa4df9b74a91e3f676f2",
+      "componentIdentity": "sha256:b7050da8c47d7d7939be97bc810c609352e32713e436c351311cf6130d39a978",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_5aa61a7c3d5e",
+        "exactBindingId": "short_evt_0cbd54ddd16a",
+        "forensicEventId": "evt_0cbd54ddd16a",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:4d269a19439b5916ac870f69050841fc48769f20a824347bfce72840265b8a2a",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:c5fba240603e233c91bc4dd02a9ea338536969e17ca92de1a56ee86da6705cd2",
+        "proposalEntrySha256": "sha256:d3ba27b420c65ad5a6c5e8516503e5c0d8714bcf10ce42a7a021c89ecaeb2f67",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:666757a21bda09ede83c29f7bf20097c29c978eddacc8c432eb4e80ddf53e2a6",
+        "sourceProfileSha256": "sha256:a99c96e63f5eb82eee834c7412a290b70d87112f94a5237ecda2e9629efe802d",
+        "sourceProfileSnapshotSha256": "sha256:d43857334dac5f83bd0f8b1892a663de0c47cc46af792bc43f8b94a2d0d4c29f",
+        "terminalOperatorApplicationSha256": "sha256:d9ef6ff9baf8018a33c1b37caacb425808bfdcecda3351902958553e5736f1a9",
+        "terminalOperatorPlanSha256": "sha256:d6086605c8fa1ac9ea463fa3020a8e065d7de6a1cbb1d9d11707a1ced241685e"
+      }
+    },
+    {
+      "candidateId": "qd_a32fd1510114e6e49b8ad754525a",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:a32fd1510114e6e49b8ad754525adb05fd718a4ae836468f98a511b41d25cad4",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:e6f2236055de899553d414d4029a752749a4fd7b186e51db50f9bea05b27a0eb",
+        "programSha256": "sha256:c61fe8c8c9986780fd962848cdf9f9b25f72ab24b034c9e181e54aef9cdcc356",
+        "proposalEntrySha256": "sha256:d56eb60cc4b28d19176a95c0ecdf281b339a51ccc33e80979723153a6a5b1b8c",
+        "sourceProfileSha256": "sha256:72997ef8c2d1377915ccbe8d7482e8f89d004ca4dcc5624704ba9e15307dcb74",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:b6132bad1c24dc687a025bbd707769162e9ebc589acbf799479a71f59b535f54",
+          "terminalOperatorApplicationSha256": "sha256:b65db484d05f39ede4233c601b755a4ef3feaa71fc703a4799fc72ac781ec631",
+          "terminalOperatorPlanSha256": "sha256:efdab7a130c0c54a530969b60641c0f806f6406e98d2662ec60476f07de1c16a"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "PRICE_ACTION",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Wick Rejection",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "min_wick_body_ratio",
+              "value": 2
+            },
+            {
+              "name": "min_wick_range_ratio",
+              "value": 0.5
+            },
+            {
+              "name": "min_candle_range",
+              "value": 0
+            },
+            {
+              "name": "close_position_threshold",
+              "value": 0.6
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "WICK_REJECTION",
+        "indicatorInstanceId": "long_evtind_9eb6317503d6",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:bd482f91154b446da91528b00bc98fd13fd1e767eb3d0dbcfee81f96a6c13d9a",
+      "componentIdentity": "sha256:6ae2d95ced67ee6c926b3332480d21bd9ede5f72a330a3344436c3d72f41c594",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_9eb6317503d6",
+        "exactBindingId": "long_evt_e7f84c2f6f84",
+        "forensicEventId": "evt_e7f84c2f6f84",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[0]",
+          "graph.eventBindings[0].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_001958c8b3288892a458207c9b76",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:c61fe8c8c9986780fd962848cdf9f9b25f72ab24b034c9e181e54aef9cdcc356",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:f18839168d4ca0cf5f58ec2e9e33292011271a2219cbb88d42d6d529c887b00e",
+        "proposalEntrySha256": "sha256:d56eb60cc4b28d19176a95c0ecdf281b339a51ccc33e80979723153a6a5b1b8c",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:a26ebb5bd280d56c5ab0065d10e026f1f688642751e888d42746b729edae9696",
+        "sourceProfileSha256": "sha256:72997ef8c2d1377915ccbe8d7482e8f89d004ca4dcc5624704ba9e15307dcb74",
+        "sourceProfileSnapshotSha256": "sha256:e6f2236055de899553d414d4029a752749a4fd7b186e51db50f9bea05b27a0eb",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_214a1bb097e504ce0d3d66efb3d2",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:214a1bb097e504ce0d3d66efb3d2877812a25529b523013f84f2cea11fafb529",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:73b93ee7749b38158c95ae71b4a7cd44accb93a568ec974f9767f97e851d76e8",
+        "programSha256": "sha256:0ec9c97ed8bb5f38d1c0868eee99632b9f5c29c320b6211aac2fcea9f306ab78",
+        "proposalEntrySha256": "sha256:cb052844f72701114d66d1be67e0341e7d3d12ee78ab8cd63e1bbdc9b92d7dbb",
+        "sourceProfileSha256": "sha256:4ef8b9037967d827296ecab25fd147b67ab2ba82a0770e4f96c3030b1e1c0457",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:3ef47ba221135dba70704dd7a0d11d6ea488fdf958ec6256173bc615143e4071",
+          "terminalOperatorApplicationSha256": "sha256:9df5dd30dcccef28de9f10f960f53f874fe4983279ba883e594738dbb631f2f7",
+          "terminalOperatorPlanSha256": "sha256:d1faf28f10cce1033c404e27f5f3c26c52178c38d78945f7fba430f8eadab556"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "NVO",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "NVO Volume Impulse",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "volume_period",
+              "value": 10
+            },
+            {
+              "name": "breakout_bars",
+              "value": 3
+            },
+            {
+              "name": "spike_ratio",
+              "value": 1.786
+            },
+            {
+              "name": "prior_max_ratio",
+              "value": 1.618
+            },
+            {
+              "name": "volume_clip",
+              "value": 6
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "NVO_VOLUME_IMPULSE",
+        "indicatorInstanceId": "short_evtind_c2009dc255d3",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:bdaaab2dadd8a5f4dce715c056b6893bba172705fef9d0a9b9df947ed414af93",
+      "componentIdentity": "sha256:17aa6f9dc665e7b8f28160b2898f0aeba1db16d641471452b1277a5dfd3eb0df",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_c2009dc255d3",
+        "exactBindingId": "short_evt_22b95e3e218f",
+        "forensicEventId": "evt_22b95e3e218f",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[1]",
+          "graph.eventBindings[2].id",
+          "graph.transitions[17].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:0ec9c97ed8bb5f38d1c0868eee99632b9f5c29c320b6211aac2fcea9f306ab78",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:cb052844f72701114d66d1be67e0341e7d3d12ee78ab8cd63e1bbdc9b92d7dbb",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:c139c15b0e44d46a6e3b23e5c7f4517c5bd0db119c6947d0d48cc80a5b04a082",
+        "sourceProfileSha256": "sha256:4ef8b9037967d827296ecab25fd147b67ab2ba82a0770e4f96c3030b1e1c0457",
+        "sourceProfileSnapshotSha256": "sha256:73b93ee7749b38158c95ae71b4a7cd44accb93a568ec974f9767f97e851d76e8",
+        "terminalOperatorApplicationSha256": "sha256:9df5dd30dcccef28de9f10f960f53f874fe4983279ba883e594738dbb631f2f7",
+        "terminalOperatorPlanSha256": "sha256:d1faf28f10cce1033c404e27f5f3c26c52178c38d78945f7fba430f8eadab556"
+      }
+    },
+    {
+      "candidateId": "qd_3a8717479a0fd538696ab149f64e",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:3a8717479a0fd538696ab149f64e9073afa7d723b9f48d162e9778293fd5db4b",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:64a112d9dc853b56efaa11d13b9b959de83be8528c8e6f3d783e625a3f97d149",
+        "programSha256": "sha256:a5559ee919f09f5b973e661fb36277407df29c615bdf191c99ec212a057b103c",
+        "proposalEntrySha256": "sha256:4299eb230b65605772321221686f2e23ca3e45302fc04e660f8664150287214e",
+        "sourceProfileSha256": "sha256:a6b0dd987e47d93ade2225d0f116b737729915ffc639dcbb229c5da777d14907",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:1e73ff6e78fb61aa3869e0c8ad262f15f9520f81d9677b4460fb9d7d22339753",
+          "terminalOperatorApplicationSha256": "sha256:fc3b676508011c21000e4139f537ca342f2b0aa742d8793d8d50a4e9590d2240",
+          "terminalOperatorPlanSha256": "sha256:078c93a560288c8512cc999b05b851a98ce4392266d74d33c125bede2a85e692"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "STOCHRSI",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "StochRSI Crossback",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            },
+            {
+              "name": "fastk_period",
+              "value": 5
+            },
+            {
+              "name": "fastd_period",
+              "value": 3
+            },
+            {
+              "name": "fastd_matype",
+              "value": 0
+            },
+            {
+              "name": "lower_threshold",
+              "value": 20
+            },
+            {
+              "name": "upper_threshold",
+              "value": 80
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "STOCHRSI_CROSSBACK",
+        "indicatorInstanceId": "long_evtind_b2a811ba40dc",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:c18614958339ebaef142f9056e3fe1398ff1fa9c2c536c99feeb89f857e706c3",
+      "componentIdentity": "sha256:b7050da8c47d7d7939be97bc810c609352e32713e436c351311cf6130d39a978",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_b2a811ba40dc",
+        "exactBindingId": "long_evt_0b901530459f",
+        "forensicEventId": "evt_0b901530459f",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:a5559ee919f09f5b973e661fb36277407df29c615bdf191c99ec212a057b103c",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:4299eb230b65605772321221686f2e23ca3e45302fc04e660f8664150287214e",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:b9a321888b903e66868f41451f812f28d07e6c61ddda40249b3699c93bddb800",
+        "sourceProfileSha256": "sha256:a6b0dd987e47d93ade2225d0f116b737729915ffc639dcbb229c5da777d14907",
+        "sourceProfileSnapshotSha256": "sha256:64a112d9dc853b56efaa11d13b9b959de83be8528c8e6f3d783e625a3f97d149",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_105e155a74febbeb68347b5d909b",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:105e155a74febbeb68347b5d909bce8497510fd38696a9a55f96cb377c31ed2e",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:68967811007ad574941218b70156a652e72ca71ab6cfa5660f807aa00cf8caec",
+        "programSha256": "sha256:140872631d1d60357477fb41699c68e6c7c4e54c4484885b22505e7d57144246",
+        "proposalEntrySha256": "sha256:441b082ca9287407dc0302ea031e5dc70b05003396eff7148fe2827d9cb8bcec",
+        "sourceProfileSha256": "sha256:5b75d4f6708b9f7b49330af8683850961549746b0c9094be2aa7e4d622218650",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:987b36b68b58da8a98da575c21fbbfe7ab6a2fe0c827d6397ed09a465972e767",
+          "terminalOperatorApplicationSha256": "sha256:972fc76eacb9f939c88cfe2087a4f18007a85e6ce78172cfe62a5df87cff27aa",
+          "terminalOperatorPlanSha256": "sha256:eda9f8d0b4e01f6a3e49fe006a671efd7a1b031511e3a449e1e908a43ea93597"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "PMO",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "PMO Cross (Price Momentum Oscillator)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "period1",
+              "value": 35
+            },
+            {
+              "name": "period2",
+              "value": 20
+            },
+            {
+              "name": "signalperiod",
+              "value": 10
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "PMO_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_dd178b446984",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:c1e45326775feba8eb17366e20e0b503b692548b503b839435f45b4b0c716a66",
+      "componentIdentity": "sha256:9e4fe26203cc152f5afe0bc8c04664d679d701059774d3805ab36f86231c9dcd",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_dd178b446984",
+        "exactBindingId": "short_evt_112799068970",
+        "forensicEventId": "evt_112799068970",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[16].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_ed27f99ba0a8dfd7c76c69687efb",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:140872631d1d60357477fb41699c68e6c7c4e54c4484885b22505e7d57144246",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:d2884644175677a861d5e19a946fff194d58842a9943a20fb58d73032258f67f",
+        "proposalEntrySha256": "sha256:441b082ca9287407dc0302ea031e5dc70b05003396eff7148fe2827d9cb8bcec",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:cce2575518c31f3776c37bbd07ea298f00a645ce013203c54439b251bbf233ec",
+        "sourceProfileSha256": "sha256:5b75d4f6708b9f7b49330af8683850961549746b0c9094be2aa7e4d622218650",
+        "sourceProfileSnapshotSha256": "sha256:68967811007ad574941218b70156a652e72ca71ab6cfa5660f807aa00cf8caec",
+        "terminalOperatorApplicationSha256": "sha256:972fc76eacb9f939c88cfe2087a4f18007a85e6ce78172cfe62a5df87cff27aa",
+        "terminalOperatorPlanSha256": "sha256:eda9f8d0b4e01f6a3e49fe006a671efd7a1b031511e3a449e1e908a43ea93597"
+      }
+    },
+    {
+      "candidateId": "qd_387101189ff59fb4e74eb1db3cbd",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:387101189ff59fb4e74eb1db3cbd1c365301a00f360ae32568b34d2ad4ec57ca",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:347d2707e75604a7c37116e4f3e611b74f53e13d7a62cbbee535105861d4babc",
+        "programSha256": "sha256:4fec9755a54190155d5282ab75bac9a23e62b7d2f71c39169912c89d570f87a5",
+        "proposalEntrySha256": "sha256:af7c1da436a3957f261032666ac486db63171a4fefe5b1f26578ee8e5d2a7045",
+        "sourceProfileSha256": "sha256:a465eadee6078fead758dba8886cdaec61e56dc249e27033d74cd039b1fd9c0e",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:535a3b975428182397ea3ec20f6b8ab3ba06d287ee8c2e186d51f0273d34d1b0",
+          "terminalOperatorApplicationSha256": "sha256:573049911118761c660a813177c53d412906ac563492564bc4e656e22204b5a4",
+          "terminalOperatorPlanSha256": "sha256:a038da19623b05f4b04e4ceb9841fce55e32e84d32c43fffd9a06b1bfad19316"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "PMO",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "PMO Cross (Price Momentum Oscillator)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "period1",
+              "value": 35
+            },
+            {
+              "name": "period2",
+              "value": 20
+            },
+            {
+              "name": "signalperiod",
+              "value": 10
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "PMO_CROSSOVER",
+        "indicatorInstanceId": "long_evtind_f857797c4c5e",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:c2eba0376f9bae7071f91f4fadcb4e7145741ea7d921eb75d8fa3a1a6e2d4437",
+      "componentIdentity": "sha256:9e4fe26203cc152f5afe0bc8c04664d679d701059774d3805ab36f86231c9dcd",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_f857797c4c5e",
+        "exactBindingId": "long_evt_acac290c770f",
+        "forensicEventId": "evt_acac290c770f",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_19e9a2130a8f91feea60349066ca",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:4fec9755a54190155d5282ab75bac9a23e62b7d2f71c39169912c89d570f87a5",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:8f3ea0bd61a565ffa2ec3c11b8b8596cb936fbe1c6e80e4713ce586a49cb8881",
+        "proposalEntrySha256": "sha256:af7c1da436a3957f261032666ac486db63171a4fefe5b1f26578ee8e5d2a7045",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:f3d943c4f9af378f09fa8ef84cea9f5f93893818e4e2714f990d2e5401d74c27",
+        "sourceProfileSha256": "sha256:a465eadee6078fead758dba8886cdaec61e56dc249e27033d74cd039b1fd9c0e",
+        "sourceProfileSnapshotSha256": "sha256:347d2707e75604a7c37116e4f3e611b74f53e13d7a62cbbee535105861d4babc",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_79d8badeb97eb3971096ee727cdb",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:79d8badeb97eb3971096ee727cdb12d914f6044d668f2e32cddc64f27b312a02",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:585d4c52ba9a03df4a73fa32ebc84d838d63d162074a7935daf0ae44ae94238e",
+        "programSha256": "sha256:0fbd9dc978b7c35ec67599ba0540bfe35c750147837819110cbf3365079a951d",
+        "proposalEntrySha256": "sha256:9df10a344d1e004218d8fadb446f19514c0f962d2b8be51d04fe04ae3111da32",
+        "sourceProfileSha256": "sha256:310384c16faf25144d75c3810a6a7e46f720b196d21e97ff6057be96df8fbe97",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:c3f2b8fec9b0836d9e4d4808c2c36649b81d91f621969a94f554eb97faa62da9",
+          "terminalOperatorApplicationSha256": "sha256:dc1c6cc9f5df9349191f6aad962bdb385c4270d9850021d0ddff83a9c48974c8",
+          "terminalOperatorPlanSha256": "sha256:56435d5366e1fc332b8b8011bc764fe0dac6ddc544e232c1dc9e1f949e82832c"
+        }
+      },
+      "component": {
+        "baseIndicatorId": null,
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "MA Cross (Moving Average Crossover)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "fastperiod",
+              "value": 9
+            },
+            {
+              "name": "slowperiod",
+              "value": 21
+            },
+            {
+              "name": "matype",
+              "value": 1
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "MA_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_ff9b5dbb488c",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:ccf72ce23dbb3b2dd8ead9243074dd1ad10c2dfe70d65003c518150ba7bfdf59",
+      "componentIdentity": "sha256:86f9b96177f7433880110dd6149f7cec955f69d966d8fc9927743f2ecbdeb6d2",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_ff9b5dbb488c",
+        "exactBindingId": "short_evt_4499cd09acfb",
+        "forensicEventId": "evt_4499cd09acfb",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[1].guards[1].eventId",
+          "graph.transitions[21].guard.guards[1].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:0fbd9dc978b7c35ec67599ba0540bfe35c750147837819110cbf3365079a951d",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:0cc8869f936bd30a5bf5050f0ff4e01381c5e0c79ab756889de008311f493f68",
+        "proposalEntrySha256": "sha256:9df10a344d1e004218d8fadb446f19514c0f962d2b8be51d04fe04ae3111da32",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:618fb600a605b98829176ed9a868afc2722a29e202645d273e6ebf80eacc67a4",
+        "sourceProfileSha256": "sha256:310384c16faf25144d75c3810a6a7e46f720b196d21e97ff6057be96df8fbe97",
+        "sourceProfileSnapshotSha256": "sha256:585d4c52ba9a03df4a73fa32ebc84d838d63d162074a7935daf0ae44ae94238e",
+        "terminalOperatorApplicationSha256": "sha256:dc1c6cc9f5df9349191f6aad962bdb385c4270d9850021d0ddff83a9c48974c8",
+        "terminalOperatorPlanSha256": "sha256:56435d5366e1fc332b8b8011bc764fe0dac6ddc544e232c1dc9e1f949e82832c"
+      }
+    },
+    {
+      "candidateId": "qd_49f384d0c93505ebc26662513c4d",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:49f384d0c93505ebc26662513c4dd784a9dfae105baf57e03c26c5b83295aeba",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:1250306ef013cf1411a8450238b1bd5fb4277ca94134d6d09020747f9b5ecf31",
+        "programSha256": "sha256:be702c9b3c7bc964eeb609324884056d5f1defadb0716dac2278eb805a98da27",
+        "proposalEntrySha256": "sha256:b6eee01c5b354c421cdb7035d1e97fee1fcac221c5addc7c14362ed6a32543af",
+        "sourceProfileSha256": "sha256:031d532073747f6c4f859ae2be00435f34bc217caae3c4674602db46dfc42d48",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:f47fffe37625b116ff5351bdcec78b85d59c164529035fe74c43368cbeda1784",
+          "terminalOperatorApplicationSha256": "sha256:c80fbd9c89d108e677f8af7ade5a6d541aacca58201eed66fd61c0da27fff61e",
+          "terminalOperatorPlanSha256": "sha256:15059344a69f1a65de43d2b13596480a42e4be96e2fef980823b0544e92eb06b"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "PMO",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "PMO Cross (Price Momentum Oscillator)",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "period1",
+              "value": 35
+            },
+            {
+              "name": "period2",
+              "value": 20
+            },
+            {
+              "name": "signalperiod",
+              "value": 10
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "PMO_CROSSOVER",
+        "indicatorInstanceId": "short_evtind_e2ddf77f4ccf",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:dd96da3f302a4a9a0a1bf6c3ee696063980b9be2509d586444956bcb2f1ca881",
+      "componentIdentity": "sha256:9e4fe26203cc152f5afe0bc8c04664d679d701059774d3805ab36f86231c9dcd",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_e2ddf77f4ccf",
+        "exactBindingId": "short_evt_a90ac2d874ad",
+        "forensicEventId": "evt_a90ac2d874ad",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[1].guards[1].eventId",
+          "graph.transitions[21].guard.guards[1].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:be702c9b3c7bc964eeb609324884056d5f1defadb0716dac2278eb805a98da27",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:99f5d32aa00fc5011323067d5562f29ddecbce4b35c05086b292cffa9debd9d3",
+        "proposalEntrySha256": "sha256:b6eee01c5b354c421cdb7035d1e97fee1fcac221c5addc7c14362ed6a32543af",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:0d8a02d624815f1c21ad8ba938035c407505e88df56187966b50d3aeae78755f",
+        "sourceProfileSha256": "sha256:031d532073747f6c4f859ae2be00435f34bc217caae3c4674602db46dfc42d48",
+        "sourceProfileSnapshotSha256": "sha256:1250306ef013cf1411a8450238b1bd5fb4277ca94134d6d09020747f9b5ecf31",
+        "terminalOperatorApplicationSha256": "sha256:c80fbd9c89d108e677f8af7ade5a6d541aacca58201eed66fd61c0da27fff61e",
+        "terminalOperatorPlanSha256": "sha256:15059344a69f1a65de43d2b13596480a42e4be96e2fef980823b0544e92eb06b"
+      }
+    },
+    {
+      "candidateId": "qd_608193c110d28759df96ff90ec00",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:608193c110d28759df96ff90ec00ad54435538d3ba70480e5572c85308c218d4",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:2ab1444da2115d0f72d577886a4d71ea4d674395a99bec40d1bda0ca9975d109",
+        "programSha256": "sha256:179c426ad28683314749ffb2158dcf148243f4402efdc76216a4345489ce8ea7",
+        "proposalEntrySha256": "sha256:0cf4fb7d113bf00c15548a9dde1a3b2512a3000af3f534073411a8b30471b9ab",
+        "sourceProfileSha256": "sha256:5a282bde2f0add368107462c07106195801eeaa5845907e8768f66de90b4ecab",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:00d9c28c968d380da2b1d7658562ec3583e5c6ee1dc6b8997dbf922a0073fdd3",
+          "terminalOperatorApplicationSha256": "sha256:e865665a2741bb8abe52cdd9819fd39542b2dac5f2550297d3b329f2af53a912",
+          "terminalOperatorPlanSha256": "sha256:db63b84d4b3dfcf1780dba6afaf957d9cfea7a2de3cba69c21c446af190fdf4f"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "MARKET_MODE",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Market Mode Transition",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "period",
+              "value": 20
+            },
+            {
+              "name": "levels",
+              "value": 10
+            },
+            {
+              "name": "delta",
+              "value": 0.5
+            },
+            {
+              "name": "fraction",
+              "value": 0.8
+            },
+            {
+              "name": "price_type",
+              "value": "median"
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "MARKET_MODE_TRANSITION",
+        "indicatorInstanceId": "short_evtind_e6ddca1ad836",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M15"
+      },
+      "componentContextIdentity": "sha256:edb1af5959e83084599fbeda40d7defc9f6963190134ebcdf63eb8ba5cbc8900",
+      "componentIdentity": "sha256:1a6ad9b8d12b02e3d3d25b6d88758441714d3aa409a35a35b87d58c1513a08ea",
+      "insertion": {
+        "bindingIndicatorInstanceId": "short_evtind_e6ddca1ad836",
+        "exactBindingId": "short_evt_34f6103aaf95",
+        "forensicEventId": "evt_34f6103aaf95",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[1].eventBindingIds[0]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[20].guard.guards[1].guards[1].eventId",
+          "graph.transitions[21].guard.guards[1].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "short",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:179c426ad28683314749ffb2158dcf148243f4402efdc76216a4345489ce8ea7",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:6247db2d9aa007e42aebb934022eca93012a879937399c039d65a83abc3ae33c",
+        "proposalEntrySha256": "sha256:0cf4fb7d113bf00c15548a9dde1a3b2512a3000af3f534073411a8b30471b9ab",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:aaaa8f130192fbe0961994bf453f4fa847059d48076333149f6786b132d7b4f3",
+        "sourceProfileSha256": "sha256:5a282bde2f0add368107462c07106195801eeaa5845907e8768f66de90b4ecab",
+        "sourceProfileSnapshotSha256": "sha256:2ab1444da2115d0f72d577886a4d71ea4d674395a99bec40d1bda0ca9975d109",
+        "terminalOperatorApplicationSha256": "sha256:e865665a2741bb8abe52cdd9819fd39542b2dac5f2550297d3b329f2af53a912",
+        "terminalOperatorPlanSha256": "sha256:db63b84d4b3dfcf1780dba6afaf957d9cfea7a2de3cba69c21c446af190fdf4f"
+      }
+    },
+    {
+      "candidateId": "qd_e72e7b747ccd08714a29c107f617",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:e72e7b747ccd08714a29c107f617cca4c74c6a8f53d7933f9e95c2d0a077678b",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:828d5ddd0de7bc4a3a9800dd3302a0ac5eb7cca8d5ff67bd54965394efa85904",
+        "programSha256": "sha256:8149bdaadc549825994f6db2c2687868d979aae3bb70e3698038c5bfb991c0eb",
+        "proposalEntrySha256": "sha256:8118cab11c97d7610daef40298f613aa47fa2457bd9537c749cba972c12c49a5",
+        "sourceProfileSha256": "sha256:b9d68d588ddd7f83b51f943761d8086c600b70bcf87716323cb359fd93968d9d",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:685412a199b3b41bebceabd065d19de8df9082cdfa9d134aa3922bd022ddc4a1",
+          "terminalOperatorApplicationSha256": "sha256:f804f11684ab655a8e5a594a59c9b7d37feac189b72ab86315cfbd677679de18",
+          "terminalOperatorPlanSha256": "sha256:ac914715ac7159eb630d21e2497dc80473b016d11d89895e0e9e8e4b948a31fb"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "CHANNEL",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Breakout First Close",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "channel_type",
+              "value": "donchian"
+            },
+            {
+              "name": "timeperiod",
+              "value": 20
+            },
+            {
+              "name": "matype",
+              "value": 0
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 2
+            },
+            {
+              "name": "price_type",
+              "value": "typical"
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "BREAKOUT_FIRST_CLOSE",
+        "indicatorInstanceId": "long_evtind_b1e0e5d7a0bf",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:f34c0aadff5d0d2f20a069fe46261f4d116b56de8b701e085a8dee727c344c2b",
+      "componentIdentity": "sha256:da7bea2a30120c0c0d221ecb7690385984b7d92467590ecc4fcd237aefa30734",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_b1e0e5d7a0bf",
+        "exactBindingId": "long_evt_22495f692eab",
+        "forensicEventId": "evt_22495f692eab",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[7].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_69e5a3407ab21e82d787eb48c8d5",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:8149bdaadc549825994f6db2c2687868d979aae3bb70e3698038c5bfb991c0eb",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:0a9332c5239d991a23b4abe36fb7b642c60dd2362a4be49dee564a2af59162e6",
+        "proposalEntrySha256": "sha256:8118cab11c97d7610daef40298f613aa47fa2457bd9537c749cba972c12c49a5",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:1a753a3aeade5901b208fae05b63ec599651bfd7eb66993336c1d78681b25254",
+        "sourceProfileSha256": "sha256:b9d68d588ddd7f83b51f943761d8086c600b70bcf87716323cb359fd93968d9d",
+        "sourceProfileSnapshotSha256": "sha256:828d5ddd0de7bc4a3a9800dd3302a0ac5eb7cca8d5ff67bd54965394efa85904",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    },
+    {
+      "candidateId": "qd_563d8421e332f7c20efe29087db2",
+      "candidateProfileBinding": {
+        "candidateIdentitySha256": "sha256:563d8421e332f7c20efe29087db2a4d1f65500a10374e974be406b2b89f38430",
+        "clockRequirement": "clock.completed_bar",
+        "profileSnapshotSha256": "sha256:c47697b8e070e21a55b5e75a4ff9edc67fe03fb8dd413ec85c5a4659eabcc819",
+        "programSha256": "sha256:95be0c3d5aecd9313d4c9fb23ecdf317283f4e75e1caf5ba2f55fbe4552df78d",
+        "proposalEntrySha256": "sha256:d9b88dfe66ece7417add465f941c3676ed4e2de4f556c8aab220fc9705983cf9",
+        "sourceProfileSha256": "sha256:5aa890b3bf8b259a96fd77160e1ef72e8a0e3f44eea749c031c5fb09ad499900",
+        "terminalOperatorApplication": {
+          "availability": "retained_in_structural_operator_history",
+          "operation": "evolvable_module_mutation",
+          "operatorTraceSha256": "sha256:d9118ff6fe4e4c10bfddfa11b4b60dc4ef6e881d8b4d7260b1045b7b8cded118",
+          "terminalOperatorApplicationSha256": "sha256:895c08f14d34dce064992d6637c621025b603da6b338b227c9403b26d88eeeb0",
+          "terminalOperatorPlanSha256": "sha256:c16e7b14ac8ca8551f361eec19b4ab6631e005464920aa3b801ddc99c5d9ebde"
+        }
+      },
+      "component": {
+        "baseIndicatorId": "TOBY_CRABEL_NR",
+        "eventOutputs": {
+          "longOutput": "bullish",
+          "shortOutput": "bearish"
+        },
+        "fullConfiguration": {
+          "isActive": true,
+          "isTrendFollowing": null,
+          "label": "Toby Crabel Narrow Range",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              0,
+              1
+            ],
+            "sell": [
+              0,
+              1
+            ]
+          },
+          "scale": 1,
+          "talibConfig": [
+            {
+              "name": "sample",
+              "value": 4
+            },
+            {
+              "name": "period",
+              "value": 40
+            }
+          ],
+          "timeframe": "M5",
+          "useFormingBar": false,
+          "weight": 1
+        },
+        "indicatorId": "TOBY_CRABEL_NARROW_RANGE",
+        "indicatorInstanceId": "long_evtind_fe4c924d0dc5",
+        "lookbackBars": 1,
+        "signalPersistence": "event-with-lookback",
+        "signalRole": "trigger",
+        "timeframe": "M5"
+      },
+      "componentContextIdentity": "sha256:fa3a470cd6d5f88990953f01f88452a1dd48ddf69ad9e77920cb0093cc788a82",
+      "componentIdentity": "sha256:c0e7a28aa3f4370843a3606b7776e23ceb1cfd6357e684fc18669b186cb2b787",
+      "insertion": {
+        "bindingIndicatorInstanceId": "long_evtind_fe4c924d0dc5",
+        "exactBindingId": "long_evt_40f9169c35ae",
+        "forensicEventId": "evt_40f9169c35ae",
+        "routeAvailability": "exact_graph_references",
+        "routeReferencePaths": [
+          "graph.entryArbitration.modules[0].eventBindingIds[1]",
+          "graph.eventBindings[1].id",
+          "graph.transitions[6].guard.guards[0].guards[1].eventId"
+        ]
+      },
+      "parentCandidateId": "qd_006856a8defe4a0768fd4076f8f1",
+      "side": "long",
+      "sourceAuthorities": {
+        "authoredProgramSha256": "sha256:95be0c3d5aecd9313d4c9fb23ecdf317283f4e75e1caf5ba2f55fbe4552df78d",
+        "catalogAuthorityAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "catalogAuthoritySha256": null,
+        "evidenceWindowIdentities": [
+          "2022-07-01T00:00:00Z/2022-10-01T00:00:00Z",
+          "2023-10-01T00:00:00Z/2024-01-01T00:00:00Z",
+          "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z",
+          "2025-04-01T00:00:00Z/2025-07-01T00:00:00Z"
+        ],
+        "phenotypeIdentitySha256": "sha256:21ace83dea25727b263687e42ddf67a11f1c60c8b7c22d2701bc25f5132dd53f",
+        "proposalEntrySha256": "sha256:d9b88dfe66ece7417add465f941c3676ed4e2de4f556c8aab220fc9705983cf9",
+        "receiptAvailability": "not_retained_in_evaluated_member_or_forensic_input",
+        "receiptSha256": null,
+        "resolvedProgramSha256": "sha256:89cddeb68faa7aa63a501a2d3a06547ad3999d29d2353ead909ca67286967564",
+        "sourceProfileSha256": "sha256:5aa890b3bf8b259a96fd77160e1ef72e8a0e3f44eea749c031c5fb09ad499900",
+        "sourceProfileSnapshotSha256": "sha256:c47697b8e070e21a55b5e75a4ff9edc67fe03fb8dd413ec85c5a4659eabcc819",
+        "terminalOperatorApplicationSha256": null,
+        "terminalOperatorPlanSha256": null
+      }
+    }
+  ],
+  "manifestCanonicalPayloadSha256": "sha256:05b7c538eb601eb9a97a363184503cb144ed8f131a154e1ec055ddf233754f3a",
+  "schemaVersion": "temporal_qd_component_surrogate_extraction_census_v3",
+  "selectionRules": {
+    "cohort": "all exact accepted directional_event_insert contexts; no performance-based exclusion",
+    "m15Canary": {
+      "rule": "lexicographically first componentContextIdentity among M15 frozen contexts",
+      "selectedComponentContextIdentity": "sha256:21d5da4e0083bcd98db6cd91c636b6b995fbf7744c45b3c8e309f6bca6288492"
+    },
+    "m5Canary": {
+      "rule": "lexicographically first componentContextIdentity across the 41 frozen contexts",
+      "selectedComponentContextIdentity": "sha256:04d667575968d19f3d04bf15de34ca5f7488f1cb72829805ba47471f9448bf1e"
+    }
+  },
+  "sourcePins": {
+    "frozenV38AutoResearchCommit": "51c2f9175f441166e7fc997109e939a9f9103b5d",
+    "historicalEngineCommit": "2bd50ccb3af1700d286da88cbcaecb4aca24f1a2",
+    "v1IdentityCorpus": {
+      "path": "C:\\repos\\fuzzfolio-autoresearch\\.tmp\\packets\\codex-component-surrogate-validation-v1-pro-update-20260828\\component-surrogate-validation-v1\\component-context-identities.jsonl",
+      "role": "outcome-value-free component/context identity source",
+      "sha256": "sha256:822dc1625a338c88873347a33056d4bea98ba20756b3412f48cb03ffbd5a4134"
+    },
+    "v38CandidateProfileSource": {
+      "path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\temporal-qd-v5-fast-ephemeral-operator-family-matrix-20260820-v38\\score\\evaluated-members.jsonl",
+      "role": "frozen candidate/profile/application provenance; only candidate/profile fields are admitted",
+      "sha256": "sha256:aeab638355de72a63cbb4fe30eab29ca59ea81cbd438a9f90f7e6eef3760ef2b"
+    },
+    "v3HumanDirectiveSha256": "sha256:97522e780e19f8b399bc465b6358660a11ee4613a3b8ee0e8d1f7e07be588a26"
+  },
+  "valueScope": "identity_source_and_configuration_only"
+}
