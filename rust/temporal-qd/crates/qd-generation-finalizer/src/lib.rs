@@ -363,6 +363,17 @@ pub fn reduce_fast_ephemeral_source(source_value: Value) -> Result<(Value, Value
     reduce_fast_ephemeral_loaded_source(&source)
 }
 
+/// Emit a research-only classifier trace over a sealed fast-ephemeral source.
+///
+/// The trace is derived only after the unchanged native Variant-0 reducer has
+/// produced its cumulative and parent archives.  It then reuses the same
+/// support, direction, and Pareto helpers to explain every cumulative row;
+/// it never changes the emitted archive decisions.
+pub fn trace_fast_ephemeral_source(source_value: Value) -> Result<Value> {
+    let source = load_fast_ephemeral_source(source_value)?;
+    trace_fast_ephemeral_loaded_source(&source)
+}
+
 fn reduce_fast_ephemeral_loaded_source(source: &Source) -> Result<(Value, Value)> {
     let plan = build_auxiliary_plan(source)?;
     ensure!(
@@ -373,6 +384,99 @@ fn reduce_fast_ephemeral_loaded_source(source: &Source) -> Result<(Value, Value)
     let cumulative = build_cumulative_archive(source, &bundles)?;
     let archive = build_parent_archive(source, &cumulative)?;
     Ok((cumulative, archive))
+}
+
+fn trace_fast_ephemeral_loaded_source(source: &Source) -> Result<Value> {
+    let (cumulative, archive) = reduce_fast_ephemeral_loaded_source(source)?;
+    let policy = member(
+        member(&source.value, "rotatingEvidence")?,
+        "robustSelection",
+    )?
+    .get("policy")
+    .context("robust policy missing")?
+    .clone();
+    verify_self_hash(&policy, "policySha256", "robust policy")?;
+    let direction_policy = member(
+        member(
+            member(&source.archive_policy, "frozenPolicy")?,
+            "directionSelection",
+        )?,
+        "selectionPolicy",
+    )?;
+    let direction_policy_sha256 = sha(
+        member(
+            member(&source.archive_policy, "frozenPolicy")?,
+            "directionSelection",
+        )?,
+        "selectionPolicySha256",
+    )?;
+    ensure!(
+        canonical_sha256(direction_policy)? == direction_policy_sha256,
+        "direction-selection policy identity drifted"
+    );
+
+    let mut rows = classify_trace(
+        array(&cumulative, "members")?,
+        &policy,
+        direction_policy,
+        source.breeder_width,
+    )?;
+    for row in &mut rows {
+        let map = object_mut(row, "classifier trace row")?;
+        map.insert("generationIndex".into(), json!(source.generation_index));
+        map.insert(
+            "requiredPanelIds".into(),
+            json!(source.required_panel_ids.clone()),
+        );
+    }
+    let mut trace_quality_ids = rows
+        .iter()
+        .filter(|row| text(row, "finalLane").ok() == Some("quality"))
+        .map(|row| text(row, "candidateId").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    let mut trace_frontier_ids = rows
+        .iter()
+        .filter(|row| text(row, "finalLane").ok() == Some("frontier"))
+        .map(|row| text(row, "candidateId").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    let mut cumulative_quality_ids = array(&cumulative, "qualityCandidateIds")?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .context("quality candidate ID is not text")?;
+    let mut cumulative_frontier_ids = array(&cumulative, "frontierCandidateIds")?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .context("frontier candidate ID is not text")?;
+    trace_quality_ids.sort();
+    trace_frontier_ids.sort();
+    cumulative_quality_ids.sort();
+    cumulative_frontier_ids.sort();
+    ensure!(
+        trace_quality_ids == cumulative_quality_ids,
+        "trace quality IDs differ from native Variant-0 output"
+    );
+    ensure!(
+        trace_frontier_ids == cumulative_frontier_ids,
+        "trace frontier IDs differ from native Variant-0 output"
+    );
+
+    let mut trace = json!({
+        "schemaVersion":"temporal_qd_v37_native_classifier_trace_v1",
+        "sourceSha256":source.source_sha256,
+        "generationIndex":source.generation_index,
+        "requiredPanelIds":source.required_panel_ids.clone(),
+        "variant0Outputs":{
+            "cumulativeArchiveSha256":sha(&cumulative, "archiveSha256")?,
+            "parentArchiveSha256":sha(&archive, "archiveSha256")?,
+            "qualityCandidateIds":array(&cumulative, "qualityCandidateIds")?,
+            "frontierCandidateIds":array(&cumulative, "frontierCandidateIds")?,
+        },
+        "candidates":rows,
+    });
+    add_self_hash(&mut trace, "traceSha256")?;
+    Ok(trace)
 }
 
 fn load_fast_ephemeral_source(value: Value) -> Result<Source> {
@@ -1663,6 +1767,49 @@ struct Classified {
     frontier_ids: Vec<String>,
 }
 
+#[derive(Clone)]
+struct DirectionSide {
+    closed_trades: u64,
+    active_window_count: u64,
+    active_window_fraction: f64,
+    net_r: f64,
+    supported: bool,
+    acceptable: bool,
+    harmful: bool,
+}
+
+#[derive(Clone)]
+struct DirectionSelection {
+    long: DirectionSide,
+    short: DirectionSide,
+    eligible: bool,
+    reason_code: &'static str,
+}
+
+#[derive(Clone)]
+struct ParetoDetail {
+    front_index: usize,
+    crowding_distance: Option<f64>,
+    selected: bool,
+}
+
+struct ParetoSelection {
+    selected: Vec<Value>,
+    details: BTreeMap<String, ParetoDetail>,
+}
+
+struct ClassifierMetrics {
+    window_count: usize,
+    active_window_count: usize,
+    closed_trades: f64,
+    active_window_fraction: f64,
+    average_closed_trades_per_month: f64,
+    cumulative_conservative_net_r: f64,
+    median_window_conservative_net_r: f64,
+    worst_window_conservative_net_r: f64,
+    cumulative_cost_drag_r: f64,
+}
+
 fn classify(
     mut rows: Vec<Value>,
     policy: &Value,
@@ -1676,43 +1823,18 @@ fn classify(
     let mut base_rows = Vec::new();
     for mut row in rows.drain(..) {
         base_rows.push(row.clone());
-        let windows = array(&row, "windowMetrics")?;
-        ensure!(!windows.is_empty(), "candidate has no windows");
-        let window_count = windows.len();
-        let mut net = Vec::new();
-        let mut drawdowns = Vec::new();
-        let mut cost_drag = Vec::new();
-        let mut active = 0usize;
-        let mut trades = 0.0;
-        for w in windows {
-            let n = number_f64(w, "conservativeNetR")?;
-            let d = number_f64(w, "maxDrawdownR")?.max(0.0);
-            let t = number_f64(w, "closedTrades")?;
-            net.push(n);
-            drawdowns.push(d);
-            cost_drag.push(number_f64(w, "noCostNetR")? - n);
-            if t > 0.0 {
-                active += 1
-            };
-            trades += t;
-        }
-        let sum_net = net.iter().sum::<f64>();
-        let median = median(&net);
-        let worst = net.iter().copied().fold(f64::INFINITY, f64::min);
-        let max_dd = drawdowns.iter().copied().fold(0.0, f64::max);
-        let drag = cost_drag.iter().sum::<f64>();
-        let novelty = number_f64(&row, "novelty")?;
-        let months = number_f64(&row, "coveredMonths")?;
-        object_mut(&mut row,"candidate")?.insert("robustSupport".into(),json!({"activeWindowFraction": active as f64/window_count as f64,"averageClosedTradesPerMonth":trades/months,"coveredWindowCount":window_count,"coveredMonths":months}));
-        object_mut(&mut row,"candidate")?.insert("robustEconomics".into(),json!({"cumulativeConservativeNetR":sum_net,"medianWindowConservativeNetR":median,"worstWindowConservativeNetR":worst,"maximumWindowDrawdownR":max_dd,"cumulativeCostDragR":drag}));
-        object_mut(&mut row,"candidate")?.insert("robustObjectives".into(),json!({"worstWindowConservativeNetR":worst,"drawdown":max_dd,"costDrag":drag,"novelty":novelty}));
-        let supported =
-            active as f64 / window_count as f64 >= min_active && trades / months >= min_trades;
+        let metrics = classify_row_metrics(&mut row)?;
+        let supported = metrics.active_window_fraction >= min_active
+            && metrics.average_closed_trades_per_month >= min_trades;
         let direction_eligible = direction_selection_eligible(
             member(&row, "cumulativeRealizedBehavior")?,
             direction_policy,
         )?;
-        if supported && direction_eligible && sum_net > 0.0 && median > 0.0 {
+        if supported
+            && direction_eligible
+            && metrics.cumulative_conservative_net_r > 0.0
+            && metrics.median_window_conservative_net_r > 0.0
+        {
             quality.push(row)
         } else if supported && direction_eligible {
             frontier.push(row)
@@ -1761,7 +1883,250 @@ fn classify(
     })
 }
 
+/// Compute the exact native classifier inputs and attach the same derived
+/// fields that selected Variant-0 members carry in the cumulative archive.
+fn classify_row_metrics(row: &mut Value) -> Result<ClassifierMetrics> {
+    let windows = array(row, "windowMetrics")?;
+    ensure!(!windows.is_empty(), "candidate has no windows");
+    let window_count = windows.len();
+    let mut net = Vec::new();
+    let mut drawdowns = Vec::new();
+    let mut cost_drag = Vec::new();
+    let mut active_window_count = 0usize;
+    let mut closed_trades = 0.0;
+    for window in windows {
+        let conservative_net_r = number_f64(window, "conservativeNetR")?;
+        let maximum_drawdown_r = number_f64(window, "maxDrawdownR")?.max(0.0);
+        let trades = number_f64(window, "closedTrades")?;
+        net.push(conservative_net_r);
+        drawdowns.push(maximum_drawdown_r);
+        cost_drag.push(number_f64(window, "noCostNetR")? - conservative_net_r);
+        if trades > 0.0 {
+            active_window_count += 1;
+        }
+        closed_trades += trades;
+    }
+    let covered_months = number_f64(row, "coveredMonths")?;
+    let cumulative_conservative_net_r = net.iter().sum::<f64>();
+    let median_window_conservative_net_r = median(&net);
+    let worst_window_conservative_net_r = net.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum_window_drawdown_r = drawdowns.iter().copied().fold(0.0, f64::max);
+    let cumulative_cost_drag_r = cost_drag.iter().sum::<f64>();
+    let novelty = number_f64(row, "novelty")?;
+    let active_window_fraction = active_window_count as f64 / window_count as f64;
+    let average_closed_trades_per_month = closed_trades / covered_months;
+    let map = object_mut(row, "candidate")?;
+    map.insert(
+        "robustSupport".into(),
+        json!({
+            "activeWindowFraction":active_window_fraction,
+            "averageClosedTradesPerMonth":average_closed_trades_per_month,
+            "coveredWindowCount":window_count,
+            "coveredMonths":covered_months,
+        }),
+    );
+    map.insert(
+        "robustEconomics".into(),
+        json!({
+            "cumulativeConservativeNetR":cumulative_conservative_net_r,
+            "medianWindowConservativeNetR":median_window_conservative_net_r,
+            "worstWindowConservativeNetR":worst_window_conservative_net_r,
+            "maximumWindowDrawdownR":maximum_window_drawdown_r,
+            "cumulativeCostDragR":cumulative_cost_drag_r,
+        }),
+    );
+    map.insert(
+        "robustObjectives".into(),
+        json!({
+            "worstWindowConservativeNetR":worst_window_conservative_net_r,
+            "drawdown":maximum_window_drawdown_r,
+            "costDrag":cumulative_cost_drag_r,
+            "novelty":novelty,
+        }),
+    );
+    Ok(ClassifierMetrics {
+        window_count,
+        active_window_count,
+        closed_trades,
+        active_window_fraction,
+        average_closed_trades_per_month,
+        cumulative_conservative_net_r,
+        median_window_conservative_net_r,
+        worst_window_conservative_net_r,
+        cumulative_cost_drag_r,
+    })
+}
+
+/// Re-run the native classifier over already-reduced cumulative rows while
+/// retaining diagnostics for rows that did not survive Pareto selection.
+/// `build_cumulative_archive` is still the only producer of Variant-0
+/// outputs; this helper is intentionally report-only.
+fn classify_trace(
+    rows: &[Value],
+    policy: &Value,
+    direction_policy: &Value,
+    width: usize,
+) -> Result<Vec<Value>> {
+    let min_active = number_f64(policy, "minimumActiveWindowFraction")?;
+    let min_trades = number_f64(policy, "minimumAverageClosedTradesPerCandidateMonth")?;
+    let mut quality = Vec::new();
+    let mut frontier = Vec::new();
+    let mut traces = BTreeMap::new();
+
+    for row in rows {
+        let candidate_id = text(row, "candidateId")?.to_owned();
+        let mut classified_row = row.clone();
+        let metrics = classify_row_metrics(&mut classified_row)?;
+        let covered_months = number_f64(row, "coveredMonths")?;
+        let active_support_passed = metrics.active_window_fraction >= min_active;
+        let trade_density_passed = metrics.average_closed_trades_per_month >= min_trades;
+        let supported = active_support_passed && trade_density_passed;
+        let direction = direction_selection_details(
+            member(&classified_row, "cumulativeRealizedBehavior")?,
+            direction_policy,
+        )?;
+        let cumulative_net = metrics.cumulative_conservative_net_r;
+        let median_net = metrics.median_window_conservative_net_r;
+        let worst_net = metrics.worst_window_conservative_net_r;
+        let cost_drag = metrics.cumulative_cost_drag_r;
+        let mut reason_codes = Vec::new();
+        if !active_support_passed {
+            reason_codes.push("active_window_fraction_below_minimum");
+        }
+        if !trade_density_passed {
+            reason_codes.push("average_trades_per_month_below_minimum");
+        }
+        if !direction.long.supported {
+            reason_codes.push("long_side_unsupported");
+        }
+        if !direction.short.supported {
+            reason_codes.push("short_side_unsupported");
+        }
+        if !direction.eligible {
+            reason_codes.push(direction.reason_code);
+        }
+        if cumulative_net <= 0.0 {
+            reason_codes.push("cumulative_net_not_positive");
+        }
+        if median_net <= 0.0 {
+            reason_codes.push("median_window_net_not_positive");
+        }
+        let pre_pareto_lane =
+            if supported && direction.eligible && cumulative_net > 0.0 && median_net > 0.0 {
+                reason_codes.push("pre_pareto_quality");
+                quality.push(classified_row);
+                "quality"
+            } else if supported && direction.eligible {
+                reason_codes.push("pre_pareto_frontier");
+                frontier.push(classified_row);
+                "frontier"
+            } else {
+                "unsupported"
+            };
+        traces.insert(
+            candidate_id.clone(),
+            json!({
+                "candidateId":candidate_id,
+                "generationIndex":row.get("generationIndex").cloned().unwrap_or(Value::Null),
+                "requiredPanelIds":row.get("requiredPanelIds").cloned().unwrap_or(Value::Null),
+                "coveredMonths":covered_months,
+                "windowCount":metrics.window_count,
+                "activeWindowCount":metrics.active_window_count,
+                "activeWindowFraction":metrics.active_window_fraction,
+                "minimumActiveWindowFraction":min_active,
+                "activeSupportPassed":active_support_passed,
+                "closedTrades":metrics.closed_trades,
+                "averageClosedTradesPerMonth":metrics.average_closed_trades_per_month,
+                "minimumAverageClosedTradesPerCandidateMonth":min_trades,
+                "tradeDensityPassed":trade_density_passed,
+                "long":direction_side_json(&direction.long),
+                "short":direction_side_json(&direction.short),
+                "directionSelectionEligible":direction.eligible,
+                "directionReasonCode":direction.reason_code,
+                "cumulativeConservativeNetR":cumulative_net,
+                "medianWindowConservativeNetR":median_net,
+                "worstWindowConservativeNetR":worst_net,
+                "cumulativeCostDragR":cost_drag,
+                "preParetoLane":pre_pareto_lane,
+                "preParetoReasonCodes":reason_codes,
+                "paretoFrontIndex":Value::Null,
+                "crowdingDistance":Value::Null,
+                "laneCapacity":Value::Null,
+                "selectedAfterPareto":false,
+                "finalLane":"unsupported",
+                "finalReasonCodes":Value::Array(Vec::new()),
+            }),
+        );
+    }
+
+    let quality_selection = pareto_with_trace(quality, width)?;
+    let frontier_cap = ((width as f64) * number_f64(policy, "frontierMaximumFraction")?) as usize;
+    let frontier_capacity = frontier_cap.min(width - quality_selection.selected.len());
+    let frontier_selection = pareto_with_trace(frontier, frontier_capacity)?;
+    for (lane, capacity, selection) in [
+        ("quality", width, &quality_selection),
+        ("frontier", frontier_capacity, &frontier_selection),
+    ] {
+        for (candidate_id, detail) in &selection.details {
+            let trace = traces
+                .get_mut(candidate_id)
+                .context("Pareto trace row lacks candidate")?;
+            let map = object_mut(trace, "classifier trace row")?;
+            map.insert("paretoFrontIndex".into(), json!(detail.front_index));
+            map.insert(
+                "crowdingDistance".into(),
+                detail
+                    .crowding_distance
+                    .map_or(Value::Null, |value| json!(value)),
+            );
+            map.insert("laneCapacity".into(), json!(capacity));
+            map.insert("selectedAfterPareto".into(), json!(detail.selected));
+            let final_reason_codes = if detail.selected {
+                map.insert("finalLane".into(), json!(lane));
+                vec![if lane == "quality" {
+                    "selected_quality"
+                } else {
+                    "selected_frontier"
+                }]
+            } else {
+                let mut codes = Vec::new();
+                if detail.front_index > 0 {
+                    codes.push("pareto_dominated");
+                }
+                codes.push("lane_capacity_not_selected");
+                codes
+            };
+            map.insert(
+                "finalReasonCodes".into(),
+                Value::Array(
+                    final_reason_codes
+                        .into_iter()
+                        .map(|code| Value::String(code.into()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    Ok(traces.into_values().collect())
+}
+
+fn direction_side_json(side: &DirectionSide) -> Value {
+    json!({
+        "closedTrades":side.closed_trades,
+        "activeWindowCount":side.active_window_count,
+        "activeWindowFraction":side.active_window_fraction,
+        "netR":side.net_r,
+        "supported":side.supported,
+        "acceptable":side.acceptable,
+        "harmful":side.harmful,
+    })
+}
+
 fn direction_selection_eligible(behavior: &Value, policy: &Value) -> Result<bool> {
+    Ok(direction_selection_details(behavior, policy)?.eligible)
+}
+
+fn direction_selection_details(behavior: &Value, policy: &Value) -> Result<DirectionSelection> {
     ensure!(
         text(behavior, "schemaVersion")? == "temporal_realized_behavior_v1",
         "direction realized behavior schema is unsupported"
@@ -1779,7 +2144,7 @@ fn direction_selection_eligible(behavior: &Value, policy: &Value) -> Result<bool
         harmful_net < minimum_acceptable_net,
         "direction harmful-side threshold is invalid"
     );
-    let side = |name: &str| -> Result<(bool, bool, bool)> {
+    let side = |name: &str| -> Result<DirectionSide> {
         let row = member(member(behavior, "sides")?, name)?;
         let closed = unsigned(row, "closedTrades")?;
         let active_windows = unsigned(row, "activeWindowCount")?;
@@ -1805,24 +2170,49 @@ fn direction_selection_eligible(behavior: &Value, policy: &Value) -> Result<bool
             "direction active flag is inconsistent"
         );
         let supported = closed >= minimum_closed_trades && active_windows >= minimum_active_windows;
-        Ok((
+        Ok(DirectionSide {
+            closed_trades: closed,
+            active_window_count: active_windows,
+            active_window_fraction: active_fraction,
+            net_r: net,
             supported,
-            supported && net >= minimum_acceptable_net,
-            supported && net <= harmful_net,
-        ))
+            acceptable: supported && net >= minimum_acceptable_net,
+            harmful: supported && net <= harmful_net,
+        })
     };
-    let (long_supported, long_acceptable, long_harmful) = side("long")?;
-    let (short_supported, short_acceptable, short_harmful) = side("short")?;
-    if (long_acceptable && short_harmful) || (short_acceptable && long_harmful) {
-        return Ok(false);
-    }
-    Ok(long_acceptable && (short_acceptable || !short_supported)
-        || (short_acceptable && !long_supported))
+    let long = side("long")?;
+    let short = side("short")?;
+    let harmful_opposite = (long.acceptable && short.harmful) || (short.acceptable && long.harmful);
+    let eligible = !harmful_opposite
+        && (long.acceptable && (short.acceptable || !short.supported)
+            || (short.acceptable && !long.supported));
+    let reason_code = if eligible {
+        "eligible"
+    } else if harmful_opposite {
+        "harmful_opposite_side"
+    } else if !long.acceptable && !short.acceptable {
+        "no_acceptable_direction"
+    } else {
+        "opposite_side_supported_but_not_acceptable"
+    };
+    Ok(DirectionSelection {
+        long,
+        short,
+        eligible,
+        reason_code,
+    })
 }
 
-fn pareto(mut rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
-    if capacity == 0 || rows.is_empty() {
-        return Ok(Vec::new());
+fn pareto(rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
+    Ok(pareto_with_trace(rows, capacity)?.selected)
+}
+
+fn pareto_with_trace(mut rows: Vec<Value>, capacity: usize) -> Result<ParetoSelection> {
+    if rows.is_empty() {
+        return Ok(ParetoSelection {
+            selected: Vec::new(),
+            details: BTreeMap::new(),
+        });
     }
     rows.sort_by(|a, b| {
         text(a, "candidateId")
@@ -1863,6 +2253,7 @@ fn pareto(mut rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
         current = next;
     }
     let mut selected = Vec::new();
+    let mut details = BTreeMap::new();
     for (front_index, front) in fronts.iter().enumerate() {
         let mut distances = BTreeMap::new();
         for i in front {
@@ -1935,7 +2326,20 @@ fn pareto(mut rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
                         .cmp(text(&rows[*b], "candidateId").unwrap_or(""))
                 })
         });
-        for i in ordered.into_iter().take(capacity - selected.len()) {
+        for i in front {
+            details.insert(
+                text(&rows[*i], "candidateId")?.to_owned(),
+                ParetoDetail {
+                    front_index,
+                    crowding_distance: (!distances[i].is_infinite()).then_some(distances[i]),
+                    selected: false,
+                },
+            );
+        }
+        for i in ordered
+            .into_iter()
+            .take(capacity.saturating_sub(selected.len()))
+        {
             let mut row = rows[i].clone();
             let m = row.as_object_mut().unwrap();
             m.insert("robustParetoFront".into(), json!(front_index));
@@ -1947,13 +2351,14 @@ fn pareto(mut rows: Vec<Value>, capacity: usize) -> Result<Vec<Value>> {
                     json!(distances[&i])
                 },
             );
+            details
+                .get_mut(text(&rows[i], "candidateId")?)
+                .context("Pareto detail lacks selected candidate")?
+                .selected = true;
             selected.push(row);
         }
-        if selected.len() >= capacity {
-            break;
-        }
     }
-    Ok(selected)
+    Ok(ParetoSelection { selected, details })
 }
 
 fn build_parent_archive(source: &Source, cumulative: &Value) -> Result<Value> {
@@ -4031,6 +4436,34 @@ mod tests {
             canonical_json_line(&actual_archive).unwrap(),
             canonical_json_line(&expected_archive).unwrap()
         );
+    }
+
+    #[test]
+    fn classifier_trace_preserves_native_variant_zero_outputs() {
+        let source = current_policy_parity_source();
+        let (before_cumulative, before_archive) =
+            reduce_fast_ephemeral_loaded_source(&source).unwrap();
+        let trace = trace_fast_ephemeral_loaded_source(&source).unwrap();
+        let (after_cumulative, after_archive) =
+            reduce_fast_ephemeral_loaded_source(&source).unwrap();
+
+        assert_eq!(
+            canonical_json_line(&before_cumulative).unwrap(),
+            canonical_json_line(&after_cumulative).unwrap()
+        );
+        assert_eq!(
+            canonical_json_line(&before_archive).unwrap(),
+            canonical_json_line(&after_archive).unwrap()
+        );
+        assert_eq!(
+            trace["variant0Outputs"]["cumulativeArchiveSha256"],
+            before_cumulative["archiveSha256"]
+        );
+        assert_eq!(
+            trace["variant0Outputs"]["parentArchiveSha256"],
+            before_archive["archiveSha256"]
+        );
+        assert_eq!(array(&trace, "candidates").unwrap().len(), 1);
     }
 
     #[test]
