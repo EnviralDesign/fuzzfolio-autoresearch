@@ -1,0 +1,110 @@
+{
+  "schemaVersion": "temporal_qd_component_feature_protocol_v2",
+  "purpose": "Retrospective component-only feature extraction for the frozen V38 directional_event_insert cohort. This protocol is sealed before the extractor is allowed to read any child-outcome material.",
+  "authority": {
+    "autoresearchCommit": "51c2f9175f441166e7fc997109e939a9f9103b5d",
+    "historicalExecutionEngineCommit": "2bd50ccb3af1700d286da88cbcaecb4aca24f1a2",
+    "workerContractSha256": "sha256:40292e2a62171f1d13fda9c5e9ba953d3e04d4270845889caabb5aa80648f4c4",
+    "campaign": "temporal-qd-v5-fast-ephemeral-operator-family-matrix-20260820-v38",
+    "developmentPanels": ["panel-1", "panel-2", "panel-3"],
+    "developmentPanelPrimary": "panel-3",
+    "windowCountPerPanel": 4
+  },
+  "componentOnlyBoundary": {
+    "permittedInputs": [
+      "frozen component indicator configuration and event binding",
+      "frozen panel/window evidence identity",
+      "historical source tree pinned by historicalExecutionEngineCommit",
+      "historical OHLCV bars bound to the task lake-window attestation"
+    ],
+    "forbiddenInputs": [
+      "candidate TemporalGraph",
+      "states, transitions, actions, positions, trades, exits, management, costs, P&L",
+      "child outcomes or outcome reports",
+      "archive, quality, direction, risk, operator, or production policy"
+    ],
+    "projection": "Instantiate only the frozen indicator from the historical engine, calculate its directional output arrays on completed OHLCV bars, and apply the frozen event binding. No profile simulation or graph execution is allowed.",
+    "extractorOutcomePathPolicy": "The feature-extraction command has no outcome-path argument and its module may not import an outcome reader."
+  },
+  "barAndEventRules": {
+    "barOrder": "chronological completed bars only",
+    "activeThreshold": 1e-09,
+    "directionalActivity": "A long or short output is active when its selected numeric directional score is greater than activeThreshold.",
+    "eventStart": "An event start is an active directional bar whose immediately preceding completed bar for that same direction is inactive. The first bar is a start when active.",
+    "freshAvailability": "The fraction of event starts among active directional bars; this is descriptive availability, not an entry decision.",
+    "forwardReturns": "For an event start at close[t], directional return at horizon h is sign * (close[t+h] - close[t]) / close[t], where sign is +1 for long and -1 for short. MFE and MAE are the maximum and minimum directional intrahorizon excursion from close[t], respectively.",
+    "volatilityNormalization": "Use the unmodified forward_response_atlas_v1 volatility normalization only when its exact input semantics and source identity match; otherwise retain raw forward-return fields and mark the normalized field unavailable."
+  },
+  "rawFeatureVector": {
+    "requiredPerComponentPanelWindowDirection": [
+      "barCount",
+      "activeBarCount",
+      "activeFraction",
+      "eventStartCount",
+      "eventStartsPer1000Bars",
+      "eventStartsPer10000Bars",
+      "meanPersistenceBars",
+      "medianPersistenceBars",
+      "maxPersistenceBars",
+      "meanBarsBetweenStarts",
+      "medianBarsBetweenStarts",
+      "configuredLookbackBars",
+      "signalPersistence",
+      "freshAvailability",
+      "forwardSampleCount",
+      "forwardDirectionalHitRate",
+      "forwardMeanMFE",
+      "forwardMeanMAE",
+      "forwardMeanMFEminusMAE",
+      "forwardVolNormalized"
+    ],
+    "forwardHorizonsBars": [1, 3, 6, 12, 24],
+    "unavailableEncoding": "null together with an explicit unavailableReason; zero is never used for unavailable evidence.",
+    "identityFields": [
+      "componentIdentitySha256",
+      "contextIdentitySha256",
+      "indicatorImplementationSha256",
+      "eventBindingSha256",
+      "panelEvidenceSha256",
+      "lakeWindowAttestationSha256",
+      "rawFeatureRowSha256"
+    ]
+  },
+  "scores": {
+    "S0": {
+      "kind": "raw descriptive vector",
+      "fields": ["eventStartsPer1000Bars", "activeFraction", "freshAvailability"],
+      "rankingRule": "none",
+      "interpretation": "availability only; not an alpha or selection score"
+    },
+    "S1": {
+      "kind": "forward_response_atlas_v1",
+      "formulaPolicy": "Use the unmodified pre-existing forward_response_atlas_v1 formula only after proving that the historical component-output, event-start, horizon, volatility, bar-order, and panel-evidence semantics exactly match that implementation. Otherwise S1 is unavailable.",
+      "tuning": "forbidden"
+    },
+    "S2": {
+      "kind": "parent-entry-conditioned descriptive retention",
+      "formulaPolicy": "Only exact retained parent entry moments may be used. Do not reconstruct an entry graph or use all route operations. If exact moments are absent, S2 is unavailable.",
+      "tuning": "forbidden"
+    },
+    "S3": {
+      "kind": "outcome-independent composite",
+      "formulaPolicy": "Unavailable: no completely specified pre-existing outcome-independent formula was identified before this protocol was sealed.",
+      "tuning": "forbidden"
+    }
+  },
+  "outcomeJoin": {
+    "separateCommand": true,
+    "acceptedInputs": ["sealed component feature rows", "frozen V38 outcome reports", "this protocol"],
+    "prohibitedBehavior": ["recompute raw features", "alter component identity", "alter panel evidence identity", "derive a score from outcomes"],
+    "primaryUnit": "one outcome per realized phenotype/context, using an outcome-blind deterministic representative rule or cluster weighting",
+    "resampling": "fixed-seed cluster/phenotype bootstrap or permutation only; iid resampling is forbidden"
+  },
+  "nonGoals": [
+    "strategy replay",
+    "new child evaluation",
+    "worker, gateway, or Vast activity",
+    "event calibration or generation",
+    "archive or production policy change"
+  ]
+}
