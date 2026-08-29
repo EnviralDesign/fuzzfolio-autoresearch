@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "temporal_qd_component_feature_protocol_v2_terminology_addendum_v1",
+  "purpose": "Version the component-only terminology correction required before V38 feature extraction without mutating the sealed V2 feature protocol.",
+  "supersedesFieldTerminologyOnly": {
+    "sealedProtocolPath": "research/temporal-qd/component-surrogate-validation-v2/feature-protocol-v2.json",
+    "sealedProtocolCommit": "0a5a74de695d98dce3b31e896a4c21d748471c04",
+    "sealedProtocolSha256": "sha256:b412209520f0a1b8ea7bacf0d1f0e0bef1eda508f0e8096fdb8e31bc8b8c04cc",
+    "sealedProtocolWasModified": false
+  },
+  "terminology": {
+    "deprecatedDescriptiveField": "freshAvailability",
+    "replacementDescriptiveField": "eventStartShareOfActiveBars",
+    "replacementDefinition": "eventStartCount / activeBarCount for a selected directional component output; null when activeBarCount is zero.",
+    "runtimeFreshnessField": "freshEventAvailability",
+    "runtimeFreshnessStatus": "unavailable_component_only",
+    "runtimeFreshnessUnavailableReason": "The exact V38 fresh_event guard belongs to the frozen graph/event runtime. This component-only canary may calculate indicator and event projections but may not execute the graph, state machine, or entry guards."
+  },
+  "canaryBinding": {
+    "selectionMethod": "first frozen task in the exact V38 panel-3/year-1-q3 screening task file; task order is the sole selection rule",
+    "taskPath": "runs/temporal-qd-v5-fast-ephemeral-operator-family-matrix-20260820-v38/run/g2-parents-800/generations/generation-0003/campaign/proposal-current-panel/screening-run/tasks.jsonl",
+    "taskId": "temporal-search-6667c9b783c2363417e6b38b4784e3d0",
+    "candidateId": "qd_28dba1f812d0cb5716ffe871a6ce",
+    "window": {
+      "panel": "panel-3",
+      "windowId": "year-1-q3",
+      "analysisStart": "2022-07-01T00:00:00Z",
+      "analysisEnd": "2022-10-01T00:00:00Z",
+      "frozenWindowSemanticSha256": "sha256:fce37ff4b2469a0cdc9eeca306e6e98667a8b074f9eee07771f201f4effcc478"
+    },
+    "component": {
+      "indicatorId": "PRICE_RECLAIM_MA",
+      "indicatorInstanceId": "long_trend_trigger",
+      "timeframe": "M5",
+      "useFormingBar": false,
+      "lookbackBars": 1,
+      "signalPersistence": "event-with-lookback",
+      "talibConfig": [
+        {"name": "timeperiod", "value": 21},
+        {"name": "matype", "value": 1},
+        {"name": "min_prior_displacement", "value": 0}
+      ],
+      "eventBinding": {
+        "eventId": "long_e_af3fff999d38",
+        "longOutput": "bullish",
+        "shortOutput": "bearish"
+      }
+    },
+    "activityProjection": {
+      "selectedOutputs": ["long", "short"],
+      "activityThreshold": 1e-09,
+      "activeDefinition": "The selected directional score is active exactly when score > 1e-9.",
+      "eventStartDefinition": "For each direction independently, an active completed bar is an event start when the preceding completed bar is inactive; the first completed bar is a start when active.",
+      "featureClock": "M5 completed_bar; calculate from the isolated lookback-inclusive window and report features only on the frozen analysis interval."
+    }
+  },
+  "boundary": {
+    "outcomeFilesAllowedInExtractor": false,
+    "temporalGraphAllowed": false,
+    "stateMachineAllowed": false,
+    "entryExitPositionTradeCostOrPnlAllowed": false,
+    "currentLakeFallbackAllowed": false,
+    "formulaTuningAllowed": false
+  },
+  "addendumCanonicalPayloadSha256": "sha256:1cefb33137149662de79def61962bbed1307e10b7eb09d9a7c963a911c693a00"
+}

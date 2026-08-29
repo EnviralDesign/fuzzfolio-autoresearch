@@ -1,0 +1,99 @@
+{
+  "schemaVersion": "temporal_qd_scope_archive_semantic_authority_ruling_v1",
+  "purpose": "Record the human-approved recovery acceptance rule for V38 component-only validation without changing the sealed feature protocol.",
+  "authority": {
+    "autoresearchCommit": "51c2f9175f441166e7fc997109e939a9f9103b5d",
+    "historicalExecutionEngineCommit": "2bd50ccb3af1700d286da88cbcaecb4aca24f1a2",
+    "featureProtocolCommit": "0a5a74de695d98dce3b31e896a4c21d748471c04",
+    "featureProtocolSha256": "sha256:b412209520f0a1b8ea7bacf0d1f0e0bef1eda508f0e8096fdb8e31bc8b8c04cc",
+    "campaign": "temporal-qd-v5-fast-ephemeral-operator-family-matrix-20260820-v38",
+    "humanRulingDocument": "codex_v38_semantic_authority_ruling_and_resume_prompt.md",
+    "humanRulingDocumentSha256": "sha256:3019e684d9a692a6542874183a2089fac2f7bf3be5136ce84eb17d42590882d2"
+  },
+  "semanticContract": {
+    "id": "fuzzfolio.canonical-bars.semantic-digest.v2",
+    "implementation": "fuzzfolio-data-lake:/app/app/lake/window_attestation.py",
+    "implementationSha256": "sha256:c6cae40cf63661c17cf71f843801309c687be28c5dc08dac56ff50154bac29a6",
+    "contractCitation": "fuzzfolio-data-lake window_attestation.py: SEMANTIC_DIGEST_CONTRACT_V2, compute_scope_semantic_sha256_from_days, compute_window_semantic_sha256",
+    "engineCitation": "shared/python/fuzzfolio_core/fuzzfolio_core/models/lake_window.py: SEMANTIC_DIGEST_CONTRACT_V2"
+  },
+  "revisedRecoveryRule": {
+    "status": "exact_semantic_authority_recovered",
+    "acceptance": "The canonical frozen request, complete archive scopes, archive raw-file hashes, exact local V2 scope/window semantic recomputation, and live semantic verifier must match. Historical and recovery receipts are retained as separate provenance fields and are not required to equal.",
+    "historicalReceiptEqualityRequired": false,
+    "historicalReceiptWasReproduced": false,
+    "forbiddenInterpretation": "The recovery receipt must not be relabeled as the historical V38 receipt."
+  },
+  "window": {
+    "panel": "panel-3",
+    "windowId": "year-1-q3",
+    "request": {
+      "schema_version": "fuzzfolio.market-data-window-request.v1",
+      "dataset": "bars",
+      "pairs": ["EURUSD"],
+      "timeframes": ["H1", "M15", "M5"],
+      "data_start": "2022-05-11T00:00:00Z",
+      "data_end": "2022-10-01T00:00:00Z",
+      "coverage_policy": "require_complete"
+    },
+    "frozenWindowSemanticSha256": "sha256:fce37ff4b2469a0cdc9eeca306e6e98667a8b074f9eee07771f201f4effcc478",
+    "historicalV38AttestationSha256": "sha256:69ccc2e8c89b1f50c01e42eaa1612be161ee98dca8520d0380f3f6870b391988",
+    "recoveryAttestationSha256": "sha256:5fdf4893730e653a99c63f263cfc023ec651bf156d63a90078ef470486c864a4",
+    "historicalCreationCoverageProvenance": {
+      "globalCoverageSha256": "sha256:3f33c16cf1604484c7cfc428627cb6620a326ff7f9514f96b0c53932c156ca2f",
+      "sourceCoverageSha256": "sha256:91b3089e7bb8711905eb65c01e48f31fe1ac0fb652ffe7e3f24916b584223019"
+    },
+    "recoveryCoverageProvenance": {
+      "globalCoverageSha256": "sha256:fa1cc91e9196c229b68977b57b3e6b24a0571cfefef8f107eccd399d068c1ca2",
+      "sourceCoverageSha256": "sha256:8120307df075cb6097ceef7c3aed6a5012ca1876a2c811b411cf9d343386bf96",
+      "promotionAuthorityIndexSha256": "sha256:936183f8eb639b220415dfa65268016b5acf279481be54fcc0a2a38b6e332291"
+    }
+  },
+  "isolatedRecovery": {
+    "root": ".tmp/artifacts/component-surrogate-validation-v2/isolated-lake/panel-3-year-1-q3",
+    "archiveScopesRecovered": 15,
+    "archiveRawArtifactSha256": {
+      "H1": {
+        "2022-05": "64c34a3591bb5134429402b31c9f4a1c55346c211fe704296c9fe5c17218702c",
+        "2022-06": "06a79de3288a7f86d8c5399a4a91253dea4d48ae7b8a51cdaf89dac010cee203",
+        "2022-07": "883d4d5352b8496b862dc9cfa73eeb78031d36ae186f0b063b5895ae6bce532e",
+        "2022-08": "05bb54991d1a3a49924b59422b88aed84543ae7da96b7ea2c286fd64f7ac9b4a",
+        "2022-09": "57a601d5cdf5c69e03c3200d0b30e33d92bf0830c86937f69a5dff245c9d1aed"
+      },
+      "M15": {
+        "2022-05": "57d8c62e0c477cd81403ab076a245f851e9ae360907b4e9ffa76d262da114e78",
+        "2022-06": "faeb8742b88418a409569304d9db047fe6b3e256a9b440893712dccad4404f33",
+        "2022-07": "ffe375a278a9a646f237d65ba2d7c09c90d53447f3e6015c31410dc1a58c2435",
+        "2022-08": "72fe581c9fdf71cf39d515113f182157a31fb9e4b7d57d105cd298c8a685c64f",
+        "2022-09": "911184bf7e58b8355a56284e69174bcd346830f6e29b09f5683dc4b195aa9902"
+      },
+      "M5": {
+        "2022-05": "0cf437fb6895dba010ed54545bc9281c4280004bdd283a36eaf3d2da324ab9c5",
+        "2022-06": "e6d3d538b14bbd2679395653b75614396c9d044dd346e4decf89246bbf9cfb03",
+        "2022-07": "2cb442d2d3805a2577225afd347158dc08dc1c0a95389a4e1fdfb174a1e5a25f",
+        "2022-08": "249fb90ec0a161366a5a890ecb158486f7b86af752ccbd3c67030a7e534959df",
+        "2022-09": "732e42864915adbc5045a9d847eb6953fdfb48a615e2ba00bf7fa699ed97dde6"
+      }
+    },
+    "localRecomputation": {
+      "passCount": 2,
+      "allArchiveRawHashesMatch": true,
+      "localRecomputedWindowSemanticSha256": "sha256:fce37ff4b2469a0cdc9eeca306e6e98667a8b074f9eee07771f201f4effcc478",
+      "semanticResultCanonicalPayloadSha256": "sha256:34656e35657387c78b312aae44d37a27bd684acb4bddd4a6e3a93dce69c76bdd",
+      "deterministicAcrossFreshProcesses": true,
+      "reports": [
+        ".tmp/artifacts/component-surrogate-validation-v2/p3-local-semantic-recompute-pass-1.json",
+        ".tmp/artifacts/component-surrogate-validation-v2/p3-local-semantic-recompute-pass-2.json"
+      ]
+    }
+  },
+  "boundaries": {
+    "sealedFeatureProtocolModified": false,
+    "currentLakeMutated": false,
+    "strategyOrGraphExecuted": false,
+    "outcomeMaterialOpenedByExtractor": false,
+    "workersGatewayVastGenerationOrCalibrationStarted": false,
+    "productionPolicyChanged": false
+  },
+  "authorityCanonicalPayloadSha256": "sha256:ad5d85b696b0d02f6a41a7c10a9e506c17338108f7f3e913230ed9a56ae6ad4d"
+}
