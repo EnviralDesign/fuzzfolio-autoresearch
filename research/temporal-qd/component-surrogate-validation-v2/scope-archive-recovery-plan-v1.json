@@ -1,0 +1,166 @@
+{
+  "schemaVersion": "fuzzfolio.component-surrogate.scope-archive-recovery-plan.v1",
+  "planCanonicalPayloadSha256": "sha256:6d517eb026a1d748a51370b6660d7b0cb02968ce5016fa3ccc98003d8d30dae5",
+  "hashScope": "SHA-256 of the canonical JSON object with planCanonicalPayloadSha256 omitted.",
+  "purpose": "Read-only recovery of exact V38 historical bar partitions into an isolated research root before any component-only canary.",
+  "authority": {
+    "autoresearchSourceCommit": "51c2f9175f441166e7fc997109e939a9f9103b5d",
+    "v2CheckpointCommit": "36602f991090296c5d28e9fd8bdb71a2e47624e8",
+    "campaign": "temporal-qd-v5-fast-ephemeral-operator-family-matrix-20260820-v38",
+    "authorityRoot": "runs/temporal-qd-v5-native-4000x1024x5-20260813-v1/authority",
+    "panelTemplates": {
+      "panel-1-template-preparation.json": "sha256:81dd78a4435f3a93c6483463f85e406e679af0ba1a766ddf99c6a7acf6b3f7c1",
+      "panel-2-template-preparation.json": "sha256:b6d0911ac55b4d1496fcfc4ac7da59de76a7f13969353b98a986d561abe92bcd",
+      "panel-3-template-preparation.json": "sha256:6621b534eb62a11dad6b88176a255134e8cf1c06ea8021e8692031cdedc8ef8c",
+      "rotating-evidence-config.json": "sha256:b17cb96869ee699e3de2ccbbebd5c89e6cc0f2620823908627f54753b9e2aeff"
+    }
+  },
+  "archiveQueryContract": {
+    "dataset": "bars",
+    "pair": "EURUSD",
+    "coveragePolicy": "require_complete",
+    "endpoints": [
+      "/api/artifacts/files",
+      "/api/artifacts/scope-archive",
+      "/api/lake/window-attestations/verify"
+    ],
+    "access": "read_only_sequential",
+    "on429": "honor Retry-After and bounded exponential backoff; record throttled_unresolved if the retry budget expires",
+    "isolation": "C:/repos/fuzzfolio-autoresearch/.tmp/artifacts/component-surrogate-validation-v2/isolated-lake",
+    "productionLakeMutation": false
+  },
+  "windows": [
+    {
+      "panel": "panel-1",
+      "windowId": "year-1-q1",
+      "taskAttestationSha256": "sha256:fc3d33a508aefd7d0b5433028e139d0f02a2a1167e8d52bc566c172a6cce4d64",
+      "windowSemanticSha256": "sha256:7ebc1c71cd8ce82e37e43f72b58245c2c8094c47c0bb8387ad42e316fcc8fa22",
+      "dataStart": "2021-11-11T00:00:00Z",
+      "dataEnd": "2022-04-01T00:00:00Z",
+      "analysisWindowStart": "2022-01-01T00:00:00Z",
+      "analysisWindowEnd": "2022-04-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2021-11", "2021-12", "2022-01", "2022-02", "2022-03"], "M15": ["2021-11", "2021-12", "2022-01", "2022-02", "2022-03"], "M5": ["2021-11", "2021-12", "2022-01", "2022-02", "2022-03"]}
+    },
+    {
+      "panel": "panel-1",
+      "windowId": "year-2-q2",
+      "taskAttestationSha256": "sha256:d349e8ebaa149cdbd4a9520f93a354688badae776e0deacac1e756ae76d90d76",
+      "windowSemanticSha256": "sha256:360a4d107d5b27acd5f4137d8e4942363c60b55fe4cfd786c139a5f1b0f375d4",
+      "dataStart": "2023-02-09T00:00:00Z",
+      "dataEnd": "2023-07-01T00:00:00Z",
+      "analysisWindowStart": "2023-04-01T00:00:00Z",
+      "analysisWindowEnd": "2023-07-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2023-02", "2023-03", "2023-04", "2023-05", "2023-06"], "M15": ["2023-02", "2023-03", "2023-04", "2023-05", "2023-06"], "M5": ["2023-02", "2023-03", "2023-04", "2023-05", "2023-06"]}
+    },
+    {
+      "panel": "panel-1",
+      "windowId": "year-3-q3",
+      "taskAttestationSha256": "sha256:68be16013b4fa623e1169053d2371d17e545b48a081110e5bae8c79b4547baf9",
+      "windowSemanticSha256": "sha256:8bf068db260d2941e399de1cdb8aa05714c0a1392b6a6d2ac6c495a84c31de52",
+      "dataStart": "2024-05-11T00:00:00Z",
+      "dataEnd": "2024-10-01T00:00:00Z",
+      "analysisWindowStart": "2024-07-01T00:00:00Z",
+      "analysisWindowEnd": "2024-10-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2024-05", "2024-06", "2024-07", "2024-08", "2024-09"], "M15": ["2024-05", "2024-06", "2024-07", "2024-08", "2024-09"], "M5": ["2024-05", "2024-06", "2024-07", "2024-08", "2024-09"]}
+    },
+    {
+      "panel": "panel-1",
+      "windowId": "year-4-q4",
+      "taskAttestationSha256": "sha256:3a96e6e6ec9843e7768436a96af1d041c89c309bdfd8e99fb39d9143f607becb",
+      "windowSemanticSha256": "sha256:a795afc8e4ef063640638bbaf812fc1b2f9d75dae392d8c19843e4c91a45a06e",
+      "dataStart": "2025-08-11T00:00:00Z",
+      "dataEnd": "2026-01-01T00:00:00Z",
+      "analysisWindowStart": "2025-10-01T00:00:00Z",
+      "analysisWindowEnd": "2026-01-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2025-08", "2025-09", "2025-10", "2025-11", "2025-12"], "M15": ["2025-08", "2025-09", "2025-10", "2025-11", "2025-12"], "M5": ["2025-08", "2025-09", "2025-10", "2025-11", "2025-12"]}
+    },
+    {
+      "panel": "panel-2",
+      "windowId": "year-1-q2",
+      "taskAttestationSha256": "sha256:ba3ae3a357c99cb6c415ff4e3315058c6ed853d7025ea828d1938aeb0263bcb0",
+      "windowSemanticSha256": "sha256:313d6ffb38f83e1f11051ef78b19ef164f2a58894e2520afc0293129ff516237",
+      "dataStart": "2022-02-09T00:00:00Z",
+      "dataEnd": "2022-07-01T00:00:00Z",
+      "analysisWindowStart": "2022-04-01T00:00:00Z",
+      "analysisWindowEnd": "2022-07-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2022-02", "2022-03", "2022-04", "2022-05", "2022-06"], "M15": ["2022-02", "2022-03", "2022-04", "2022-05", "2022-06"], "M5": ["2022-02", "2022-03", "2022-04", "2022-05", "2022-06"]}
+    },
+    {
+      "panel": "panel-2",
+      "windowId": "year-2-q3",
+      "taskAttestationSha256": "sha256:71b630c7a17853086e8e7d1a6e71fa2d6855887aae08ec59123cb9a3b2c3e762",
+      "windowSemanticSha256": "sha256:c42ec30e2cd46056f1b68dfde57934de09468e5d9383a65eb44ef88599cd6523",
+      "dataStart": "2023-05-11T00:00:00Z",
+      "dataEnd": "2023-10-01T00:00:00Z",
+      "analysisWindowStart": "2023-07-01T00:00:00Z",
+      "analysisWindowEnd": "2023-10-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2023-05", "2023-06", "2023-07", "2023-08", "2023-09"], "M15": ["2023-05", "2023-06", "2023-07", "2023-08", "2023-09"], "M5": ["2023-05", "2023-06", "2023-07", "2023-08", "2023-09"]}
+    },
+    {
+      "panel": "panel-2",
+      "windowId": "year-3-q4",
+      "taskAttestationSha256": "sha256:ffa1366a15058a9e26e12a43b174f4e4ae86f3f6b486c9449871aa8a472af4c0",
+      "windowSemanticSha256": "sha256:ee1e30fe2e09fb11a50ebc0ed9c41da444e657178a2aa449a406218110c8fe77",
+      "dataStart": "2024-08-11T00:00:00Z",
+      "dataEnd": "2025-01-01T00:00:00Z",
+      "analysisWindowStart": "2024-10-01T00:00:00Z",
+      "analysisWindowEnd": "2025-01-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2024-08", "2024-09", "2024-10", "2024-11", "2024-12"], "M15": ["2024-08", "2024-09", "2024-10", "2024-11", "2024-12"], "M5": ["2024-08", "2024-09", "2024-10", "2024-11", "2024-12"]}
+    },
+    {
+      "panel": "panel-2",
+      "windowId": "year-4-q1",
+      "taskAttestationSha256": "sha256:cfb420c48b5cbe977447617c082ff4fc0fd779da41013c30b3b827a6f6a0c503",
+      "windowSemanticSha256": "sha256:9ccfcdc7d6b9d593b460d04bd12763b5a7a92cdc5b1fa2efad51b05a2eab75f1",
+      "dataStart": "2024-11-11T00:00:00Z",
+      "dataEnd": "2025-04-01T00:00:00Z",
+      "analysisWindowStart": "2025-01-01T00:00:00Z",
+      "analysisWindowEnd": "2025-04-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2024-11", "2024-12", "2025-01", "2025-02", "2025-03"], "M15": ["2024-11", "2024-12", "2025-01", "2025-02", "2025-03"], "M5": ["2024-11", "2024-12", "2025-01", "2025-02", "2025-03"]}
+    },
+    {
+      "panel": "panel-3",
+      "windowId": "year-1-q3",
+      "taskAttestationSha256": "sha256:69ccc2e8c89b1f50c01e42eaa1612be161ee98dca8520d0380f3f6870b391988",
+      "windowSemanticSha256": "sha256:fce37ff4b2469a0cdc9eeca306e6e98667a8b074f9eee07771f201f4effcc478",
+      "dataStart": "2022-05-11T00:00:00Z",
+      "dataEnd": "2022-10-01T00:00:00Z",
+      "analysisWindowStart": "2022-07-01T00:00:00Z",
+      "analysisWindowEnd": "2022-10-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2022-05", "2022-06", "2022-07", "2022-08", "2022-09"], "M15": ["2022-05", "2022-06", "2022-07", "2022-08", "2022-09"], "M5": ["2022-05", "2022-06", "2022-07", "2022-08", "2022-09"]}
+    },
+    {
+      "panel": "panel-3",
+      "windowId": "year-2-q4",
+      "taskAttestationSha256": "sha256:a166dad2b98193e23f05b5d9ce0381c639ea2a799d77e0284dc40767d2907f7b",
+      "windowSemanticSha256": "sha256:8522bb0da3b7bcbad2f00b458a3eb96ec6dd016cfd016f8b85bc3e42d90fed7d",
+      "dataStart": "2023-08-11T00:00:00Z",
+      "dataEnd": "2024-01-01T00:00:00Z",
+      "analysisWindowStart": "2023-10-01T00:00:00Z",
+      "analysisWindowEnd": "2024-01-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2023-08", "2023-09", "2023-10", "2023-11", "2023-12"], "M15": ["2023-08", "2023-09", "2023-10", "2023-11", "2023-12"], "M5": ["2023-08", "2023-09", "2023-10", "2023-11", "2023-12"]}
+    },
+    {
+      "panel": "panel-3",
+      "windowId": "year-3-q1",
+      "taskAttestationSha256": "sha256:68185a32d28076e7491f06c94a1ac85f07e68b4bc0a91d3e5e79ca16bf5256a8",
+      "windowSemanticSha256": "sha256:5241e09bf9956301c4b2413e56f339cc829732e28d0242a700d1c5fe474a1c77",
+      "dataStart": "2023-11-11T00:00:00Z",
+      "dataEnd": "2024-04-01T00:00:00Z",
+      "analysisWindowStart": "2024-01-01T00:00:00Z",
+      "analysisWindowEnd": "2024-04-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2023-11", "2023-12", "2024-01", "2024-02", "2024-03"], "M15": ["2023-11", "2023-12", "2024-01", "2024-02", "2024-03"], "M5": ["2023-11", "2023-12", "2024-01", "2024-02", "2024-03"]}
+    },
+    {
+      "panel": "panel-3",
+      "windowId": "year-4-q2",
+      "taskAttestationSha256": "sha256:0326e7ac34388559b5a2c4a87c36a727f72be684d493593db6787f3a6827bbde",
+      "windowSemanticSha256": "sha256:a69d0d3309390ed22688e4b620407b5bdc94283329a897693155511e978f2aed",
+      "dataStart": "2025-02-09T00:00:00Z",
+      "dataEnd": "2025-07-01T00:00:00Z",
+      "analysisWindowStart": "2025-04-01T00:00:00Z",
+      "analysisWindowEnd": "2025-07-01T00:00:00Z",
+      "monthlyPartitions": {"H1": ["2025-02", "2025-03", "2025-04", "2025-05", "2025-06"], "M15": ["2025-02", "2025-03", "2025-04", "2025-05", "2025-06"], "M5": ["2025-02", "2025-03", "2025-04", "2025-05", "2025-06"]}
+    }
+  ]
+}
