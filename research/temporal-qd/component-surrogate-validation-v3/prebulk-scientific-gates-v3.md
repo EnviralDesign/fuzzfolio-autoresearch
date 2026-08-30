@@ -16,8 +16,12 @@ The historical engine authority is `EnviralDesign/FuzzFolio` commit
 `extraction-census-v3.json` is an outcome-value-free, self-hashed census:
 
 - 41 directional component contexts and 19 immutable component identities.
-- Declared selection coverage: 25 long contexts, 17 short contexts, 11 M5
-  contexts, and 9 M15 contexts.
+- Context-derived coverage: 20 long contexts, 21 short contexts, 37 M5
+  contexts, and 4 M15 contexts.
+- Separately, the frozen outcome-reconciliation cohort declares 25 exact P3
+  same-panel parent-comparable contexts, 17 realized phenotypes among those
+  contexts, 11 children with P1/P2 backfill, and 9 exact P1/P2 parent-comparable
+  cases.  Those are not side or timeframe counts.
 - Canonical payload SHA-256:
   `sha256:05b7c538eb601eb9a97a363184503cb144ed8f131a154e1ec055ddf233754f3a`.
 - The M5 and M15 canaries are selected lexicographically from that manifest,
