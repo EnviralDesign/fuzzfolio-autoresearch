@@ -9481,11 +9481,13 @@ struct V5StaticNeighborhoodChoice {
     operator_id: String,
     choice_kind: String,
     construction_kind: Option<String>,
+    compiler_admitted: bool,
     choice: crate::v5_operators::V5LegacyOperatorChoice,
 }
 
 struct V5StaticNeighborhoodPreparedSide {
     parent_program: Value,
+    compiled_profile: crate::v5_operators::V5CompiledProfileView,
     recompiler: Arc<V5SealedEvolvedPairRecompiler>,
 }
 
@@ -9552,17 +9554,184 @@ fn static_neighborhood_balanced_selection(
     selected
 }
 
-fn static_neighborhood_classification(
-    operator_id: &str,
-    child_equals_parent: bool,
-) -> &'static str {
-    if child_equals_parent {
-        "exact_no_op"
-    } else if operator_id == crate::v5_operators::V5_TOPOLOGY_OPERATOR_ID {
-        "coherent_single_region_change"
-    } else {
-        "small_local_change"
+fn static_neighborhood_pointer_component(component: &str) -> String {
+    component.replace('~', "~0").replace('/', "~1")
+}
+
+fn static_neighborhood_pointer_join(path: &str, component: &str) -> String {
+    format!("{path}/{}", static_neighborhood_pointer_component(component))
+}
+
+fn static_neighborhood_value_witness(value: &Value) -> Result<Value> {
+    match value {
+        Value::Array(values) => Ok(object([
+            ("kind", Value::String("array".to_owned())),
+            ("length", Value::from(values.len() as u64)),
+            ("sha256", Value::String(canonical_sha256(value)?)),
+        ])),
+        Value::Object(values) => Ok(object([
+            ("kind", Value::String("object".to_owned())),
+            ("memberCount", Value::from(values.len() as u64)),
+            ("sha256", Value::String(canonical_sha256(value)?)),
+        ])),
+        _ => clone_value(value),
     }
+}
+
+fn static_neighborhood_diff_entries(
+    parent: Option<&Value>,
+    child: Option<&Value>,
+    path: &str,
+    entries: &mut Vec<Value>,
+) -> Result<()> {
+    if parent == child {
+        return Ok(());
+    }
+    match (parent, child) {
+        (Some(Value::Object(parent_fields)), Some(Value::Object(child_fields))) => {
+            let mut keys = BTreeSet::new();
+            keys.extend(parent_fields.keys().cloned());
+            keys.extend(child_fields.keys().cloned());
+            for key in keys {
+                static_neighborhood_diff_entries(
+                    parent_fields.get(&key),
+                    child_fields.get(&key),
+                    &static_neighborhood_pointer_join(path, &key),
+                    entries,
+                )?;
+            }
+        }
+        (Some(Value::Array(parent_values)), Some(Value::Array(child_values))) => {
+            for index in 0..parent_values.len().max(child_values.len()) {
+                static_neighborhood_diff_entries(
+                    parent_values.get(index),
+                    child_values.get(index),
+                    &static_neighborhood_pointer_join(path, &index.to_string()),
+                    entries,
+                )?;
+            }
+        }
+        _ => {
+            let before_present = parent.is_some();
+            let after_present = child.is_some();
+            entries.push(object([
+                (
+                    "path",
+                    Value::String(if path.is_empty() {
+                        "/".to_owned()
+                    } else {
+                        path.to_owned()
+                    }),
+                ),
+                ("beforePresent", Value::Bool(before_present)),
+                ("afterPresent", Value::Bool(after_present)),
+                (
+                    "before",
+                    match parent {
+                        Some(value) => static_neighborhood_value_witness(value)?,
+                        None => Value::Null,
+                    },
+                ),
+                (
+                    "after",
+                    match child {
+                        Some(value) => static_neighborhood_value_witness(value)?,
+                        None => Value::Null,
+                    },
+                ),
+            ]));
+        }
+    }
+    Ok(())
+}
+
+fn static_neighborhood_delta_category(path: &str) -> &'static str {
+    if path.starts_with("/nodes/") {
+        if path.contains("/guard") {
+            "guard"
+        } else if path.contains("/actions") {
+            "action"
+        } else {
+            "state"
+        }
+    } else if path.starts_with("/edges/") {
+        if path.contains("/guard") {
+            "guard"
+        } else if path.contains("/actions") {
+            "action"
+        } else {
+            "transition"
+        }
+    } else if path.starts_with("/resources/indicators/") {
+        "indicator"
+    } else if path.starts_with("/resources/evidenceGroups/") {
+        "evidence_group"
+    } else if path.starts_with("/resources/events/") {
+        "event"
+    } else if path.starts_with("/resources/managementRefs/") {
+        "management"
+    } else if path.starts_with("/budget/") {
+        "budget"
+    } else {
+        "program_envelope"
+    }
+}
+
+fn static_neighborhood_delta_geometry(
+    parent: &Value,
+    child: &Value,
+    trace: &Value,
+) -> Result<(String, Value)> {
+    let mut changes = Vec::new();
+    static_neighborhood_diff_entries(Some(parent), Some(child), "", &mut changes)?;
+    let mut change_counts = Map::new();
+    for change in &changes {
+        let path = static_neighborhood_text(change, "path", "v5 static delta change")?;
+        let category = static_neighborhood_delta_category(&path);
+        let next = change_counts
+            .get(category)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            + 1;
+        change_counts.insert(category.to_owned(), Value::from(next));
+    }
+    let classification = if changes.is_empty() {
+        "same_side_no_op"
+    } else if change_counts.len() == 1 {
+        "single_category_exact_delta"
+    } else {
+        "mixed_exact_delta"
+    }
+    .to_owned();
+    Ok((
+        classification,
+        object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_v5_static_delta_geometry_v1".to_owned()),
+            ),
+            (
+                "parentProgramSha256",
+                Value::String(canonical_sha256(parent)?),
+            ),
+            (
+                "childProgramSha256",
+                Value::String(canonical_sha256(child)?),
+            ),
+            ("changedPathCount", Value::from(changes.len() as u64)),
+            ("changeCounts", Value::Object(change_counts)),
+            ("changes", Value::Array(changes)),
+            ("mutationTrace", clone_value(trace)?),
+            (
+                "mutationTraceSha256",
+                Value::String(canonical_sha256(trace)?),
+            ),
+        ]),
+    ))
+}
+
+fn static_neighborhood_stage_trace(stages: &[&str]) -> Value {
+    array(stages.iter().map(|stage| Value::String((*stage).to_owned())))
 }
 
 fn static_neighborhood_row(
@@ -9574,14 +9743,25 @@ fn static_neighborhood_row(
         "planSha256",
         "v5 static neighborhood plan",
     )?;
-    let applied = crate::v5_operators::apply_operator_plan(
-        &prepared.parent_program,
-        &prepared
-            .recompiler
-            .projection
-            .operator_authority(&choice.side)?,
-        &choice.choice.native_plan,
-    );
+    let operator_authority = prepared
+        .recompiler
+        .projection
+        .operator_authority(&choice.side)?;
+    let selection = crate::v5_operators::V5EvolvedOperatorSelection {
+        native_plan: choice.choice.native_plan.clone(),
+        legacy_choice: choice.choice.legacy_choice.clone(),
+        receipt: object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_v5_static_enumerated_choice_v1".to_owned()),
+            ),
+            ("planSha256", Value::String(plan_sha256.clone())),
+            (
+                "legacyChoiceSha256",
+                Value::String(choice.choice.legacy_choice_sha256.clone()),
+            ),
+        ]),
+    };
     let mut row = object([
         (
             "parentCandidateId",
@@ -9620,21 +9800,112 @@ fn static_neighborhood_row(
     let fields = row
         .as_object_mut()
         .expect("constructed static neighborhood row is an object");
+    if !choice.compiler_admitted {
+        fields.insert(
+            "stageTrace".to_owned(),
+            static_neighborhood_stage_trace(&[
+                "raw_plan_enumerated",
+                "excluded_by_compiled_child_admission",
+            ]),
+        );
+        fields.insert(
+            "terminalStage".to_owned(),
+            Value::String("excluded_by_compiled_child_admission".to_owned()),
+        );
+        fields.insert(
+            "staticClassification".to_owned(),
+            Value::String("compiled_child_admission_excluded".to_owned()),
+        );
+        fields.insert(
+            "admissionDisposition".to_owned(),
+            Value::String("excluded_by_compiled_child_admission".to_owned()),
+        );
+        return Ok(row);
+    }
+    let applied = crate::v5_operators::execute_evolved_operator_selection_with_admission(
+        &choice.parent_pair_identity_sha256,
+        &prepared.parent_program,
+        &operator_authority,
+        &prepared.compiled_profile,
+        selection,
+        prepared.recompiler.as_ref(),
+    );
     match applied {
         Err(error) => {
+            fields.insert(
+                "stageTrace".to_owned(),
+                static_neighborhood_stage_trace(&[
+                    "raw_plan_enumerated",
+                    "admitted_choice",
+                    "operator_apply_rejected",
+                ]),
+            );
+            fields.insert(
+                "terminalStage".to_owned(),
+                Value::String("operator_apply_rejected".to_owned()),
+            );
             fields.insert(
                 "staticClassification".to_owned(),
                 Value::String("invalid_rejected".to_owned()),
             );
             fields.insert(
                 "admissionDisposition".to_owned(),
-                Value::String("operator_rejected".to_owned()),
+                Value::String("operator_apply_rejected".to_owned()),
             );
             fields.insert("reasonCode".to_owned(), Value::String(error.to_string()));
         }
-        Ok(application) => {
+        Ok(execution) => {
+            if execution.disposition != crate::v5_operators::V5OperatorDisposition::Accepted {
+                let reason_detail = required(
+                    &execution.result.value,
+                    "reasonDetail",
+                    "v5 static operator execution result",
+                )?
+                .as_str()
+                .unwrap_or_default();
+                let terminal_stage = if execution.disposition
+                    == crate::v5_operators::V5OperatorDisposition::NoOp
+                {
+                    "same_side_no_op"
+                } else if reason_detail.contains("not currently applicable") {
+                    "currentness_rejected"
+                } else {
+                    "operator_apply_rejected"
+                };
+                fields.insert(
+                    "stageTrace".to_owned(),
+                    static_neighborhood_stage_trace(&[
+                        "raw_plan_enumerated",
+                        "admitted_choice",
+                        terminal_stage,
+                    ]),
+                );
+                fields.insert(
+                    "terminalStage".to_owned(),
+                    Value::String(terminal_stage.to_owned()),
+                );
+                fields.insert(
+                    "staticClassification".to_owned(),
+                    Value::String(terminal_stage.to_owned()),
+                );
+                fields.insert(
+                    "admissionDisposition".to_owned(),
+                    Value::String(execution.reason_code),
+                );
+                return Ok(row);
+            }
+            let application = execution
+                .application
+                .ok_or_else(|| invalid("accepted static operator execution omitted its application"))?;
+            let delta = execution
+                .delta
+                .ok_or_else(|| invalid("accepted static operator execution omitted its delta"))?;
             let child_program_sha256 = canonical_sha256(&application.child_program)?;
-            let child_equals_parent = application.child_program == prepared.parent_program;
+            let (static_classification, delta_geometry) = static_neighborhood_delta_geometry(
+                &prepared.parent_program,
+                &application.child_program,
+                &delta.trace,
+            )?;
             fields.insert(
                 "childProgramSha256".to_owned(),
                 Value::String(child_program_sha256),
@@ -9648,20 +9919,27 @@ fn static_neighborhood_row(
                 )?
                 .clone(),
             );
+            fields.insert("deltaGeometry".to_owned(), delta_geometry);
             match prepared
                 .recompiler
                 .admit_evolved_child_full_pair(&choice.operator_id, &application.child_program)
             {
                 Ok(()) => {
                     fields.insert(
+                        "stageTrace".to_owned(),
+                        static_neighborhood_stage_trace(&[
+                            "raw_plan_enumerated",
+                            "admitted_choice",
+                            "accepted_full_pair",
+                        ]),
+                    );
+                    fields.insert(
+                        "terminalStage".to_owned(),
+                        Value::String("accepted_full_pair".to_owned()),
+                    );
+                    fields.insert(
                         "staticClassification".to_owned(),
-                        Value::String(
-                            static_neighborhood_classification(
-                                &choice.operator_id,
-                                child_equals_parent,
-                            )
-                            .to_owned(),
-                        ),
+                        Value::String(static_classification),
                     );
                     fields.insert(
                         "admissionDisposition".to_owned(),
@@ -9671,19 +9949,24 @@ fn static_neighborhood_row(
                 Err(error) => {
                     let detail = error.to_string();
                     fields.insert(
+                        "stageTrace".to_owned(),
+                        static_neighborhood_stage_trace(&[
+                            "raw_plan_enumerated",
+                            "admitted_choice",
+                            "full_pair_compile_rejected",
+                        ]),
+                    );
+                    fields.insert(
+                        "terminalStage".to_owned(),
+                        Value::String("full_pair_compile_rejected".to_owned()),
+                    );
+                    fields.insert(
                         "staticClassification".to_owned(),
-                        Value::String(
-                            if detail.to_ascii_lowercase().contains("liveness") {
-                                "static_liveness_risk"
-                            } else {
-                                "invalid_rejected"
-                            }
-                            .to_owned(),
-                        ),
+                        Value::String("full_pair_compile_rejected".to_owned()),
                     );
                     fields.insert(
                         "admissionDisposition".to_owned(),
-                        Value::String("rejected_full_pair".to_owned()),
+                        Value::String("full_pair_compile_rejected".to_owned()),
                     );
                     fields.insert("reasonCode".to_owned(), Value::String(detail));
                 }
@@ -9721,6 +10004,7 @@ pub fn inspect_v5_static_neighborhood(
     )?;
     let mut parent_ids = BTreeSet::new();
     let mut all_choices = Vec::new();
+    let mut compiled_child_admitted_plan_count = 0_usize;
     let mut prepared_sides = Vec::new();
     for parent in parents {
         let role = text(
@@ -9742,7 +10026,17 @@ pub fn inspect_v5_static_neighborhood(
         for side in ["long", "short"] {
             let state = recompiler.state_for_side(side)?;
             let operator_authority = recompiler.projection.operator_authority(side)?;
-            let choices = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
+            let raw_choices = crate::v5_operators::enumerate_evolved_operator_choices(
+                &state.program,
+                &operator_authority,
+                &state.compiled_profile,
+            )
+            .map_err(|error| {
+                invalid(format!(
+                    "v5 static neighborhood raw choice enumeration: {error}"
+                ))
+            })?;
+            let admitted_choices = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
                 &state.program,
                 &operator_authority,
                 &state.compiled_profile,
@@ -9753,12 +10047,18 @@ pub fn inspect_v5_static_neighborhood(
                     "v5 static neighborhood choice enumeration: {error}"
                 ))
             })?;
+            compiled_child_admitted_plan_count += admitted_choices.len();
+            let admitted_choice_hashes = admitted_choices
+                .iter()
+                .map(|choice| choice.legacy_choice_sha256.clone())
+                .collect::<BTreeSet<_>>();
             let prepared_side_index = prepared_sides.len();
             prepared_sides.push(V5StaticNeighborhoodPreparedSide {
                 parent_program: state.program.clone(),
+                compiled_profile: state.compiled_profile.clone(),
                 recompiler: Arc::clone(&recompiler),
             });
-            for choice in choices {
+            for choice in raw_choices {
                 let operator_id = static_neighborhood_text(
                     &choice.native_plan,
                     "operatorId",
@@ -9778,12 +10078,17 @@ pub fn inspect_v5_static_neighborhood(
                     operator_id,
                     choice_kind,
                     construction_kind: static_neighborhood_construction_kind(&choice.native_plan)?,
+                    compiler_admitted: admitted_choice_hashes
+                        .contains(&choice.legacy_choice_sha256),
                     choice,
                 });
             }
         }
     }
-    let enumerated_plan_count = all_choices.len();
+    let raw_plan_enumerated_count = all_choices.len();
+    let excluded_by_compiled_child_admission_count = raw_plan_enumerated_count
+        .checked_sub(compiled_child_admitted_plan_count)
+        .ok_or_else(|| invalid("compiled child admission count exceeds raw plan count"))?;
     let selected = static_neighborhood_balanced_selection(all_choices, max_plans);
     let rows = selected
         .into_iter()
@@ -9808,7 +10113,18 @@ pub fn inspect_v5_static_neighborhood(
             Value::String(canonical_sha256(&Value::String(analysis_seed))?),
         ),
         ("maxPlans", Value::from(max_plans as u64)),
-        ("enumeratedPlanCount", Value::from(enumerated_plan_count as u64)),
+        (
+            "rawPlanEnumeratedCount",
+            Value::from(raw_plan_enumerated_count as u64),
+        ),
+        (
+            "compiledChildAdmittedPlanCount",
+            Value::from(compiled_child_admitted_plan_count as u64),
+        ),
+        (
+            "excludedByCompiledChildAdmissionCount",
+            Value::from(excluded_by_compiled_child_admission_count as u64),
+        ),
         ("selectedPlanCount", Value::from(rows.len() as u64)),
         (
             "selectionPolicy",
