@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Create a compact, hash-only V37/V38 existing-construction fixture.
+"""Create a portable, hash-only V37/V38 existing-construction fixture.
 
-The fixture references immutable local authority and retained construction
-inputs by absolute path and SHA-256.  It deliberately does not copy market
-data, proposal rows, result packs, or candidate payloads into the repository.
+The committed fixture identifies every retained input by its role, relative
+coordinate, byte size, and SHA-256.  A separate ignored resolver report binds
+those portable coordinates to one local checkout.  Neither output copies
+market data, proposal rows, result packs, or candidate payloads.
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ from autoresearch.temporal_qd_v5_native import (
 )
 
 
-SCHEMA = "evolutionary_substrate_existing_construction_fixture_v2"
+SCHEMA = "evolutionary_substrate_existing_construction_fixture_v3"
+DEFAULT_MANIFEST_SHA256 = "490cac548bd735945219a8c3d85add4348d476f6190b238b2371255d37391c72"
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -39,20 +41,72 @@ def sha256_file(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def artifact(name: str, path: Path, *, role: str) -> dict[str, Any]:
+def artifact(
+    name: str,
+    path: Path,
+    *,
+    role: str,
+    root_role: str,
+    root: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if not path.is_file():
         raise RuntimeError(f"required retained artifact is missing: {path}")
-    return {
+    try:
+        relative_path = path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise RuntimeError(f"artifact {name} is outside its declared root {root}: {path}") from error
+    portable = {
         "name": name,
         "role": role,
-        "absolutePath": str(path),
+        "rootRole": root_role,
+        "relativePath": relative_path,
         "bytes": path.stat().st_size,
         "sha256": sha256_file(path),
     }
+    resolver = {**portable, "absolutePath": str(path.resolve())}
+    return portable, resolver
 
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def normalized_sha256(value: str) -> str:
+    value = value.removeprefix("sha256:")
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"invalid SHA-256 identity: {value!r}")
+    return value
+
+
+def resolve_invocation(v38_run_root: Path, manifest_sha256: str) -> Path:
+    """Select exactly one retained V38 invocation by its manifest identity."""
+
+    expected = normalized_sha256(manifest_sha256)
+    invocation_root = (
+        v38_run_root
+        / "generations"
+        / "generation-0003"
+        / "proposal"
+        / "native-batch"
+        / "v5-proposal"
+    )
+    if not invocation_root.is_dir():
+        raise RuntimeError(f"retained invocation directory is missing: {invocation_root}")
+    matches: list[Path] = []
+    for candidate in sorted(invocation_root.iterdir(), key=lambda item: item.name):
+        manifest_path = candidate / "manifest.json"
+        if not candidate.is_dir() or not manifest_path.is_file():
+            continue
+        manifest = read_json(manifest_path)
+        actual = manifest.get("manifestSha256")
+        if isinstance(actual, str) and normalized_sha256(actual) == expected:
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise RuntimeError(
+            "expected exactly one retained invocation matching "
+            f"sha256:{expected}; found {len(matches)} under {invocation_root}"
+        )
+    return matches[0]
 
 
 def validate_twice(
@@ -86,13 +140,10 @@ def validate_twice(
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
     proposal_root = args.v38_run_root / "generations" / "generation-0003" / "proposal"
-    invocation = next((proposal_root / "native-batch" / "v5-proposal").iterdir())
-    v37_ledger = Path(
-        r"C:\repos\fuzzfolio-autoresearch\runs\temporal-qd-v5-fast-ephemeral-4000x1024x5-20260818-v37\run\broad-4000x1024x5\generations\generation-0002\proposal\identity-ledger.json"
-    )
-    v37_archive = Path(
-        r"\\?\C:\repos\fuzzfolio-autoresearch\runs\temporal-qd-v5-fast-ephemeral-4000x1024x5-20260818-v37\run\broad-4000x1024x5\generations\generation-0002\native-finalization\archive.json"
-    )
+    invocation = resolve_invocation(args.v38_run_root, args.manifest_sha256)
+    v37_generation = args.v37_run_root / "generations" / f"generation-{args.v37_parent_generation:04d}"
+    v37_ledger = v37_generation / "proposal" / "identity-ledger.json"
+    v37_archive = v37_generation / "native-finalization" / "archive.json"
     pair_path = args.authority_root / "pair-run-config.json"
     evolvable_path = args.authority_root / "evolvable-authority.json"
     frozen_path = invocation / "frozen-authority.json"
@@ -103,19 +154,24 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     frozen = read_json(frozen_path)
     manifest = read_json(manifest_path)
     validation = validate_twice(pair=pair, evolvable=evolvable, frozen=frozen, manifest=manifest)
-    contents = [
-        artifact("pair-run-config", pair_path, role="both-side static source authority"),
-        artifact("evolvable-authority", evolvable_path, role="compiler/admission/budget authority"),
-        artifact("parameters", args.authority_root / "parameters.json", role="retained authority parameters"),
-        artifact("frozen-authority", frozen_path, role="sealed native construction closure"),
-        artifact("proposal-manifest", manifest_path, role="existing evolved construction manifest"),
-        artifact("native-batch-authority", authority_path, role="retained executable authority receipt"),
-        artifact("v37-parent-archive", v37_archive, role="evolved construction parent archive input"),
-        artifact("v37-identity-ledger", v37_ledger, role="evolved construction identity ledger input"),
-        artifact("proposal-attempts-receipt", proposal_root / "proposal-attempts-receipt.json", role="retained attempt journal receipt"),
-        artifact("proposal-identity-ledger", proposal_root / "identity-ledger.json", role="retained evolved proposal identity ledger"),
-        artifact("native-finalization-manifest", args.v38_run_root / "generations" / "generation-0003" / "native-finalization" / "manifest.json", role="retained compile/finalization receipt"),
+    artifact_requests = [
+        ("pair-run-config", pair_path, "both-side static source authority", "authorityRoot", args.authority_root),
+        ("evolvable-authority", evolvable_path, "compiler/admission/budget authority", "authorityRoot", args.authority_root),
+        ("parameters", args.authority_root / "parameters.json", "retained authority parameters", "authorityRoot", args.authority_root),
+        ("frozen-authority", frozen_path, "sealed native construction closure", "v38RunRoot", args.v38_run_root),
+        ("proposal-manifest", manifest_path, "existing evolved construction manifest", "v38RunRoot", args.v38_run_root),
+        ("native-batch-authority", authority_path, "retained executable authority receipt", "v38RunRoot", args.v38_run_root),
+        ("v37-parent-archive", v37_archive, "evolved construction parent archive input", "v37RunRoot", args.v37_run_root),
+        ("v37-identity-ledger", v37_ledger, "evolved construction identity ledger input", "v37RunRoot", args.v37_run_root),
+        ("proposal-attempts-receipt", proposal_root / "proposal-attempts-receipt.json", "retained attempt journal receipt", "v38RunRoot", args.v38_run_root),
+        ("proposal-identity-ledger", proposal_root / "identity-ledger.json", "retained evolved proposal identity ledger", "v38RunRoot", args.v38_run_root),
+        ("native-finalization-manifest", args.v38_run_root / "generations" / "generation-0003" / "native-finalization" / "manifest.json", "retained compile/finalization receipt", "v38RunRoot", args.v38_run_root),
     ]
+    contents, resolver_contents = zip(
+        *(artifact(name, path, role=role, root_role=root_role, root=root)
+          for name, path, role, root_role, root in artifact_requests),
+        strict=True,
+    )
     output = {
         "schemaVersion": SCHEMA,
         "purpose": "read-only, content-addressed fixture for the existing native evolved-construction path",
@@ -137,22 +193,43 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         },
         "frozenAuthoritySha256": frozen["authoritySha256"],
         "manifestSha256": manifest["manifestSha256"],
-        "contents": contents,
+        "manifestSelection": {
+            "manifestSha256": "sha256:" + normalized_sha256(args.manifest_sha256),
+            "invocationRelativePath": invocation.relative_to(args.v38_run_root).as_posix(),
+        },
+        "roots": {
+            "authorityRoot": "supplied argument",
+            "v37RunRoot": "supplied argument",
+            "v38RunRoot": "supplied argument",
+        },
+        "contents": list(contents),
         "validation": validation,
     }
     output["fixtureSha256"] = "sha256:" + hashlib.sha256(canonical_bytes(output)).hexdigest()
-    return output
+    resolver = {
+        "schemaVersion": "evolutionary_substrate_fixture_local_resolver_v1",
+        "fixtureSha256": output["fixtureSha256"],
+        "contents": list(resolver_contents),
+    }
+    resolver["resolverSha256"] = "sha256:" + hashlib.sha256(canonical_bytes(resolver)).hexdigest()
+    return {"portableFixture": output, "localResolverReport": resolver}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--authority-root", required=True, type=Path)
+    parser.add_argument("--v37-run-root", required=True, type=Path)
     parser.add_argument("--v38-run-root", required=True, type=Path)
+    parser.add_argument("--v37-parent-generation", type=int, default=2)
+    parser.add_argument("--manifest-sha256", default=DEFAULT_MANIFEST_SHA256)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--resolver-output", required=True, type=Path)
     args = parser.parse_args()
     value = build(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(canonical_bytes(value) + b"\n")
+    args.output.write_bytes(canonical_bytes(value["portableFixture"]) + b"\n")
+    args.resolver_output.parent.mkdir(parents=True, exist_ok=True)
+    args.resolver_output.write_bytes(canonical_bytes(value["localResolverReport"]) + b"\n")
     return 0
 
 
