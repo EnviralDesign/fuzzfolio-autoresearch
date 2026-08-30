@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "temporal_qd_component_surrogate_v4_correction_protocol_v1",
+  "acceptedV3": {
+    "branch": "research/component-surrogate-validation-v3",
+    "head": "01c36bb220168691b7d3ab558971836906587e02",
+    "featureCorpusCanonicalPayloadSha256": "sha256:ce3d3a4bdf2ef1df7c996b59ce082878f78846e8627b2f37f523891940690cad",
+    "featureCorpusSealCanonicalPayloadSha256": "sha256:e93f02bb197245a340585b0aaff03a204f513eba01da4f27a3bb4a4dd66b68e5",
+    "recoveryWindowCount": 12,
+    "primaryFeatureRowCount": 456,
+    "m15NativeSensitivityRowCount": 24
+  },
+  "frozenSources": {
+    "historicalExecutionEngineCommit": "2bd50ccb3af1700d286da88cbcaecb4aca24f1a2",
+    "autoresearchV38Commit": "51c2f9175f441166e7fc997109e939a9f9103b5d",
+    "featureProtocolV2GitBlobSha256": "sha256:b412209520f0a1b8ea7bacf0d1f0e0bef1eda508f0e8096fdb8e31bc8b8c04cc",
+    "authenticatedTopologyAnalysisSha256": "sha256:f5c49eae57aace0c254b43f3c22e479aa02f807de7db3b283d096f9f30fa60d0"
+  },
+  "eventProjection": {
+    "primarySource": "named raw EventBinding longOutput/shortOutput after historical warm-up coercion and cross-timeframe alignment",
+    "processedScores": "diagnostic_only",
+    "rawMissingRule": "only null/NaN historical visual-alignment values coerce false; finite events must be exact booleans or 0/1",
+    "freshEventDefinition": "every active completed decision-clock event bar",
+    "eventStartDefinition": "false-to-true transition using the exact immediately preceding completed decision-clock event state, including the retained warm-up predecessor",
+    "m15PrimaryClock": "M5 decision clock at M15 completed bar plus 10 minutes with no raw forward-fill",
+    "m15NativeClock": "separate sensitivity only"
+  },
+  "correctedForwardResponse": {
+    "horizonsBars": [1, 3, 6, 12, 24],
+    "directionalReturn": "sign * (close[t+h] - close[t]) / close[t]",
+    "perHorizonFields": [
+      "sampleCount",
+      "meanDirectionalReturn",
+      "medianDirectionalReturn",
+      "directionalHitRate",
+      "meanMFE",
+      "meanMAE",
+      "meanMFEminusMAE",
+      "mfeGreaterThanMaeRate"
+    ],
+    "longExcursion": {
+      "mfe": "max(0, (max(high[t+1:t+h]) - close[t]) / close[t])",
+      "mae": "max(0, (close[t] - min(low[t+1:t+h])) / close[t])"
+    },
+    "shortExcursion": {
+      "mfe": "max(0, (close[t] - min(low[t+1:t+h])) / close[t])",
+      "mae": "max(0, (max(high[t+1:t+h]) - close[t]) / close[t])"
+    },
+    "v3ExcursionSpan": "retained as historical diagnostic only; it is not V4 favorable-minus-adverse asymmetry",
+    "volatilityNormalization": "only emit the exact historical forward_response_atlas_v1 calculation if byte-for-byte formula parity is demonstrated; otherwise unavailable with reason"
+  },
+  "sterileOutputs": {
+    "v3Artifacts": "preserved and never overwritten",
+    "featureExtraction": "two fresh outcome-inaccessible processes must produce byte-identical V4 corpora before child outcomes open",
+    "s2": "a separate pre-child-outcome parent-entry authority and sealed parent_entry_conditioned evidence use only exact parent records, component projections, recovered bars, and entry timestamps",
+    "rawProjectionRetention": "large raw timestamped projections may remain ignored locally, but their exact schema, row count, path, and SHA256 must be bound by the V4 seals"
+  },
+  "analysisContract": {
+    "phenotypeHandling": "retain lexicographic outcome-blind representative as a named view and report exhaustive 60-combination representative sensitivity and/or exact fractional weighting",
+    "contextHandling": "report and, where sample size permits, rank/center inside parentCandidateId + side + insertion route/site; parent-only pooling is sensitivity only",
+    "lopoLabel": "within_parent_descriptor_association unless an actual frozen train-other-parents/predict-held-out-parent model exists",
+    "multiplicity": "report every frozen horizon and fixed-seed max-absolute-rho family-wise permutation; do not select a favorable horizon or fit outcome-selected weights",
+    "crossPanel": "P3 sealed feature to P1 and P2 outcomes separately, with success on both reported"
+  },
+  "hardBoundary": {
+    "candidateStrategyReplay": false,
+    "childEvaluation": false,
+    "workerGatewayVastGenerationCalibration": false,
+    "archiveMutation": false,
+    "productionPolicyChange": false
+  },
+  "correctionProtocolCanonicalPayloadSha256": "sha256:210d76e703a9e6285e926f2d257916a08bf98e7f9ef6831765f853c6a21c510c"
+}
