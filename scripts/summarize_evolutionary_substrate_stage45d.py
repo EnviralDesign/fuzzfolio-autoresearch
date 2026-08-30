@@ -49,6 +49,19 @@ def read_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def read_jsonl(path: Path, *, label: str) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise SummaryError(f"{label} row {line_number} is not an object")
+            values.append(value)
+    if not values:
+        raise SummaryError(f"{label} is empty")
+    return values
+
+
 def rows(value: dict[str, Any], label: str) -> list[dict[str, Any]]:
     raw_rows = value.get("rows")
     if not isinstance(raw_rows, list) or not all(isinstance(row, dict) for row in raw_rows):
@@ -352,13 +365,33 @@ def historical_initial_protection(parent_material_path: Path) -> dict[str, Any]:
     }
 
 
-def coverage_projection(coverage: dict[str, Any]) -> dict[str, Any]:
+def coverage_projection(coverage: dict[str, Any], projection_rows: list[dict[str, Any]]) -> dict[str, Any]:
     v38 = coverage.get("v38")
     if not isinstance(v38, dict):
         raise SummaryError("historical coverage has no V38 projection")
     attempts = v38.get("attempts")
     if not isinstance(attempts, dict):
         raise SummaryError("historical coverage V38 attempts are missing")
+    expected_rows = attempts.get("recordCount")
+    if isinstance(expected_rows, int) and expected_rows != len(projection_rows):
+        raise SummaryError("historical V38 projection count does not match its coverage summary")
+    family_outcomes: dict[str, dict[str, int]] = {}
+    for row in projection_rows:
+        slot = row.get("matrixSlot")
+        outcome = row.get("outcome")
+        family = slot.get("operatorFamily") if isinstance(slot, dict) else None
+        disposition = outcome.get("disposition") if isinstance(outcome, dict) else None
+        if not isinstance(family, str) or not isinstance(disposition, str):
+            raise SummaryError("historical V38 projection row lacks family/disposition")
+        family_outcomes.setdefault(family, {})[disposition] = (
+            family_outcomes.setdefault(family, {}).get(disposition, 0) + 1
+        )
+    initial_rows = [
+        row
+        for row in projection_rows
+        if isinstance(row.get("matrixSlot"), dict)
+        and row["matrixSlot"].get("operatorFamily") == "initial_protection"
+    ]
     return {
         "schemaVersion": coverage.get("schemaVersion"),
         "scope": coverage.get("scope"),
@@ -374,6 +407,25 @@ def coverage_projection(coverage: dict[str, Any]) -> dict[str, Any]:
             "operatorPlanBodyStatus": v38.get("compactAttemptProjection", {})
             .get("interpretation", {})
             .get("operatorPlanBodyStatus"),
+            "familyDispositionMatrix": {
+                family: dict(sorted(dispositions.items()))
+                for family, dispositions in sorted(family_outcomes.items())
+            },
+            "initialProtection": {
+                "scheduledSlotCount": len(initial_rows),
+                "dispositions": counter(
+                    row.get("outcome", {}).get("disposition", "missing")
+                    if isinstance(row.get("outcome"), dict)
+                    else "missing"
+                    for row in initial_rows
+                ),
+                "identityLedgerEffects": counter(
+                    row.get("outcome", {}).get("identityLedgerEffect", "missing")
+                    if isinstance(row.get("outcome"), dict)
+                    else "missing"
+                    for row in initial_rows
+                ),
+            },
         },
     }
 
@@ -405,6 +457,7 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
         "productionSelectorSample": args.selector,
         "structuredGrammar": args.grammar,
         "historicalCoverage": args.historical_coverage,
+        "historicalV38Projection": args.historical_v38_projection,
         "historicalInitialParentMaterial": args.historical_initial_parent_material,
     }
     inputs = {name: artifact(path, detail="input retained unchanged") for name, path in paths.items()}
@@ -414,6 +467,9 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
     selector_report = read_object(args.selector)
     grammar = read_object(args.grammar)
     historical_coverage = read_object(args.historical_coverage)
+    historical_v38_projection = read_jsonl(
+        args.historical_v38_projection, label="historical V38 compact attempt projection"
+    )
     neighborhood = stage_summary(neighborhood_report, label="profile-aware neighborhood")
     legacy = stage_summary(legacy_report, label="legacy static neighborhood")
     selector = selector_summary(selector_report)
@@ -436,7 +492,9 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
             "sourceMethod": "executable structured registry projection; no Rust-source regular-expression extraction",
         },
         "historical": {
-            "v37v38ConstructionCoverage": coverage_projection(historical_coverage),
+            "v37v38ConstructionCoverage": coverage_projection(
+                historical_coverage, historical_v38_projection
+            ),
             "v38InitialProtectionAcceptedEvidence": historical_initial_protection(
                 args.historical_initial_parent_material
             ),
@@ -484,7 +542,7 @@ The frozen production selector sample executed {selector['drawCount']} determini
 
 The static envelope selected count is {coverage['staticEnvelopeSelectedPlanCount']} of {coverage['staticEnvelopeRawPlanCount']} raw plans. Coverage-balanced selection equals the full envelope: {str(coverage['coverageBalancedEqualsEnvelope']).lower()}. The 4,000 selector draws are a distinct repeated host/side schedule.
 
-Historical retained V38 accepted parent material contains {historical['recordCount']} initial-protection records ({json.dumps(historical['byMutatedSide'], sort_keys=True)}), all with retained plan/application hashes, child-program identity, and child-pair identity. The separate retained V38 800-slot attempt journal has hash/outcome evidence but not plan bodies. Runtime guard provenance and runtime/market behavior are unavailable in this packet.
+Historical V38 scheduled {summary['historical']['v37v38ConstructionCoverage']['v38']['initialProtection']['scheduledSlotCount']} initial-protection slots: {json.dumps(summary['historical']['v37v38ConstructionCoverage']['v38']['initialProtection']['dispositions'], sort_keys=True)}. Retained accepted parent material contains {historical['recordCount']} initial-protection records ({json.dumps(historical['byMutatedSide'], sort_keys=True)}), all with retained plan/application hashes, child-program identity, and child-pair identity. The separate retained V38 800-slot attempt journal has hash/outcome evidence but not plan bodies. Runtime guard provenance and runtime/market behavior are unavailable in this packet.
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(memo, encoding="utf-8", newline="\n")
@@ -505,6 +563,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selector", required=True, type=Path)
     parser.add_argument("--grammar", required=True, type=Path)
     parser.add_argument("--historical-coverage", required=True, type=Path)
+    parser.add_argument("--historical-v38-projection", required=True, type=Path)
     parser.add_argument("--historical-initial-parent-material", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--memo-output", required=True, type=Path)
