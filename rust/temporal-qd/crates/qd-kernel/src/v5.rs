@@ -48,11 +48,11 @@ pub const V5_EVOLVED_PARENT_SNAPSHOT_SCHEMA: &str = "temporal_qd_v5_evolved_pare
 /// neighborhoods. It does not construct a generation, select parents, or
 /// materialize a candidate/archive artifact.
 pub const V5_STATIC_NEIGHBORHOOD_REPORT_SCHEMA: &str =
-    "temporal_qd_v5_static_neighborhood_report_v1";
+    "temporal_qd_v5_static_neighborhood_report_v2";
 /// Research-only, write-neutral projection of exact ordered same-side
 /// crossover attempts across frozen evolved parents.
 pub const V5_STATIC_SAME_SIDE_CROSSOVER_REPORT_SCHEMA: &str =
-    "temporal_qd_v5_static_same_side_crossover_report_v1";
+    "temporal_qd_v5_static_same_side_crossover_report_v2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum V5Error {
@@ -8786,6 +8786,8 @@ pub fn verify_v5_evolved_parent_reference(
 #[derive(Clone, Debug)]
 struct V5EvolvedPairRuntime {
     pair_identity_sha256: String,
+    executable_semantic_sha256: String,
+    normalized_profile_sha256: String,
     long_program: Value,
     short_program: Value,
     long_module_lineage: Vec<Value>,
@@ -8978,6 +8980,8 @@ fn rebuild_runtime_pair(
     let short_state = evolved_side_state(&pair, projection, "short")?;
     Ok(V5EvolvedPairRuntime {
         pair_identity_sha256: pair.pair_identity_sha256,
+        executable_semantic_sha256: pair.executable_semantic_sha256,
+        normalized_profile_sha256: pair.validation.profile_snapshot_sha256,
         long_program,
         short_program,
         long_module_lineage,
@@ -9005,6 +9009,15 @@ impl V5SealedEvolvedPairRecompiler {
             proposal_seed,
             runtime: V5EvolvedPairRuntime {
                 pair_identity_sha256: parent.pair_identity_sha256,
+                executable_semantic_sha256: parent
+                    .accepted_record
+                    .executable_semantic_sha256
+                    .clone(),
+                normalized_profile_sha256: parent
+                    .accepted_record
+                    .compiled
+                    .profile_snapshot_sha256
+                    .clone(),
                 long_program: parent.long_program,
                 short_program: parent.short_program,
                 long_module_lineage: parent.long_module_lineage,
@@ -9486,6 +9499,9 @@ struct V5StaticNeighborhoodChoice {
     choice_kind: String,
     construction_kind: Option<String>,
     compiler_admitted: bool,
+    admission_stage: String,
+    exact_reason_code: String,
+    exact_reason_detail: Option<String>,
     choice: crate::v5_operators::V5LegacyOperatorChoice,
 }
 
@@ -9867,6 +9883,14 @@ fn static_neighborhood_row(
         ),
         ("planSha256", Value::String(plan_sha256)),
         (
+            "nativePlanSha256",
+            Value::String(static_neighborhood_text(
+                &choice.choice.native_plan,
+                "planSha256",
+                "v5 static neighborhood native plan",
+            )?),
+        ),
+        (
             "legacyChoiceSha256",
             Value::String(choice.choice.legacy_choice_sha256.clone()),
         ),
@@ -9909,6 +9933,21 @@ fn static_neighborhood_row(
         fields.insert(
             "admissionDisposition".to_owned(),
             Value::String("excluded_by_compiled_child_admission".to_owned()),
+        );
+        fields.insert(
+            "admissionStage".to_owned(),
+            Value::String(choice.admission_stage),
+        );
+        fields.insert(
+            "exactReasonCode".to_owned(),
+            Value::String(choice.exact_reason_code),
+        );
+        fields.insert(
+            "exactReasonDetail".to_owned(),
+            choice
+                .exact_reason_detail
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
         return Ok(row);
     }
@@ -10020,6 +10059,14 @@ fn static_neighborhood_row(
                     fields.insert(
                         "childPairIdentitySha256".to_owned(),
                         Value::String(runtime.pair_identity_sha256.clone()),
+                    );
+                    fields.insert(
+                        "executableSemanticSha256".to_owned(),
+                        Value::String(runtime.executable_semantic_sha256.clone()),
+                    );
+                    fields.insert(
+                        "normalizedProfileSha256".to_owned(),
+                        Value::String(runtime.normalized_profile_sha256.clone()),
                     );
                     fields.insert(
                         "oppositeSide".to_owned(),
@@ -10148,22 +10195,6 @@ pub fn inspect_v5_static_neighborhood(
                     "v5 static neighborhood raw choice enumeration: {error}"
                 ))
             })?;
-            let admitted_choices = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
-                &state.program,
-                &operator_authority,
-                &state.compiled_profile,
-                recompiler.as_ref(),
-            )
-            .map_err(|error| {
-                invalid(format!(
-                    "v5 static neighborhood choice enumeration: {error}"
-                ))
-            })?;
-            compiled_child_admitted_plan_count += admitted_choices.len();
-            let admitted_choice_hashes = admitted_choices
-                .iter()
-                .map(|choice| choice.legacy_choice_sha256.clone())
-                .collect::<BTreeSet<_>>();
             let prepared_side_index = prepared_sides.len();
             prepared_sides.push(V5StaticNeighborhoodPreparedSide {
                 parent_program: state.program.clone(),
@@ -10171,6 +10202,20 @@ pub fn inspect_v5_static_neighborhood(
                 recompiler: Arc::clone(&recompiler),
             });
             for choice in raw_choices {
+                let diagnostic = crate::v5_operators::diagnose_evolved_operator_choice_admission(
+                    &state.program,
+                    &operator_authority,
+                    &choice.native_plan,
+                    recompiler.as_ref(),
+                )
+                .map_err(|error| {
+                    invalid(format!(
+                        "v5 static neighborhood compiled-child diagnostic: {error}"
+                    ))
+                })?;
+                if diagnostic.admitted {
+                    compiled_child_admitted_plan_count += 1;
+                }
                 let operator_id = static_neighborhood_text(
                     &choice.native_plan,
                     "operatorId",
@@ -10190,8 +10235,10 @@ pub fn inspect_v5_static_neighborhood(
                     operator_id,
                     choice_kind,
                     construction_kind: static_neighborhood_construction_kind(&choice.native_plan)?,
-                    compiler_admitted: admitted_choice_hashes
-                        .contains(&choice.legacy_choice_sha256),
+                    compiler_admitted: diagnostic.admitted,
+                    admission_stage: diagnostic.admission_stage,
+                    exact_reason_code: diagnostic.exact_reason_code,
+                    exact_reason_detail: diagnostic.exact_reason_detail,
                     choice,
                 });
             }
@@ -10289,6 +10336,14 @@ fn static_crossover_row(
             "recipientProgramSha256",
             Value::String(canonical_sha256(&recipient_state.program)?),
         ),
+        (
+            "recipientExecutableSemanticSha256",
+            Value::String(recipient.recompiler.runtime.executable_semantic_sha256.clone()),
+        ),
+        (
+            "recipientNormalizedProfileSha256",
+            Value::String(recipient.recompiler.runtime.normalized_profile_sha256.clone()),
+        ),
         ("donorCandidateId", Value::String(donor.candidate_id.clone())),
         (
             "donorPairIdentitySha256",
@@ -10302,6 +10357,14 @@ fn static_crossover_row(
         (
             "donorProgramSha256",
             Value::String(canonical_sha256(&donor_state.program)?),
+        ),
+        (
+            "donorExecutableSemanticSha256",
+            Value::String(donor.recompiler.runtime.executable_semantic_sha256.clone()),
+        ),
+        (
+            "donorNormalizedProfileSha256",
+            Value::String(donor.recompiler.runtime.normalized_profile_sha256.clone()),
         ),
         ("side", Value::String(choice.side.clone())),
         (
@@ -10408,6 +10471,14 @@ fn static_crossover_row(
             fields.insert(
                 "childPairIdentitySha256".to_owned(),
                 Value::String(runtime.pair_identity_sha256.clone()),
+            );
+            fields.insert(
+                "executableSemanticSha256".to_owned(),
+                Value::String(runtime.executable_semantic_sha256.clone()),
+            );
+            fields.insert(
+                "normalizedProfileSha256".to_owned(),
+                Value::String(runtime.normalized_profile_sha256.clone()),
             );
             fields.insert("oppositeSide".to_owned(), Value::String(opposite_side.to_owned()));
             fields.insert(
@@ -10709,6 +10780,14 @@ fn static_selector_row(
             "parentPairIdentitySha256",
             Value::String(state.pair_identity_sha256.clone()),
         ),
+        (
+            "parentExecutableSemanticSha256",
+            Value::String(prepared.recompiler.runtime.executable_semantic_sha256.clone()),
+        ),
+        (
+            "parentNormalizedProfileSha256",
+            Value::String(prepared.recompiler.runtime.normalized_profile_sha256.clone()),
+        ),
         ("parentRole", Value::String(prepared.role.clone())),
         ("side", Value::String(side.to_owned())),
         ("family", Value::String(family)),
@@ -10799,6 +10878,14 @@ fn static_selector_row(
             fields.insert(
                 "childPairIdentitySha256".to_owned(),
                 Value::String(runtime.pair_identity_sha256),
+            );
+            fields.insert(
+                "executableSemanticSha256".to_owned(),
+                Value::String(runtime.executable_semantic_sha256),
+            );
+            fields.insert(
+                "normalizedProfileSha256".to_owned(),
+                Value::String(runtime.normalized_profile_sha256),
             );
             fields.insert(
                 "terminalStage".to_owned(),

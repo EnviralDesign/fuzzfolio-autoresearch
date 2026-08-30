@@ -755,6 +755,17 @@ pub struct V5LegacyOperatorChoice {
     pub legacy_choice_ordering_sha256: String,
 }
 
+/// A research-only witness of the existing compiled-child admission boundary.
+/// It retains the authority's own rejection detail without applying a choice,
+/// materializing a candidate, or changing the production vocabulary.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct V5EvolvedChoiceAdmissionDiagnostic {
+    pub admitted: bool,
+    pub admission_stage: String,
+    pub exact_reason_code: String,
+    pub exact_reason_detail: Option<String>,
+}
+
 fn hold_choices_from_policy(policy: &Value) -> Result<Vec<Value>> {
     if object_get(policy, "enabled") != Some(&Value::Bool(true)) {
         return Ok(Vec::new());
@@ -9633,6 +9644,63 @@ fn admitted_native_plan(
         operator_id,
         construction,
     )?))
+}
+
+/// Diagnose one already-structurally-admitted native plan at the exact
+/// transaction-owned compiled-child boundary. The result is deliberately
+/// narrower than selection or application: it replays no proposal draw and
+/// preserves the authority error rather than guessing a reason from plan
+/// shape.
+pub(crate) fn diagnose_evolved_operator_choice_admission(
+    program: &Value,
+    authority: &V5OperatorAuthority,
+    native_plan: &Value,
+    admission: &dyn V5EvolvedChildAdmission,
+) -> Result<V5EvolvedChoiceAdmissionDiagnostic> {
+    verify_plan(program, authority, native_plan)?;
+    let operator_id = text(
+        required(native_plan, "operatorId", "evolved admission diagnostic native plan")?,
+        "evolved admission diagnostic operator ID",
+    )?;
+    let construction = required(
+        native_plan,
+        "construction",
+        "evolved admission diagnostic native plan",
+    )?;
+    let (child, _) = transform_for_operator(program, authority, &operator_id, construction)?;
+    if child == *program {
+        return Ok(V5EvolvedChoiceAdmissionDiagnostic {
+            admitted: false,
+            admission_stage: "structural_child_validation".to_owned(),
+            exact_reason_code: "same_side_no_op".to_owned(),
+            exact_reason_detail: Some(
+                "authority-produced native plan reconstructed the unchanged parent program"
+                    .to_owned(),
+            ),
+        });
+    }
+    if let Err(error) = validate_program(&child, authority) {
+        return Ok(V5EvolvedChoiceAdmissionDiagnostic {
+            admitted: false,
+            admission_stage: "structural_child_validation".to_owned(),
+            exact_reason_code: "structural_child_validation_rejected".to_owned(),
+            exact_reason_detail: Some(error.to_string()),
+        });
+    }
+    match admission.admit_evolved_child(&operator_id, &child) {
+        Ok(()) => Ok(V5EvolvedChoiceAdmissionDiagnostic {
+            admitted: true,
+            admission_stage: "compiled_child_admission".to_owned(),
+            exact_reason_code: "accepted".to_owned(),
+            exact_reason_detail: None,
+        }),
+        Err(error) => Ok(V5EvolvedChoiceAdmissionDiagnostic {
+            admitted: false,
+            admission_stage: "compiled_child_admission".to_owned(),
+            exact_reason_code: "compiled_child_authority_rejected".to_owned(),
+            exact_reason_detail: Some(error.to_string()),
+        }),
+    }
 }
 
 /// Rebuild the exact legacy Python choice objects in their historic canonical
