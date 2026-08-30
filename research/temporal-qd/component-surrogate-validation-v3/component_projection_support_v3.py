@@ -131,6 +131,53 @@ def load_isolated_bars(
     return frame[[*REQUIRED_BAR_COLUMNS, "pair"]].copy(), checks
 
 
+def load_recovered_window_bars(
+    *,
+    root: Path,
+    archive_artifacts: list[dict[str, Any]],
+    timeframe: str,
+    pair: str,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Read one recovered V38 window only through its recorded archive files."""
+    root = root.resolve()
+    selected = sorted(
+        (item for item in archive_artifacts if item.get("timeframe") == timeframe),
+        key=lambda item: str(item.get("relativePath")),
+    )
+    if not selected:
+        raise RuntimeError(f"recovery report has no {timeframe} artifacts")
+    chunks: list[pd.DataFrame] = []
+    checks: list[dict[str, Any]] = []
+    for artifact in selected:
+        relative_path = str(artifact.get("relativePath") or "")
+        expected_hash = str(artifact.get("rawSha256") or "")
+        path = (root / relative_path).resolve()
+        if root not in path.parents or not path.is_file():
+            raise RuntimeError(f"recovered artifact is absent or escaped its root: {path}")
+        actual_hash = sha256_file(path)
+        if actual_hash != expected_hash:
+            raise RuntimeError(f"recovered raw hash drift: {path}")
+        table = pq.ParquetFile(path).read(columns=["bar_start_s", *REQUIRED_BAR_COLUMNS])
+        chunks.append(table.to_pandas())
+        checks.append({
+            "relativePath": relative_path.replace("\\", "/"),
+            "rawSha256": actual_hash,
+            "rawSha256MatchesRecovery": True,
+        })
+    frame = pd.concat(chunks, ignore_index=True)
+    frame["bar_start"] = pd.to_datetime(frame.pop("bar_start_s"), unit="s", utc=True)
+    if frame["bar_start"].duplicated().any():
+        raise RuntimeError(f"recovered {timeframe} frame has duplicate bar starts")
+    frame = frame.sort_values("bar_start", ascending=False).set_index("bar_start")
+    if frame.empty or not frame.index.is_monotonic_decreasing or frame.index.tz is None:
+        raise RuntimeError(f"recovered {timeframe} frame is not a nonempty newest-first UTC frame")
+    for column in REQUIRED_BAR_COLUMNS:
+        if not pd.api.types.is_numeric_dtype(frame[column]):
+            raise RuntimeError(f"recovered {timeframe} {column} is not numeric")
+    frame["pair"] = pair
+    return frame[[*REQUIRED_BAR_COLUMNS, "pair"]].copy(), checks
+
+
 def normalize_raw_event(values: Any, *, expected_length: int, label: str) -> tuple[np.ndarray, int]:
     raw = np.asarray(values).reshape(-1)
     if len(raw) != expected_length:
