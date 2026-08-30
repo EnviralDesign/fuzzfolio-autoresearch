@@ -1,0 +1,610 @@
+{
+  "attestationPolicy": "Every recovered window later records frozenWindowSemanticSha256 plus separate archive/recovery receipt and local raw-file attestations; those attestations are not substituted for one another.",
+  "authority": {
+    "autoresearchCommit": "51c2f9175f441166e7fc997109e939a9f9103b5d",
+    "extractionCensusCanonicalPayloadSha256": "sha256:05b7c538eb601eb9a97a363184503cb144ed8f131a154e1ec055ddf233754f3a",
+    "historicalExecutionEngineCommit": "2bd50ccb3af1700d286da88cbcaecb4aca24f1a2",
+    "historicalProjectionAuditCanonicalPayloadSha256": "sha256:9c3261e460b5a202c4ff31ff5c390cd80e62efc358c669e7daabc637c3c82b52",
+    "proCompletionAuthorizationSha256": "sha256:19e6db31a7439443ef59775145e4e2b42317e7a5be10af0de5d7b644e6304acf"
+  },
+  "authorityAddendumCanonicalPayloadSha256": "sha256:fe76c8718cd02147f8ab5ab06fd2f2e6c8b8fc292d708af62b994be76ad65a16",
+  "clockAndFrameContract": {
+    "decisionClock": "completed M5 observation clock",
+    "inputFrame": {
+      "analysisInterval": "half-open [start, end) after warmup bars are supplied to the indicator",
+      "completeBarsOnly": true,
+      "index": "UTC bar_start datetime index, unique and newest-first before historical indicator execution",
+      "noLakeFallback": true,
+      "pairMetadata": "pair is supplied as the frozen archive instrument so any historical scale lookup resolves from the input frame.",
+      "requiredColumns": [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "pair"
+      ]
+    },
+    "m15": "M15 source raw events first expose at M5 source-start plus 10 minutes; raw events use exact reindexing without forward fill, while processed diagnostic scores use the separate historical forward-fill path.",
+    "m5": "M5 source raw events expose on the coincident completed M5 observation."
+  },
+  "componentImplementations": [
+    {
+      "implementationClass": "BreakoutFirstCloseIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "BREAKOUT_FIRST_CLOSE",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low"
+      ]
+    },
+    {
+      "implementationClass": "BufferedRangeBreakoutIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low"
+      ]
+    },
+    {
+      "implementationClass": "ChannelReentryIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "CHANNEL_REENTRY",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low"
+      ]
+    },
+    {
+      "implementationClass": "EhlersFisherTransitionIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ehlers_indicators.py",
+      "implementationSourceSha256": "sha256:e27385a753eb77646e214e57335f2f7a494006247d4be43acf46011a666f91de",
+      "indicatorId": "EHLERS_FISHER_TRANSITION",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low",
+        "open"
+      ]
+    },
+    {
+      "implementationClass": "KeyReversalIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "KEY_REVERSAL_SIGNAL",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low",
+        "open"
+      ]
+    },
+    {
+      "implementationClass": "KSTCrossoverIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bespoke_momentum_indicators.py",
+      "implementationSourceSha256": "sha256:d07ca5aeb2ffdd9016ecfbfe28f60ab10017afe32e889822a4659235b2e17f9f",
+      "indicatorId": "KST_CROSSOVER",
+      "requiredColumns": []
+    },
+    {
+      "implementationClass": "MarketModeTransitionIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "MARKET_MODE_TRANSITION",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low",
+        "open"
+      ]
+    },
+    {
+      "implementationClass": "MACrossoverIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ma_crossover_indicator.py",
+      "implementationSourceSha256": "sha256:c74b1c07980fe2b5987057a4c172cddc98e9a8e24594f6bb5b297a3723a89b4f",
+      "indicatorId": "MA_CROSSOVER",
+      "requiredColumns": []
+    },
+    {
+      "implementationClass": "NormalizedVolumeImpulseIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bar_force_indicators.py",
+      "implementationSourceSha256": "sha256:3e6e573aeb889ba575ba70b4ba92b998f48217f1c9803e0f657480b54f3e688f",
+      "indicatorId": "NVO_VOLUME_IMPULSE",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low"
+      ]
+    },
+    {
+      "implementationClass": "PMOCrossoverIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bespoke_momentum_indicators.py",
+      "implementationSourceSha256": "sha256:d07ca5aeb2ffdd9016ecfbfe28f60ab10017afe32e889822a4659235b2e17f9f",
+      "indicatorId": "PMO_CROSSOVER",
+      "requiredColumns": []
+    },
+    {
+      "implementationClass": "PriceReclaimMAIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "PRICE_RECLAIM_MA",
+      "requiredColumns": [
+        "close"
+      ]
+    },
+    {
+      "implementationClass": "RSICrossbackIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "RSI_CROSSBACK",
+      "requiredColumns": [
+        "close"
+      ]
+    },
+    {
+      "implementationClass": "StochRSICrossbackIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "STOCHRSI_CROSSBACK",
+      "requiredColumns": [
+        "close"
+      ]
+    },
+    {
+      "implementationClass": "StochCrossoverIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/stoch_crossover_indicator.py",
+      "implementationSourceSha256": "sha256:b99324807f7c8926f305f33b86013ecd5cf996c71bd828ad7be745fc22d69f8c",
+      "indicatorId": "STOCH_CROSSOVER",
+      "requiredColumns": []
+    },
+    {
+      "implementationClass": "ThrustBarIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "THRUST_BAR_SIGNAL",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low",
+        "open"
+      ]
+    },
+    {
+      "implementationClass": "TobyCrabelNarrowRangeIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/compression_indicators.py",
+      "implementationSourceSha256": "sha256:d3ef2c29eabcdfc173731b6502e83469a1b7ae2fa4679164a53d0931cea9c8f4",
+      "indicatorId": "TOBY_CRABEL_NARROW_RANGE",
+      "requiredColumns": []
+    },
+    {
+      "implementationClass": "TTFDSLTransitionIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bespoke_momentum_indicators.py",
+      "implementationSourceSha256": "sha256:d07ca5aeb2ffdd9016ecfbfe28f60ab10017afe32e889822a4659235b2e17f9f",
+      "indicatorId": "TTF_DSL_TRANSITION",
+      "requiredColumns": [
+        "high",
+        "low"
+      ]
+    },
+    {
+      "implementationClass": "WaveTrendCrossoverIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bespoke_momentum_indicators.py",
+      "implementationSourceSha256": "sha256:d07ca5aeb2ffdd9016ecfbfe28f60ab10017afe32e889822a4659235b2e17f9f",
+      "indicatorId": "WAVETREND_CROSSOVER",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low"
+      ]
+    },
+    {
+      "implementationClass": "WickRejectionIndicator",
+      "implementationSource": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py",
+      "implementationSourceSha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+      "indicatorId": "WICK_REJECTION",
+      "requiredColumns": [
+        "close",
+        "high",
+        "low",
+        "open"
+      ]
+    }
+  ],
+  "componentOnlyBoundary": {
+    "extractorContract": "One deterministic component-only extractor has no outcome path argument or outcome reader import; it must be run in an isolated process.",
+    "forbiddenInputs": [
+      "candidate TemporalGraph or profile execution",
+      "child outcomes, economics, P&L, costs, or archive values",
+      "worker, gateway, market-lake fallback, or network data reads"
+    ],
+    "permittedInputs": [
+      "outcome-free V3 census",
+      "pinned historical engine/catalog/runtime",
+      "isolated archive-recovered OHLCV bars",
+      "the frozen protocol and this addendum"
+    ]
+  },
+  "featureProtocolV2": {
+    "commit": "0a5a74de695d98dce3b31e896a4c21d748471c04",
+    "gitBlobObjectId": "c90064ac7802f0d677319e83407e26222837fda4",
+    "gitBlobSha256": "sha256:b412209520f0a1b8ea7bacf0d1f0e0bef1eda508f0e8096fdb8e31bc8b8c04cc",
+    "worktreeMatchesFrozenGitBlob": true
+  },
+  "pinnedHistoricalSources": [
+    {
+      "path": "shared/constants/indicators.json",
+      "sha256": "sha256:7a23e188358830a3edf179c21a26c1650d5e9beddfb6f5fc93c5ce0dcc817742"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/models/common.py",
+      "sha256": "sha256:20e920beada794371d7c3cc9c3749547b93b7f1ce33e235f1adecd1350a6b855"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/models/indicator.py",
+      "sha256": "sha256:11822e02fa5fa0f1bc1d4ea8334eb53c7ea85ff2382427e3c5e7003bcc45efd1"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/compute/aligned_scoring.py",
+      "sha256": "sha256:5c09681e3d5faf245b8c9ad4e7df616f4a2561f07cb3ea38224f8771a9641d25"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/compute/indicator_batch_execution.py",
+      "sha256": "sha256:d5c484ac5d1fad292ce6a1edb2366716071050fa8d777cf5313f73e333935917"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/base_indicator.py",
+      "sha256": "sha256:2d934db87fcf9f46a654f3756bc811538b322cf6a55e9862ead79e60cd09f1b7"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/indicator_factory.py",
+      "sha256": "sha256:c6af5dc065f7ed2bb225b0e0cea01e421ccbcdcfbd6ed28f5cf0f683e060c180"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/market_utils.py",
+      "sha256": "sha256:983bf9cb43e18dcc7369f4496ff1cb76030d7506c822bf41510e203eaf12b269"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/temporal_graph/graph_models.py",
+      "sha256": "sha256:022d1eee7ae6111185b4e8ef91b78951be4ed1c669d0d8905076a80984582e2e"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/temporal_graph/observation_adapter.py",
+      "sha256": "sha256:a439d8ae724981244dae40f72a4bdfd8a04fb1303beb28fb38cd4e005035aa04"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/rust_runtime.py",
+      "sha256": "sha256:91916c6fdc7102bdb421aefa4e7794ca37e2d69c6664eac22338ac12142cbb09"
+    },
+    {
+      "path": "shared/python/fuzzfolio_core/fuzzfolio_core/talib_runtime.py",
+      "sha256": "sha256:d1c348b38a347806ba3eddc833cc5146a297cfb5f8743e1cb1fb6cf1275ee29a"
+    }
+  ],
+  "projectionAndFreshness": {
+    "eventBindingSelection": "The selected raw output is longOutput for a long-owned binding and shortOutput for a short-owned binding.",
+    "eventStarts": "An event start remains a separate false-to-true descriptive transition; eventStartShareOfActiveBars must never substitute for freshEventFraction.",
+    "freshEvent": "At every completed, non-provisional observation where the selected aligned raw binding is active, that binding belongs in facts.freshEvents. There is no inactive-to-active edge filter.",
+    "freshFeatures": [
+      "freshEventBarCount",
+      "freshEventFraction",
+      "freshEventAvailability = freshEventFraction"
+    ],
+    "primaryEvent": "The named raw EventBinding output after historical warmup coercion and cross-timeframe alignment; processed long/short scores are retained only as diagnostics.",
+    "rawDomain": "At the historical visual-alignment boundary, missing/NaN raw event samples become false. A non-missing raw event must be Boolean or exact numeric 0/1; no numeric threshold is permitted."
+  },
+  "runtime": {
+    "allImportedFuzzfolioCoreModulesUnderPinnedEngine": true,
+    "importedFuzzfolioCoreModules": [
+      {
+        "module": "fuzzfolio_core",
+        "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/__init__.py"
+      },
+      {
+        "module": "fuzzfolio_core.compute",
+        "sha256": "sha256:819ee7c8175f4adfb3590a3148f8ed07e8c05267111eb18ee45b03f2c233cde1",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/compute/__init__.py"
+      },
+      {
+        "module": "fuzzfolio_core.compute.indicator_batch_execution",
+        "sha256": "sha256:d5c484ac5d1fad292ce6a1edb2366716071050fa8d777cf5313f73e333935917",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/compute/indicator_batch_execution.py"
+      },
+      {
+        "module": "fuzzfolio_core.compute.quality_score",
+        "sha256": "sha256:515cd70ab0b11810b643b61199814d01521f16c0eb97121ea6f94fc0813c57a3",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/compute/quality_score.py"
+      },
+      {
+        "module": "fuzzfolio_core.market_structure",
+        "sha256": "sha256:8c652f68c31bd5da42458e2caa717f1f1ada3a3dcebe842d04f0fc4c02b79469",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/market_structure.py"
+      },
+      {
+        "module": "fuzzfolio_core.models",
+        "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/models/__init__.py"
+      },
+      {
+        "module": "fuzzfolio_core.models.common",
+        "sha256": "sha256:20e920beada794371d7c3cc9c3749547b93b7f1ce33e235f1adecd1350a6b855",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/models/common.py"
+      },
+      {
+        "module": "fuzzfolio_core.models.indicator",
+        "sha256": "sha256:11822e02fa5fa0f1bc1d4ea8334eb53c7ea85ff2382427e3c5e7003bcc45efd1",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/models/indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.models.scoring",
+        "sha256": "sha256:ae493434dac4385a16ae662bc301e18a2a1dcd88cbb630229157c63939d83664",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/models/scoring.py"
+      },
+      {
+        "module": "fuzzfolio_core.models.scoringprofile",
+        "sha256": "sha256:7fabe607676eb73ad03ccf405ea39c13e658c4c445003fc78d8a14c6eaff44b9",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/models/scoringprofile.py"
+      },
+      {
+        "module": "fuzzfolio_core.rust_runtime",
+        "sha256": "sha256:91916c6fdc7102bdb421aefa4e7794ca37e2d69c6664eac22338ac12142cbb09",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/rust_runtime.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine",
+        "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/__init__.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators",
+        "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/__init__.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.adosc_indicator",
+        "sha256": "sha256:ff6efe57a7f0210fea51a1ea6d3352107bf2fc094caa2f1668b709f5a70fc139",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/adosc_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.adx_indicator",
+        "sha256": "sha256:eb71a4ae0df6b629b5b2ab5b900f23923905b5a80453ca3048f63e6b34073e15",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/adx_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.aroon_indicator",
+        "sha256": "sha256:e610a4a173849ff775351d2e76b3ea331238836ff9552d83c4eaa1221ec404b1",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/aroon_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.atr_indicator",
+        "sha256": "sha256:8ddd7829fd6904d688581ef47b0bef7fef6d8ffccdf6a0a946a973099482a566",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/atr_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.bar_force_indicators",
+        "sha256": "sha256:3e6e573aeb889ba575ba70b4ba92b998f48217f1c9803e0f657480b54f3e688f",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bar_force_indicators.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.base_indicator",
+        "sha256": "sha256:2d934db87fcf9f46a654f3756bc811538b322cf6a55e9862ead79e60cd09f1b7",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/base_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.bbands_position_indicator",
+        "sha256": "sha256:b612b83b66d2dc5dad421db087a945c71b4541a907ab340d1dce58caed6a65a5",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bbands_position_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.bespoke_momentum_indicators",
+        "sha256": "sha256:d07ca5aeb2ffdd9016ecfbfe28f60ab10017afe32e889822a4659235b2e17f9f",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/bespoke_momentum_indicators.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.candlestick_pattern_scanner_indicator",
+        "sha256": "sha256:97cd8282b6596d1b2b5b0c7a659623209f7ead604583f30feafddc863465bfb4",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/candlestick_pattern_scanner_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.cci_indicator",
+        "sha256": "sha256:d40c3e321c3236f1e919f619b039b56829d29575549f460d4292093c5d5b82ed",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/cci_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.chaikin_ad_indicator",
+        "sha256": "sha256:de1ff0ee1214c8547a543ea726c85f2815d162199417f02865d5df0e22448de4",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/chaikin_ad_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.cmo_indicator",
+        "sha256": "sha256:40c06de6b3246d83fe926b5de88c48f8541151bd72161749b8586f9b8328aa2b",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/cmo_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.compression_indicators",
+        "sha256": "sha256:d3ef2c29eabcdfc173731b6502e83469a1b7ae2fa4679164a53d0931cea9c8f4",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/compression_indicators.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.donchian_channel_indicator",
+        "sha256": "sha256:6fc07872a69591c0662eb225abf7ce260561cf931911cefa0625c7d09997545c",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/donchian_channel_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.ehlers_indicators",
+        "sha256": "sha256:e27385a753eb77646e214e57335f2f7a494006247d4be43acf46011a666f91de",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ehlers_indicators.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.garch_indicator",
+        "sha256": "sha256:106400e3dbdf0cde47ac566054e1b76352ebaec0009a89f5f12b6c40fcd528a6",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/garch_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.indicator_factory",
+        "sha256": "sha256:c6af5dc065f7ed2bb225b0e0cea01e421ccbcdcfbd6ed28f5cf0f683e060c180",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/indicator_factory.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.keltner_channel_indicator",
+        "sha256": "sha256:fe12482fb017694f23d20ffd2f392ebb752331dd04365ec9bc4c99174a3e8c6f",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/keltner_channel_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.ma_crossover_indicator",
+        "sha256": "sha256:c74b1c07980fe2b5987057a4c172cddc98e9a8e24594f6bb5b297a3723a89b4f",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ma_crossover_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.ma_distance_indicator",
+        "sha256": "sha256:7619f59854bfc78032d5babe4711d60c41ba65f376e4b9087c19c07d9c6fe9f2",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ma_distance_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.ma_slope_indicator",
+        "sha256": "sha256:cfc7a59727e4686cf01d64ade23e215fb3e94696fbfa09a6f11b0a0b7cf3dd26",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ma_slope_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.ma_spread_indicator",
+        "sha256": "sha256:55804f095959744772188fde4f17d5e878a0542d5baf6a541ff6e2fad47c69cc",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ma_spread_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.macd_crossover_indicator",
+        "sha256": "sha256:459255e481b2aef0df50b1f13b8918e2f2bce7557ca34144dcb71544c8f2a29a",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/macd_crossover_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.macd_histogram_indicator",
+        "sha256": "sha256:624ed52ef7b50cb718ab9a55758585797e75fb4d0bfd4ff252476a5116608811",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/macd_histogram_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.mfi_indicator",
+        "sha256": "sha256:84426faadd641497c6c8a4c809e71e36783ed584e6d62ae38921b662153dbbd5",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/mfi_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.minus_di_indicator",
+        "sha256": "sha256:38728d56884fa57b37d5de0ad7f58e3c63ba61e41365d8b288a4b1f74003c359",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/minus_di_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.mom_indicator",
+        "sha256": "sha256:9a4315cecb9b211b2777038616c6ffc533f488af26018f86b87617f61fefec6d",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/mom_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.obv_indicator",
+        "sha256": "sha256:eb381e5a23f45dc5ccc44736e3d16730de58c2486e4ef7da1731746ee8b0788c",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/obv_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.plus_di_indicator",
+        "sha256": "sha256:4b23734a708a388217005b56e86529d14efc0f06530dcc55c26c636295a99688",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/plus_di_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.profile_indicators",
+        "sha256": "sha256:abc6406becd90fbc8e62adbe669785b8360893d183a77f9583f838321c283924",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/profile_indicators.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.rsi_indicator",
+        "sha256": "sha256:55b357429d93cffd44f5195c1da676e1bc6a8a158cb82aa658493732df47d8c0",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/rsi_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.sar_indicator",
+        "sha256": "sha256:43c7bde6769cf6c3f18f6165f391ffbde6a287e0b1d340fd510646d7750e5df5",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/sar_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.stoch_crossover_indicator",
+        "sha256": "sha256:b99324807f7c8926f305f33b86013ecd5cf996c71bd828ad7be745fc22d69f8c",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/stoch_crossover_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.stoch_indicator",
+        "sha256": "sha256:f0fd80c005aa7ffc935b57117b99fd24915713174e088d16a891c9f31c8c31d2",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/stoch_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.stochf_indicator",
+        "sha256": "sha256:90b877f5d90cbf1bc3bb5f7eb9424c5710f6412d4ecc52e2ae9e50198541e6e4",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/stochf_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.stochrsi_indicator",
+        "sha256": "sha256:7b51f06b66a39164742e682b7ab4a4337fd3e0fdf3a0dba00750724249f5ba99",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/stochrsi_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.trigger_indicators",
+        "sha256": "sha256:6a89c35d7599c2aac829fcbc7fabb69463250e9e8c6233163744578a077c3082",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/trigger_indicators.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.ultosc_indicator",
+        "sha256": "sha256:eede85a40bdc111b6daf28e07cc81f163ef06a4d62f3000e7ec615b49e68d81b",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/ultosc_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.indicators.willr_indicator",
+        "sha256": "sha256:e1a10f6c203f75fa0e113612f0c5d1a2453016c02eb9d927a7563ad913b0b0ff",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/indicators/willr_indicator.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.market_utils",
+        "sha256": "sha256:983bf9cb43e18dcc7369f4496ff1cb76030d7506c822bf41510e203eaf12b269",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/market_utils.py"
+      },
+      {
+        "module": "fuzzfolio_core.scoring_engine.scoring_functions",
+        "sha256": "sha256:dd83d477ac540d11b5933b7c1c9766220a0623784213b9518bf051a43b14778c",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/scoring_engine/scoring_functions.py"
+      },
+      {
+        "module": "fuzzfolio_core.talib_runtime",
+        "sha256": "sha256:d1c348b38a347806ba3eddc833cc5146a297cfb5f8743e1cb1fb6cf1275ee29a",
+        "source": "shared/python/fuzzfolio_core/fuzzfolio_core/talib_runtime.py"
+      }
+    ],
+    "numpy": "2.4.0",
+    "pandas": "2.3.3",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "pyarrow": "21.0.0",
+    "python": "3.13.12 (main, Mar 24 2026, 22:56:40) [MSC v.1944 64 bit (AMD64)]",
+    "rustNative": {
+      "artifacts": [
+        {
+          "relativePath": "__init__.py",
+          "sha256": "sha256:8b9b74c29bc5358596a3fd186c2ba5584b7146ec985fabceae595eb1a80f2e2c"
+        },
+        {
+          "relativePath": "fuzzfolio_rust_core.cp313-win_amd64.pyd",
+          "sha256": "sha256:0a400de28f524925953ee59357cea673a6878adde2041e1e31233456bc9d2e43"
+        }
+      ],
+      "buildInfo": {
+        "crate_name": "fuzzfolio-rust-core",
+        "crate_version": "0.1.0",
+        "profile": "unknown",
+        "target_arch": "x86_64",
+        "target_os": "windows"
+      },
+      "module": "fuzzfolio_rust_core",
+      "modulePath": "C:\\repos\\fuzzfolio-autoresearch\\.tmp\\worktrees\\trading-dashboard\\component-surrogate-validation-v2-engine\\backend\\.venv\\Lib\\site-packages\\fuzzfolio_rust_core\\__init__.py",
+      "packageRoot": "C:\\repos\\fuzzfolio-autoresearch\\.tmp\\worktrees\\trading-dashboard\\component-surrogate-validation-v2-engine\\backend\\.venv\\Lib\\site-packages\\fuzzfolio_rust_core"
+    }
+  },
+  "schemaVersion": "temporal_qd_component_surrogate_feature_projection_runtime_authority_addendum_v1"
+}
