@@ -9771,6 +9771,10 @@ fn static_neighborhood_row(
             "parentPairIdentitySha256",
             Value::String(choice.parent_pair_identity_sha256.clone()),
         ),
+        (
+            "parentSideProgramSha256",
+            Value::String(canonical_sha256(&prepared.parent_program)?),
+        ),
         ("parentRole", Value::String(choice.parent_role.clone())),
         ("side", Value::String(choice.side.clone())),
         ("operatorId", Value::String(choice.operator_id.clone())),
@@ -9791,6 +9795,14 @@ fn static_neighborhood_row(
         (
             "legacyChoiceOrderingSha256",
             Value::String(choice.choice.legacy_choice_ordering_sha256.clone()),
+        ),
+        (
+            "nativePlanConstruction",
+            clone_value(required(
+                &choice.choice.native_plan,
+                "construction",
+                "v5 static neighborhood plan",
+            )?)?,
         ),
         (
             "behaviorStatus",
@@ -9920,11 +9932,33 @@ fn static_neighborhood_row(
                 .clone(),
             );
             fields.insert("deltaGeometry".to_owned(), delta_geometry);
-            match prepared
-                .recompiler
-                .admit_evolved_child_full_pair(&choice.operator_id, &application.child_program)
-            {
-                Ok(()) => {
+            match prepared.recompiler.recompile_operator_runtime(&delta) {
+                Ok(runtime) => {
+                    let opposite_side = if choice.side == "long" { "short" } else { "long" };
+                    let parent_opposite = prepared.recompiler.state_for_side(opposite_side)?;
+                    let child_opposite = runtime.program(opposite_side)?;
+                    let parent_opposite_sha256 = canonical_sha256(&parent_opposite.program)?;
+                    let child_opposite_sha256 = canonical_sha256(child_opposite)?;
+                    fields.insert(
+                        "childPairIdentitySha256".to_owned(),
+                        Value::String(runtime.pair_identity_sha256.clone()),
+                    );
+                    fields.insert(
+                        "oppositeSide".to_owned(),
+                        Value::String(opposite_side.to_owned()),
+                    );
+                    fields.insert(
+                        "oppositeSideParentProgramSha256".to_owned(),
+                        Value::String(parent_opposite_sha256.clone()),
+                    );
+                    fields.insert(
+                        "oppositeSideChildProgramSha256".to_owned(),
+                        Value::String(child_opposite_sha256.clone()),
+                    );
+                    fields.insert(
+                        "oppositeSideUnchanged".to_owned(),
+                        Value::Bool(parent_opposite_sha256 == child_opposite_sha256),
+                    );
                     fields.insert(
                         "stageTrace".to_owned(),
                         static_neighborhood_stage_trace(&[

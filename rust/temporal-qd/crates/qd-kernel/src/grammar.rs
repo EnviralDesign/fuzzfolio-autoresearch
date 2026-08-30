@@ -12,6 +12,10 @@ pub const GRAMMAR_SCHEMA: &str = "temporal_typed_fragment_grammar_v2";
 pub const GRAMMAR_VERSION: &str = "3";
 pub const MODULE_SCHEMA: &str = "temporal_typed_fragment_module_v2";
 pub const WITNESS_SCHEMA: &str = "temporal_typed_fragment_activation_recipe_v1";
+/// Read-only projection schema for auditing the sealed executable grammar.
+/// It is intentionally separate from the compact frozen-authority registry,
+/// which binds only the fields needed by construction.
+pub const REGISTRY_PROJECTION_SCHEMA: &str = "temporal_typed_fragment_grammar_registry_projection_v1";
 pub const ENTRY_ROUTE_DECISION_INDICATOR_CAP: usize = 3;
 pub const ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION: &str =
     "temporal_entry_route_decision_indicator_cap_v1";
@@ -484,6 +488,60 @@ pub fn registry() -> BTreeMap<String, FragmentSpec> {
         recipe(&["state_age"], "recovery"),
     ));
     result
+}
+
+/// Export the complete executable registry without parsing Rust source text.
+/// This is a research/audit projection only; production construction continues
+/// to read [`registry`] directly.
+pub fn registry_projection() -> Value {
+    let productions = registry()
+        .into_values()
+        .map(|fragment| {
+            obj(vec![
+                ("productionId", Value::String(fragment.production_id)),
+                ("family", Value::String(fragment.family)),
+                (
+                    "consumes",
+                    Value::String(fragment.consumes.as_str().to_owned()),
+                ),
+                (
+                    "produces",
+                    Value::String(fragment.produces.as_str().to_owned()),
+                ),
+                (
+                    "resourceSlots",
+                    Value::Array(
+                        fragment
+                            .resource_slots
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                ),
+                (
+                    "choiceDomains",
+                    Value::Object(
+                        fragment
+                            .choice_domains
+                            .into_iter()
+                            .map(|(key, values)| (key, Value::Array(values)))
+                            .collect(),
+                    ),
+                ),
+                ("maxInstances", Value::from(fragment.max_instances as u64)),
+                ("activationRecipe", fragment.activation_recipe),
+            ])
+        })
+        .collect();
+    obj(vec![
+        (
+            "schemaVersion",
+            Value::String(REGISTRY_PROJECTION_SCHEMA.to_owned()),
+        ),
+        ("grammarSchema", Value::String(GRAMMAR_SCHEMA.to_owned())),
+        ("grammarVersion", Value::String(GRAMMAR_VERSION.to_owned())),
+        ("productions", Value::Array(productions)),
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq)]

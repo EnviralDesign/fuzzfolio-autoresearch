@@ -34,6 +34,7 @@ use temporal_qd_kernel::v5::{
 };
 use temporal_qd_kernel::{
     factory::ParentReference,
+    grammar::registry_projection,
     g0_funnel::{
         DEFAULT_G0_ADMISSION_THREAD_CAP, G0FunnelOutcome, G0FunnelRequest,
         MAX_G0_ADMISSION_THREAD_CAP, finalize_g0,
@@ -118,6 +119,9 @@ fn run() -> Result<()> {
     if args.len() == 2 && args[1] == "--version-json" {
         return write_stdout_json(&serde_json::to_value(NativeVersion::current())?);
     }
+    if args.len() == 2 && args[1] == "--grammar-registry" {
+        return write_stdout_json(&registry_projection());
+    }
     if args.len() == 3 && args[1] == "--static-neighborhood" {
         return execute_static_neighborhood(Path::new(&args[2]));
     }
@@ -132,7 +136,7 @@ fn run() -> Result<()> {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::FastEphemeralV1);
     }
     bail!(
-        "usage: temporal-qd-batch --version-json | --static-neighborhood REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
+        "usage: temporal-qd-batch --version-json | --grammar-registry | --static-neighborhood REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
     )
 }
 
