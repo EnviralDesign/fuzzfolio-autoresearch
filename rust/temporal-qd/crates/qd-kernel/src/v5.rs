@@ -11,7 +11,7 @@
 //! the exact same program envelope rather than adding a one-off G0 shortcut.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -44,6 +44,11 @@ pub const V5_EVOLVED_PARENT_MATERIAL_SCHEMA: &str = "temporal_qd_v5_evolved_pare
 /// It seals the source archive identities alongside the exact compact parent
 /// material so offline replay never has to reopen a previous-generation file.
 pub const V5_EVOLVED_PARENT_SNAPSHOT_SCHEMA: &str = "temporal_qd_v5_evolved_parent_snapshot_v1";
+/// Research-only, write-neutral projection of canonical one-step operator
+/// neighborhoods. It does not construct a generation, select parents, or
+/// materialize a candidate/archive artifact.
+pub const V5_STATIC_NEIGHBORHOOD_REPORT_SCHEMA: &str =
+    "temporal_qd_v5_static_neighborhood_report_v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum V5Error {
@@ -9457,6 +9462,376 @@ impl crate::v5_operators::V5EvolvedPairRecompiler for V5SealedEvolvedPairRecompi
             .and_then(|runtime| Self::recompiled_output(&runtime, &delta.side))
             .map_err(operator_error)
     }
+}
+
+/// A caller-selected frozen parent and its descriptive role. The role is
+/// report-only: it never enters operator selection or candidate identity.
+#[derive(Clone, Debug)]
+pub struct V5StaticNeighborhoodParent {
+    pub role: String,
+    pub reference: ParentReference,
+}
+
+struct V5StaticNeighborhoodChoice {
+    prepared_side_index: usize,
+    parent_candidate_id: String,
+    parent_pair_identity_sha256: String,
+    parent_role: String,
+    side: String,
+    operator_id: String,
+    choice_kind: String,
+    construction_kind: Option<String>,
+    choice: crate::v5_operators::V5LegacyOperatorChoice,
+}
+
+struct V5StaticNeighborhoodPreparedSide {
+    parent_program: Value,
+    recompiler: Arc<V5SealedEvolvedPairRecompiler>,
+}
+
+fn static_neighborhood_choice_key(choice: &V5StaticNeighborhoodChoice) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        choice.parent_role,
+        choice.parent_candidate_id,
+        choice.side,
+        choice.operator_id,
+        choice
+            .construction_kind
+            .as_deref()
+            .unwrap_or("unclassified")
+    )
+}
+
+fn static_neighborhood_text(value: &Value, key: &str, label: &str) -> Result<String> {
+    text(required(value, key, label)?, label)
+}
+
+fn static_neighborhood_construction_kind(plan: &Value) -> Result<Option<String>> {
+    let construction = required(plan, "construction", "v5 static neighborhood plan")?;
+    Ok(construction
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
+fn static_neighborhood_balanced_selection(
+    choices: Vec<V5StaticNeighborhoodChoice>,
+    max_plans: usize,
+) -> Vec<V5StaticNeighborhoodChoice> {
+    let mut groups = BTreeMap::<String, VecDeque<V5StaticNeighborhoodChoice>>::new();
+    for choice in choices {
+        groups
+            .entry(static_neighborhood_choice_key(&choice))
+            .or_default()
+            .push_back(choice);
+    }
+    for choices in groups.values_mut() {
+        choices.make_contiguous().sort_by(|left, right| {
+            left.choice
+                .legacy_choice_sha256
+                .cmp(&right.choice.legacy_choice_sha256)
+        });
+    }
+    let mut selected = Vec::new();
+    while selected.len() < max_plans {
+        let mut advanced = false;
+        for choices in groups.values_mut() {
+            if selected.len() == max_plans {
+                break;
+            }
+            if let Some(choice) = choices.pop_front() {
+                selected.push(choice);
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    selected
+}
+
+fn static_neighborhood_classification(
+    operator_id: &str,
+    child_equals_parent: bool,
+) -> &'static str {
+    if child_equals_parent {
+        "exact_no_op"
+    } else if operator_id == crate::v5_operators::V5_TOPOLOGY_OPERATOR_ID {
+        "coherent_single_region_change"
+    } else {
+        "small_local_change"
+    }
+}
+
+fn static_neighborhood_row(
+    choice: V5StaticNeighborhoodChoice,
+    prepared: &V5StaticNeighborhoodPreparedSide,
+) -> Result<Value> {
+    let plan_sha256 = static_neighborhood_text(
+        &choice.choice.native_plan,
+        "planSha256",
+        "v5 static neighborhood plan",
+    )?;
+    let applied = crate::v5_operators::apply_operator_plan(
+        &prepared.parent_program,
+        &prepared
+            .recompiler
+            .projection
+            .operator_authority(&choice.side)?,
+        &choice.choice.native_plan,
+    );
+    let mut row = object([
+        (
+            "parentCandidateId",
+            Value::String(choice.parent_candidate_id.clone()),
+        ),
+        (
+            "parentPairIdentitySha256",
+            Value::String(choice.parent_pair_identity_sha256.clone()),
+        ),
+        ("parentRole", Value::String(choice.parent_role.clone())),
+        ("side", Value::String(choice.side.clone())),
+        ("operatorId", Value::String(choice.operator_id.clone())),
+        ("choiceKind", Value::String(choice.choice_kind.clone())),
+        (
+            "constructionKind",
+            choice
+                .construction_kind
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        ),
+        ("planSha256", Value::String(plan_sha256)),
+        (
+            "legacyChoiceSha256",
+            Value::String(choice.choice.legacy_choice_sha256.clone()),
+        ),
+        (
+            "legacyChoiceOrderingSha256",
+            Value::String(choice.choice.legacy_choice_ordering_sha256.clone()),
+        ),
+        (
+            "behaviorStatus",
+            Value::String("unknown_no_runtime_or_market_execution".to_owned()),
+        ),
+    ]);
+    let fields = row
+        .as_object_mut()
+        .expect("constructed static neighborhood row is an object");
+    match applied {
+        Err(error) => {
+            fields.insert(
+                "staticClassification".to_owned(),
+                Value::String("invalid_rejected".to_owned()),
+            );
+            fields.insert(
+                "admissionDisposition".to_owned(),
+                Value::String("operator_rejected".to_owned()),
+            );
+            fields.insert("reasonCode".to_owned(), Value::String(error.to_string()));
+        }
+        Ok(application) => {
+            let child_program_sha256 = canonical_sha256(&application.child_program)?;
+            let child_equals_parent = application.child_program == prepared.parent_program;
+            fields.insert(
+                "childProgramSha256".to_owned(),
+                Value::String(child_program_sha256),
+            );
+            fields.insert(
+                "applicationSha256".to_owned(),
+                required(
+                    &application.audit,
+                    "applicationSha256",
+                    "v5 static neighborhood application audit",
+                )?
+                .clone(),
+            );
+            match prepared
+                .recompiler
+                .admit_evolved_child_full_pair(&choice.operator_id, &application.child_program)
+            {
+                Ok(()) => {
+                    fields.insert(
+                        "staticClassification".to_owned(),
+                        Value::String(
+                            static_neighborhood_classification(
+                                &choice.operator_id,
+                                child_equals_parent,
+                            )
+                            .to_owned(),
+                        ),
+                    );
+                    fields.insert(
+                        "admissionDisposition".to_owned(),
+                        Value::String("accepted_full_pair".to_owned()),
+                    );
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    fields.insert(
+                        "staticClassification".to_owned(),
+                        Value::String(
+                            if detail.to_ascii_lowercase().contains("liveness") {
+                                "static_liveness_risk"
+                            } else {
+                                "invalid_rejected"
+                            }
+                            .to_owned(),
+                        ),
+                    );
+                    fields.insert(
+                        "admissionDisposition".to_owned(),
+                        Value::String("rejected_full_pair".to_owned()),
+                    );
+                    fields.insert("reasonCode".to_owned(), Value::String(detail));
+                }
+            }
+        }
+    }
+    Ok(row)
+}
+
+/// Enumerate a bounded, deterministic, parent-role-balanced set of existing
+/// one-step plans, apply each through the canonical Rust API, and admit its
+/// child through the canonical full-pair compiler. This function is strictly
+/// write-neutral: no selector draw, generation transaction, archive, ledger,
+/// candidate materialization, or runtime/market evaluation occurs here.
+pub fn inspect_v5_static_neighborhood(
+    shared_authority: &Value,
+    parents: &[V5StaticNeighborhoodParent],
+    analysis_seed: &str,
+    max_plans: usize,
+) -> Result<Value> {
+    if parents.is_empty() {
+        return Err(invalid(
+            "v5 static neighborhood requires at least one parent",
+        ));
+    }
+    if max_plans == 0 || max_plans > 4_000 {
+        return Err(invalid(
+            "v5 static neighborhood max plans must be between 1 and 4000",
+        ));
+    }
+    let authority = V5SharedConstructionAuthority::from_shared_object(shared_authority)?;
+    let analysis_seed = text(
+        &Value::String(analysis_seed.to_owned()),
+        "v5 static neighborhood analysis seed",
+    )?;
+    let mut parent_ids = BTreeSet::new();
+    let mut all_choices = Vec::new();
+    let mut prepared_sides = Vec::new();
+    for parent in parents {
+        let role = text(
+            &Value::String(parent.role.clone()),
+            "v5 static neighborhood parent role",
+        )?;
+        parent.reference.validate().map_err(|error| {
+            invalid(format!("v5 static neighborhood parent reference: {error}"))
+        })?;
+        if !parent_ids.insert(parent.reference.candidate_id.clone()) {
+            return Err(invalid("v5 static neighborhood repeats a parent candidate"));
+        }
+        let material = load_v5_evolved_parent(&authority, &parent.reference)?;
+        let recompiler = Arc::new(V5SealedEvolvedPairRecompiler::from_verified_parent(
+            &authority,
+            &material,
+            &analysis_seed,
+        )?);
+        for side in ["long", "short"] {
+            let state = recompiler.state_for_side(side)?;
+            let operator_authority = recompiler.projection.operator_authority(side)?;
+            let choices = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
+                &state.program,
+                &operator_authority,
+                &state.compiled_profile,
+                recompiler.as_ref(),
+            )
+            .map_err(|error| {
+                invalid(format!(
+                    "v5 static neighborhood choice enumeration: {error}"
+                ))
+            })?;
+            let prepared_side_index = prepared_sides.len();
+            prepared_sides.push(V5StaticNeighborhoodPreparedSide {
+                parent_program: state.program.clone(),
+                recompiler: Arc::clone(&recompiler),
+            });
+            for choice in choices {
+                let operator_id = static_neighborhood_text(
+                    &choice.native_plan,
+                    "operatorId",
+                    "v5 static neighborhood plan",
+                )?;
+                let choice_kind = static_neighborhood_text(
+                    &choice.native_plan,
+                    "choiceKind",
+                    "v5 static neighborhood plan",
+                )?;
+                all_choices.push(V5StaticNeighborhoodChoice {
+                    prepared_side_index,
+                    parent_candidate_id: material.candidate_id.clone(),
+                    parent_pair_identity_sha256: material.pair_identity_sha256.clone(),
+                    parent_role: role.clone(),
+                    side: side.to_owned(),
+                    operator_id,
+                    choice_kind,
+                    construction_kind: static_neighborhood_construction_kind(&choice.native_plan)?,
+                    choice,
+                });
+            }
+        }
+    }
+    let enumerated_plan_count = all_choices.len();
+    let selected = static_neighborhood_balanced_selection(all_choices, max_plans);
+    let rows = selected
+        .into_iter()
+        .map(|choice| {
+            let prepared = prepared_sides
+                .get(choice.prepared_side_index)
+                .ok_or_else(|| invalid("v5 static neighborhood prepared side is missing"))?;
+            static_neighborhood_row(choice, prepared)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut value = object([
+        (
+            "schemaVersion",
+            Value::String(V5_STATIC_NEIGHBORHOOD_REPORT_SCHEMA.to_owned()),
+        ),
+        (
+            "sharedAuthoritySha256",
+            Value::String(authority.shared_authority_sha256),
+        ),
+        (
+            "analysisSeedSha256",
+            Value::String(canonical_sha256(&Value::String(analysis_seed))?),
+        ),
+        ("maxPlans", Value::from(max_plans as u64)),
+        ("enumeratedPlanCount", Value::from(enumerated_plan_count as u64)),
+        ("selectedPlanCount", Value::from(rows.len() as u64)),
+        (
+            "selectionPolicy",
+            Value::String(
+                "deterministic_round_robin_by_parent_role_parent_side_operator_construction_kind_v1"
+                    .to_owned(),
+            ),
+        ),
+        (
+            "scope",
+            Value::String(
+                "write_neutral_existing_one_step_enumeration_apply_and_full_pair_admission_only"
+                    .to_owned(),
+            ),
+        ),
+        ("rows", Value::Array(rows)),
+    ]);
+    let report_sha256 = canonical_sha256(&value)?;
+    value
+        .as_object_mut()
+        .expect("constructed static neighborhood report is an object")
+        .insert("reportSha256".to_owned(), Value::String(report_sha256));
+    Ok(value)
 }
 
 fn v5_compact_evidence_scope() -> Result<Value> {

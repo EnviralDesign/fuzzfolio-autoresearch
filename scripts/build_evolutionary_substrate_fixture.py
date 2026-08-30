@@ -163,6 +163,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         ("native-batch-authority", authority_path, "retained executable authority receipt", "v38RunRoot", args.v38_run_root),
         ("v37-parent-archive", v37_archive, "evolved construction parent archive input", "v37RunRoot", args.v37_run_root),
         ("v37-identity-ledger", v37_ledger, "evolved construction identity ledger input", "v37RunRoot", args.v37_run_root),
+        ("v38-run-config", args.v38_run_root / "config.json", "retained V38 matrix contract and parent-role source", "v38RunRoot", args.v38_run_root),
+        ("v38-parent-material", proposal_root / "parent-material.jsonl", "opaque frozen parent reconstruction payloads", "v38RunRoot", args.v38_run_root),
         ("proposal-attempts-receipt", proposal_root / "proposal-attempts-receipt.json", "retained attempt journal receipt", "v38RunRoot", args.v38_run_root),
         ("proposal-identity-ledger", proposal_root / "identity-ledger.json", "retained evolved proposal identity ledger", "v38RunRoot", args.v38_run_root),
         ("native-finalization-manifest", args.v38_run_root / "generations" / "generation-0003" / "native-finalization" / "manifest.json", "retained compile/finalization receipt", "v38RunRoot", args.v38_run_root),

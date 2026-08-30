@@ -28,7 +28,8 @@ use temporal_qd_contract::{
 };
 use temporal_qd_kernel::v5::{
     V5AttemptJournal, V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5SelectedProjection,
-    V5SharedConstructionAuthority, parent_reference_from_v5_compact_record,
+    V5SharedConstructionAuthority, V5StaticNeighborhoodParent, inspect_v5_static_neighborhood,
+    parent_reference_from_v5_compact_record,
     verify_v5_evolved_parent_reference,
 };
 use temporal_qd_kernel::{
@@ -117,6 +118,9 @@ fn run() -> Result<()> {
     if args.len() == 2 && args[1] == "--version-json" {
         return write_stdout_json(&serde_json::to_value(NativeVersion::current())?);
     }
+    if args.len() == 3 && args[1] == "--static-neighborhood" {
+        return execute_static_neighborhood(Path::new(&args[2]));
+    }
     if args.len() == 3 && args[1] == "--manifest" {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::Durable);
     }
@@ -128,8 +132,200 @@ fn run() -> Result<()> {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::FastEphemeralV1);
     }
     bail!(
-        "usage: temporal-qd-batch --version-json | --manifest PATH [--execution-mode fast-ephemeral-v1]"
+        "usage: temporal-qd-batch --version-json | --static-neighborhood REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
     )
+}
+
+const V5_STATIC_NEIGHBORHOOD_REQUEST_SCHEMA: &str =
+    "temporal_qd_v5_static_neighborhood_request_v1";
+
+fn static_neighborhood_text(fields: &Map<String, Value>, key: &str) -> Result<String> {
+    fields
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && *value == value.trim())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("static neighborhood request {key} is invalid"))
+}
+
+fn static_neighborhood_parents(
+    parent_material_path: &Path,
+    requested: &[(String, String)],
+) -> Result<Vec<V5StaticNeighborhoodParent>> {
+    let requested_by_id = requested
+        .iter()
+        .map(|(candidate_id, role)| (candidate_id.clone(), role.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let file = fs::File::open(parent_material_path).with_context(|| {
+        format!(
+            "open static neighborhood parent material: {}",
+            parent_material_path.display()
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut loaded = BTreeMap::<String, ParentReference>::new();
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        let read = reader
+            .by_ref()
+            .take((v5_fast_ephemeral::MAX_PARENT_MATERIAL_ROW_BYTES + 1) as u64)
+            .read_until(b'\n', &mut raw)
+            .context("read static neighborhood parent material row")?;
+        if read == 0 {
+            break;
+        }
+        if raw.len() > v5_fast_ephemeral::MAX_PARENT_MATERIAL_ROW_BYTES
+            || raw.last() != Some(&b'\n')
+            || raw.contains(&b'\r')
+        {
+            bail!("static neighborhood parent material row is not canonical LF JSONL")
+        }
+        let value: Value =
+            serde_json::from_slice(&raw).context("parse static neighborhood parent material row")?;
+        if canonical_json_line(&value)? != raw {
+            bail!("static neighborhood parent material row is not canonical JSON plus LF")
+        }
+        let fields = value
+            .as_object()
+            .ok_or_else(|| anyhow!("static neighborhood parent material row is not an object"))?;
+        let candidate_id = static_neighborhood_text(fields, "candidateId")?;
+        if !requested_by_id.contains_key(&candidate_id) {
+            continue;
+        }
+        let expected = [
+            "schemaVersion",
+            "candidateId",
+            "pairIdentitySha256",
+            "proposalEntrySha256",
+            "pairPayload",
+            "rowSha256",
+        ];
+        if fields.len() != expected.len()
+            || expected.iter().any(|key| !fields.contains_key(*key))
+            || fields.get("schemaVersion").and_then(Value::as_str)
+                != Some(v5_fast_ephemeral::PARENT_MATERIAL_ROW_SCHEMA)
+        {
+            bail!("static neighborhood parent material row shape is incompatible")
+        }
+        let supplied_row_sha256 = static_neighborhood_text(fields, "rowSha256")?;
+        let mut semantic = fields.clone();
+        semantic.remove("rowSha256");
+        if canonical_sha256(&Value::Object(semantic))? != supplied_row_sha256 {
+            bail!("static neighborhood parent material row identity drifted")
+        }
+        let reference = ParentReference {
+            pair_identity_sha256: static_neighborhood_text(fields, "pairIdentitySha256")?,
+            candidate_id: candidate_id.clone(),
+            pair_payload: fields
+                .get("pairPayload")
+                .cloned()
+                .ok_or_else(|| anyhow!("static neighborhood parent material lacks pair payload"))?,
+            selection_audit: None,
+        };
+        reference
+            .validate()
+            .context("validate static neighborhood parent reference")?;
+        if loaded.insert(candidate_id, reference).is_some() {
+            bail!("static neighborhood parent material repeats a requested candidate")
+        }
+    }
+    if loaded.len() != requested_by_id.len() {
+        bail!("static neighborhood parent material lacks a requested candidate")
+    }
+    requested
+        .iter()
+        .map(|(candidate_id, role)| {
+            let reference = loaded
+                .remove(candidate_id)
+                .ok_or_else(|| anyhow!("requested static neighborhood parent is unavailable"))?;
+            Ok(V5StaticNeighborhoodParent {
+                role: role.clone(),
+                reference,
+            })
+        })
+        .collect()
+}
+
+fn execute_static_neighborhood(request_path: &Path) -> Result<()> {
+    let request_path = safe_existing_file(request_path, "static neighborhood request")?;
+    let raw = fs::read(&request_path).with_context(|| {
+        format!(
+            "read static neighborhood request: {}",
+            request_path.display()
+        )
+    })?;
+    let request: Value =
+        serde_json::from_slice(&raw).context("parse static neighborhood request")?;
+    let fields = request
+        .as_object()
+        .ok_or_else(|| anyhow!("static neighborhood request is not an object"))?;
+    let expected = [
+        "schemaVersion",
+        "frozenAuthorityPath",
+        "parentMaterialPath",
+        "parents",
+        "analysisSeed",
+        "maxPlans",
+    ];
+    if fields.len() != expected.len()
+        || expected.iter().any(|key| !fields.contains_key(*key))
+        || fields.get("schemaVersion").and_then(Value::as_str)
+            != Some(V5_STATIC_NEIGHBORHOOD_REQUEST_SCHEMA)
+    {
+        bail!("static neighborhood request shape is incompatible")
+    }
+    let authority_path = safe_existing_file(
+        Path::new(&static_neighborhood_text(fields, "frozenAuthorityPath")?),
+        "static neighborhood frozen authority",
+    )?;
+    let authority: Value = serde_json::from_slice(
+        &fs::read(&authority_path).with_context(|| {
+            format!(
+                "read static neighborhood frozen authority: {}",
+                authority_path.display()
+            )
+        })?,
+    )
+    .context("parse static neighborhood frozen authority")?;
+    let parent_material_path = safe_existing_file(
+        Path::new(&static_neighborhood_text(fields, "parentMaterialPath")?),
+        "static neighborhood parent material",
+    )?;
+    let parents = fields
+        .get("parents")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| anyhow!("static neighborhood request parents are invalid"))?;
+    let mut requested = Vec::new();
+    let mut seen = BTreeSet::new();
+    for parent in parents {
+        let parent = parent
+            .as_object()
+            .ok_or_else(|| anyhow!("static neighborhood request parent is not an object"))?;
+        if parent.len() != 2 || !parent.contains_key("candidateId") || !parent.contains_key("role") {
+            bail!("static neighborhood request parent shape is incompatible")
+        }
+        let candidate_id = static_neighborhood_text(parent, "candidateId")?;
+        if !seen.insert(candidate_id.clone()) {
+            bail!("static neighborhood request repeats a parent candidate")
+        }
+        requested.push((candidate_id, static_neighborhood_text(parent, "role")?));
+    }
+    let max_plans = fields
+        .get("maxPlans")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=4_000).contains(value))
+        .ok_or_else(|| anyhow!("static neighborhood request maxPlans must be 1 through 4000"))?;
+    let report = inspect_v5_static_neighborhood(
+        &authority,
+        &static_neighborhood_parents(&parent_material_path, &requested)?,
+        &static_neighborhood_text(fields, "analysisSeed")?,
+        max_plans,
+    )
+    .context("inspect static neighborhood through canonical v5 seams")?;
+    write_stdout_json(&report)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
