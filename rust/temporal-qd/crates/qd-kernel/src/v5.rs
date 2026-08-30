@@ -49,6 +49,10 @@ pub const V5_EVOLVED_PARENT_SNAPSHOT_SCHEMA: &str = "temporal_qd_v5_evolved_pare
 /// materialize a candidate/archive artifact.
 pub const V5_STATIC_NEIGHBORHOOD_REPORT_SCHEMA: &str =
     "temporal_qd_v5_static_neighborhood_report_v1";
+/// Research-only, write-neutral projection of exact ordered same-side
+/// crossover attempts across frozen evolved parents.
+pub const V5_STATIC_SAME_SIDE_CROSSOVER_REPORT_SCHEMA: &str =
+    "temporal_qd_v5_static_same_side_crossover_report_v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum V5Error {
@@ -9491,6 +9495,21 @@ struct V5StaticNeighborhoodPreparedSide {
     recompiler: Arc<V5SealedEvolvedPairRecompiler>,
 }
 
+struct V5StaticCrossoverPreparedParent {
+    candidate_id: String,
+    pair_identity_sha256: String,
+    role: String,
+    material: V5EvolvedParentMaterial,
+    recompiler: Arc<V5SealedEvolvedPairRecompiler>,
+}
+
+struct V5StaticCrossoverChoice {
+    recipient_index: usize,
+    donor_index: usize,
+    side: String,
+    plan: Value,
+}
+
 fn static_neighborhood_choice_key(choice: &V5StaticNeighborhoodChoice) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -9578,6 +9597,30 @@ fn static_neighborhood_value_witness(value: &Value) -> Result<Value> {
     }
 }
 
+fn static_neighborhood_array_item_key(value: &Value) -> Option<String> {
+    let fields = value.as_object()?;
+    if let Some(identifier) = fields.get("id").and_then(Value::as_str) {
+        return Some(format!("id:{identifier}"));
+    }
+    fields
+        .get("meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("instanceId"))
+        .and_then(Value::as_str)
+        .map(|identifier| format!("instance:{identifier}"))
+}
+
+fn static_neighborhood_keyed_array<'a>(values: &'a [Value]) -> Option<BTreeMap<String, &'a Value>> {
+    let mut keyed = BTreeMap::new();
+    for value in values {
+        let key = static_neighborhood_array_item_key(value)?;
+        if keyed.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    Some(keyed)
+}
+
 fn static_neighborhood_diff_entries(
     parent: Option<&Value>,
     child: Option<&Value>,
@@ -9602,13 +9645,30 @@ fn static_neighborhood_diff_entries(
             }
         }
         (Some(Value::Array(parent_values)), Some(Value::Array(child_values))) => {
-            for index in 0..parent_values.len().max(child_values.len()) {
-                static_neighborhood_diff_entries(
-                    parent_values.get(index),
-                    child_values.get(index),
-                    &static_neighborhood_pointer_join(path, &index.to_string()),
-                    entries,
-                )?;
+            if let (Some(parent_by_key), Some(child_by_key)) = (
+                static_neighborhood_keyed_array(parent_values),
+                static_neighborhood_keyed_array(child_values),
+            ) {
+                let mut keys = BTreeSet::new();
+                keys.extend(parent_by_key.keys().cloned());
+                keys.extend(child_by_key.keys().cloned());
+                for key in keys {
+                    static_neighborhood_diff_entries(
+                        parent_by_key.get(&key).copied(),
+                        child_by_key.get(&key).copied(),
+                        &static_neighborhood_pointer_join(path, &key),
+                        entries,
+                    )?;
+                }
+            } else {
+                for index in 0..parent_values.len().max(child_values.len()) {
+                    static_neighborhood_diff_entries(
+                        parent_values.get(index),
+                        child_values.get(index),
+                        &static_neighborhood_pointer_join(path, &index.to_string()),
+                        entries,
+                    )?;
+                }
             }
         }
         _ => {
@@ -9688,12 +9748,30 @@ fn static_neighborhood_delta_geometry(
     for change in &changes {
         let path = static_neighborhood_text(change, "path", "v5 static delta change")?;
         let category = static_neighborhood_delta_category(&path);
-        let next = change_counts
-            .get(category)
+        let disposition = match (
+            change.get("beforePresent").and_then(Value::as_bool),
+            change.get("afterPresent").and_then(Value::as_bool),
+        ) {
+            (Some(false), Some(true)) => "added",
+            (Some(true), Some(false)) => "removed",
+            _ => "modified",
+        };
+        let category_counts = change_counts
+            .entry(category.to_owned())
+            .or_insert_with(|| object([
+                ("added", Value::from(0_u64)),
+                ("removed", Value::from(0_u64)),
+                ("modified", Value::from(0_u64)),
+            ]));
+        let category_counts = category_counts
+            .as_object_mut()
+            .expect("constructed static delta category count is an object");
+        let next = category_counts
+            .get(disposition)
             .and_then(Value::as_u64)
             .unwrap_or_default()
             + 1;
-        change_counts.insert(category.to_owned(), Value::from(next));
+        category_counts.insert(disposition.to_owned(), Value::from(next));
     }
     let classification = if changes.is_empty() {
         "same_side_no_op"
@@ -10180,6 +10258,366 @@ pub fn inspect_v5_static_neighborhood(
     value
         .as_object_mut()
         .expect("constructed static neighborhood report is an object")
+        .insert("reportSha256".to_owned(), Value::String(report_sha256));
+    Ok(value)
+}
+
+fn static_crossover_row(
+    choice: V5StaticCrossoverChoice,
+    recipient: &V5StaticCrossoverPreparedParent,
+    donor: &V5StaticCrossoverPreparedParent,
+) -> Result<Value> {
+    let recipient_state = recipient.recompiler.state_for_side(&choice.side)?;
+    let donor_state = donor.recompiler.state_for_side(&choice.side)?;
+    let authority = recipient.recompiler.projection.operator_authority(&choice.side)?;
+    let plan_sha256 = canonical_sha256(&choice.plan)?;
+    let mut row = object([
+        (
+            "recipientCandidateId",
+            Value::String(recipient.candidate_id.clone()),
+        ),
+        (
+            "recipientPairIdentitySha256",
+            Value::String(recipient.pair_identity_sha256.clone()),
+        ),
+        ("recipientRole", Value::String(recipient.role.clone())),
+        (
+            "recipientModuleIdentitySha256",
+            Value::String(recipient_state.module_identity_sha256.clone()),
+        ),
+        (
+            "recipientProgramSha256",
+            Value::String(canonical_sha256(&recipient_state.program)?),
+        ),
+        ("donorCandidateId", Value::String(donor.candidate_id.clone())),
+        (
+            "donorPairIdentitySha256",
+            Value::String(donor.pair_identity_sha256.clone()),
+        ),
+        ("donorRole", Value::String(donor.role.clone())),
+        (
+            "donorModuleIdentitySha256",
+            Value::String(donor_state.module_identity_sha256.clone()),
+        ),
+        (
+            "donorProgramSha256",
+            Value::String(canonical_sha256(&donor_state.program)?),
+        ),
+        ("side", Value::String(choice.side.clone())),
+        (
+            "operatorId",
+            Value::String(crate::v5_operators::V5_CROSSOVER_OPERATOR_ID.to_owned()),
+        ),
+        ("crossoverPlanSha256", Value::String(plan_sha256.clone())),
+        ("nativePlan", clone_value(&choice.plan)?),
+        (
+            "behaviorStatus",
+            Value::String("unknown_no_runtime_or_market_execution".to_owned()),
+        ),
+    ]);
+    let fields = row
+        .as_object_mut()
+        .expect("constructed static crossover row is an object");
+    let application = match crate::v5_operators::apply_same_side_crossover_plan(
+        &recipient_state.program,
+        &donor_state.program,
+        &authority,
+        &choice.plan,
+    ) {
+        Ok(application) => application,
+        Err(error) => {
+            fields.insert(
+                "stageTrace".to_owned(),
+                static_neighborhood_stage_trace(&[
+                    "raw_plan_enumerated",
+                    "operator_apply_rejected",
+                ]),
+            );
+            fields.insert(
+                "terminalStage".to_owned(),
+                Value::String("operator_apply_rejected".to_owned()),
+            );
+            fields.insert(
+                "reasonCode".to_owned(),
+                Value::String(error.to_string()),
+            );
+            return Ok(row);
+        }
+    };
+    let trace = clone_value(required(
+        &application.audit,
+        "semanticDelta",
+        "v5 static crossover application audit",
+    )?)?;
+    let delta = crate::v5_operators::V5EvolvedSameSideCrossoverDelta {
+        side: choice.side.clone(),
+        recipient_pair_identity_sha256: recipient_state.pair_identity_sha256.clone(),
+        donor_pair_identity_sha256: donor_state.pair_identity_sha256.clone(),
+        recipient_module_identity_sha256: recipient_state.module_identity_sha256.clone(),
+        donor_module_identity_sha256: donor_state.module_identity_sha256.clone(),
+        recipient_program_sha256: canonical_sha256(&recipient_state.program)?,
+        donor_program_sha256: canonical_sha256(&donor_state.program)?,
+        child_program: clone_value(&application.child_program)?,
+        child_program_sha256: canonical_sha256(&application.child_program)?,
+        native_plan: clone_value(&choice.plan)?,
+        selection: object([
+            (
+                "schemaVersion",
+                Value::String("temporal_qd_v5_static_crossover_enumerated_plan_v1".to_owned()),
+            ),
+            ("crossoverPlanSha256", Value::String(plan_sha256)),
+            (
+                "recipientPairIdentitySha256",
+                Value::String(recipient_state.pair_identity_sha256.clone()),
+            ),
+            (
+                "donorPairIdentitySha256",
+                Value::String(donor_state.pair_identity_sha256.clone()),
+            ),
+        ]),
+        trace: clone_value(&trace)?,
+    };
+    let (static_classification, delta_geometry) = static_neighborhood_delta_geometry(
+        &recipient_state.program,
+        &application.child_program,
+        &trace,
+    )?;
+    fields.insert(
+        "childProgramSha256".to_owned(),
+        Value::String(canonical_sha256(&application.child_program)?),
+    );
+    fields.insert(
+        "applicationSha256".to_owned(),
+        clone_value(required(
+            &application.audit,
+            "applicationSha256",
+            "v5 static crossover application audit",
+        )?)?,
+    );
+    fields.insert("deltaGeometry".to_owned(), delta_geometry);
+    match recipient
+        .recompiler
+        .recompile_crossover_runtime(&donor.material, &delta)
+    {
+        Ok(runtime) => {
+            let opposite_side = if choice.side == "long" { "short" } else { "long" };
+            let parent_opposite = recipient.recompiler.state_for_side(opposite_side)?;
+            let child_opposite = runtime.program(opposite_side)?;
+            let parent_opposite_sha256 = canonical_sha256(&parent_opposite.program)?;
+            let child_opposite_sha256 = canonical_sha256(child_opposite)?;
+            fields.insert(
+                "childPairIdentitySha256".to_owned(),
+                Value::String(runtime.pair_identity_sha256.clone()),
+            );
+            fields.insert("oppositeSide".to_owned(), Value::String(opposite_side.to_owned()));
+            fields.insert(
+                "oppositeSideParentProgramSha256".to_owned(),
+                Value::String(parent_opposite_sha256.clone()),
+            );
+            fields.insert(
+                "oppositeSideChildProgramSha256".to_owned(),
+                Value::String(child_opposite_sha256.clone()),
+            );
+            fields.insert(
+                "oppositeSideUnchanged".to_owned(),
+                Value::Bool(parent_opposite_sha256 == child_opposite_sha256),
+            );
+            fields.insert(
+                "stageTrace".to_owned(),
+                static_neighborhood_stage_trace(&[
+                    "raw_plan_enumerated",
+                    "accepted_full_pair",
+                ]),
+            );
+            fields.insert(
+                "terminalStage".to_owned(),
+                Value::String("accepted_full_pair".to_owned()),
+            );
+            fields.insert(
+                "staticClassification".to_owned(),
+                Value::String(static_classification),
+            );
+        }
+        Err(error) => {
+            fields.insert(
+                "stageTrace".to_owned(),
+                static_neighborhood_stage_trace(&[
+                    "raw_plan_enumerated",
+                    "full_pair_compile_rejected",
+                ]),
+            );
+            fields.insert(
+                "terminalStage".to_owned(),
+                Value::String("full_pair_compile_rejected".to_owned()),
+            );
+            fields.insert("reasonCode".to_owned(), Value::String(error.to_string()));
+        }
+    }
+    Ok(row)
+}
+
+/// Enumerate every executable same-side crossover plan for the frozen ordered
+/// recipient/donor pairs.  This audit owns no selector draw, generation,
+/// archive, candidate materialization, runtime trace, or market evaluation.
+pub fn inspect_v5_static_same_side_crossover(
+    shared_authority: &Value,
+    parents: &[V5StaticNeighborhoodParent],
+    analysis_seed: &str,
+    max_plans: usize,
+) -> Result<Value> {
+    if parents.len() < 2 {
+        return Err(invalid(
+            "v5 static crossover requires at least two distinct parents",
+        ));
+    }
+    if max_plans == 0 || max_plans > 4_000 {
+        return Err(invalid(
+            "v5 static crossover max plans must be between 1 and 4000",
+        ));
+    }
+    let authority = V5SharedConstructionAuthority::from_shared_object(shared_authority)?;
+    let analysis_seed = text(
+        &Value::String(analysis_seed.to_owned()),
+        "v5 static crossover analysis seed",
+    )?;
+    let mut seen = BTreeSet::new();
+    let mut prepared = Vec::new();
+    for parent in parents {
+        parent.reference.validate().map_err(|error| {
+            invalid(format!("v5 static crossover parent reference: {error}"))
+        })?;
+        if !seen.insert(parent.reference.candidate_id.clone()) {
+            return Err(invalid("v5 static crossover repeats a parent candidate"));
+        }
+        let material = load_v5_evolved_parent(&authority, &parent.reference)?;
+        let recompiler = Arc::new(V5SealedEvolvedPairRecompiler::from_verified_parent(
+            &authority,
+            &material,
+            &analysis_seed,
+        )?);
+        prepared.push(V5StaticCrossoverPreparedParent {
+            candidate_id: material.candidate_id.clone(),
+            pair_identity_sha256: material.pair_identity_sha256.clone(),
+            role: parent.role.clone(),
+            material,
+            recompiler,
+        });
+    }
+    let mut choices = Vec::new();
+    let mut pair_outcomes = Vec::new();
+    for recipient_index in 0..prepared.len() {
+        for donor_index in 0..prepared.len() {
+            if recipient_index == donor_index {
+                continue;
+            }
+            for side in ["long", "short"] {
+                let recipient = &prepared[recipient_index];
+                let donor = &prepared[donor_index];
+                let recipient_state = recipient.recompiler.state_for_side(side)?;
+                let donor_state = donor.recompiler.state_for_side(side)?;
+                let operator_authority = recipient.recompiler.projection.operator_authority(side)?;
+                let plans = crate::v5_operators::enumerate_same_side_crossover_plans(
+                    &recipient_state.program,
+                    &donor_state.program,
+                    &operator_authority,
+                )
+                .map_err(|error| {
+                    invalid(format!("v5 static crossover plan enumeration: {error}"))
+                })?;
+                pair_outcomes.push(object([
+                    (
+                        "recipientCandidateId",
+                        Value::String(recipient.candidate_id.clone()),
+                    ),
+                    ("donorCandidateId", Value::String(donor.candidate_id.clone())),
+                    ("side", Value::String(side.to_owned())),
+                    (
+                        "terminalStage",
+                        Value::String(
+                            if plans.is_empty() {
+                                "no_compatible_port"
+                            } else {
+                                "raw_plan_enumerated"
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                    ("eligiblePlanCount", Value::from(plans.len() as u64)),
+                ]));
+                for plan in plans {
+                    choices.push(V5StaticCrossoverChoice {
+                        recipient_index,
+                        donor_index,
+                        side: side.to_owned(),
+                        plan,
+                    });
+                }
+            }
+        }
+    }
+    if choices.len() > max_plans {
+        return Err(invalid(
+            "v5 static crossover exhaustive plan count exceeds the research cap",
+        ));
+    }
+    let raw_plan_enumerated_count = choices.len();
+    let rows = choices
+        .into_iter()
+        .map(|choice| {
+            let recipient = prepared
+                .get(choice.recipient_index)
+                .ok_or_else(|| invalid("v5 static crossover recipient is missing"))?;
+            let donor = prepared
+                .get(choice.donor_index)
+                .ok_or_else(|| invalid("v5 static crossover donor is missing"))?;
+            static_crossover_row(choice, recipient, donor)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ordered_pair_count = prepared
+        .len()
+        .checked_mul(prepared.len().saturating_sub(1))
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| invalid("v5 static crossover ordered pair count overflowed"))?;
+    let mut value = object([
+        (
+            "schemaVersion",
+            Value::String(V5_STATIC_SAME_SIDE_CROSSOVER_REPORT_SCHEMA.to_owned()),
+        ),
+        (
+            "sharedAuthoritySha256",
+            Value::String(authority.shared_authority_sha256),
+        ),
+        (
+            "analysisSeedSha256",
+            Value::String(canonical_sha256(&Value::String(analysis_seed))?),
+        ),
+        ("maxPlans", Value::from(max_plans as u64)),
+        ("hostCount", Value::from(prepared.len() as u64)),
+        ("selfCrossoverExcludedCount", Value::from((prepared.len() * 2) as u64)),
+        ("orderedRecipientDonorSidePairCount", Value::from(ordered_pair_count as u64)),
+        (
+            "rawPlanEnumeratedCount",
+            Value::from(raw_plan_enumerated_count as u64),
+        ),
+        ("selectedPlanCount", Value::from(rows.len() as u64)),
+        (
+            "selectionPolicy",
+            Value::String("exhaustive_all_valid_ordered_recipient_donor_pairs_v1".to_owned()),
+        ),
+        (
+            "scope",
+            Value::String(
+                "write_neutral_existing_same_side_crossover_enumeration_apply_and_full_pair_recompile_only"
+                    .to_owned(),
+            ),
+        ),
+        ("pairOutcomes", Value::Array(pair_outcomes)),
+        ("rows", Value::Array(rows)),
+    ]);
+    let report_sha256 = canonical_sha256(&value)?;
+    value
+        .as_object_mut()
+        .expect("constructed static crossover report is an object")
         .insert("reportSha256".to_owned(), Value::String(report_sha256));
     Ok(value)
 }
