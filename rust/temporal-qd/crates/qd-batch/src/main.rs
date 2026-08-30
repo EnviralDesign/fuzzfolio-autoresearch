@@ -30,6 +30,7 @@ use temporal_qd_kernel::v5::{
     V5AttemptJournal, V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5SelectedProjection,
     V5SharedConstructionAuthority, V5StaticNeighborhoodParent, inspect_v5_static_neighborhood,
     inspect_v5_static_same_side_crossover,
+    inspect_v5_static_selector_sample,
     parent_reference_from_v5_compact_record,
     verify_v5_evolved_parent_reference,
 };
@@ -129,6 +130,9 @@ fn run() -> Result<()> {
     if args.len() == 3 && args[1] == "--static-same-side-crossover" {
         return execute_static_same_side_crossover(Path::new(&args[2]));
     }
+    if args.len() == 3 && args[1] == "--static-selector-sample" {
+        return execute_static_selector_sample(Path::new(&args[2]));
+    }
     if args.len() == 3 && args[1] == "--manifest" {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::Durable);
     }
@@ -140,7 +144,7 @@ fn run() -> Result<()> {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::FastEphemeralV1);
     }
     bail!(
-        "usage: temporal-qd-batch --version-json | --grammar-registry | --static-neighborhood REQUEST | --static-same-side-crossover REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
+        "usage: temporal-qd-batch --version-json | --grammar-registry | --static-neighborhood REQUEST | --static-same-side-crossover REQUEST | --static-selector-sample REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
     )
 }
 
@@ -407,6 +411,84 @@ fn execute_static_same_side_crossover(request_path: &Path) -> Result<()> {
         max_plans,
     )
     .context("inspect static same-side crossover through canonical v5 seams")?;
+    write_stdout_json(&report)
+}
+
+fn execute_static_selector_sample(request_path: &Path) -> Result<()> {
+    let request_path = safe_existing_file(request_path, "static selector sample request")?;
+    let raw = fs::read(&request_path).with_context(|| {
+        format!("read static selector sample request: {}", request_path.display())
+    })?;
+    let request: Value =
+        serde_json::from_slice(&raw).context("parse static selector sample request")?;
+    let fields = request
+        .as_object()
+        .ok_or_else(|| anyhow!("static selector sample request is not an object"))?;
+    let expected = [
+        "schemaVersion",
+        "frozenAuthorityPath",
+        "parentMaterialPath",
+        "parents",
+        "analysisSeed",
+        "maxPlans",
+    ];
+    if fields.len() != expected.len()
+        || expected.iter().any(|key| !fields.contains_key(*key))
+        || fields.get("schemaVersion").and_then(Value::as_str)
+            != Some(V5_STATIC_NEIGHBORHOOD_REQUEST_SCHEMA)
+    {
+        bail!("static selector sample request shape is incompatible")
+    }
+    let authority_path = safe_existing_file(
+        Path::new(&static_neighborhood_text(fields, "frozenAuthorityPath")?),
+        "static selector sample frozen authority",
+    )?;
+    let authority: Value = serde_json::from_slice(
+        &fs::read(&authority_path).with_context(|| {
+            format!(
+                "read static selector sample frozen authority: {}",
+                authority_path.display()
+            )
+        })?,
+    )
+    .context("parse static selector sample frozen authority")?;
+    let parent_material_path = safe_existing_file(
+        Path::new(&static_neighborhood_text(fields, "parentMaterialPath")?),
+        "static selector sample parent material",
+    )?;
+    let parents = fields
+        .get("parents")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| anyhow!("static selector sample parents are invalid"))?;
+    let mut requested = Vec::new();
+    let mut seen = BTreeSet::new();
+    for parent in parents {
+        let parent = parent
+            .as_object()
+            .ok_or_else(|| anyhow!("static selector sample parent is not an object"))?;
+        if parent.len() != 2 || !parent.contains_key("candidateId") || !parent.contains_key("role") {
+            bail!("static selector sample parent shape is incompatible")
+        }
+        let candidate_id = static_neighborhood_text(parent, "candidateId")?;
+        if !seen.insert(candidate_id.clone()) {
+            bail!("static selector sample repeats a parent candidate")
+        }
+        requested.push((candidate_id, static_neighborhood_text(parent, "role")?));
+    }
+    let draw_count = fields
+        .get("maxPlans")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=4_000).contains(value))
+        .ok_or_else(|| anyhow!("static selector sample draw count must be 1 through 4000"))?;
+    let report = inspect_v5_static_selector_sample(
+        &authority,
+        &static_neighborhood_parents(&parent_material_path, &requested)?,
+        &static_neighborhood_text(fields, "analysisSeed")?,
+        draw_count,
+    )
+    .context("inspect static production selector sample through canonical v5 seams")?;
     write_stdout_json(&report)
 }
 

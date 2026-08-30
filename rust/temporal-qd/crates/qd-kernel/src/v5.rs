@@ -10622,6 +10622,291 @@ pub fn inspect_v5_static_same_side_crossover(
     Ok(value)
 }
 
+fn static_selector_seed(
+    analysis_seed: &str,
+    draw_index: usize,
+    parent_candidate_id: &str,
+    side: &str,
+) -> Result<String> {
+    Ok(canonical_sha256(&object([
+        ("analysisSeed", Value::String(analysis_seed.to_owned())),
+        ("drawIndex", Value::from(draw_index as u64)),
+        (
+            "parentCandidateId",
+            Value::String(parent_candidate_id.to_owned()),
+        ),
+        ("side", Value::String(side.to_owned())),
+        (
+            "purpose",
+            Value::String("v5_static_production_selector_sample_v1".to_owned()),
+        ),
+    ]))?)
+}
+
+fn static_selector_row(
+    draw_index: usize,
+    analysis_seed: &str,
+    prepared: &V5StaticCrossoverPreparedParent,
+    side: &str,
+) -> Result<Value> {
+    let state = prepared.recompiler.state_for_side(side)?;
+    let authority = prepared.recompiler.projection.operator_authority(side)?;
+    let proposal_seed = static_selector_seed(
+        analysis_seed,
+        draw_index,
+        &prepared.candidate_id,
+        side,
+    )?;
+    let admitted = match crate::v5_operators::select_admitted_evolved_operator_choice_from_state(
+        &proposal_seed,
+        &state,
+        &authority,
+        prepared.recompiler.as_ref(),
+    ) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            return Ok(object([
+                ("drawIndex", Value::from(draw_index as u64)),
+                ("proposalSeed", Value::String(proposal_seed)),
+                (
+                    "parentCandidateId",
+                    Value::String(prepared.candidate_id.clone()),
+                ),
+                ("parentRole", Value::String(prepared.role.clone())),
+                ("side", Value::String(side.to_owned())),
+                (
+                    "terminalStage",
+                    Value::String("selector_rejected".to_owned()),
+                ),
+                ("reasonCode", Value::String(error.to_string())),
+            ]));
+        }
+    };
+    let selection = admitted.replay_selection();
+    let receipt = selection
+        .receipt
+        .as_object()
+        .ok_or_else(|| invalid("static selector receipt is not an object"))?;
+    let family = static_neighborhood_text(
+        &selection.receipt,
+        "family",
+        "static selector receipt",
+    )?;
+    let mutation_class = receipt.get("mutationClass").cloned().unwrap_or(Value::Null);
+    let plan_sha256 = static_neighborhood_text(
+        &selection.native_plan,
+        "planSha256",
+        "static selector native plan",
+    )?;
+    let mut row = object([
+        ("drawIndex", Value::from(draw_index as u64)),
+        ("proposalSeed", Value::String(proposal_seed)),
+        (
+            "parentCandidateId",
+            Value::String(prepared.candidate_id.clone()),
+        ),
+        (
+            "parentPairIdentitySha256",
+            Value::String(state.pair_identity_sha256.clone()),
+        ),
+        ("parentRole", Value::String(prepared.role.clone())),
+        ("side", Value::String(side.to_owned())),
+        ("family", Value::String(family)),
+        ("mutationClass", mutation_class),
+        (
+            "operatorId",
+            clone_value(required(
+                &selection.native_plan,
+                "operatorId",
+                "static selector native plan",
+            )?)?,
+        ),
+        (
+            "choiceKind",
+            clone_value(required(
+                &selection.native_plan,
+                "choiceKind",
+                "static selector native plan",
+            )?)?,
+        ),
+        ("planSha256", Value::String(plan_sha256)),
+        (
+            "legacyChoiceSha256",
+            Value::String(canonical_sha256(&selection.legacy_choice)?),
+        ),
+        (
+            "nativePlanConstruction",
+            clone_value(required(
+                &selection.native_plan,
+                "construction",
+                "static selector native plan",
+            )?)?,
+        ),
+        (
+            "selectionReceiptSha256",
+            clone_value(required(
+                &selection.receipt,
+                "selectionSha256",
+                "static selector receipt",
+            )?)?,
+        ),
+        (
+            "behaviorStatus",
+            Value::String("unknown_no_runtime_or_market_execution".to_owned()),
+        ),
+    ]);
+    let fields = row
+        .as_object_mut()
+        .expect("constructed static selector row is an object");
+    let execution = crate::v5_operators::execute_admitted_evolved_operator_selection(
+        &state.pair_identity_sha256,
+        &state.program,
+        &authority,
+        &state.compiled_profile,
+        admitted,
+    )
+    .map_err(|error| invalid(format!("static selector execution: {error}")))?;
+    if execution.disposition != crate::v5_operators::V5OperatorDisposition::Accepted {
+        let terminal_stage = if execution.disposition
+            == crate::v5_operators::V5OperatorDisposition::NoOp
+        {
+            "same_side_no_op"
+        } else {
+            "operator_apply_rejected"
+        };
+        fields.insert(
+            "terminalStage".to_owned(),
+            Value::String(terminal_stage.to_owned()),
+        );
+        fields.insert(
+            "reasonCode".to_owned(),
+            Value::String(execution.reason_code),
+        );
+        return Ok(row);
+    }
+    let application = execution
+        .application
+        .ok_or_else(|| invalid("accepted static selector execution omitted application"))?;
+    let delta = execution
+        .delta
+        .ok_or_else(|| invalid("accepted static selector execution omitted delta"))?;
+    match prepared.recompiler.recompile_operator_runtime(&delta) {
+        Ok(runtime) => {
+            fields.insert(
+                "childProgramSha256".to_owned(),
+                Value::String(canonical_sha256(&application.child_program)?),
+            );
+            fields.insert(
+                "childPairIdentitySha256".to_owned(),
+                Value::String(runtime.pair_identity_sha256),
+            );
+            fields.insert(
+                "terminalStage".to_owned(),
+                Value::String("accepted_full_pair".to_owned()),
+            );
+        }
+        Err(error) => {
+            fields.insert(
+                "terminalStage".to_owned(),
+                Value::String("full_pair_compile_rejected".to_owned()),
+            );
+            fields.insert("reasonCode".to_owned(), Value::String(error.to_string()));
+        }
+    }
+    Ok(row)
+}
+
+/// Measure the current production mutation selector under a frozen, published
+/// parent/side schedule.  Each draw starts from its frozen host: this is a
+/// conditional mutation-prior sample, not generation allocation, parent
+/// selection, or an evolutionary continuation.
+pub fn inspect_v5_static_selector_sample(
+    shared_authority: &Value,
+    parents: &[V5StaticNeighborhoodParent],
+    analysis_seed: &str,
+    draw_count: usize,
+) -> Result<Value> {
+    if parents.is_empty() {
+        return Err(invalid("v5 static selector sample requires at least one parent"));
+    }
+    if draw_count == 0 || draw_count > 4_000 {
+        return Err(invalid(
+            "v5 static selector sample draw count must be between 1 and 4000",
+        ));
+    }
+    let authority = V5SharedConstructionAuthority::from_shared_object(shared_authority)?;
+    let analysis_seed = text(
+        &Value::String(analysis_seed.to_owned()),
+        "v5 static selector sample analysis seed",
+    )?;
+    let mut seen = BTreeSet::new();
+    let mut prepared = Vec::new();
+    for parent in parents {
+        parent.reference.validate().map_err(|error| {
+            invalid(format!("v5 static selector parent reference: {error}"))
+        })?;
+        if !seen.insert(parent.reference.candidate_id.clone()) {
+            return Err(invalid("v5 static selector sample repeats a parent candidate"));
+        }
+        let material = load_v5_evolved_parent(&authority, &parent.reference)?;
+        let recompiler = Arc::new(V5SealedEvolvedPairRecompiler::from_verified_parent(
+            &authority,
+            &material,
+            &analysis_seed,
+        )?);
+        prepared.push(V5StaticCrossoverPreparedParent {
+            candidate_id: material.candidate_id.clone(),
+            pair_identity_sha256: material.pair_identity_sha256.clone(),
+            role: parent.role.clone(),
+            material,
+            recompiler,
+        });
+    }
+    let rows = (0..draw_count)
+        .map(|draw_index| {
+            let slot = draw_index % (prepared.len() * 2);
+            let parent = prepared
+                .get(slot / 2)
+                .ok_or_else(|| invalid("v5 static selector schedule parent is missing"))?;
+            let side = if slot % 2 == 0 { "long" } else { "short" };
+            static_selector_row(draw_index, &analysis_seed, parent, side)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut value = object([
+        (
+            "schemaVersion",
+            Value::String("temporal_qd_v5_static_selector_sample_report_v1".to_owned()),
+        ),
+        (
+            "sharedAuthoritySha256",
+            Value::String(authority.shared_authority_sha256),
+        ),
+        (
+            "analysisSeedSha256",
+            Value::String(canonical_sha256(&Value::String(analysis_seed))?),
+        ),
+        ("drawCount", Value::from(draw_count as u64)),
+        (
+            "schedule",
+            Value::String("draw_index_mod_host_count_then_long_short_v1".to_owned()),
+        ),
+        (
+            "scope",
+            Value::String(
+                "read_only_conditional_production_mutation_selector_sample_no_generation_or_parent_selection"
+                    .to_owned(),
+            ),
+        ),
+        ("rows", Value::Array(rows)),
+    ]);
+    let report_sha256 = canonical_sha256(&value)?;
+    value
+        .as_object_mut()
+        .expect("constructed static selector sample report is an object")
+        .insert("reportSha256".to_owned(), Value::String(report_sha256));
+    Ok(value)
+}
+
 fn v5_compact_evidence_scope() -> Result<Value> {
     let semantic = object([
         (
