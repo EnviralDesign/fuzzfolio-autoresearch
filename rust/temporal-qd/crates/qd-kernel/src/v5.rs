@@ -10384,7 +10384,7 @@ pub fn inspect_v5_static_round_trips(
         .map_err(|error| invalid(format!("v5 static round-trip child vocabulary: {error}")))?
         .into_iter()
         .find_map(|candidate| {
-            crate::v5_operators::apply_operator_plan(
+            crate::v5_operators::apply_current_admitted_evolved_plan(
                 &child_state.program,
                 &child_authority,
                 &candidate.native_plan,

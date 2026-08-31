@@ -9877,6 +9877,19 @@ fn apply_verified_operator_plan(
     })
 }
 
+/// Apply a choice that has just been enumerated from the current compiled
+/// vocabulary.  This avoids rebuilding that same raw vocabulary for a
+/// read-only inspector; it is not a general replay API and the caller still
+/// has to supply the exact sealed authority used for enumeration.
+pub(crate) fn apply_current_admitted_evolved_plan(
+    parent: &Value,
+    authority: &V5OperatorAuthority,
+    plan: &Value,
+) -> Result<V5OperatorApplication> {
+    verify_plan(parent, authority, plan)?;
+    apply_verified_operator_plan(parent, authority, canonical_clone(plan)?)
+}
+
 fn execution_result(
     disposition: V5OperatorDisposition,
     authority: &V5OperatorAuthority,
