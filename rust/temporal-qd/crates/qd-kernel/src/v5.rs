@@ -10309,6 +10309,143 @@ pub fn inspect_v5_static_neighborhood(
     Ok(value)
 }
 
+/// Execute a small, explicitly requested set of in-memory round trips.  This
+/// probe is read-only: it advances a sealed compiler state, enumerates that
+/// child's admitted vocabulary, and reports whether a one-step plan restores
+/// the original side program.  It never constructs a proposal, candidate,
+/// archive row, or runtime/market evaluation.
+pub fn inspect_v5_static_round_trips(
+    shared_authority: &Value,
+    parents: &[V5StaticNeighborhoodParent],
+    analysis_seed: &str,
+    requested: &[(String, String, String)],
+) -> Result<Value> {
+    if requested.is_empty() || requested.len() > 32 {
+        return Err(invalid("v5 static round-trip probe count must be 1 through 32"));
+    }
+    let authority = V5SharedConstructionAuthority::from_shared_object(shared_authority)?;
+    let mut prepared = BTreeMap::new();
+    for parent in parents {
+        let material = load_v5_evolved_parent(&authority, &parent.reference)?;
+        let recompiler = V5SealedEvolvedPairRecompiler::from_verified_parent(
+            &authority,
+            &material,
+            analysis_seed,
+        )?;
+        prepared.insert(material.candidate_id.clone(), (parent.role.clone(), recompiler));
+    }
+    let mut rows = Vec::new();
+    for (candidate_id, side, native_plan_sha256) in requested {
+        let (role, recompiler) = prepared
+            .get(candidate_id)
+            .ok_or_else(|| invalid("v5 static round-trip requested parent is unavailable"))?;
+        let parent_state = recompiler.state_for_side(side)?;
+        let operator_authority = recompiler.projection.operator_authority(side)?;
+        let choice = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
+            &parent_state.program,
+            &operator_authority,
+            &parent_state.compiled_profile,
+            recompiler,
+        )
+        .map_err(|error| invalid(format!("v5 static round-trip forward vocabulary: {error}")))?
+        .into_iter()
+        .find(|choice| {
+            required(&choice.native_plan, "planSha256", "v5 static round-trip plan")
+                .and_then(|value| text(value, "v5 static round-trip plan SHA-256"))
+                .is_ok_and(|value| value == *native_plan_sha256)
+        })
+        .ok_or_else(|| invalid("v5 static round-trip requested forward plan is not admitted"))?;
+        let selection = crate::v5_operators::V5EvolvedOperatorSelection {
+            native_plan: choice.native_plan.clone(),
+            legacy_choice: choice.legacy_choice.clone(),
+            receipt: object([]),
+        };
+        let forward = crate::v5_operators::execute_evolved_operator_selection_with_admission(
+            recompiler.pair_identity_sha256(),
+            &parent_state.program,
+            &operator_authority,
+            &parent_state.compiled_profile,
+            selection,
+            recompiler,
+        )
+        .map_err(|error| invalid(format!("v5 static round-trip forward execution: {error}")))?;
+        let delta = forward
+            .delta
+            .ok_or_else(|| invalid("v5 static round-trip forward step was not accepted"))?;
+        let child_recompiler = recompiler.advance_evolved_operator(&delta)?;
+        let child_state = child_recompiler.state_for_side(side)?;
+        let child_authority = child_recompiler.projection.operator_authority(side)?;
+        let inverse = crate::v5_operators::enumerate_evolved_operator_choices_with_admission(
+            &child_state.program,
+            &child_authority,
+            &child_state.compiled_profile,
+            &child_recompiler,
+        )
+        .map_err(|error| invalid(format!("v5 static round-trip child vocabulary: {error}")))?
+        .into_iter()
+        .find_map(|candidate| {
+            crate::v5_operators::apply_operator_plan(
+                &child_state.program,
+                &child_authority,
+                &candidate.native_plan,
+            )
+            .ok()
+            .filter(|application| application.child_program == parent_state.program)
+            .map(|_| candidate)
+        });
+        let opposite_side = if side == "long" { "short" } else { "long" };
+        let mut row = object([
+            ("parentCandidateId", Value::String(candidate_id.clone())),
+            ("parentRole", Value::String(role.clone())),
+            ("side", Value::String(side.clone())),
+            ("forwardNativePlanSha256", Value::String(native_plan_sha256.clone())),
+            ("parentProgramSha256", Value::String(canonical_sha256(&parent_state.program)?)),
+            ("childProgramSha256", Value::String(canonical_sha256(&child_state.program)?)),
+            ("parentExecutableSemanticSha256", Value::String(recompiler.runtime.executable_semantic_sha256.clone())),
+            ("childExecutableSemanticSha256", Value::String(child_recompiler.runtime.executable_semantic_sha256.clone())),
+            ("oppositeSide", Value::String(opposite_side.to_owned())),
+            ("behaviorStatus", Value::String("unknown_no_runtime_or_market_execution".to_owned())),
+        ]);
+        let fields = row.as_object_mut().expect("constructed round-trip row is an object");
+        if let Some(inverse) = inverse {
+            let selection = crate::v5_operators::V5EvolvedOperatorSelection {
+                native_plan: inverse.native_plan.clone(),
+                legacy_choice: inverse.legacy_choice.clone(),
+                receipt: object([]),
+            };
+            let execution = crate::v5_operators::execute_evolved_operator_selection_with_admission(
+                child_recompiler.pair_identity_sha256(),
+                &child_state.program,
+                &child_authority,
+                &child_state.compiled_profile,
+                selection,
+                &child_recompiler,
+            )
+            .map_err(|error| invalid(format!("v5 static round-trip inverse execution: {error}")))?;
+            let reverse_delta = execution.delta.ok_or_else(|| invalid("v5 static round-trip inverse was not accepted"))?;
+            let restored = child_recompiler.recompile_operator_runtime(&reverse_delta)?;
+            fields.insert("inverseNativePlanSha256".to_owned(), clone_value(required(&inverse.native_plan, "planSha256", "v5 static round-trip inverse")?)?);
+            fields.insert("outcome".to_owned(), Value::String("exactly_reversible_in_one_step".to_owned()));
+            fields.insert("restoredProgramSha256".to_owned(), Value::String(canonical_sha256(restored.program(side)?)?));
+            fields.insert("restoredExecutableSemanticSha256".to_owned(), Value::String(restored.executable_semantic_sha256.clone()));
+            fields.insert("restoredOppositeUnchanged".to_owned(), Value::Bool(restored.program(opposite_side)? == recompiler.runtime.program(opposite_side)?));
+            fields.insert("restoredProgramMatchesParent".to_owned(), Value::Bool(restored.program(side)? == &parent_state.program));
+        } else {
+            fields.insert("outcome".to_owned(), Value::String("no_inverse_exposed".to_owned()));
+        }
+        rows.push(row);
+    }
+    let mut report = object([
+        ("schemaVersion", Value::String("temporal_qd_v5_static_round_trip_report_v1".to_owned())),
+        ("sharedAuthoritySha256", Value::String(authority.shared_authority_sha256)),
+        ("scope", Value::String("write_neutral_compile_only_in_memory_round_trip_probe".to_owned())),
+        ("rows", Value::Array(rows)),
+    ]);
+    let report_sha256 = canonical_sha256(&report)?;
+    report.as_object_mut().expect("constructed round-trip report is an object").insert("reportSha256".to_owned(), Value::String(report_sha256));
+    Ok(report)
+}
+
 fn static_crossover_row(
     choice: V5StaticCrossoverChoice,
     recipient: &V5StaticCrossoverPreparedParent,

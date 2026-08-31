@@ -29,6 +29,7 @@ use temporal_qd_contract::{
 use temporal_qd_kernel::v5::{
     V5AttemptJournal, V5AttemptOutcomeAudit, V5CompactAcceptedRecord, V5SelectedProjection,
     V5SharedConstructionAuthority, V5StaticNeighborhoodParent, inspect_v5_static_neighborhood,
+    inspect_v5_static_round_trips,
     inspect_v5_static_same_side_crossover,
     inspect_v5_static_selector_sample,
     parent_reference_from_v5_compact_record,
@@ -133,6 +134,9 @@ fn run() -> Result<()> {
     if args.len() == 3 && args[1] == "--static-selector-sample" {
         return execute_static_selector_sample(Path::new(&args[2]));
     }
+    if args.len() == 3 && args[1] == "--static-round-trip" {
+        return execute_static_round_trip(Path::new(&args[2]));
+    }
     if args.len() == 3 && args[1] == "--manifest" {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::Durable);
     }
@@ -144,7 +148,7 @@ fn run() -> Result<()> {
         return execute_manifest(Path::new(&args[2]), V5BatchExecutionMode::FastEphemeralV1);
     }
     bail!(
-        "usage: temporal-qd-batch --version-json | --grammar-registry | --static-neighborhood REQUEST | --static-same-side-crossover REQUEST | --static-selector-sample REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
+        "usage: temporal-qd-batch --version-json | --grammar-registry | --static-neighborhood REQUEST | --static-same-side-crossover REQUEST | --static-selector-sample REQUEST | --static-round-trip REQUEST | --manifest PATH [--execution-mode fast-ephemeral-v1]"
     )
 }
 
@@ -489,6 +493,97 @@ fn execute_static_selector_sample(request_path: &Path) -> Result<()> {
         draw_count,
     )
     .context("inspect static production selector sample through canonical v5 seams")?;
+    write_stdout_json(&report)
+}
+
+fn execute_static_round_trip(request_path: &Path) -> Result<()> {
+    let request_path = safe_existing_file(request_path, "static round-trip request")?;
+    let request: Value = serde_json::from_slice(&fs::read(&request_path)?)
+        .context("parse static round-trip request")?;
+    let fields = request
+        .as_object()
+        .ok_or_else(|| anyhow!("static round-trip request is not an object"))?;
+    let expected = [
+        "schemaVersion",
+        "frozenAuthorityPath",
+        "parentMaterialPath",
+        "parents",
+        "analysisSeed",
+        "probes",
+    ];
+    if fields.len() != expected.len()
+        || expected.iter().any(|key| !fields.contains_key(*key))
+        || fields.get("schemaVersion").and_then(Value::as_str)
+            != Some("temporal_qd_v5_static_round_trip_request_v1")
+    {
+        bail!("static round-trip request shape is incompatible")
+    }
+    let authority_path = safe_existing_file(
+        Path::new(&static_neighborhood_text(fields, "frozenAuthorityPath")?),
+        "static round-trip frozen authority",
+    )?;
+    let authority: Value = serde_json::from_slice(&fs::read(&authority_path)?)
+        .context("parse static round-trip frozen authority")?;
+    let parent_material_path = safe_existing_file(
+        Path::new(&static_neighborhood_text(fields, "parentMaterialPath")?),
+        "static round-trip parent material",
+    )?;
+    let parents = fields
+        .get("parents")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| anyhow!("static round-trip request parents are invalid"))?;
+    let mut requested_parents = Vec::new();
+    let mut seen = BTreeSet::new();
+    for parent in parents {
+        let parent = parent
+            .as_object()
+            .ok_or_else(|| anyhow!("static round-trip parent is not an object"))?;
+        if parent.len() != 2 || !parent.contains_key("candidateId") || !parent.contains_key("role") {
+            bail!("static round-trip parent shape is incompatible")
+        }
+        let candidate_id = static_neighborhood_text(parent, "candidateId")?;
+        if !seen.insert(candidate_id.clone()) {
+            bail!("static round-trip request repeats a parent candidate")
+        }
+        requested_parents.push((candidate_id, static_neighborhood_text(parent, "role")?));
+    }
+    let probes = fields
+        .get("probes")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= 32)
+        .ok_or_else(|| anyhow!("static round-trip request probes are invalid"))?;
+    let mut requested_probes = Vec::new();
+    let mut probe_seen = BTreeSet::new();
+    for probe in probes {
+        let probe = probe
+            .as_object()
+            .ok_or_else(|| anyhow!("static round-trip probe is not an object"))?;
+        if probe.len() != 3
+            || !probe.contains_key("candidateId")
+            || !probe.contains_key("side")
+            || !probe.contains_key("nativePlanSha256")
+        {
+            bail!("static round-trip probe shape is incompatible")
+        }
+        let candidate_id = static_neighborhood_text(probe, "candidateId")?;
+        let side = static_neighborhood_text(probe, "side")?;
+        if !matches!(side.as_str(), "long" | "short") {
+            bail!("static round-trip probe side is invalid")
+        }
+        let plan = static_neighborhood_text(probe, "nativePlanSha256")?;
+        if !probe_seen.insert((candidate_id.clone(), side.clone(), plan.clone())) {
+            bail!("static round-trip request repeats a probe")
+        }
+        requested_probes.push((candidate_id, side, plan));
+    }
+    let report = inspect_v5_static_round_trips(
+        &authority,
+        &static_neighborhood_parents(&parent_material_path, &requested_parents)?,
+        &static_neighborhood_text(fields, "analysisSeed")?,
+        &requested_probes,
+    )
+    .context("inspect static round trips through canonical v5 seams")?;
     write_stdout_json(&report)
 }
 
