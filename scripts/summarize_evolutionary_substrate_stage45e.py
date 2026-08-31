@@ -388,17 +388,34 @@ def historical_join(historical: list[dict[str, Any]]) -> dict[str, Any]:
             "scope": "observational retained-construction join only; no behavioral or economic causation claim"}
 
 
+def reversibility(round_trip: dict[str, Any]) -> dict[str, Any]:
+    check_report_hash(round_trip, "round-trip")
+    probe_rows = rows(round_trip, "round-trip")
+    if len(probe_rows) != 10:
+        raise SummaryError("round-trip probe does not contain its predeclared ten witnesses")
+    outcomes = counts(row.get("outcome") for row in probe_rows)
+    if outcomes != {"exactly_reversible_in_one_step": 8, "no_inverse_exposed": 2}:
+        raise SummaryError(f"unexpected round-trip outcome census: {outcomes}")
+    restored = [row for row in probe_rows if row.get("outcome") == "exactly_reversible_in_one_step"]
+    if not all(row.get("restoredProgramMatchesParent") and row.get("restoredOppositeUnchanged") for row in restored):
+        raise SummaryError("reported exact round trip does not restore program/opposite-side invariants")
+    return {"schemaVersion": round_trip.get("schemaVersion"), "scope": round_trip.get("scope"), "outcomes": outcomes,
+            "exactRestorationsPreservePairExecutableSemantic": sum(row.get("parentExecutableSemanticSha256") == row.get("restoredExecutableSemanticSha256") for row in restored),
+            "records": probe_rows,
+            "interpretation": "Bounded current-vocabulary probe only: no inverse exposed is not proof that a longer or different-semantic inverse cannot exist."}
+
+
 def build(args: argparse.Namespace) -> dict[str, Any]:
-    neighborhood, selector, crossover, grammar = (read_object(path) for path in (args.neighborhood, args.selector, args.crossover, args.grammar))
+    neighborhood, selector, crossover, grammar, round_trip = (read_object(path) for path in (args.neighborhood, args.selector, args.crossover, args.grammar, args.round_trip))
     historical = read_jsonl(args.historical_v38_projection)
     hashes = {"neighborhood": check_report_hash(neighborhood, "neighborhood"), "selector": check_report_hash(selector, "selector"), "crossover": check_report_hash(crossover, "crossover")}
     envelope, cross = accepted(neighborhood), accepted(crossover)
     semantic, selected = semantic_diversity(envelope, selector, cross, historical)
     output = {"schemaVersion": SCHEMA, "scope": "static/compile-only evidence reducer; no market, runtime, generation, archive mutation, worker, gateway, or Vast activity",
-              "inputs": {"neighborhood": artifact(args.neighborhood), "selector": artifact(args.selector), "crossover": artifact(args.crossover), "grammar": artifact(args.grammar), "historicalV38Projection": artifact(args.historical_v38_projection)},
+              "inputs": {"neighborhood": artifact(args.neighborhood), "selector": artifact(args.selector), "crossover": artifact(args.crossover), "grammar": artifact(args.grammar), "roundTrip": artifact(args.round_trip), "historicalV38Projection": artifact(args.historical_v38_projection)},
               "verifiedInputReportHashes": hashes, "controls": controls(neighborhood, selector, crossover, grammar), "exclusions": exclusion_ledger(neighborhood),
               "semanticDiversity": semantic, "localityTaxonomy": taxonomy(envelope), "aliases": aliases_and_probabilities(envelope, selected),
-              "conditionalLottery": lottery(selected, envelope), "crossover": crossover_summary(cross, crossover), "historicalJoin": historical_join(historical),
+              "conditionalLottery": lottery(selected, envelope), "crossover": crossover_summary(cross, crossover), "reversibility": reversibility(round_trip), "historicalJoin": historical_join(historical),
               "limitations": ["No runtime trace or market evaluation was read or executed.", "Historical V38 executable-semantic identities cannot be reconstructed from its retained compact projection without inventing missing raw-profile inputs."]}
     output["reportSha256"] = canonical_sha256(output)
     return output
@@ -406,7 +423,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("neighborhood", "selector", "crossover", "grammar", "historical-v38-projection", "output"):
+    for name in ("neighborhood", "selector", "crossover", "grammar", "round-trip", "historical-v38-projection", "output"):
         parser.add_argument("--" + name, required=True, type=Path)
     args = parser.parse_args()
     output = build(args)
